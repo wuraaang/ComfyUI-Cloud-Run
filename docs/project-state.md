@@ -1,6 +1,6 @@
 # Project state
 
-Status: V0 preview implementation authorized.
+Status: V0 preview implemented and locally certified. Paid rental remains disabled.
 
 Source of truth: `AGENTS.md` plus Leo's approved minimal plan.
 

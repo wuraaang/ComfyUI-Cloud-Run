@@ -1,0 +1,13 @@
+[project]
+name = "comfyui-cloud-run"
+description = "Preview and compare Vast GPU offers from a web-only ComfyUI extension."
+version = "0.1.0"
+license = { file = "LICENSE" }
+requires-python = ">=3.9"
+dependencies = []
+classifiers = ["Operating System :: OS Independent"]
+
+[tool.comfy]
+PublisherId = "wuraaang"
+DisplayName = "Cloud Run"
+Tags = ["cloud", "gpu", "vast", "preview"]

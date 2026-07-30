@@ -1,0 +1,13 @@
+.DS_Store
+.coverage
+.env
+.env.*
+.pytest_cache/
+.worktrees/
+__pycache__/
+*.py[cod]
+build/
+dist/
+node_modules/
+settings.json
+data/
