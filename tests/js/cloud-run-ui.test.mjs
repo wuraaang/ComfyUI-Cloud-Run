@@ -500,6 +500,40 @@ test("server quote shows the exact paid confirmation before create", async () =>
   );
 });
 
+test("quote review displays the sanitized backend error", async () => {
+  const document = new FakeDocument();
+  mountLocalRunButton(document);
+  const responses = [
+    settingsResponse(),
+    jsonResponse({
+      offers: [
+        {
+          offer_id: 42,
+          gpu_name: "RTX 4090",
+          gpu_ram_gb: 24,
+          dph_total: 0.42,
+          reliability: 0.99,
+        },
+      ],
+    }),
+    jsonResponse(
+      { error: "The selected Vast offer is no longer available." },
+      { ok: false, status: 409 },
+    ),
+  ];
+
+  mountCloudRun(document, async () => responses.shift());
+  await document.getElementById("cloud-run-button").click();
+  await document.getElementById("cloud-run-search").click();
+  await document.getElementById("cloud-run-offer-0").click();
+  await document.getElementById("cloud-run-preview-selection").click();
+
+  assert.equal(
+    document.getElementById("cloud-run-status").textContent,
+    "The selected Vast offer is no longer available.",
+  );
+});
+
 test("every server lifecycle state has an explicit safe presentation", () => {
   const expected = {
     idle: { poll: false },

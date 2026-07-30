@@ -160,10 +160,27 @@ function createIdempotencyKey(browserWindow) {
 
 
 async function fetchJson(fetchImpl, endpoint, options) {
-  const response = await fetchImpl(endpoint, options);
-  const payload = await response.json();
-  if (!response.ok || !payload || typeof payload !== "object") {
+  let response;
+  try {
+    response = await fetchImpl(endpoint, options);
+  } catch {
     throw new Error("request failed");
+  }
+
+  let payload;
+  try {
+    payload = await response.json();
+  } catch {
+    throw new Error("request failed");
+  }
+
+  if (!payload || typeof payload !== "object") {
+    throw new Error("request failed");
+  }
+  if (!response.ok) {
+    const message =
+      typeof payload.error === "string" ? payload.error.trim() : "";
+    throw new Error(message || "request failed");
   }
   return payload;
 }
@@ -738,7 +755,7 @@ export function mountCloudRun(document, fetchImpl, browserWindow = globalThis) {
     }
     setBusy(true);
     status.textContent = "Creating a short-lived server quote…";
-    let failed = false;
+    let failureMessage = null;
     try {
       currentAttempt = await fetchJson(fetchImpl, QUOTES_ENDPOINT, {
         method: "POST",
@@ -748,12 +765,17 @@ export function mountCloudRun(document, fetchImpl, browserWindow = globalThis) {
           idempotency_key: idempotencyKey,
         }),
       });
-    } catch {
-      failed = true;
+    } catch (error) {
+      const message =
+        error instanceof Error ? String(error.message).trim() : "";
+      failureMessage =
+        message && message !== "request failed"
+          ? message
+          : "The selected offer could not be quoted.";
     } finally {
       setBusy(false);
-      if (failed) {
-        status.textContent = "The selected offer could not be quoted.";
+      if (failureMessage) {
+        status.textContent = failureMessage;
       }
     }
   });
