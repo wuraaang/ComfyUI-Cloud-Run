@@ -216,6 +216,39 @@ class CloudRunServiceTests(unittest.TestCase):
         self.assertEqual(len(provider.lookup_calls), 2)
         self.assertEqual(provider.search_calls, [])
 
+    def test_confirmation_rejects_quote_identity_changes_without_create(self):
+        from cloud_run.service import QuoteUnavailable
+
+        changed_offers = [
+            ("gpu-name", {**offer(), "gpu_name": "RTX 4080"}),
+            ("vram", {**offer(), "gpu_ram_gb": 16.0}),
+            ("canonical-id", {**offer(), "offer_id": 99}),
+        ]
+        for case_name, changed_offer in changed_offers:
+            with self.subTest(case=case_name):
+                provider = FakeProvider(
+                    lookups=[offer(), changed_offer],
+                )
+                service = self.service(provider)
+                idempotency_key = "idem-changed-" + case_name
+                preview = asyncio.run(
+                    service.preview_offer(
+                        offer_id=42,
+                        idempotency_key=idempotency_key,
+                    )
+                )
+
+                with self.assertRaises(QuoteUnavailable):
+                    asyncio.run(
+                        service.confirm(
+                            preview.attempt_id,
+                            idempotency_key=idempotency_key,
+                        )
+                    )
+
+                self.assertEqual(len(provider.lookup_calls), 2)
+                self.assertEqual(provider.create_calls, [])
+
     def test_attempt_and_creating_state_exist_before_the_only_paid_call(self):
         provider = FakeProvider(lookups=[offer(), offer()])
         service = self.service(provider)
