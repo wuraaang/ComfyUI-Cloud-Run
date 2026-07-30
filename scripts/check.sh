@@ -120,6 +120,7 @@ allowed_provider_actions = {
     "create_instance",
     "destroy_instance",
     "get_instance",
+    "get_offer",
     "list_instances",
     "search_offers",
 }
@@ -132,7 +133,8 @@ provider_actions = {
             node.name.endswith(("_instance", "_instances"))
             and not node.name.startswith("_")
         )
-        or node.name in {"search_offers", "rent_instance", "stop_instance"}
+        or node.name
+        in {"get_offer", "search_offers", "rent_instance", "stop_instance"}
     )
 }
 if provider_actions != allowed_provider_actions:

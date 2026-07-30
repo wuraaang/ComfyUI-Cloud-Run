@@ -204,16 +204,22 @@ async def _search_with_session(
     max_price_per_hour,
     min_vram_gb,
     search_options,
+    *,
+    offer_id=None,
 ):
     try:
+        request_payload = build_search_payload(
+            max_price_per_hour,
+            min_vram_gb,
+            **search_options,
+        )
+        if offer_id is not None:
+            request_payload["ask_contract_id"] = {"eq": int(offer_id)}
+            request_payload["limit"] = 1
         async with session.post(
             OFFER_SEARCH_URL,
             headers=_headers(api_key),
-            json=build_search_payload(
-                max_price_per_hour,
-                min_vram_gb,
-                **search_options,
-            ),
+            json=request_payload,
         ) as response:
             if response.status in (401, 403):
                 raise OfferSearchError("Vast rejected the saved API key.")
@@ -321,6 +327,58 @@ def _validate_offer_id(offer_id):
     if value is None or not value.isdigit():
         raise VastConfigurationError("A valid Vast offer ID is required.")
     return value
+
+
+async def get_offer(
+    api_key,
+    offer_id,
+    max_price_per_hour,
+    min_vram_gb,
+    session=None,
+    *,
+    min_inet_down_mbps=0,
+    min_disk_bw_mbps=0,
+    min_reliability=MIN_RELIABILITY,
+    verified_only=True,
+    secure_cloud_only=False,
+):
+    if not isinstance(api_key, str) or not api_key.strip():
+        raise OfferSearchConfigurationError("Vast API key is not configured.")
+    identifier = _validate_offer_id(offer_id)
+    options = {
+        "min_inet_down_mbps": min_inet_down_mbps,
+        "min_disk_bw_mbps": min_disk_bw_mbps,
+        "min_reliability": min_reliability,
+        "verified_only": verified_only,
+        "secure_cloud_only": secure_cloud_only,
+    }
+
+    async def operation(client):
+        offers = await _search_with_session(
+            client,
+            api_key.strip(),
+            max_price_per_hour,
+            min_vram_gb,
+            options,
+            offer_id=identifier,
+        )
+        return next(
+            (
+                offer
+                for offer in offers
+                if str(offer.get("offer_id")) == identifier
+            ),
+            None,
+        )
+
+    try:
+        return await _run_with_session(operation, session)
+    except OfferSearchError:
+        raise
+    except VastError:
+        raise OfferSearchError(
+            "Vast offer search is temporarily unavailable."
+        ) from None
 
 
 def _validate_label(label):

@@ -129,6 +129,59 @@ class VastRequestTests(unittest.TestCase):
             ],
         )
 
+    def test_exact_offer_lookup_uses_contract_id_and_requires_canonical_match(self):
+        from cloud_run.vast import OFFER_SEARCH_URL, get_offer
+
+        matching_offer = {
+            "id": 42,
+            "gpu_name": "RTX 4090",
+            "gpu_ram": 24576,
+            "dph_total": 0.42,
+            "reliability2": 0.99,
+            "rentable": True,
+            "verified": True,
+            "num_gpus": 1,
+            "type": "ondemand",
+        }
+        matching_session = FakeSession(
+            FakeResponse(200, {"offers": [matching_offer]})
+        )
+
+        selected = asyncio.run(
+            get_offer(
+                "synthetic-value",
+                offer_id="42",
+                max_price_per_hour=0.75,
+                min_vram_gb=24,
+                session=matching_session,
+            )
+        )
+
+        self.assertEqual(selected["offer_id"], 42)
+        url, request = matching_session.calls[0]
+        self.assertEqual(url, OFFER_SEARCH_URL)
+        self.assertEqual(
+            request["json"]["ask_contract_id"],
+            {"eq": 42},
+        )
+        self.assertEqual(request["json"]["limit"], 1)
+        self.assertEqual(request["json"]["dph_total"], {"lte": 0.75})
+        self.assertEqual(request["json"]["gpu_ram"], {"gte": 24576})
+
+        mismatched_session = FakeSession(
+            FakeResponse(200, {"offers": [{**matching_offer, "id": 99}]})
+        )
+        mismatched = asyncio.run(
+            get_offer(
+                "synthetic-value",
+                offer_id=42,
+                max_price_per_hour=0.75,
+                min_vram_gb=24,
+                session=mismatched_session,
+            )
+        )
+        self.assertIsNone(mismatched)
+
     def test_missing_key_fails_before_request(self):
         from cloud_run.vast import OfferSearchConfigurationError, search_offers
 
