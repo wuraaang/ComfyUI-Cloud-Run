@@ -92,6 +92,35 @@ class FakeProvider:
         self.calls.append(("search", api_key, max_price_per_hour, min_vram_gb))
         return list(self.search_results)
 
+    async def get_offer(
+        self,
+        api_key,
+        offer_id,
+        *,
+        max_price_per_hour,
+        min_vram_gb,
+    ):
+        self.calls.append(
+            (
+                "lookup",
+                str(offer_id),
+                api_key,
+                max_price_per_hour,
+                min_vram_gb,
+            )
+        )
+        return next(
+            (
+                dict(offer)
+                for offer in self.search_results
+                if str(offer.get("offer_id")) == str(offer_id)
+                and float(offer.get("dph_total", float("inf")))
+                <= max_price_per_hour
+                and float(offer.get("gpu_ram_gb", 0)) >= min_vram_gb
+            ),
+            None,
+        )
+
     async def create_instance(
         self,
         api_key,
