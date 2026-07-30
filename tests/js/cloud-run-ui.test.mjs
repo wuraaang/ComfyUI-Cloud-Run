@@ -260,10 +260,52 @@ test("waits for a late local Run button and injects the launcher only once", asy
   const launcher = document.getElementById("cloud-run-button");
   assert.ok(launcher);
   assert.deepEqual(actionbar.children, [queueGroup, launcher]);
-  assert.equal(disconnectCount, 1);
+  assert.equal(disconnectCount, 0);
 
   await extension.setup();
   assert.deepEqual(actionbar.children, [queueGroup, launcher]);
+});
+
+test("reattaches the same launcher after the action bar is replaced", () => {
+  const document = new FakeDocument();
+  const first = mountLocalRunButton(document);
+  let mutationCallback = null;
+  let disconnectCount = 0;
+  const browserWindow = {
+    MutationObserver: class {
+      constructor(callback) {
+        mutationCallback = callback;
+      }
+
+      observe(root, options) {
+        assert.equal(root, document.body);
+        assert.deepEqual(options, { childList: true, subtree: true });
+      }
+
+      disconnect() {
+        disconnectCount += 1;
+      }
+    },
+  };
+
+  const launcher = mountCloudRun(
+    document,
+    async () => settingsResponse(),
+    browserWindow,
+  );
+  assert.equal(typeof mutationCallback, "function");
+  assert.deepEqual(first.actionbar.children, [first.queueGroup, launcher]);
+
+  first.actionbar.remove();
+  const second = mountLocalRunButton(document);
+  mutationCallback();
+
+  assert.equal(launcher.isConnected, true);
+  assert.deepEqual(second.actionbar.children, [second.queueGroup, launcher]);
+  assert.equal(disconnectCount, 0);
+
+  mutationCallback();
+  assert.deepEqual(second.actionbar.children, [second.queueGroup, launcher]);
 });
 
 test("keeps the Extensions command usable when the action bar is unavailable", async () => {

@@ -380,31 +380,32 @@ function placeLauncherBesideLocalRun(document, launcher) {
   const queueGroup = queueButton?.parentElement;
   const actionbar = queueGroup?.parentElement;
   if (!actionbar) return false;
+  if (
+    launcher.parentElement === actionbar &&
+    queueGroup.nextSibling === launcher
+  ) {
+    return true;
+  }
   actionbar.insertBefore(launcher, queueGroup.nextSibling);
   return true;
 }
 
 
 function ensureLauncherPlacement(browserWindow, document, mounted) {
-  if (placeLauncherBesideLocalRun(document, mounted.launcher)) {
-    mounted.observer?.disconnect();
-    mounted.observer = null;
-    return true;
-  }
+  const placed = placeLauncherBesideLocalRun(document, mounted.launcher);
   if (
-    mounted.observer ||
-    typeof browserWindow?.MutationObserver !== "function"
+    !mounted.observer &&
+    typeof browserWindow?.MutationObserver === "function"
   ) {
-    return false;
+    mounted.observer = new browserWindow.MutationObserver(() => {
+      placeLauncherBesideLocalRun(document, mounted.launcher);
+    });
+    mounted.observer.observe(document.body, {
+      childList: true,
+      subtree: true,
+    });
   }
-  mounted.observer = new browserWindow.MutationObserver(() => {
-    if (placeLauncherBesideLocalRun(document, mounted.launcher)) {
-      mounted.observer?.disconnect();
-      mounted.observer = null;
-    }
-  });
-  mounted.observer.observe(document.body, { childList: true, subtree: true });
-  return false;
+  return placed;
 }
 
 
