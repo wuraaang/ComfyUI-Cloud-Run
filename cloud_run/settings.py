@@ -104,7 +104,7 @@ def public_settings(settings):
         "min_vram_gb": settings["min_vram_gb"],
         "official_template_id": OFFICIAL_TEMPLATE_ID,
         "official_template_name": OFFICIAL_TEMPLATE_NAME,
-        "preview_only": True,
+        "lifecycle_enabled": True,
     }
 
 

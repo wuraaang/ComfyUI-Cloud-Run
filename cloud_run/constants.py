@@ -1,7 +1,9 @@
-"""Fixed values for the preview-only Cloud Run slice."""
+"""Fixed values for the managed Vast.ai Cloud Run lifecycle."""
 
 OFFICIAL_TEMPLATE_ID = "57808457573e32120301649763d8e019"
 OFFICIAL_TEMPLATE_NAME = "Official ComfyUI"
+COMFYUI_CONTAINER_PORT = 8188
+DEFAULT_DISK_GB = 80
 
 DEFAULT_MAX_PRICE_PER_HOUR = 1.0
 DEFAULT_MIN_VRAM_GB = 16

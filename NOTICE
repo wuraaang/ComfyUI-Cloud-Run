@@ -1,0 +1,16 @@
+ComfyUI Cloud Run
+Copyright (c) 2026 wuraaang
+
+This MIT-licensed package independently reimplements a narrow set of lifecycle
+contracts and safety policies using LoRA Dataset Studio as a behavioral reference:
+
+  LoRA Dataset Studio
+  Commit: de697caf9d607a29c72cebdc2794eecd6b147606
+  License at that commit: PolyForm Noncommercial 1.0.0
+
+The referenced behavior includes Vast offer normalization, host blacklisting,
+reliability-aware offer choice, leak-safe provisioning, forced cleanup, restart
+reconciliation, boot monitoring, and destruction-gated single replacement.
+
+No source code was copied from LoRA Dataset Studio. ComfyUI Cloud Run contains
+an independent, dependency-free implementation scoped to this custom node.

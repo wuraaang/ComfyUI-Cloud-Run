@@ -1,10 +1,16 @@
 # ComfyUI Cloud Run
 
-ComfyUI Cloud Run is a standalone, web-only ComfyUI custom-node package. It adds no graph nodes and no separate application.
+ComfyUI Cloud Run is a standalone, web-only ComfyUI custom-node package. It
+adds no graph nodes and does not replace or intercept ComfyUI's local
+**Run/Exécuter** action.
 
-> **Preview only — no instance will be rented.**
+> **Paid Vast.ai rental:** searching and reviewing are free, but
+> **Confirm & rent GPU** can start hourly billing. The first real certification
+> of this development branch still requires a separate human GO; repository
+> tests and the current certification are fake/offline only.
 
-This first slice stores a write-only Vast API key on the ComfyUI backend, searches real on-demand Vast GPU offers, and previews a selected offer with the official ComfyUI template `57808457573e32120301649763d8e019`. It cannot create, rent, start, stop, or destroy a provider instance.
+Only the official ComfyUI Vast template
+`57808457573e32120301649763d8e019` is allowed.
 
 ## Install
 
@@ -14,54 +20,118 @@ Place this repository at:
 <ComfyUI>/custom_nodes/ComfyUI-Cloud-Run
 ```
 
-Restart ComfyUI. The package requires no additional Python dependency: it uses the stdlib plus the aiohttp and frontend facilities already provided by ComfyUI.
+Restart ComfyUI. The package adds no Python dependency; it uses the stdlib plus
+the aiohttp and frontend facilities supplied by ComfyUI.
 
-The development target for this slice is ComfyUI Core `0.29.0`, frontend package `1.47.10`, and Python `3.13.12`.
+The pinned development host is ComfyUI Core `0.29.0`, frontend `1.47.10`, and
+Python `3.13.12`.
 
-## Use
+## Use and cost boundary
 
-1. Click the persistent **Cloud Run** button.
-2. Enter a Vast API key, maximum hourly price, and minimum VRAM.
-3. Click **Save settings**. After a successful save, the password field is cleared.
-4. Click **Search Vast GPUs**.
-5. Select an offer and click **Preview selection**.
+1. Click **Cloud Run**, immediately beside local **Run/Exécuter**.
+2. Save a Vast API key, maximum hourly price, and minimum VRAM.
+3. Click **Search Vast GPUs** and choose an offer.
+4. Click **Review paid rental**. This asks the backend for a short-lived quote;
+   it does not rent anything.
+5. Verify the offer ID, GPU, VRAM, hourly rate, configured cap, and official
+   template.
+6. Click **Confirm & rent GPU** only if you accept hourly billing.
+7. Use **Cancel** while provisioning or **Destroy — end Vast billing** when
+   finished. A ready instance continues billing until destruction is confirmed.
 
-The final preview shows the selected GPU and price with the official template and explicitly confirms that no instance was created.
+No rental occurs when opening the dialog, saving settings, searching, selecting,
+or requesting a quote. Confirmation revalidates the same offer at a price no
+higher than the quoted price. A durable idempotency key and unique managed label
+are saved before the provider call, so retrying the same browser request cannot
+create a second instance.
 
-## Security and data
+## Secrets and local data
 
-- The API key is sent only in the JSON body of the same-origin settings request.
-- It is stored in `<ComfyUI user directory>/comfyui-cloud-run/settings.json`.
-- The settings file is written atomically with mode `0600`; its dedicated directory is mode `0700`.
-- `COMFYUI_CLOUD_RUN_DATA_DIR` can override the data directory for isolated development and tests.
-- The key is write-only: backend responses contain only `configured: true|false` and never return a value, masked fragment, or provider credential.
-- Remote offer values are reduced to five fields and rendered through DOM `textContent`.
-- The only provider request is read-only offer search: `POST https://console.vast.ai/api/v0/bundles/`.
+- The API key travels only in the same-origin settings JSON body.
+- It is write-only: no backend response returns the value or a masked fragment.
+- Settings are stored at
+  `<ComfyUI user directory>/comfyui-cloud-run/settings.json`.
+- Durable attempts are stored in `attempts.sqlite3`; the expiring bad-host list
+  is `host-blacklist.json` in the same directory.
+- Files use mode `0600` and the dedicated directory uses `0700`.
+- `COMFYUI_CLOUD_RUN_DATA_DIR` overrides the data directory for isolated tests.
+- Browser storage is never used for credentials or provider state.
+- Provider values are reduced to browser-safe fields and rendered with DOM
+  `textContent`.
 
-No provider `/asks` or `/instances` path exists in the runtime package.
+## Cancellation, destruction, and recovery
+
+Cancellation before creation produces zero rentals. If cancellation races an
+in-flight create, intent is persisted first; the backend finds the instance by
+its unique label, destroys it, and verifies fresh Vast inventory before saying
+`cancelled`.
+
+Vast stop is not exposed by this package. **Destroy** is the billing-safe
+terminal action. A successful DELETE response alone is insufficient: inventory
+must also prove that the managed instance and label are absent.
+
+On ComfyUI startup, recovery reconciles durable attempts with only
+`comfy-cloud-run-*` labels. Restarting never blindly creates a new instance. A
+transient boot or transport failure may trigger exactly one replacement, but
+only after the original instance is destroyed, absence is verified, and its
+machine/host/IP is blacklisted. Authentication, quota, budget, validation, and
+configuration failures never retry.
+
+If cleanup cannot be verified, the UI stays failed, shows the residual instance
+ID, warns that billing may continue, and displays an emergency instruction to
+destroy that instance in the Vast.ai console. Never interpret a backend error
+or closed ComfyUI window as proof that billing stopped.
+
+## Uninstall
+
+Before uninstalling, destroy every managed instance and verify the Vast
+inventory is empty. Removing this custom node, deleting its data directory, or
+stopping ComfyUI **does not destroy** any remote Vast instance. If the package
+is already unavailable, use the Vast.ai console as the emergency cleanup path.
+
+## Provider calls
+
+The backend owns every Vast request:
+
+| Method | Provider endpoint | Purpose |
+| --- | --- | --- |
+| `POST` | `https://console.vast.ai/api/v0/bundles/` | Search filtered on-demand offers. |
+| `PUT` | `https://console.vast.ai/api/v0/asks/{offer_id}/` | Create once with the official template. |
+| `GET` | `https://console.vast.ai/api/v1/instances/` | Reconcile inventory and labels. |
+| `GET` | `https://console.vast.ai/api/v0/instances/{instance_id}/` | Poll readiness. |
+| `DELETE` | `https://console.vast.ai/api/v0/instances/{instance_id}/` | Destroy, followed by inventory verification. |
+
+The browser calls only same-origin ComfyUI routes.
 
 ## Local API
 
-All routes are registered with ComfyUI's `PromptServer`:
-
 | Method | Route | Purpose |
 | --- | --- | --- |
-| `GET` | `/cloud-run/api/settings` | Return redacted preview settings. |
-| `PUT` | `/cloud-run/api/settings` | Validate and atomically store settings. |
-| `POST` | `/cloud-run/api/offers` | Search and sanitize matching Vast offers. |
-
-There are no other Cloud Run backend routes in this slice.
+| `GET` | `/cloud-run/api/settings` | Return redacted settings. |
+| `PUT` | `/cloud-run/api/settings` | Validate and atomically save settings. |
+| `POST` | `/cloud-run/api/offers` | Search and rank sanitized offers. |
+| `POST` | `/cloud-run/api/quotes` | Persist a non-renting quote and idempotency key. |
+| `GET` | `/cloud-run/api/attempts/{attempt_id}` | Reconcile and return browser-safe state. |
+| `POST` | `/cloud-run/api/attempts/{attempt_id}/confirm` | Revalidate and create once. |
+| `POST` | `/cloud-run/api/attempts/{attempt_id}/cancel` | Persist cancellation and clean up. |
+| `DELETE` | `/cloud-run/api/attempts/{attempt_id}` | Explicitly destroy and verify absence. |
 
 ## Repository checks
 
-Run the deterministic local gate:
+Run the deterministic offline gate:
 
 ```sh
 scripts/check.sh
 ```
 
-It runs Python and Node tests, syntax compilation, secret-pattern checks, and forbidden provider-path/method checks. The tests use fake HTTP sessions and a tiny fake DOM; they do not read real credentials or make network calls.
+It runs Python and Node tests, a complete fake lifecycle, compilation checks,
+secret scanning, route/state allowlists, and provider-origin/method checks. It
+does not read real credentials, contact Vast, rent hardware, or publish to the
+Comfy Registry.
 
-## License
+## Scope and license
 
-MIT. See `LICENSE`.
+Workflow transfer, model synchronization, custom-node resolution, other cloud
+providers, telemetry, and Registry publication are out of scope.
+
+MIT. See `LICENSE` and `NOTICE`.

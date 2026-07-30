@@ -51,6 +51,9 @@ import ast
 import re
 from pathlib import Path
 
+from cloud_run.constants import OFFICIAL_TEMPLATE_ID
+from cloud_run.models import AttemptState
+
 excluded = {".git", ".worktrees", "__pycache__", "node_modules"}
 text_files = []
 for path in Path(".").rglob("*"):
@@ -83,30 +86,20 @@ if secret_findings:
         print("[check] possible {} in {}".format(label, path))
     raise SystemExit(1)
 
-production_paths = [
-    Path("__init__.py"),
-    *sorted(Path("cloud_run").glob("*.py")),
-    *sorted(Path("web").rglob("*.js")),
-]
-production_source = "\n".join(
-    path.read_text(encoding="utf-8") for path in production_paths
-)
-for forbidden_path in ("/" + "asks", "/" + "instances"):
-    if forbidden_path in production_source:
-        print("[check] forbidden provider path detected")
-        raise SystemExit(1)
-
 vast_path = Path("cloud_run/vast.py")
 vast_source = vast_path.read_text(encoding="utf-8")
 vast_tree = ast.parse(vast_source, str(vast_path))
-provider_urls = [
+provider_urls = {
     node.value
     for node in ast.walk(vast_tree)
     if isinstance(node, ast.Constant)
     and isinstance(node.value, str)
     and "console.vast.ai" in node.value
-]
-if provider_urls != ["https://console.vast.ai/api/v0/bundles/"]:
+}
+if provider_urls != {
+    "https://console.vast.ai/api/v0",
+    "https://console.vast.ai/api/v1",
+}:
     print("[check] unexpected Vast provider URL surface")
     raise SystemExit(1)
 
@@ -116,18 +109,105 @@ provider_methods = {
     if isinstance(node, ast.Call)
     and isinstance(node.func, ast.Attribute)
     and isinstance(node.func.value, ast.Name)
-    and node.func.value.id == "session"
+    and node.func.value.id in {"client", "session"}
     and node.func.attr in {"get", "post", "put", "patch", "delete"}
 }
-if provider_methods != {"post"}:
+if provider_methods != {"delete", "get", "post", "put"}:
     print("[check] unexpected Vast provider HTTP method surface")
     raise SystemExit(1)
 
-for node in ast.walk(vast_tree):
+allowed_provider_actions = {
+    "create_instance",
+    "destroy_instance",
+    "get_instance",
+    "list_instances",
+    "search_offers",
+}
+provider_actions = {
+    node.name
+    for node in ast.walk(vast_tree)
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    and (
+        (
+            node.name.endswith(("_instance", "_instances"))
+            and not node.name.startswith("_")
+        )
+        or node.name in {"search_offers", "rent_instance", "stop_instance"}
+    )
+}
+if provider_actions != allowed_provider_actions:
+    print("[check] unexpected Vast provider action surface")
+    raise SystemExit(1)
+
+if OFFICIAL_TEMPLATE_ID != "57808457573e32120301649763d8e019":
+    print("[check] official template allowlist changed")
+    raise SystemExit(1)
+
+routes_path = Path("cloud_run/routes.py")
+routes_tree = ast.parse(
+    routes_path.read_text(encoding="utf-8"),
+    str(routes_path),
+)
+registered_routes = set()
+for node in ast.walk(routes_tree):
     if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
         continue
-    if node.name.startswith(("create", "rent", "start", "stop", "destroy")):
-        print("[check] forbidden provider action function detected")
+    for decorator in node.decorator_list:
+        if (
+            isinstance(decorator, ast.Call)
+            and isinstance(decorator.func, ast.Attribute)
+            and decorator.func.attr in {"delete", "get", "post", "put"}
+            and len(decorator.args) == 1
+            and isinstance(decorator.args[0], ast.Constant)
+            and isinstance(decorator.args[0].value, str)
+        ):
+            registered_routes.add(
+                (decorator.func.attr.upper(), decorator.args[0].value)
+            )
+
+allowed_cloud_run_routes = {
+    ("GET", "/cloud-run/api/settings"),
+    ("PUT", "/cloud-run/api/settings"),
+    ("POST", "/cloud-run/api/offers"),
+    ("POST", "/cloud-run/api/quotes"),
+    ("GET", "/cloud-run/api/attempts/{attempt_id}"),
+    ("POST", "/cloud-run/api/attempts/{attempt_id}/confirm"),
+    ("POST", "/cloud-run/api/attempts/{attempt_id}/cancel"),
+    ("DELETE", "/cloud-run/api/attempts/{attempt_id}"),
+}
+if registered_routes != allowed_cloud_run_routes:
+    print("[check] unexpected same-origin route surface")
+    raise SystemExit(1)
+
+expected_attempt_states = {
+    "idle",
+    "searching",
+    "offer_selected",
+    "confirming",
+    "creating",
+    "starting",
+    "cancel_requested",
+    "destroying",
+    "retrying",
+    "ready",
+    "cancelled",
+    "failed",
+}
+if {state.value for state in AttemptState} != expected_attempt_states:
+    print("[check] lifecycle state allowlist changed")
+    raise SystemExit(1)
+
+frontend_source = Path("web/js/cloud-run.js").read_text(encoding="utf-8")
+for forbidden_frontend_value in (
+    "console.vast.ai",
+    "/" + "asks/",
+    "/" + "instances/",
+    "localStorage",
+    "sessionStorage",
+    ".innerHTML",
+):
+    if forbidden_frontend_value in frontend_source:
+        print("[check] forbidden frontend provider or secret surface")
         raise SystemExit(1)
 
 print("[check] secret and provider boundary scan passed")

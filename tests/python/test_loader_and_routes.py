@@ -28,6 +28,9 @@ class FakeRoutes:
     def post(self, path):
         return self._register("POST", path)
 
+    def delete(self, path):
+        return self._register("DELETE", path)
+
 
 class LoaderContractTests(unittest.TestCase):
     def test_web_only_exports_and_exact_decorator_routes(self):
@@ -36,8 +39,12 @@ class LoaderContractTests(unittest.TestCase):
 
         routes = FakeRoutes()
         server_module = types.ModuleType("server")
+        startup_callbacks = []
         server_module.PromptServer = types.SimpleNamespace(
-            instance=types.SimpleNamespace(routes=routes)
+            instance=types.SimpleNamespace(
+                routes=routes,
+                app=types.SimpleNamespace(on_startup=startup_callbacks),
+            )
         )
 
         aiohttp_module = types.ModuleType("aiohttp")
@@ -91,9 +98,16 @@ class LoaderContractTests(unittest.TestCase):
                 ("GET", "/cloud-run/api/settings"),
                 ("PUT", "/cloud-run/api/settings"),
                 ("POST", "/cloud-run/api/offers"),
+                ("POST", "/cloud-run/api/quotes"),
+                ("GET", "/cloud-run/api/attempts/{attempt_id}"),
+                ("POST", "/cloud-run/api/attempts/{attempt_id}/confirm"),
+                ("POST", "/cloud-run/api/attempts/{attempt_id}/cancel"),
+                ("DELETE", "/cloud-run/api/attempts/{attempt_id}"),
             ],
         )
         self.assertTrue(all(callable(item[2]) for item in routes.registered))
+        self.assertEqual(len(startup_callbacks), 1)
+        self.assertTrue(callable(startup_callbacks[0]))
 
 
 if __name__ == "__main__":

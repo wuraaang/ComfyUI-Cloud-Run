@@ -1,4 +1,4 @@
-"""ComfyUI Cloud Run preview-only web extension."""
+"""ComfyUI Cloud Run managed web extension."""
 
 from .cloud_run.routes import register_routes
 

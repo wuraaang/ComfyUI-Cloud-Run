@@ -26,12 +26,26 @@ class FakeResponse:
 
 class FakeSession:
     def __init__(self, response):
-        self.response = response
+        self.responses = list(response) if isinstance(response, list) else [response]
         self.calls = []
+        self.methods = []
+
+    def _request(self, method, url, **kwargs):
+        self.methods.append(method)
+        self.calls.append((url, kwargs))
+        return self.responses.pop(0)
+
+    def delete(self, url, **kwargs):
+        return self._request("DELETE", url, **kwargs)
+
+    def get(self, url, **kwargs):
+        return self._request("GET", url, **kwargs)
 
     def post(self, url, **kwargs):
-        self.calls.append((url, kwargs))
-        return self.response
+        return self._request("POST", url, **kwargs)
+
+    def put(self, url, **kwargs):
+        return self._request("PUT", url, **kwargs)
 
 
 class VastRequestTests(unittest.TestCase):
@@ -50,8 +64,11 @@ class VastRequestTests(unittest.TestCase):
                             "dph_total": 0.42,
                             "reliability": 0.96,
                             "reliability2": 0.987,
+                            "machine_id": 77,
                             "host_id": 123,
                             "public_ipaddr": "192.0.2.10",
+                            "inet_down": 850.0,
+                            "disk_bw": 640.0,
                         }
                     ]
                 },
@@ -103,6 +120,11 @@ class VastRequestTests(unittest.TestCase):
                     "gpu_ram_gb": 24.0,
                     "dph_total": 0.42,
                     "reliability": 0.987,
+                    "machine_id": "77",
+                    "host_id": "123",
+                    "public_ipaddr": "192.0.2.10",
+                    "inet_down_mbps": 850.0,
+                    "disk_bw_mbps": 640.0,
                 }
             ],
         )
@@ -146,6 +168,8 @@ class VastNormalizationAndErrorTests(unittest.TestCase):
                     "reliability": 0.97,
                     "reliability2": 0.99,
                     "machine_id": 77,
+                    "inet_down": 500,
+                    "disk_bw": 400,
                 },
                 {
                     "id": 30,
@@ -208,6 +232,11 @@ class VastNormalizationAndErrorTests(unittest.TestCase):
                     "gpu_ram_gb": 32.0,
                     "dph_total": 0.25,
                     "reliability": 0.99,
+                    "machine_id": "77",
+                    "host_id": None,
+                    "public_ipaddr": None,
+                    "inet_down_mbps": 500.0,
+                    "disk_bw_mbps": 400.0,
                 },
                 {
                     "offer_id": 20,
@@ -215,6 +244,11 @@ class VastNormalizationAndErrorTests(unittest.TestCase):
                     "gpu_ram_gb": 24.0,
                     "dph_total": 0.5,
                     "reliability": 0.96,
+                    "machine_id": None,
+                    "host_id": "88",
+                    "public_ipaddr": "192.0.2.1",
+                    "inet_down_mbps": None,
+                    "disk_bw_mbps": None,
                 },
             ],
         )
@@ -226,8 +260,32 @@ class VastNormalizationAndErrorTests(unittest.TestCase):
                 "gpu_ram_gb",
                 "dph_total",
                 "reliability",
+                "machine_id",
+                "host_id",
+                "public_ipaddr",
+                "inet_down_mbps",
+                "disk_bw_mbps",
             },
         )
+
+    def test_quality_filters_are_forwarded_to_vast(self):
+        from cloud_run.vast import build_search_payload
+
+        payload = build_search_payload(
+            0.75,
+            24,
+            min_inet_down_mbps=250,
+            min_disk_bw_mbps=300,
+            min_reliability=0.98,
+            verified_only=False,
+            secure_cloud_only=True,
+        )
+
+        self.assertNotIn("verified", payload)
+        self.assertEqual(payload["datacenter"], {"eq": True})
+        self.assertEqual(payload["inet_down"], {"gte": 250})
+        self.assertEqual(payload["disk_bw"], {"gte": 300})
+        self.assertEqual(payload["reliability"], {"gte": 0.98})
 
     def test_malformed_payload_is_a_sanitized_failure(self):
         from cloud_run.vast import OfferSearchError, search_offers
@@ -341,6 +399,150 @@ class VastNormalizationAndErrorTests(unittest.TestCase):
         self.assertEqual(captured["timeout"].total, 30)
         self.assertIs(captured["session_timeout"], captured["timeout"])
         self.assertTrue(captured["closed"])
+
+
+class VastLifecycleRequestTests(unittest.TestCase):
+    def test_create_uses_only_the_official_comfyui_template(self):
+        from cloud_run.constants import OFFICIAL_TEMPLATE_ID
+        from cloud_run.vast import VAST_API_V0, create_instance
+
+        session = FakeSession(
+            FakeResponse(200, {"success": True, "new_contract": 987})
+        )
+
+        instance_id = asyncio.run(
+            create_instance(
+                "synthetic-value",
+                offer_id=42,
+                disk_gb=80,
+                label="comfy-cloud-run-attempt-1",
+                session=session,
+            )
+        )
+
+        self.assertEqual(instance_id, "987")
+        self.assertEqual(session.methods, ["PUT"])
+        self.assertEqual(session.calls, [
+            (
+                VAST_API_V0 + "/asks/42/",
+                {
+                    "headers": {
+                        "Authorization": "Bearer synthetic-value",
+                        "Accept": "application/json",
+                    },
+                    "json": {
+                        "template_hash_id": OFFICIAL_TEMPLATE_ID,
+                        "label": "comfy-cloud-run-attempt-1",
+                        "disk": 80,
+                    },
+                },
+            )
+        ])
+
+    def test_create_rejects_an_unapproved_template_before_request(self):
+        from cloud_run.vast import VastConfigurationError, create_instance
+
+        session = FakeSession(FakeResponse(200, {}))
+        with self.assertRaises(VastConfigurationError):
+            asyncio.run(
+                create_instance(
+                    "synthetic-value",
+                    offer_id=42,
+                    disk_gb=80,
+                    label="comfy-cloud-run-attempt-1",
+                    template_id="unapproved-template",
+                    session=session,
+                )
+            )
+        self.assertEqual(session.calls, [])
+
+    def test_list_get_destroy_and_url_derivation_are_normalized(self):
+        from cloud_run.vast import (
+            VAST_API_V0,
+            VAST_API_V1,
+            derive_base_url,
+            destroy_instance,
+            get_instance,
+            list_instances,
+        )
+
+        raw_instance = {
+            "id": 987,
+            "actual_status": "running",
+            "public_ipaddr": "8.8.8.8",
+            "ports": {"8188/tcp": [{"HostPort": "32100"}]},
+            "label": "comfy-cloud-run-attempt-1",
+            "dph_total": 0.42,
+            "status_msg": "ready",
+            "jupyter_token": "provider-secret",
+        }
+        list_session = FakeSession(
+            FakeResponse(200, {"instances": [raw_instance]})
+        )
+        listed = asyncio.run(list_instances("synthetic-value", session=list_session))
+        self.assertEqual(list_session.methods, ["GET"])
+        self.assertEqual(list_session.calls[0][0], VAST_API_V1 + "/instances/")
+        self.assertEqual(listed[0]["instance_id"], "987")
+        self.assertEqual(listed[0]["jupyter_token"], "provider-secret")
+
+        get_session = FakeSession(
+            FakeResponse(200, {"instances": raw_instance})
+        )
+        fetched = asyncio.run(
+            get_instance("synthetic-value", "987", session=get_session)
+        )
+        self.assertEqual(get_session.calls[0][0], VAST_API_V0 + "/instances/987/")
+        self.assertEqual(fetched, listed[0])
+        self.assertEqual(derive_base_url(fetched, 8188), "http://8.8.8.8:32100")
+        self.assertIsNone(
+            derive_base_url(
+                {**fetched, "public_ipaddr": "not-an-ip"},
+                8188,
+            )
+        )
+        self.assertIsNone(
+            derive_base_url(
+                {
+                    "public_ipaddr": "10.0.0.8",
+                    "ports": {"8188/tcp": [{"HostPort": "32100"}]},
+                },
+                8188,
+            )
+        )
+
+        for status, expected in ((200, True), (404, True), (500, False)):
+            with self.subTest(status=status):
+                destroy_session = FakeSession(FakeResponse(status, {}))
+                destroyed = asyncio.run(
+                    destroy_instance(
+                        "synthetic-value",
+                        "987",
+                        session=destroy_session,
+                    )
+                )
+                self.assertEqual(destroyed, expected)
+                self.assertEqual(
+                    destroy_session.calls[0][0],
+                    VAST_API_V0 + "/instances/987/",
+                )
+                self.assertEqual(destroy_session.methods, ["DELETE"])
+
+    def test_mutation_errors_are_sanitized(self):
+        from cloud_run.vast import VastError, create_instance
+
+        marker = "provider-secret-marker"
+        response = FakeResponse(500, {"error": marker})
+        with self.assertRaises(VastError) as raised:
+            asyncio.run(
+                create_instance(
+                    "synthetic-value",
+                    offer_id=42,
+                    disk_gb=80,
+                    label="comfy-cloud-run-attempt-1",
+                    session=FakeSession(response),
+                )
+            )
+        self.assertNotIn(marker, str(raised.exception))
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import {
+  attemptPresentation,
   mountCloudRun,
   registerCloudRunWhenReady,
 } from "../../web/js/cloud-run.js";
@@ -20,7 +21,7 @@ function settingsResponse() {
         min_vram_gb: 16,
         official_template_id: "57808457573e32120301649763d8e019",
         official_template_name: "Official ComfyUI",
-        preview_only: true,
+        lifecycle_enabled: true,
       };
     },
   };
@@ -37,9 +38,48 @@ function jsonResponse(payload, { ok = true, status = 200 } = {}) {
   };
 }
 
+function attemptPayload(status, overrides = {}) {
+  return {
+    attempt_id: "attempt-1",
+    status,
+    offer: {
+      offer_id: "42",
+      gpu_name: "RTX 4090",
+      gpu_ram_gb: 24,
+      dph_total: 0.42,
+      reliability: 0.99,
+      max_price_per_hour: 0.55,
+      expires_at: 160,
+    },
+    instance_id: null,
+    ready_url: null,
+    retry_count: 0,
+    cancel_requested: false,
+    error: null,
+    billing_may_continue: false,
+    emergency_action: null,
+    official_template_id: "57808457573e32120301649763d8e019",
+    official_template_name: "Official ComfyUI",
+    ...overrides,
+  };
+}
 
-test("mounts an immediately visible Cloud Run button and required preview modal", async () => {
+function mountLocalRunButton(document) {
+  const actionbar = document.createElement("div");
+  const queueGroup = document.createElement("div");
+  const queueButton = document.createElement("button");
+  queueButton.setAttribute("data-testid", "queue-button");
+  queueButton.textContent = "Run";
+  queueGroup.appendChild(queueButton);
+  actionbar.appendChild(queueGroup);
+  document.body.appendChild(actionbar);
+  return { actionbar, queueButton, queueGroup };
+}
+
+
+test("mounts Cloud Run immediately after the local Run group", async () => {
   const document = new FakeDocument();
+  const { actionbar, queueGroup } = mountLocalRunButton(document);
   const requests = [];
   const fetchImpl = async (...args) => {
     requests.push(args);
@@ -50,11 +90,17 @@ test("mounts an immediately visible Cloud Run button and required preview modal"
 
   const launcher = document.getElementById("cloud-run-button");
   assert.ok(launcher);
-  assert.equal(launcher.textContent, "Cloud Run");
+  assert.equal(launcher.textContent, "☁ Cloud Run");
   assert.equal(launcher.getAttribute("data-testid"), "cloud-run-button");
   assert.equal(launcher.hidden, false);
   assert.notEqual(launcher.style.display, "none");
   assert.equal(launcher.isConnected, true);
+  assert.deepEqual(actionbar.children, [queueGroup, launcher]);
+  assert.equal(
+    launcher.getAttribute("title"),
+    "Launch on Vast.ai — paid GPU rental",
+  );
+  assert.equal(launcher.getAttribute("aria-label"), "Cloud Run on Vast.ai");
 
   const dialog = document.getElementById("cloud-run-modal");
   assert.ok(dialog);
@@ -67,7 +113,7 @@ test("mounts an immediately visible Cloud Run button and required preview modal"
   assert.equal(requests[0][0], "/cloud-run/api/settings");
   assert.equal(
     document.getElementById("cloud-run-preview-banner").textContent,
-    "Preview only — no instance will be rented.",
+    "Paid Vast.ai rental — nothing is created until explicit confirmation.",
   );
   assert.equal(document.getElementById("cloud-run-api-key").type, "password");
   assert.ok(document.getElementById("cloud-run-max-price"));
@@ -82,13 +128,40 @@ test("mounts an immediately visible Cloud Run button and required preview modal"
   );
   assert.equal(
     document.getElementById("cloud-run-preview-selection").textContent,
-    "Preview selection",
+    "Review paid rental",
   );
+});
+
+test("opens from the keyboard without changing the local Run button", async () => {
+  const document = new FakeDocument();
+  const { queueButton } = mountLocalRunButton(document);
+  const requests = [];
+  mountCloudRun(document, async (...args) => {
+    requests.push(args);
+    return settingsResponse();
+  });
+  const launcher = document.getElementById("cloud-run-button");
+  const event = {
+    type: "keydown",
+    key: "Enter",
+    defaultPrevented: false,
+    preventDefault() {
+      this.defaultPrevented = true;
+    },
+  };
+
+  await launcher.dispatchEvent(event);
+
+  assert.equal(event.defaultPrevented, true);
+  assert.equal(document.getElementById("cloud-run-modal").open, true);
+  assert.equal(requests.length, 1);
+  assert.equal(queueButton.textContent, "Run");
 });
 
 
 test("registers through the pinned ComfyUI extension API and mounts during setup", async () => {
   const document = new FakeDocument();
+  mountLocalRunButton(document);
   const apiRequests = [];
   let extension = null;
   const app = {
@@ -116,22 +189,130 @@ test("registers through the pinned ComfyUI extension API and mounts during setup
 
   assert.equal(registered, true);
   assert.ok(extension);
-  assert.equal(extension.name, "comfyui-cloud-run.preview");
+  assert.equal(extension.name, "comfyui-cloud-run.lifecycle");
   assert.equal(typeof extension.setup, "function");
+  assert.deepEqual(
+    extension.commands.map(({ id, label }) => ({ id, label })),
+    [{ id: "vast-cloud-run.open", label: "Cloud Run" }],
+  );
+  assert.deepEqual(extension.menuCommands, [
+    {
+      path: ["Extensions", "Vast Cloud Run"],
+      commands: ["vast-cloud-run.open"],
+    },
+  ]);
 
   await extension.setup();
   const launcher = document.getElementById("cloud-run-button");
   assert.ok(launcher);
-  assert.equal(launcher.textContent, "Cloud Run");
+  assert.equal(launcher.textContent, "☁ Cloud Run");
 
-  await launcher.click();
+  await extension.commands[0].function();
   assert.equal(apiRequests.length, 1);
   assert.equal(apiRequests[0][0], "/cloud-run/api/settings");
+  assert.equal(document.getElementById("cloud-run-modal").open, true);
+});
+
+test("waits for a late local Run button and injects the launcher only once", async () => {
+  const document = new FakeDocument();
+  let extension = null;
+  let mutationCallback = null;
+  let observedRoot = null;
+  let disconnectCount = 0;
+  const app = {
+    registerExtension(specification) {
+      extension = specification;
+    },
+  };
+  const browserWindow = {
+    comfyAPI: {
+      app: { app },
+      api: { api: { fetchApi: async () => settingsResponse() } },
+    },
+    MutationObserver: class {
+      constructor(callback) {
+        mutationCallback = callback;
+      }
+
+      observe(root) {
+        observedRoot = root;
+      }
+
+      disconnect() {
+        disconnectCount += 1;
+      }
+    },
+    setTimeout() {
+      assert.fail("ready ComfyUI APIs must not schedule a retry");
+    },
+  };
+
+  registerCloudRunWhenReady(browserWindow, document);
+  await extension.setup();
+
+  assert.equal(document.getElementById("cloud-run-button"), null);
+  assert.equal(observedRoot, document.body);
+  assert.equal(typeof mutationCallback, "function");
+
+  const { actionbar, queueGroup } = mountLocalRunButton(document);
+  mutationCallback();
+
+  const launcher = document.getElementById("cloud-run-button");
+  assert.ok(launcher);
+  assert.deepEqual(actionbar.children, [queueGroup, launcher]);
+  assert.equal(disconnectCount, 1);
+
+  await extension.setup();
+  assert.deepEqual(actionbar.children, [queueGroup, launcher]);
+});
+
+test("keeps the Extensions command usable when the action bar is unavailable", async () => {
+  const document = new FakeDocument();
+  let extension = null;
+  const app = {
+    registerExtension(specification) {
+      extension = specification;
+    },
+  };
+  const browserWindow = {
+    comfyAPI: {
+      app: { app },
+      api: { api: { fetchApi: async () => settingsResponse() } },
+    },
+    setTimeout() {
+      assert.fail("ready ComfyUI APIs must not schedule a retry");
+    },
+  };
+
+  registerCloudRunWhenReady(browserWindow, document);
+  await extension.setup();
+
+  assert.equal(document.getElementById("cloud-run-button"), null);
+  await extension.commands[0].function();
+  assert.equal(document.getElementById("cloud-run-modal").open, true);
+});
+
+test("keeps the dialog usable when the Cloud Run backend is unavailable", async () => {
+  const document = new FakeDocument();
+  mountLocalRunButton(document);
+  mountCloudRun(document, async () => {
+    throw new Error("synthetic backend outage");
+  });
+
+  await document.getElementById("cloud-run-button").click();
+
+  assert.equal(document.getElementById("cloud-run-modal").open, true);
+  assert.equal(
+    document.getElementById("cloud-run-status").textContent,
+    "Settings could not be loaded.",
+  );
+  assert.equal(document.getElementById("cloud-run-close").disabled, false);
 });
 
 
 test("saves settings with a write-only optional key and clears the password", async () => {
   const document = new FakeDocument();
+  mountLocalRunButton(document);
   const requests = [];
   const responses = [
     settingsResponse(),
@@ -141,7 +322,7 @@ test("saves settings with a write-only optional key and clears the password", as
       min_vram_gb: 32,
       official_template_id: "57808457573e32120301649763d8e019",
       official_template_name: "Official ComfyUI",
-      preview_only: true,
+      lifecycle_enabled: true,
     }),
     jsonResponse({
       configured: true,
@@ -149,7 +330,7 @@ test("saves settings with a write-only optional key and clears the password", as
       min_vram_gb: 48,
       official_template_id: "57808457573e32120301649763d8e019",
       official_template_name: "Official ComfyUI",
-      preview_only: true,
+      lifecycle_enabled: true,
     }),
   ];
   const fetchImpl = async (...args) => {
@@ -194,6 +375,7 @@ test("saves settings with a write-only optional key and clears the password", as
 
 test("searches and renders selectable remote offers as inert text", async () => {
   const document = new FakeDocument();
+  mountLocalRunButton(document);
   const requests = [];
   const maliciousName = "<img src=x onerror=steal()>";
   const responses = [
@@ -208,7 +390,6 @@ test("searches and renders selectable remote offers as inert text", async () => 
           reliability: 0.99,
         },
       ],
-      preview_only: true,
     }),
   ];
   const fetchImpl = async (...args) => {
@@ -244,8 +425,9 @@ test("searches and renders selectable remote offers as inert text", async () => 
 });
 
 
-test("previews the selected offer and official template without another request", async () => {
+test("server quote shows the exact paid confirmation before create", async () => {
   const document = new FakeDocument();
+  mountLocalRunButton(document);
   const requests = [];
   const responses = [
     settingsResponse(),
@@ -259,7 +441,28 @@ test("previews the selected offer and official template without another request"
           reliability: 0.99,
         },
       ],
-      preview_only: true,
+    }),
+    jsonResponse({
+      attempt_id: "attempt-1",
+      status: "offer_selected",
+      offer: {
+        offer_id: "42",
+        gpu_name: "RTX 4090",
+        gpu_ram_gb: 24,
+        dph_total: 0.42,
+        reliability: 0.99,
+        max_price_per_hour: 0.55,
+        expires_at: 160,
+      },
+      instance_id: null,
+      ready_url: null,
+      retry_count: 0,
+      cancel_requested: false,
+      error: null,
+      billing_may_continue: false,
+      emergency_action: null,
+      official_template_id: "57808457573e32120301649763d8e019",
+      official_template_name: "Official ComfyUI",
     }),
   ];
   const fetchImpl = async (...args) => {
@@ -270,19 +473,301 @@ test("previews the selected offer and official template without another request"
   await document.getElementById("cloud-run-button").click();
   await document.getElementById("cloud-run-search").click();
   await document.getElementById("cloud-run-offer-0").click();
-  const requestCountBeforePreview = requests.length;
 
   await document.getElementById("cloud-run-preview-selection").click();
 
-  assert.equal(requests.length, requestCountBeforePreview);
+  assert.equal(requests.length, 3);
+  assert.equal(requests[2][0], "/cloud-run/api/quotes");
+  assert.equal(requests[2][1].method, "POST");
+  const body = JSON.parse(requests[2][1].body);
+  assert.equal(body.offer_id, 42);
+  assert.equal(typeof body.idempotency_key, "string");
+  assert.ok(body.idempotency_key.length > 0);
   const preview = document.getElementById("cloud-run-selection-preview");
   assert.ok(preview.textContent.includes("RTX 4090"));
+  assert.ok(preview.textContent.includes("24 GB"));
   assert.ok(preview.textContent.includes("$0.42/h"));
+  assert.ok(preview.textContent.includes("$0.55/h"));
+  assert.ok(preview.textContent.includes("Offer: 42"));
   assert.ok(preview.textContent.includes("Official ComfyUI"));
   assert.ok(
     preview.textContent.includes("57808457573e32120301649763d8e019"),
   );
-  assert.ok(preview.textContent.includes("No instance was created."));
+  assert.ok(preview.textContent.includes("No rental exists until you confirm"));
+  assert.equal(
+    document.getElementById("cloud-run-confirm").hidden,
+    false,
+  );
+});
+
+test("every server lifecycle state has an explicit safe presentation", () => {
+  const expected = {
+    idle: { poll: false },
+    searching: { poll: true },
+    offer_selected: { confirm: true, poll: false },
+    confirming: { poll: true },
+    creating: { cancel: true, poll: true },
+    starting: { cancel: true, poll: true },
+    cancel_requested: { poll: true },
+    destroying: { poll: true },
+    retrying: { cancel: true, poll: true },
+    ready: { open: true, destroy: true, poll: false },
+    cancelled: { poll: false },
+    failed: { destroy: true, poll: false },
+  };
+
+  for (const [status, flags] of Object.entries(expected)) {
+    const payload = attemptPayload(status, {
+      instance_id: ["ready", "failed"].includes(status) ? "instance-9" : null,
+      ready_url: status === "ready" ? "http://8.8.8.8:32100" : null,
+      billing_may_continue: status === "failed",
+      emergency_action:
+        status === "failed"
+          ? "Destroy Vast instance instance-9 immediately."
+          : null,
+    });
+    const presentation = attemptPresentation(payload);
+    assert.ok(presentation.message.length > 0, status);
+    for (const key of ["confirm", "cancel", "open", "destroy", "poll"]) {
+      assert.equal(Boolean(presentation[key]), Boolean(flags[key]), `${status}:${key}`);
+    }
+  }
+});
+
+test("confirmation reuses one idempotency key, polls to ready, opens, then destroys", async () => {
+  const document = new FakeDocument();
+  mountLocalRunButton(document);
+  const requests = [];
+  const timers = new Map();
+  let nextTimer = 1;
+  const browserWindow = {
+    crypto: { randomUUID: () => "browser-idem-1" },
+    setTimeout(callback) {
+      const id = nextTimer++;
+      timers.set(id, callback);
+      return id;
+    },
+    clearTimeout(id) {
+      timers.delete(id);
+    },
+  };
+  const responses = [
+    settingsResponse(),
+    jsonResponse({
+      offers: [
+        {
+          offer_id: 42,
+          gpu_name: "RTX 4090",
+          gpu_ram_gb: 24,
+          dph_total: 0.42,
+          reliability: 0.99,
+        },
+      ],
+    }),
+    jsonResponse(attemptPayload("offer_selected")),
+    jsonResponse(
+      attemptPayload("starting", { instance_id: "instance-9" }),
+    ),
+    jsonResponse(
+      attemptPayload("ready", {
+        instance_id: "instance-9",
+        ready_url: "http://8.8.8.8:32100",
+      }),
+    ),
+    jsonResponse(attemptPayload("cancelled")),
+  ];
+  const fetchImpl = async (...args) => {
+    requests.push(args);
+    return responses.shift();
+  };
+
+  mountCloudRun(document, fetchImpl, browserWindow);
+  await document.getElementById("cloud-run-button").click();
+  await document.getElementById("cloud-run-search").click();
+  await document.getElementById("cloud-run-offer-0").click();
+  await document.getElementById("cloud-run-preview-selection").click();
+  await document.getElementById("cloud-run-confirm").click();
+
+  assert.equal(requests[2][0], "/cloud-run/api/quotes");
+  assert.equal(
+    JSON.parse(requests[2][1].body).idempotency_key,
+    "browser-idem-1",
+  );
+  assert.equal(
+    requests[3][0],
+    "/cloud-run/api/attempts/attempt-1/confirm",
+  );
+  assert.equal(
+    JSON.parse(requests[3][1].body).idempotency_key,
+    "browser-idem-1",
+  );
+  assert.equal(timers.size, 1);
+  const poll = [...timers.values()][0];
+  timers.clear();
+  await poll();
+
+  assert.equal(
+    requests[4][0],
+    "/cloud-run/api/attempts/attempt-1",
+  );
+  const open = document.getElementById("cloud-run-open");
+  assert.equal(open.hidden, false);
+  assert.equal(open.getAttribute("href"), "http://8.8.8.8:32100");
+  assert.equal(open.getAttribute("target"), "_blank");
+  assert.equal(open.getAttribute("rel"), "noopener noreferrer");
+  assert.equal(
+    document.getElementById("cloud-run-destroy").hidden,
+    false,
+  );
+
+  await document.getElementById("cloud-run-destroy").click();
+
+  assert.equal(
+    requests[5][0],
+    "/cloud-run/api/attempts/attempt-1",
+  );
+  assert.equal(requests[5][1].method, "DELETE");
+  assert.equal(
+    document.getElementById("cloud-run-status").textContent,
+    "Cancelled. Vast inventory is confirmed empty.",
+  );
+});
+
+test("Cancel remains available during creation and polls until confirmed empty", async () => {
+  const document = new FakeDocument();
+  mountLocalRunButton(document);
+  const requests = [];
+  const timers = new Map();
+  let nextTimer = 1;
+  const browserWindow = {
+    crypto: { randomUUID: () => "browser-idem-cancel" },
+    setTimeout(callback) {
+      const id = nextTimer++;
+      timers.set(id, callback);
+      return id;
+    },
+    clearTimeout(id) {
+      timers.delete(id);
+    },
+  };
+  const responses = [
+    settingsResponse(),
+    jsonResponse({
+      offers: [
+        {
+          offer_id: 42,
+          gpu_name: "RTX 4090",
+          gpu_ram_gb: 24,
+          dph_total: 0.42,
+          reliability: 0.99,
+        },
+      ],
+    }),
+    jsonResponse(attemptPayload("offer_selected")),
+    jsonResponse(attemptPayload("creating")),
+    jsonResponse(
+      attemptPayload("cancel_requested", { cancel_requested: true }),
+    ),
+    jsonResponse(attemptPayload("cancelled")),
+  ];
+  const fetchImpl = async (...args) => {
+    requests.push(args);
+    return responses.shift();
+  };
+
+  mountCloudRun(document, fetchImpl, browserWindow);
+  await document.getElementById("cloud-run-button").click();
+  await document.getElementById("cloud-run-search").click();
+  await document.getElementById("cloud-run-offer-0").click();
+  await document.getElementById("cloud-run-preview-selection").click();
+  await document.getElementById("cloud-run-confirm").click();
+
+  const cancel = document.getElementById("cloud-run-cancel");
+  assert.equal(cancel.hidden, false);
+  assert.equal(cancel.disabled, false);
+  await cancel.click();
+  assert.equal(
+    requests[4][0],
+    "/cloud-run/api/attempts/attempt-1/cancel",
+  );
+  assert.equal(requests[4][1].method, "POST");
+  assert.equal(timers.size, 1);
+  const poll = [...timers.values()][0];
+  timers.clear();
+  await poll();
+  assert.equal(
+    document.getElementById("cloud-run-status").textContent,
+    "Cancelled. Vast inventory is confirmed empty.",
+  );
+});
+
+test("mutable controls lock while a provider-changing request is in flight", async () => {
+  const document = new FakeDocument();
+  mountLocalRunButton(document);
+  let releaseConfirmation;
+  const confirmationResponse = new Promise((resolve) => {
+    releaseConfirmation = resolve;
+  });
+  const responses = [
+    settingsResponse(),
+    jsonResponse({
+      offers: [
+        {
+          offer_id: 42,
+          gpu_name: "RTX 4090",
+          gpu_ram_gb: 24,
+          dph_total: 0.42,
+          reliability: 0.99,
+        },
+      ],
+    }),
+    jsonResponse(attemptPayload("offer_selected")),
+    confirmationResponse,
+  ];
+  const browserWindow = {
+    crypto: { randomUUID: () => "browser-idem-lock" },
+    setTimeout() {
+      return 1;
+    },
+    clearTimeout() {},
+  };
+  const fetchImpl = async () => responses.shift();
+
+  mountCloudRun(document, fetchImpl, browserWindow);
+  await document.getElementById("cloud-run-button").click();
+  await document.getElementById("cloud-run-search").click();
+  await document.getElementById("cloud-run-offer-0").click();
+  await document.getElementById("cloud-run-preview-selection").click();
+
+  const confirming = document.getElementById("cloud-run-confirm").click();
+  await Promise.resolve();
+  assert.equal(document.getElementById("cloud-run-confirm").disabled, true);
+  assert.equal(document.getElementById("cloud-run-search").disabled, true);
+  assert.equal(document.getElementById("cloud-run-save-settings").disabled, true);
+  releaseConfirmation(
+    jsonResponse(
+      attemptPayload("starting", { instance_id: "instance-9" }),
+    ),
+  );
+  await confirming;
+  assert.equal(document.getElementById("cloud-run-cancel").disabled, false);
+});
+
+test("residual failure keeps the instance ID and emergency destruction visible", async () => {
+  const presentation = attemptPresentation(
+    attemptPayload("failed", {
+      instance_id: "instance-99",
+      error: "Automatic cleanup could not be verified.",
+      billing_may_continue: true,
+      emergency_action:
+        "Destroy Vast instance instance-99 in the Vast.ai console immediately.",
+    }),
+  );
+
+  assert.equal(presentation.destroy, true);
+  assert.ok(presentation.message.includes("instance-99"));
+  assert.ok(presentation.message.includes("billing may continue"));
+  assert.ok(presentation.message.includes("Vast.ai console"));
 });
 
 
@@ -309,5 +794,10 @@ test("frontend source has no HTML, browser-storage, URL, console, or mutation cr
   }
   assert.ok(source.includes('const SETTINGS_ENDPOINT = "/cloud-run/api/settings"'));
   assert.ok(source.includes('const OFFERS_ENDPOINT = "/cloud-run/api/offers"'));
+  assert.ok(source.includes('const QUOTES_ENDPOINT = "/cloud-run/api/quotes"'));
   assert.ok(source.includes("details.textContent"));
+  assert.equal(source.includes("position: fixed"), false);
+  assert.ok(source.includes("#cloud-run-button:focus-visible"));
+  assert.ok(source.includes("@media (max-width: 480px)"));
+  assert.ok(source.includes("width: 32px"));
 });

@@ -51,6 +51,16 @@ export class FakeElement {
     return false;
   }
 
+  get parentElement() {
+    return this.parentNode;
+  }
+
+  get nextSibling() {
+    if (!this.parentNode) return null;
+    const index = this.parentNode.children.indexOf(this);
+    return this.parentNode.children[index + 1] ?? null;
+  }
+
   setAttribute(name, value) {
     const stringValue = String(value);
     this.attributes.set(name, stringValue);
@@ -63,8 +73,18 @@ export class FakeElement {
   }
 
   appendChild(child) {
+    child.remove();
     child.parentNode = this;
     this.children.push(child);
+    return child;
+  }
+
+  insertBefore(child, reference) {
+    child.remove();
+    const index = reference === null ? -1 : this.children.indexOf(reference);
+    child.parentNode = this;
+    if (index === -1) this.children.push(child);
+    else this.children.splice(index, 0, child);
     return child;
   }
 
@@ -124,12 +144,32 @@ export class FakeElement {
     );
     this.parentNode = null;
   }
+
+  querySelector(selector) {
+    return findBySelector(this, selector);
+  }
 }
 
 function findById(root, id) {
   if (root.id === id) return root;
   for (const child of root.children) {
     const found = findById(child, id);
+    if (found) return found;
+  }
+  return null;
+}
+
+function findBySelector(root, selector) {
+  const attributeMatch = selector.match(/^\[([^=]+)="([^"]+)"\]$/);
+  if (
+    attributeMatch &&
+    root.getAttribute(attributeMatch[1]) === attributeMatch[2]
+  ) {
+    return root;
+  }
+  if (selector.startsWith("#") && root.id === selector.slice(1)) return root;
+  for (const child of root.children) {
+    const found = findBySelector(child, selector);
     if (found) return found;
   }
   return null;
@@ -148,5 +188,12 @@ export class FakeDocument {
 
   getElementById(id) {
     return findById(this.head, id) ?? findById(this.body, id);
+  }
+
+  querySelector(selector) {
+    return (
+      findBySelector(this.head, selector) ??
+      findBySelector(this.body, selector)
+    );
   }
 }

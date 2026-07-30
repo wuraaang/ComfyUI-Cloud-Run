@@ -4,21 +4,44 @@
 
 Build one standalone ComfyUI custom-node package named `ComfyUI-Cloud-Run`. It is a web/backend extension only: no graph node and no separate application.
 
-This repository is new. Do not modify, import from, depend on, or reconstruct `/Users/wuraaang/comfyui-vast-cockpit`. LoRA Dataset Studio may be inspected read-only only to understand the already-proven Vast search contract. Reimplement narrowly; do not copy licensed code or training orchestration.
+Do not modify, import from, depend on, or reconstruct
+`/Users/wuraaang/comfyui-vast-cockpit`. LoRA Dataset Studio may be inspected
+read-only at commit `de697caf9d607a29c72cebdc2794eecd6b147606` to understand
+its proven Vast client and lifecycle policies. Reimplement those contracts
+narrowly for ComfyUI; do not import its Flask, SQLAlchemy, dataset, training,
+checkpoint, or AI Toolkit code.
 
-## Current slice: preview only
+## Current slice: safe Vast.ai lifecycle
 
-The user must see a persistent `Cloud Run` button in the real ComfyUI UI. Clicking it opens a small modal that:
+Extend the certified preview V0 into one safe vertical lifecycle:
 
-- states clearly that preview mode cannot rent anything;
-- accepts a Vast API key once through a password field;
-- stores the key only in a backend-owned file with mode `0600` and never returns it;
-- accepts a maximum hourly price and minimum VRAM;
-- searches real Vast on-demand offers read-only;
-- lists selectable offers with GPU, VRAM, hourly price, and reliability;
-- lets the user preview/confirm a selected offer and the official ComfyUI template `57808457573e32120301649763d8e019` without creating an instance.
+- place a separate `Cloud Run` action immediately beside local `Run/Exécuter`;
+- preserve the local run action without interception or behavior changes;
+- keep the Vast credential write-only and backend-owned;
+- search and rank offers without renting;
+- show a complete paid confirmation before the first mutation;
+- revalidate the offer and price, then create exactly one managed instance;
+- persist and expose creation, boot, cancellation, failure, and ready states;
+- support explicit cancellation and destruction with inventory verification;
+- reconcile managed instances after restart;
+- permit at most one replacement after a transient boot failure, and only after
+  destruction of the first instance has been verified.
 
-There must be no create, rent, start, destroy, or other provider-mutation route or code path in this slice. A browser click cannot rent a GPU.
+Only the official ComfyUI Vast template
+`57808457573e32120301649763d8e019` may be created. No workflow transfer,
+model synchronization, custom-node resolution, other provider, telemetry, or
+Registry publication belongs to this slice.
+
+## Paid-action gate
+
+- No provider mutation occurs when opening the dialog, saving settings,
+  searching, selecting, or previewing an offer.
+- A create call requires a fresh explicit confirmation containing GPU, VRAM,
+  hourly price, offer ID, configured cap, and template.
+- No real Vast.ai rental without a separate human GO.
+- Automated tests and local certification use fake/offline provider clients.
+- Never hide or destroy a residual billed instance after an unverified cleanup;
+  show its identifier and an emergency action instead.
 
 ## Engineering contract
 
@@ -29,6 +52,9 @@ There must be no create, rent, start, destroy, or other provider-mutation route 
 - Namespace backend routes under `/cloud-run/api/`.
 - Render remote values with `textContent`, not HTML.
 - Never log, return, screenshot, or commit the API key.
+- Persist paid-attempt intent before provider mutation and enforce idempotency
+  server-side.
+- A duplicate browser request must never create a second instance.
 - All implementation, tests, scripts, and runtime/build configuration stay inside this repository.
 - `scripts/check.sh` is the deterministic repository gate.
 
