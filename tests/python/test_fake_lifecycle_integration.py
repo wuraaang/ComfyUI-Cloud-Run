@@ -44,6 +44,22 @@ class OfflineVast:
             return [dict(self.offer)]
         return []
 
+    async def get_offer(
+        self,
+        _api_key,
+        offer_id,
+        *,
+        max_price_per_hour,
+        min_vram_gb,
+    ):
+        if (
+            str(self.offer["offer_id"]) == str(offer_id)
+            and self.offer["dph_total"] <= max_price_per_hour
+            and self.offer["gpu_ram_gb"] >= min_vram_gb
+        ):
+            return dict(self.offer)
+        return None
+
     async def create_instance(
         self,
         _api_key,

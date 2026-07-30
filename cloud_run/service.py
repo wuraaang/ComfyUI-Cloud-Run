@@ -46,6 +46,21 @@ class VastProvider:
             min_vram_gb=min_vram_gb,
         )
 
+    async def get_offer(
+        self,
+        api_key,
+        offer_id,
+        *,
+        max_price_per_hour,
+        min_vram_gb,
+    ):
+        return await vast.get_offer(
+            api_key,
+            offer_id=offer_id,
+            max_price_per_hour=max_price_per_hour,
+            min_vram_gb=min_vram_gb,
+        )
+
     async def create_instance(
         self,
         api_key,
@@ -132,6 +147,29 @@ class CloudRunService:
             now=float(self.clock()),
         )
 
+    async def _eligible_offer(self, identifier, settings):
+        selected = await self.provider.get_offer(
+            settings["api_key"],
+            identifier,
+            max_price_per_hour=settings["max_price_per_hour"],
+            min_vram_gb=settings["min_vram_gb"],
+        )
+        if selected is None:
+            return None
+        eligible = apply_offer_policy(
+            [selected],
+            blacklist=self.blacklist,
+            now=float(self.clock()),
+        )
+        return next(
+            (
+                offer
+                for offer in eligible
+                if str(offer.get("offer_id")) == str(identifier)
+            ),
+            None,
+        )
+
     async def preview_offer(self, *, offer_id, idempotency_key):
         key = _idempotency_key(idempotency_key)
         existing = self.repository.get_by_idempotency_key(key)
@@ -140,24 +178,7 @@ class CloudRunService:
 
         identifier = _offer_id(offer_id)
         settings = self._settings()
-        offers = await self.provider.search_offers(
-            settings["api_key"],
-            max_price_per_hour=settings["max_price_per_hour"],
-            min_vram_gb=settings["min_vram_gb"],
-        )
-        eligible = apply_offer_policy(
-            offers,
-            blacklist=self.blacklist,
-            now=float(self.clock()),
-        )
-        selected = next(
-            (
-                offer
-                for offer in eligible
-                if str(offer.get("offer_id")) == identifier
-            ),
-            None,
-        )
+        selected = await self._eligible_offer(identifier, settings)
         if selected is None:
             raise QuoteUnavailable(
                 "The selected Vast offer is no longer available."
@@ -205,26 +226,20 @@ class CloudRunService:
         return attempt
 
     async def _revalidated_offer(self, attempt, settings):
-        offers = await self.provider.search_offers(
-            settings["api_key"],
-            max_price_per_hour=settings["max_price_per_hour"],
-            min_vram_gb=settings["min_vram_gb"],
+        selected = await self._eligible_offer(
+            attempt.quote.offer_id,
+            settings,
         )
-        eligible = apply_offer_policy(
-            offers,
-            blacklist=self.blacklist,
-            now=float(self.clock()),
-        )
-        for offer in eligible:
-            if (
-                str(offer.get("offer_id")) == attempt.quote.offer_id
-                and str(offer.get("gpu_name")) == attempt.quote.gpu_name
-                and float(offer.get("gpu_ram_gb", 0))
-                >= attempt.quote.gpu_ram_gb
-                and float(offer.get("dph_total", float("inf")))
-                <= attempt.quote.dph_total
-            ):
-                return offer
+        if selected is None:
+            return None
+        if (
+            str(selected.get("gpu_name")) == attempt.quote.gpu_name
+            and float(selected.get("gpu_ram_gb", 0))
+            >= attempt.quote.gpu_ram_gb
+            and float(selected.get("dph_total", float("inf")))
+            <= attempt.quote.dph_total
+        ):
+            return selected
         return None
 
     async def _instance_for_label(self, api_key, label):

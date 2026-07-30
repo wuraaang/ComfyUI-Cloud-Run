@@ -33,9 +33,11 @@ class FakeSettings:
 
 
 class FakeProvider:
-    def __init__(self, searches=None):
+    def __init__(self, searches=None, lookups=None):
         self.searches = list(searches or [[offer()]])
+        self.lookups = list([offer()] if lookups is None else lookups)
         self.search_calls = []
+        self.lookup_calls = []
         self.create_calls = []
         self.inventory_calls = []
         self.instances = []
@@ -56,6 +58,23 @@ class FakeProvider:
         if len(self.searches) > 1:
             return self.searches.pop(0)
         return list(self.searches[0])
+
+    async def get_offer(
+        self,
+        api_key,
+        offer_id,
+        *,
+        max_price_per_hour,
+        min_vram_gb,
+    ):
+        self.lookup_calls.append(
+            (api_key, str(offer_id), max_price_per_hour, min_vram_gb)
+        )
+        if not self.lookups:
+            return None
+        if len(self.lookups) > 1:
+            return self.lookups.pop(0)
+        return self.lookups[0]
 
     async def create_instance(
         self,
@@ -129,6 +148,23 @@ class CloudRunServiceTests(unittest.TestCase):
         self.assertEqual(reopened.quote.expires_at, 160.0)
         self.assertEqual(provider.create_calls, [])
 
+    def test_preview_uses_exact_lookup_when_offer_is_absent_from_broad_results(self):
+        provider = FakeProvider(searches=[[]], lookups=[offer()])
+        service = self.service(provider)
+
+        preview = asyncio.run(
+            service.preview_offer(
+                offer_id=42,
+                idempotency_key="idem-targeted-preview",
+            )
+        )
+
+        self.assertEqual(preview.quote.offer_id, "42")
+        self.assertEqual(provider.search_calls, [])
+        self.assertEqual(len(provider.lookup_calls), 1)
+        self.assertEqual(provider.lookup_calls[0][1], "42")
+        self.assertEqual(provider.create_calls, [])
+
     def test_duplicate_preview_idempotency_key_returns_original_attempt(self):
         provider = FakeProvider()
         service = self.service(provider)
@@ -153,7 +189,10 @@ class CloudRunServiceTests(unittest.TestCase):
     def test_confirmation_revalidates_same_offer_and_never_accepts_price_rise(self):
         from cloud_run.service import QuoteUnavailable
 
-        provider = FakeProvider(searches=[[offer()], [offer(price=0.43)]])
+        provider = FakeProvider(
+            searches=[[]],
+            lookups=[offer(), offer(price=0.43)],
+        )
         service = self.service(provider)
         preview = asyncio.run(
             service.preview_offer(
@@ -174,9 +213,11 @@ class CloudRunServiceTests(unittest.TestCase):
         self.assertEqual(saved.state, AttemptState.FAILED)
         self.assertEqual(provider.create_calls, [])
         self.assertNotIn("0.43", saved.sanitized_error)
+        self.assertEqual(len(provider.lookup_calls), 2)
+        self.assertEqual(provider.search_calls, [])
 
     def test_attempt_and_creating_state_exist_before_the_only_paid_call(self):
-        provider = FakeProvider(searches=[[offer()], [offer()]])
+        provider = FakeProvider(lookups=[offer(), offer()])
         service = self.service(provider)
         preview = asyncio.run(
             service.preview_offer(
@@ -212,7 +253,7 @@ class CloudRunServiceTests(unittest.TestCase):
         self.assertNotIn("synthetic-value", repr(started.public_payload()))
 
     def test_ambiguous_create_is_reconciled_by_unique_label_without_retry(self):
-        provider = FakeProvider(searches=[[offer()], [offer()]])
+        provider = FakeProvider(lookups=[offer(), offer()])
         provider.create_error = VastError(
             "sensitive provider timeout",
             retryable=True,
@@ -253,7 +294,7 @@ class CloudRunServiceTests(unittest.TestCase):
         self.assertNotIn("sensitive", repr(reconciled.public_payload()))
 
     def test_unknown_create_outcome_stays_recoverable_and_is_never_reissued(self):
-        provider = FakeProvider(searches=[[offer()], [offer()]])
+        provider = FakeProvider(lookups=[offer(), offer()])
         provider.create_error = VastError(
             "sensitive provider timeout",
             retryable=True,
