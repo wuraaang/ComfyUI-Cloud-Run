@@ -359,6 +359,33 @@ class CloudRunServiceTests(unittest.TestCase):
         self.assertIn("inventory", unknown.sanitized_error.lower())
         self.assertNotIn("sensitive", unknown.sanitized_error)
 
+    def test_known_sanitized_create_refusal_is_preserved_for_the_user(self):
+        provider = FakeProvider(lookups=[offer(), offer()])
+        provider.create_error = VastError(
+            "Vast API key cannot create instances.",
+            status=403,
+        )
+        service = self.service(provider)
+        preview = asyncio.run(
+            service.preview_offer(
+                offer_id=42,
+                idempotency_key="idem-known-refusal",
+            )
+        )
+
+        failed = asyncio.run(
+            service.confirm(
+                preview.attempt_id,
+                idempotency_key="idem-known-refusal",
+            )
+        )
+
+        self.assertEqual(failed.state, AttemptState.FAILED)
+        self.assertEqual(
+            failed.sanitized_error,
+            "Vast API key cannot create instances.",
+        )
+
     def test_confirmation_rejects_expired_quote_and_wrong_idempotency_key(self):
         from cloud_run.service import CloudRunValidationError, QuoteUnavailable
 

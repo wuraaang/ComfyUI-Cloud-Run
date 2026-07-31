@@ -160,7 +160,7 @@ or its template/image configuration.
    `search_offers`, `create_instance`, `list_instances`, `get_instance`,
    `destroy_instance`, and `derive_base_url`.
 4. Hard-code an allowlist containing only official ComfyUI template
-   `57808457573e32120301649763d8e019`.
+   `027fba7753c024be019030fb42aed900`.
 5. Use HTTPS, bounded connect/read/total timeouts, and normalized error classes.
 6. Run:
 

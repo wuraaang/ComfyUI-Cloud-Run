@@ -5,7 +5,7 @@ from __future__ import annotations
 import ipaddress
 import math
 
-from .constants import OFFICIAL_TEMPLATE_ID
+from .constants import DEFAULT_DISK_GB, OFFICIAL_TEMPLATE_ID
 
 
 VAST_API_V0 = "https://console.vast.ai/api/v0"
@@ -81,9 +81,12 @@ def build_search_payload(
         "reliability": {"gte": float(min_reliability)},
         "rentable": {"eq": True},
         "dph_total": {"lte": float(max_price_per_hour)},
+        "disk_space": {"gte": DEFAULT_DISK_GB},
+        "allocated_storage": DEFAULT_DISK_GB,
         "num_gpus": {"eq": 1},
         "type": "ondemand",
         "limit": OFFER_SEARCH_LIMIT,
+        "order": [["dph_total", "asc"]],
     }
     if verified_only:
         payload["verified"] = {"eq": True}
@@ -130,6 +133,7 @@ def normalize_offers(
         )
         inet_down = _finite_number(raw.get("inet_down"))
         disk_bw = _finite_number(raw.get("disk_bw"))
+        disk_space = _finite_number(raw.get("disk_space"))
         rental_type = raw.get("type")
         num_gpus = raw.get("num_gpus")
         rentable = raw.get("rentable")
@@ -177,6 +181,10 @@ def normalize_offers(
             or (
                 min_disk_bw_mbps
                 and (disk_bw is None or disk_bw < float(min_disk_bw_mbps))
+            )
+            or (
+                disk_space is not None
+                and disk_space < DEFAULT_DISK_GB
             )
         ):
             continue
@@ -426,8 +434,19 @@ async def create_instance(
                 },
             ) as response:
                 if response.status != 200:
+                    if response.status in (401, 403):
+                        message = "Vast API key cannot create instances."
+                    elif response.status in (404, 410):
+                        message = (
+                            "The selected Vast offer or template is no longer "
+                            "available."
+                        )
+                    elif response.status == 400:
+                        message = "Vast rejected the instance configuration."
+                    else:
+                        message = "Vast instance creation failed."
                     raise VastError(
-                        "Vast instance creation failed.",
+                        message,
                         status=response.status,
                         retryable=response.status in (408, 409, 429)
                         or response.status >= 500,

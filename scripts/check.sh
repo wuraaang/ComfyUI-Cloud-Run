@@ -141,7 +141,7 @@ if provider_actions != allowed_provider_actions:
     print("[check] unexpected Vast provider action surface")
     raise SystemExit(1)
 
-if OFFICIAL_TEMPLATE_ID != "57808457573e32120301649763d8e019":
+if OFFICIAL_TEMPLATE_ID != "027fba7753c024be019030fb42aed900":
     print("[check] official template allowlist changed")
     raise SystemExit(1)
 

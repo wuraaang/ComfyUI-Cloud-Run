@@ -39,7 +39,7 @@ class RepositoryContractTests(unittest.TestCase):
         readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
         for required_text in (
             "Paid Vast.ai rental",
-            "57808457573e32120301649763d8e019",
+            "027fba7753c024be019030fb42aed900",
             "0600",
             "/cloud-run/api/settings",
             "/cloud-run/api/offers",

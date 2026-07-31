@@ -105,10 +105,13 @@ class VastRequestTests(unittest.TestCase):
                 "reliability": {"gte": 0.95},
                 "rentable": {"eq": True},
                 "dph_total": {"lte": 0.75},
+                "disk_space": {"gte": 80},
+                "allocated_storage": 80,
                 "num_gpus": {"eq": 1},
                 "verified": {"eq": True},
                 "type": "ondemand",
                 "limit": 20,
+                "order": [["dph_total", "asc"]],
             },
         )
         self.assertEqual(
@@ -340,6 +343,31 @@ class VastNormalizationAndErrorTests(unittest.TestCase):
         self.assertEqual(payload["disk_bw"], {"gte": 300})
         self.assertEqual(payload["reliability"], {"gte": 0.98})
 
+    def test_normalization_rejects_explicitly_insufficient_disk_space(self):
+        from cloud_run.vast import normalize_offers
+
+        payload = {
+            "offers": [
+                {
+                    "id": 42,
+                    "gpu_name": "RTX 3090",
+                    "gpu_ram": 24576,
+                    "dph_total": 0.2,
+                    "reliability2": 0.99,
+                    "disk_space": 79.9,
+                }
+            ]
+        }
+
+        self.assertEqual(
+            normalize_offers(
+                payload,
+                max_price_per_hour=0.75,
+                min_vram_gb=24,
+            ),
+            [],
+        )
+
     def test_malformed_payload_is_a_sanitized_failure(self):
         from cloud_run.vast import OfferSearchError, search_offers
 
@@ -455,6 +483,14 @@ class VastNormalizationAndErrorTests(unittest.TestCase):
 
 
 class VastLifecycleRequestTests(unittest.TestCase):
+    def test_official_template_hash_matches_current_vast_catalog_pin(self):
+        from cloud_run.constants import OFFICIAL_TEMPLATE_ID
+
+        self.assertEqual(
+            OFFICIAL_TEMPLATE_ID,
+            "027fba7753c024be019030fb42aed900",
+        )
+
     def test_create_uses_only_the_official_comfyui_template(self):
         from cloud_run.constants import OFFICIAL_TEMPLATE_ID
         from cloud_run.vast import VAST_API_V0, create_instance
@@ -596,6 +632,40 @@ class VastLifecycleRequestTests(unittest.TestCase):
                 )
             )
         self.assertNotIn(marker, str(raised.exception))
+
+    def test_create_maps_provider_status_without_echoing_response_details(self):
+        from cloud_run.vast import VastError, create_instance
+
+        marker = "provider-secret-marker"
+        cases = (
+            (400, "Vast rejected the instance configuration."),
+            (401, "Vast API key cannot create instances."),
+            (403, "Vast API key cannot create instances."),
+            (
+                404,
+                "The selected Vast offer or template is no longer available.",
+            ),
+            (
+                410,
+                "The selected Vast offer or template is no longer available.",
+            ),
+        )
+        for status, expected in cases:
+            with self.subTest(status=status):
+                with self.assertRaises(VastError) as raised:
+                    asyncio.run(
+                        create_instance(
+                            "synthetic-value",
+                            offer_id=42,
+                            disk_gb=80,
+                            label="comfy-cloud-run-attempt-1",
+                            session=FakeSession(
+                                FakeResponse(status, {"error": marker})
+                            ),
+                        )
+                    )
+                self.assertEqual(str(raised.exception), expected)
+                self.assertNotIn(marker, str(raised.exception))
 
 
 if __name__ == "__main__":

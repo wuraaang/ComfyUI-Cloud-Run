@@ -14,7 +14,7 @@
 - Do not modify, import from, or depend on ComfyRelay or `/Users/wuraaang/comfyui-vast-cockpit`.
 - Do not change the package architecture, graph-node surface, local Run behavior, or user-visible offer selectors.
 - No live `/confirm` request, instance creation, cancellation, destruction, or other paid Vast action is authorized.
-- Only official template `57808457573e32120301649763d8e019` may ever be created.
+- Only official template `027fba7753c024be019030fb42aed900` may ever be created.
 - Never log, return, print, screenshot, or commit the Vast API key or bearer header.
 - Exact lookup must use `ask_contract_id`, then require the canonical returned `offer_id` to equal the requested ID.
 - Never silently replace the selected offer.

@@ -358,7 +358,11 @@ class CloudRunService:
                 attempt.attempt_id,
                 AttemptState.FAILED,
                 now=float(self.clock()),
-                sanitized_error="Vast instance creation failed.",
+                sanitized_error=(
+                    str(error)
+                    if isinstance(error, vast.VastError)
+                    else "Vast instance creation failed."
+                ),
             )
 
         return await self._finish_created_instance(

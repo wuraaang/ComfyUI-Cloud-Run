@@ -19,7 +19,7 @@ function settingsResponse() {
         configured: false,
         max_price_per_hour: 1,
         min_vram_gb: 16,
-        official_template_id: "57808457573e32120301649763d8e019",
+        official_template_id: "027fba7753c024be019030fb42aed900",
         official_template_name: "Official ComfyUI",
         lifecycle_enabled: true,
       };
@@ -58,7 +58,7 @@ function attemptPayload(status, overrides = {}) {
     error: null,
     billing_may_continue: false,
     emergency_action: null,
-    official_template_id: "57808457573e32120301649763d8e019",
+    official_template_id: "027fba7753c024be019030fb42aed900",
     official_template_name: "Official ComfyUI",
     ...overrides,
   };
@@ -362,7 +362,7 @@ test("saves settings with a write-only optional key and clears the password", as
       configured: true,
       max_price_per_hour: 0.55,
       min_vram_gb: 32,
-      official_template_id: "57808457573e32120301649763d8e019",
+      official_template_id: "027fba7753c024be019030fb42aed900",
       official_template_name: "Official ComfyUI",
       lifecycle_enabled: true,
     }),
@@ -370,7 +370,7 @@ test("saves settings with a write-only optional key and clears the password", as
       configured: true,
       max_price_per_hour: 0.6,
       min_vram_gb: 48,
-      official_template_id: "57808457573e32120301649763d8e019",
+      official_template_id: "027fba7753c024be019030fb42aed900",
       official_template_name: "Official ComfyUI",
       lifecycle_enabled: true,
     }),
@@ -503,7 +503,7 @@ test("server quote shows the exact paid confirmation before create", async () =>
       error: null,
       billing_may_continue: false,
       emergency_action: null,
-      official_template_id: "57808457573e32120301649763d8e019",
+      official_template_id: "027fba7753c024be019030fb42aed900",
       official_template_name: "Official ComfyUI",
     }),
   ];
@@ -533,7 +533,7 @@ test("server quote shows the exact paid confirmation before create", async () =>
   assert.ok(preview.textContent.includes("Offer: 42"));
   assert.ok(preview.textContent.includes("Official ComfyUI"));
   assert.ok(
-    preview.textContent.includes("57808457573e32120301649763d8e019"),
+    preview.textContent.includes("027fba7753c024be019030fb42aed900"),
   );
   assert.ok(preview.textContent.includes("No rental exists until you confirm"));
   assert.equal(

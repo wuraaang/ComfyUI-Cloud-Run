@@ -1,7 +1,7 @@
 const SETTINGS_ENDPOINT = "/cloud-run/api/settings";
 const OFFERS_ENDPOINT = "/cloud-run/api/offers";
 const QUOTES_ENDPOINT = "/cloud-run/api/quotes";
-const OFFICIAL_TEMPLATE_ID = "57808457573e32120301649763d8e019";
+const OFFICIAL_TEMPLATE_ID = "027fba7753c024be019030fb42aed900";
 const OFFICIAL_TEMPLATE_NAME = "Official ComfyUI";
 const OPEN_COMMAND_ID = "vast-cloud-run.open";
 const POLL_INTERVAL_MS = 1000;

@@ -108,7 +108,7 @@ bar is absent.
   the exact GPU, VRAM, hourly price, offer ID, configured cap, and official
   template.
 - The only permitted creation template remains
-  `57808457573e32120301649763d8e019`.
+  `027fba7753c024be019030fb42aed900`.
 - No API key, bearer header, or provider response secret may appear in logs,
   browser payloads, tests, screenshots, commits, or error text.
 

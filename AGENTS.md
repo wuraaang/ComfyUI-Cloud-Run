@@ -28,7 +28,7 @@ Extend the certified preview V0 into one safe vertical lifecycle:
   destruction of the first instance has been verified.
 
 Only the official ComfyUI Vast template
-`57808457573e32120301649763d8e019` may be created. No workflow transfer,
+`027fba7753c024be019030fb42aed900` may be created. No workflow transfer,
 model synchronization, custom-node resolution, other provider, telemetry, or
 Registry publication belongs to this slice.
 

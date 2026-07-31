@@ -152,7 +152,7 @@ class SettingsPersistenceTests(unittest.TestCase):
                     "configured": True,
                     "max_price_per_hour": 0.8,
                     "min_vram_gb": 24,
-                    "official_template_id": "57808457573e32120301649763d8e019",
+                    "official_template_id": "027fba7753c024be019030fb42aed900",
                     "official_template_name": "Official ComfyUI",
                     "lifecycle_enabled": True,
                 },
@@ -191,7 +191,7 @@ class SettingsPersistenceTests(unittest.TestCase):
             "configured": False,
             "max_price_per_hour": 1.0,
             "min_vram_gb": 16,
-            "official_template_id": "57808457573e32120301649763d8e019",
+            "official_template_id": "027fba7753c024be019030fb42aed900",
             "official_template_name": "Official ComfyUI",
             "lifecycle_enabled": True,
         }
