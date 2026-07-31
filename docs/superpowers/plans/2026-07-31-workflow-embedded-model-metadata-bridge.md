@@ -18,7 +18,7 @@
 - Keep the workflow parser read-only. Do not silently repair or mutate an unrelated workflow, and do not infer a source from a similar filename.
 - Do not implement a second missing-model downloader or metadata format. The local proof certifies native ComfyUI action visibility only; generic localhost server-side placement remains outside Cloud Run.
 - Leave custom-node discovery and approval behavior unchanged; this slice changes only static model source resolution.
-- Support only public, ungated Hugging Face model repositories in this slice. Do not add Hugging Face credentials, gated access, Civitai, R2, arbitrary URLs, redirects, signed URLs, or URL guessing from filenames.
+- Support only public, ungated Hugging Face model repositories in this slice. Do not add Hugging Face credentials, gated access, Civitai, R2, arbitrary URLs, arbitrary redirects, persisted or exposed signed URLs, or URL guessing from filenames. Only an artifact whose kind is exactly `model` may manually follow at most one cross-origin redirect from the stored canonical commit-pinned `huggingface.co` locator to an exact blob origin listed in the approved design; automatic redirect following remains disabled, later redirects stay on the selected origin, and the temporary target is never persisted or exposed.
 - Treat every workflow string and every remote JSON body as untrusted. Reject ambiguity, traversal, credentials, fragments, source substitution, missing immutable identity, unknown sizes, and missing digests before rental.
 - Do not download model bytes during capture, free preflight, automated tests, or the local native-panel proof. Hugging Face network tests are fake and offline except for the separately identified read-only Gold preflight proof.
 - Keep inputs local-first: an active image, mask, or video must already exist beneath the approved ComfyUI input root, must be hashed locally, and must use the existing verified local relay unless a separately approved cache source already exists.
@@ -37,6 +37,7 @@
 - Existing session/lifecycle design: `docs/superpowers/specs/2026-07-31-workflow-derived-vast-gpu-session-design.md`.
 - Hugging Face's official client documents `model_info(repo_id, revision=REVISION, files_metadata=True)` as returning revision identity and per-file size/LFS metadata: <https://huggingface.co/docs/huggingface_hub/en/package_reference/hf_api>.
 - The official client currently implements that read-only call as `GET /api/models/{repo_id}/revision/{revision}?blobs=true`; keep the origin and response contract explicit rather than importing a credential-aware Hub client: <https://github.com/huggingface/huggingface_hub/blob/main/src/huggingface_hub/hf_api.py>.
+- Hugging Face documents that model bytes are served from separate storage/CDN hostnames and that downloads follow redirects from `huggingface.co`: <https://huggingface.co/docs/hub/models-downloading>.
 
 ---
 
@@ -66,10 +67,10 @@
 ### Existing worker and lifecycle files
 
 - `remote_worker/provision.py`: bounded per-artifact transfer progress snapshots with no URL or secret.
-- `remote_worker/transfers.py`: internal transfer-versus-digest-verification progress events; download semantics and verification remain unchanged.
+- `remote_worker/transfers.py`: internal transfer-versus-digest-verification progress events; retain size/digest verification while allowing the design's single manually validated Hugging Face blob-origin transition.
 - `remote_worker/server.py`: optional sanitized progress in existing manifest/transaction responses.
 - `remote_worker/state.py`: validated atomic storage of the sanitized progress snapshot.
-- `cloud_run/lifecycle.py`: immediate verified destruction and diagnostic preservation for typed terminal provisioning failures.
+- `cloud_run/lifecycle.py`: immediate verified destruction and diagnostic preservation for typed terminal provisioning failures, followed by active-work abandonment only after inventory verification.
 
 ### Existing test coverage to extend
 
@@ -886,6 +887,14 @@ After implementation, run the same command and expect all tests to pass. Do not 
 
 In `_apply_manifest()`, start the existing `worker.apply_manifest(request)` as a task. While it is pending, poll the deterministic transaction ID `provision-<manifest digest>` through the existing signed `worker.transaction()` method at the configured bounded poll interval. Accept absence before the worker creates the record. Validate every returned old or extended payload, persist only the sanitized progress object, and always await/cancel and consume the apply task safely on cancellation or failure. Validate and persist the final apply response's progress as well, so a fast worker still records its `ready` snapshot even when no intermediate poll ran.
 
+The worker transaction ID above is scoped to one worker instance and remains
+unchanged for protocol compatibility. The controller's global
+`provision_transactions` table must store progress under a separate bounded,
+deterministic identity derived from `(session_id, manifest_digest)`. Retries for
+one session reuse that local identity; different sessions using the same
+manifest never share it. The controller-local identity is never sent to or
+accepted from the worker.
+
 Keep the existing upload handshake and three-attempt bound. A progress response cannot satisfy ready state, alter required uploads, replace the final apply response, or extend a deadline.
 
 Map `dependency_id` to `ArtifactSpec.logical_name` only inside `_session_payload()` using the locally stored immutable manifest. Expose `current_model` only when the ID belongs to a model artifact. Compute the public aggregate from the manifest's exact transfer total and bounded worker/local relay offsets; never expose the worker artifact URL.
@@ -1015,6 +1024,13 @@ terminal-provisioning path.
 Thread that value only through automatic terminal-provisioning destruction. Normal user-requested destruction and deadline destruction retain existing clearing behavior. A residual-billing failure always overrides the diagnostic with urgent manual-recovery guidance.
 
 Catch `TerminalProvisioningError` before the broad exception in `wait_until_session_ready()`, transition the session to failed with the static diagnostic, then call `destroy_session(session_id, terminal_error=diagnostic)` immediately. Add the equivalent explicit helper call for a typed provisioning failure while applying a compatible delta to a ready session.
+
+Apply the same typed boundary during startup `recover_sessions()`: if
+`recover_session()` receives a valid but deadline-incompatible worker response,
+it raises `TerminalProvisioningError`; the lifecycle preserves the diagnostic,
+requests destruction immediately, and performs a fresh inventory verification.
+An unavailable deadline transport continues to raise the ordinary recoverable
+`SessionExecutionError`.
 
 - [ ] **Step 7: Verify lifecycle safety and commit**
 
@@ -1249,6 +1265,11 @@ Expected: both complete gates pass consecutively, including Python, Node, compil
 - [ ] **Step 4: Request code review and address only evidenced findings**
 
 Read and follow `superpowers:requesting-code-review`. Review against the approved design and this plan, with special attention to URL/origin confinement, subgraph identity, collision handling, old worker/preflight compatibility, progress secrecy, rental gating, and residual-billing behavior.
+
+For Hugging Face model bytes, distinguish the forbidden cases (automatic or
+arbitrary redirects, more than one cross-origin transition, and persistence or
+exposure of temporary targets) from the required manual transition to an exact
+approved blob origin. Metadata API redirects remain forbidden.
 
 For actionable findings, follow `superpowers:receiving-code-review`, add a red regression, make the minimal correction, commit it, and repeat both complete gates.
 

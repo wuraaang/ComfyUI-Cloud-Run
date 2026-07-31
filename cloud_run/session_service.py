@@ -740,6 +740,43 @@ def _safe_remote_error(error):
     return message if message in allowed else "Remote execution failed."
 
 
+def _deadline_response_matches(response, request):
+    fields = {
+        "mode",
+        "deadline_at",
+        "retrieval_grace_seconds",
+        "destroy_intent",
+        "destroy_requested",
+    }
+    if not isinstance(response, dict) or set(response) != fields:
+        return False
+    mode = request.get("mode") if isinstance(request, dict) else None
+    if mode == "finite":
+        expected_deadline = request.get("deadline_at")
+        expected_grace = request.get("retrieval_grace_seconds")
+        deadline_at = response.get("deadline_at")
+        if (
+            isinstance(deadline_at, bool)
+            or not isinstance(deadline_at, (int, float))
+            or not math.isfinite(deadline_at)
+            or deadline_at != expected_deadline
+        ):
+            return False
+    elif mode == "none":
+        expected_deadline = None
+        expected_grace = 0
+    else:
+        return False
+    return (
+        response.get("mode") == mode
+        and response.get("deadline_at") == expected_deadline
+        and type(response.get("retrieval_grace_seconds")) is int
+        and response.get("retrieval_grace_seconds") == expected_grace
+        and response.get("destroy_intent") is False
+        and response.get("destroy_requested") is False
+    )
+
+
 def _validated_provision_progress(payload, manifest):
     progress = payload.get("progress")
     if progress is None:
@@ -859,6 +896,20 @@ def _provision_payload_valid(payload, manifest):
     ):
         return False
     return True
+
+
+def _stored_provision_transaction_id(session_id, manifest_digest):
+    if (
+        not isinstance(session_id, str)
+        or not _IDENTIFIER.fullmatch(session_id)
+        or not isinstance(manifest_digest, str)
+        or not _HEX_64.fullmatch(manifest_digest)
+    ):
+        raise ValueError("Invalid provisioning transaction identity.")
+    identity = hashlib.sha256(
+        (session_id + "\0" + manifest_digest).encode("ascii")
+    ).hexdigest()
+    return "provision-session-" + identity
 
 
 class SessionService:
@@ -1290,11 +1341,7 @@ class SessionService:
                 response = None
         else:
             response = None
-        valid = (
-            isinstance(response, dict)
-            and response.get("mode") == mode
-            and response.get("deadline_at") == deadline_at
-        )
+        valid = _deadline_response_matches(response, request)
         if not valid:
             self._sessions().update(
                 session.session_id,
@@ -1415,6 +1462,14 @@ class SessionService:
         if session.state != SessionState.DESTROYED:
             raise SessionExecutionError(
                 "Deadline destruction is not inventory verified."
+            )
+        self._abandon_session_work(session.session_id)
+
+    def confirmed_terminal_destroy(self, session_id):
+        session = self.session(session_id)
+        if session.state != SessionState.DESTROYED:
+            raise SessionExecutionError(
+                "Terminal destruction is not inventory verified."
             )
         self._abandon_session_work(session.session_id)
 
@@ -1894,7 +1949,10 @@ class SessionService:
                 "stalled": "Remote provisioning stalled.",
             }.get(response["state"])
             self.job_repository.record_provision_progress(
-                transaction_id=response["transaction_id"],
+                transaction_id=_stored_provision_transaction_id(
+                    session.session_id,
+                    manifest.digest,
+                ),
                 session_id=session.session_id,
                 job_id=transfer_job_id,
                 manifest_digest=manifest.digest,
@@ -2140,15 +2198,7 @@ class SessionService:
             raise SessionExecutionError(
                 "Remote deadline enforcement failed."
             ) from None
-        if (
-            not isinstance(deadline_result, dict)
-            or deadline_result.get("mode") != session.deadline_mode
-            or (
-                session.deadline_mode == "finite"
-                and deadline_result.get("deadline_at")
-                != session.deadline_at
-            )
-        ):
+        if not _deadline_response_matches(deadline_result, policy):
             raise TerminalProvisioningError(
                 "Remote deadline enforcement failed."
             )
@@ -2234,16 +2284,8 @@ class SessionService:
             raise SessionExecutionError(
                 "Remote deadline enforcement failed."
             ) from None
-        if (
-            not isinstance(deadline_result, dict)
-            or deadline_result.get("mode") != session.deadline_mode
-            or (
-                session.deadline_mode == "finite"
-                and deadline_result.get("deadline_at")
-                != session.deadline_at
-            )
-        ):
-            raise SessionExecutionError(
+        if not _deadline_response_matches(deadline_result, policy):
+            raise TerminalProvisioningError(
                 "Remote deadline enforcement failed."
             )
         self.job_repository.replace_installed_set(

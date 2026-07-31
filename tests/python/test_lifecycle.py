@@ -789,6 +789,8 @@ class RecoveringSessionService:
         self.recovery_calls = []
         self.deadline_destroy_calls = []
         self.deadline_prepare_calls = []
+        self.terminal_destroy_calls = []
+        self.active_work = {}
 
     async def bootstrap_session(self, session_id):
         session = self.repository.get(session_id)
@@ -802,6 +804,12 @@ class RecoveringSessionService:
 
     def confirmed_deadline_destroy(self, session_id):
         self.deadline_destroy_calls.append(session_id)
+
+    def confirmed_terminal_destroy(self, session_id):
+        state = self.repository.get(session_id).state
+        self.terminal_destroy_calls.append((session_id, state))
+        if state == SessionState.DESTROYED:
+            self.active_work[session_id] = "failed"
 
     async def prepare_deadline_destroy(self, session_id):
         self.deadline_prepare_calls.append(session_id)
@@ -838,6 +846,15 @@ class TerminalSessionService(RecoveringSessionService):
     async def bootstrap_session(self, session_id):
         session = self.repository.get(session_id)
         self.bootstrap_calls.append(session)
+        raise TerminalProvisioningError(self.diagnostic)
+
+
+class TerminalRecoverySessionService(RecoveringSessionService):
+    diagnostic = "Remote deadline enforcement failed."
+
+    async def recover_session(self, session_id):
+        session = self.repository.get(session_id)
+        self.recovery_calls.append(session)
         raise TerminalProvisioningError(self.diagnostic)
 
 
@@ -1119,6 +1136,56 @@ class SessionLifecycleTests(LifecycleTestCase):
         self.assertEqual(
             [call[0] for call in self.provider.calls],
             ["list"],
+        )
+
+    def test_terminal_recovery_failure_destroys_and_verifies_immediately(self):
+        self.session_service = TerminalRecoverySessionService(self.sessions)
+        session = self.save_session(state=SessionState.READY)
+        self.provider.instances = [
+            self.worker_instance("instance-1", session.label)
+        ]
+
+        recovered = asyncio.run(
+            self.session_lifecycle().recover_sessions()
+        )
+
+        destroyed = self.sessions.get(session.session_id)
+        self.assertEqual(recovered, [destroyed])
+        self.assertEqual(destroyed.state, SessionState.DESTROYED)
+        self.assertIsNone(destroyed.instance_id)
+        self.assertFalse(destroyed.public_payload()["billing_may_continue"])
+        self.assertEqual(
+            destroyed.sanitized_error,
+            TerminalRecoverySessionService.diagnostic,
+        )
+        self.assertEqual(self.clock.sleeps, [])
+        self.assertEqual(
+            [call[0] for call in self.provider.calls],
+            ["list", "destroy", "list"],
+        )
+
+    def test_terminal_running_recovery_abandons_work_after_verified_destroy(self):
+        self.session_service = TerminalRecoverySessionService(self.sessions)
+        session = self.save_session(state=SessionState.RUNNING)
+        self.session_service.active_work[session.session_id] = "running"
+        self.provider.instances = [
+            self.worker_instance("instance-1", session.label)
+        ]
+
+        recovered = asyncio.run(
+            self.session_lifecycle().recover_sessions()
+        )
+
+        destroyed = self.sessions.get(session.session_id)
+        self.assertEqual(recovered, [destroyed])
+        self.assertEqual(destroyed.state, SessionState.DESTROYED)
+        self.assertEqual(
+            self.session_service.terminal_destroy_calls,
+            [(session.session_id, SessionState.DESTROYED)],
+        )
+        self.assertEqual(
+            self.session_service.active_work[session.session_id],
+            "failed",
         )
 
     def test_expired_session_absence_is_recorded_as_deadline_destruction(self):

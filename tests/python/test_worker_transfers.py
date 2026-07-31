@@ -107,10 +107,15 @@ class FakeRangeClient:
         if self.failures:
             self.failures -= 1
             raise OSError("temporary transport failure")
-        if self.redirect is not None:
+        redirect = (
+            self.redirect.get(url)
+            if isinstance(self.redirect, dict)
+            else self.redirect if url == SOURCE_URL else None
+        )
+        if redirect is not None:
             return FakeResponse(
                 status=302,
-                headers={"Location": self.redirect},
+                headers={"Location": redirect},
                 url=url,
                 payload=b"",
             )
@@ -305,6 +310,101 @@ class TransferManagerTests(unittest.TestCase):
                 with self.assertRaises(TransferError):
                     asyncio.run(manager.download(artifact, client=client))
                 self.assertFalse(destination.exists())
+
+    def test_huggingface_download_follows_only_allowlisted_blob_redirects(self):
+        payload = b"redirected-huggingface-model"
+        allowed_hosts = (
+            "cas-bridge.xethub.hf.co",
+            "cdn-lfs-eu-1.hf.co",
+            "cdn-lfs-us-1.hf.co",
+            "transfer.xethub-eu.hf.co",
+            "transfer.xethub.hf.co",
+            "us.aws.cdn.hf.co",
+            "us.gcp.cdn.hf.co",
+        )
+
+        for index, host in enumerate(allowed_hosts):
+            with self.subTest(host=host):
+                artifact = artifact_for(
+                    payload,
+                    artifact_id=f"redirected-model-{index}",
+                    destination=f"models/checkpoints/redirected-{index}.bin",
+                )
+                redirected = (
+                    f"https://{host}/immutable/model.bin"
+                    "?temporary-signature=synthetic"
+                )
+                client = FakeRangeClient(payload, redirect=redirected)
+
+                result = asyncio.run(
+                    self.manager(max_retries=0).download(
+                        artifact,
+                        client=client,
+                    )
+                )
+
+                self.assertEqual(result.state, "verified")
+                self.assertEqual(
+                    [request[0] for request in client.requests],
+                    [SOURCE_URL, redirected],
+                )
+                self.assertTrue(
+                    all(
+                        allow_redirects is False
+                        for _url, _headers, allow_redirects in client.requests
+                    )
+                )
+
+    def test_huggingface_download_rejects_a_second_cross_origin_redirect(self):
+        from remote_worker.transfers import TransferError
+
+        payload = b"redirect-chain"
+        first = "https://us.aws.cdn.hf.co/immutable/model.bin"
+        second = "https://us.gcp.cdn.hf.co/immutable/model.bin"
+        client = FakeRangeClient(
+            payload,
+            redirect={SOURCE_URL: first, first: second},
+        )
+
+        with self.assertRaises(TransferError):
+            asyncio.run(
+                self.manager(max_retries=0).download(
+                    artifact_for(payload),
+                    client=client,
+                )
+            )
+
+    def test_huggingface_blob_redirect_is_restricted_to_model_artifacts(self):
+        from remote_worker.transfers import TransferError
+
+        payload = b"non-model-huggingface-artifact"
+        artifact = ArtifactSpec(
+            artifact_id="remote-input",
+            kind="input",
+            logical_name="remote-input",
+            destination="input/remote-input.bin",
+            size_bytes=len(payload),
+            sha256=hashlib.sha256(payload).hexdigest(),
+            source=SourceSpec(
+                kind="huggingface",
+                locator=SOURCE_URL,
+                immutable_revision=REVISION,
+            ),
+        )
+        client = FakeRangeClient(
+            payload,
+            redirect="https://us.aws.cdn.hf.co/immutable/input.bin",
+        )
+
+        with self.assertRaises(TransferError):
+            asyncio.run(
+                self.manager(max_retries=0).download(
+                    artifact,
+                    client=client,
+                )
+            )
+
+        self.assertEqual(len(client.requests), 1)
 
     def test_download_retries_transport_only_and_caps_concurrency_at_four(self):
         payload = b"concurrent-payload"

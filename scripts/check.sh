@@ -488,10 +488,17 @@ if route_keys & forbidden_response_keys:
 
 allowed_external_hosts = {
     "api.comfy.org",
+    "cas-bridge.xethub.hf.co",
+    "cdn-lfs-eu-1.hf.co",
+    "cdn-lfs-us-1.hf.co",
     "civitai.com",
     "console.vast.ai",
     "github.com",
     "huggingface.co",
+    "transfer.xethub-eu.hf.co",
+    "transfer.xethub.hf.co",
+    "us.aws.cdn.hf.co",
+    "us.gcp.cdn.hf.co",
     "vast.ai",
 }
 observed_external_hosts = set()
@@ -511,10 +518,17 @@ if observed_external_hosts - allowed_external_hosts:
     fail("external origin allowlist changed")
 if not {
     "api.comfy.org",
+    "cas-bridge.xethub.hf.co",
+    "cdn-lfs-eu-1.hf.co",
+    "cdn-lfs-us-1.hf.co",
     "civitai.com",
     "console.vast.ai",
     "github.com",
     "huggingface.co",
+    "transfer.xethub-eu.hf.co",
+    "transfer.xethub.hf.co",
+    "us.aws.cdn.hf.co",
+    "us.gcp.cdn.hf.co",
 }.issubset(observed_external_hosts):
     fail("approved external origin policy is incomplete")
 

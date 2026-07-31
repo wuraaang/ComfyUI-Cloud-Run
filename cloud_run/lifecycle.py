@@ -1206,6 +1206,27 @@ class CloudRunLifecycle:
                 )
             except (asyncio.CancelledError, KeyboardInterrupt):
                 raise
+            except TerminalProvisioningError as error:
+                diagnostic = str(error)
+                session = repository.get(session.session_id)
+                session = repository.transition(
+                    session.session_id,
+                    SessionState.FAILED,
+                    now=float(self.clock()),
+                    sanitized_error=diagnostic,
+                )
+                session = await self.destroy_session(
+                    session.session_id,
+                    terminal_error=diagnostic,
+                )
+                if session.state == SessionState.DESTROYED:
+                    confirmed = getattr(
+                        self.session_service,
+                        "confirmed_terminal_destroy",
+                        None,
+                    )
+                    if callable(confirmed):
+                        confirmed(session.session_id)
             except Exception:
                 session = repository.get(session.session_id)
             recovered.append(session)

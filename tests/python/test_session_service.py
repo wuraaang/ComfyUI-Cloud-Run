@@ -16,7 +16,13 @@ from cloud_run.manifest import (
     PythonWheelSpec,
     SourceSpec,
 )
-from cloud_run.models import CloudJob, CloudSession, JobState, SessionState
+from cloud_run.models import (
+    CloudJob,
+    CloudSession,
+    JobState,
+    SessionState,
+    TransferState,
+)
 from cloud_run.relay import RelaySyncResult
 from cloud_run.repository import SessionRepository
 from cloud_run.resolver import NodeResolution
@@ -1166,6 +1172,80 @@ class ReusableSessionTests(unittest.TestCase):
         self.assertNotIn("huggingface.co", repr(latest))
         self.assertNotIn("provider-token", repr(latest))
 
+    def test_provision_progress_identity_is_session_scoped_and_retry_idempotent(self):
+        manifest = self.initial_manifest
+        total_bytes = sum(
+            artifact.size_bytes for artifact in manifest.artifacts
+        )
+        response = {
+            "transaction_id": "provision-" + manifest.digest,
+            "manifest_digest": manifest.digest,
+            "state": "applying",
+            "planned_restarts": 0,
+            "repair_restarts": 0,
+            "missing_class_types": [],
+            "missing_artifacts": [],
+            "progress": {
+                "phase": "model_transfer",
+                "dependency_id": self.model.artifact_id,
+                "transferred_bytes": 1,
+                "total_bytes": total_bytes,
+            },
+        }
+        first_session = self.sessions.get("session-1")
+        second_session = CloudSession.new(
+            "session-key-2",
+            session_id="session-2",
+            manifest_digest=manifest.digest,
+            deadline_at=7300.0,
+            deadline_mode="finite",
+            disk_gb=80,
+            now=100.0,
+            state=SessionState.READY,
+        ).transition(
+            SessionState.READY,
+            now=100.0,
+            installed_manifest_digest=manifest.digest,
+            instance_id="88",
+            worker_base_url="http://8.8.4.4:30000",
+            provider_token="second-provider-token",
+            session_secret_hex="e" * 64,
+        )
+        self.sessions.create_or_get(second_session)
+
+        self.service._record_provision_progress(
+            response,
+            session=first_session,
+            manifest=manifest,
+            transfer_job_id="bootstrap:session-1",
+        )
+        first_identity = self.jobs.latest_provision_transaction(
+            "session-1"
+        ).transaction_id
+        self.service._record_provision_progress(
+            response,
+            session=first_session,
+            manifest=manifest,
+            transfer_job_id="bootstrap:session-1",
+        )
+        self.service._record_provision_progress(
+            response,
+            session=second_session,
+            manifest=manifest,
+            transfer_job_id="bootstrap:session-2",
+        )
+
+        first = self.jobs.latest_provision_transaction("session-1")
+        second = self.jobs.latest_provision_transaction("session-2")
+        self.assertEqual(first.transaction_id, first_identity)
+        self.assertNotEqual(first.transaction_id, second.transaction_id)
+        self.assertEqual(first.manifest_digest, manifest.digest)
+        self.assertEqual(second.manifest_digest, manifest.digest)
+        self.assertEqual(
+            response["transaction_id"],
+            "provision-" + manifest.digest,
+        )
+
     def test_legacy_apply_response_without_progress_remains_accepted(self):
         result = asyncio.run(
             self.service._apply_manifest(
@@ -1529,6 +1609,112 @@ class ReusableSessionTests(unittest.TestCase):
             ],
         )
 
+    def test_ready_recovery_inconsistent_deadline_response_is_terminal(self):
+        self.worker.claimed = True
+
+        async def inconsistent_deadline(_policy):
+            return {"mode": "none", "acknowledged": True}
+
+        self.worker.update_deadline = inconsistent_deadline
+
+        with self.assertRaises(TerminalProvisioningError) as caught:
+            asyncio.run(self.service.recover_session("session-1"))
+
+        self.assertIs(type(caught.exception), TerminalProvisioningError)
+        self.assertEqual(
+            str(caught.exception),
+            "Remote deadline enforcement failed.",
+        )
+
+    def test_ready_recovery_rejects_incompatible_deadline_policy_fields(self):
+        self.worker.claimed = True
+        expected = {
+            "mode": "finite",
+            "deadline_at": 7300.0,
+            "retrieval_grace_seconds": 300,
+            "destroy_intent": False,
+            "destroy_requested": False,
+        }
+        incompatible = (
+            {**expected, "retrieval_grace_seconds": 0},
+            {**expected, "destroy_intent": True},
+        )
+
+        for response in incompatible:
+            with self.subTest(response=response):
+                async def incompatible_deadline(_policy, response=response):
+                    return response
+
+                self.worker.update_deadline = incompatible_deadline
+
+                with self.assertRaises(TerminalProvisioningError):
+                    asyncio.run(self.service.recover_session("session-1"))
+
+    def test_confirmed_terminal_destroy_abandons_active_session_work(self):
+        session = self.sessions.get("session-1")
+        session = self.sessions.save(
+            session.transition(SessionState.RUNNING, now=101.0)
+        )
+        running = CloudJob(
+            job_id="terminal-recovery-job",
+            session_id=session.session_id,
+            idempotency_key="terminal-recovery-key",
+            state=JobState.RUNNING,
+            prompt_digest=self.first_capture.prompt_digest,
+            capture_json=self.first_capture.canonical_payload(),
+            manifest_digest=session.installed_manifest_digest,
+            remote_prompt_id=(
+                "11111111-1111-1111-1111-111111111111"
+            ),
+            sanitized_error=None,
+            created_at=100.0,
+            updated_at=101.0,
+            version=1,
+        )
+        self.jobs.create_job(running)
+        self.jobs.save_transfer(
+            job_id=running.job_id,
+            artifact_id="unfinished-output",
+            direction="download",
+            expected_size=20,
+            sha256="f" * 64,
+            offset=10,
+            state=TransferState.TRANSFERRING,
+            private_path=str(self.path.parent / "unfinished-output.part"),
+        )
+        for state in (
+            SessionState.FAILED,
+            SessionState.DESTROY_REQUESTED,
+            SessionState.DESTROYING,
+            SessionState.DESTROYED,
+        ):
+            session = self.sessions.transition(
+                session.session_id,
+                state,
+                now=session.updated_at + 1,
+                destroy_requested=(
+                    state
+                    in {
+                        SessionState.DESTROY_REQUESTED,
+                        SessionState.DESTROYING,
+                    }
+                ),
+            )
+
+        self.service.confirmed_terminal_destroy(session.session_id)
+
+        failed = self.jobs.get_job(running.job_id)
+        transfer = self.jobs.get_transfer(
+            running.job_id,
+            "unfinished-output",
+        )
+        self.assertEqual(failed.state, JobState.FAILED)
+        self.assertEqual(
+            failed.sanitized_error,
+            "Remote execution was interrupted by GPU destruction.",
+        )
+        self.assertEqual(transfer.state, TransferState.ABANDONED)
+
     def test_running_recovery_idempotently_resumes_remote_job_and_harvest(self):
         session = self.sessions.get("session-1")
         session = self.sessions.save(
@@ -1776,6 +1962,12 @@ class ReusableSessionTests(unittest.TestCase):
                 return {
                     "mode": payload["mode"],
                     "deadline_at": payload.get("deadline_at"),
+                    "retrieval_grace_seconds": payload.get(
+                        "retrieval_grace_seconds",
+                        0,
+                    ),
+                    "destroy_intent": False,
+                    "destroy_requested": False,
                 }
 
             self.worker.update_deadline = blocked_update

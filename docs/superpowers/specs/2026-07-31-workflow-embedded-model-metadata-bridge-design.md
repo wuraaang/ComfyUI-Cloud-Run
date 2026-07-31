@@ -262,6 +262,34 @@ then submits the captured native prompt.
 The worker never sees the mutable annotation URL, Agent Panel authority, or a
 provider account credential.
 
+Worker provisioning retries keep the worker-local transaction identity derived
+from the manifest digest. Controller progress storage uses a distinct
+session-and-manifest-derived identity so two paid sessions with the same
+manifest cannot collide in the global local database. That controller identity
+does not change the worker protocol or appear in a worker request.
+
+The canonical commit-pinned Hugging Face locator remains the only URL stored in
+the manifest. Because Hugging Face serves large public files through separate
+blob services, the worker may handle redirects manually with automatic redirect
+following disabled. It permits at most one cross-origin transition, only from
+`huggingface.co` and only to one of these exact HTTPS origins:
+
+- `cas-bridge.xethub.hf.co`;
+- `cdn-lfs-eu-1.hf.co`;
+- `cdn-lfs-us-1.hf.co`;
+- `transfer.xethub-eu.hf.co`;
+- `transfer.xethub.hf.co`;
+- `us.aws.cdn.hf.co`;
+- `us.gcp.cdn.hf.co`.
+
+Subsequent redirects must remain on that selected origin. The redirect target,
+including any temporary signature, exists only for the active request: it is
+never written to worker state, controller storage, logs, or a public payload.
+Every resulting byte stream remains bound to the manifest's exact size and
+SHA-256 before atomic installation. An unknown origin, extra cross-origin hop,
+or integrity mismatch fails closed. This exception applies only to model-byte
+transport; Hugging Face metadata API requests still reject every redirect.
+
 ## Data flow
 
 1. The Agent Panel selects a loader filename and writes its native metadata.
@@ -319,7 +347,14 @@ No case above performs a Vast mutation.
 A transient model transfer may use the existing bounded retry. A deterministic
 digest mismatch is never installed. Once authorized retry, repair, or
 replacement options are exhausted, terminal bootstrap, transfer, or
-environment-validation failure immediately enters verified destruction.
+environment-validation failure immediately enters verified destruction. The
+same rule applies during process-restart recovery when a deterministic worker
+response contradicts any field of the already-approved deadline policy. The
+controller validates the exact response field set, deadline, retrieval grace,
+and strict false destroy flags; transport unavailability remains on its
+existing recoverable path. Once terminal destruction is inventory-verified,
+active durable jobs become failed and incomplete output downloads become
+abandoned.
 
 If destroy or fresh-inventory verification fails, the UI remains in the
 existing residual-billing failure state with the instance identity and manual
@@ -355,6 +390,16 @@ Implementation follows strict red-green TDD.
   fail closed;
 - all automated tests use fake responses and perform no external download.
 
+### Worker blob-transport tests
+
+- a canonical commit-pinned Hugging Face locator can follow one manual redirect
+  to each explicitly approved blob origin;
+- an unknown origin, a second cross-origin redirect, or a non-model artifact is
+  rejected;
+- automatic redirect following remains disabled and every accepted payload is
+  size- and SHA-256-verified before installation;
+- temporary redirect targets are never persisted or exposed.
+
 ### Resolver and manifest tests
 
 - an annotated model absent locally resolves source-first;
@@ -373,6 +418,9 @@ Implementation follows strict red-green TDD.
 - resolved rows show only sanitized pinned metadata;
 - progress reports current phase and transfer bytes;
 - terminal provisioning failure requests destruction;
+- deterministic terminal recovery failure requests the same immediate verified
+  destruction, preserves its sanitized diagnostic, and abandons active durable
+  work only after destruction is inventory-verified;
 - residual-billing state is never hidden;
 - fake end-to-end certification reaches ready, executes, retrieves, and
   verifies destroy with source-first model fixtures.
@@ -427,6 +475,9 @@ execution, output verification, immediate teardown, and fresh-inventory proof.
 - A public annotated Hugging Face model can resolve without existing locally.
 - Every rentable model has an immutable commit, exact positive size, lowercase
   SHA-256, canonical destination, and sanitized provenance.
+- A verified Hugging Face model can reach its bytes through one explicitly
+  allowlisted ephemeral blob redirect without changing the stored canonical
+  source or exposing the redirect target.
 - Missing or conflicting metadata, missing input media, mutable unresolved
   identity, and digest collisions block rental.
 - The existing immutable manifest and worker protocol remain authoritative.
@@ -443,6 +494,8 @@ execution, output verification, immediate teardown, and fresh-inventory proof.
 ## Non-goals
 
 - trusting workflow URLs without independent verification;
+- arbitrary cross-origin redirects or persistence/exposure of temporary signed
+  blob URLs;
 - guessing a model source from filename similarity;
 - requiring a local model download before Cloud Run;
 - implementing a second missing-model UI or workflow metadata format;
