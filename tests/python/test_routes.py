@@ -20,11 +20,6 @@ from cloud_run.models import (
     OfferQuote,
     SessionState,
 )
-from cloud_run.service import (
-    AttemptNotFound,
-    CloudRunValidationError,
-    QuoteUnavailable,
-)
 from cloud_run.vast import OfferSearchError
 
 
@@ -148,8 +143,67 @@ class SettingsRouteTests(unittest.TestCase):
                 "official_template_id": "027fba7753c024be019030fb42aed900",
                 "official_template_name": "Official ComfyUI",
                 "lifecycle_enabled": True,
+                "active_sessions": [],
             },
         )
+
+    def test_get_rediscovers_recovered_sessions_without_browser_storage(self):
+        from cloud_run.job_repository import JobRepository
+        from cloud_run.repository import SessionRepository
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            database = root / "private" / "sessions.sqlite3"
+            sessions = SessionRepository(database)
+            jobs = JobRepository(database)
+            ready = CloudSession.new(
+                "private-session-key",
+                session_id="session-recovered",
+                manifest_digest="c" * 64,
+                deadline_at=7_300.0,
+                deadline_mode="finite",
+                disk_gb=80,
+                now=100.0,
+                state=SessionState.READY,
+            ).transition(
+                SessionState.READY,
+                now=100.0,
+                instance_id="77",
+                provider_token="private-provider-token",
+                session_secret_hex="d" * 64,
+            )
+            sessions.create_or_get(ready)
+            service = types.SimpleNamespace(
+                session_repository=sessions,
+                job_repository=jobs,
+                session_service=types.SimpleNamespace(
+                    alerts=lambda session, now: []
+                ),
+                clock=lambda: 200.0,
+            )
+            handlers = captured_handlers(
+                service_factory=lambda: service
+            )
+            with mock.patch.dict(
+                os.environ,
+                {"COMFYUI_CLOUD_RUN_DATA_DIR": str(root / "settings")},
+                clear=False,
+            ):
+                response = asyncio.run(
+                    handlers[("GET", "/cloud-run/api/settings")](
+                        FakeRequest()
+                    )
+                )
+
+        active = response.payload["active_sessions"]
+        self.assertEqual(
+            [session["session_id"] for session in active],
+            ["session-recovered"],
+        )
+        self.assertEqual(active[0]["status"], "ready")
+        self.assertNotIn("private-session-key", repr(active))
+        self.assertNotIn("private-provider-token", repr(active))
+        self.assertNotIn("d" * 64, repr(active))
 
     def test_put_saves_key_but_returns_only_public_settings(self):
         sensitive_marker = "synthetic-value"
@@ -184,6 +238,7 @@ class SettingsRouteTests(unittest.TestCase):
             "official_template_id": "027fba7753c024be019030fb42aed900",
             "official_template_name": "Official ComfyUI",
             "lifecycle_enabled": True,
+            "active_sessions": [],
         }
         self.assertEqual(put_response.status, 200)
         self.assertEqual(put_response.payload, expected)
@@ -557,169 +612,13 @@ def attempt(state=AttemptState.OFFER_SELECTED):
     )
 
 
-class LifecycleRouteTests(unittest.TestCase):
-    def test_quote_confirm_and_get_attempt_are_same_origin_sanitized_routes(self):
-        service = mock.Mock()
-        quoted = attempt()
-        started = quoted.transition(
-            AttemptState.CONFIRMING,
-            now=101.0,
-        ).transition(
-            AttemptState.CREATING,
-            now=102.0,
-        ).transition(
-            AttemptState.STARTING,
-            now=103.0,
-            instance_id="instance-9",
-        )
-        service.preview_offer = mock.AsyncMock(return_value=quoted)
-        service.confirm = mock.AsyncMock(return_value=started)
-        service.refresh = mock.AsyncMock(return_value=started)
-        service.cancel = mock.AsyncMock(
-            return_value=started.transition(
-                AttemptState.CANCEL_REQUESTED,
-                now=104.0,
-                cancel_requested=True,
-            )
-        )
-        service.destroy = mock.AsyncMock(
-            return_value=started.transition(
-                AttemptState.DESTROYING,
-                now=104.0,
-            ).transition(
-                AttemptState.CANCELLED,
-                now=105.0,
-                instance_id=None,
-            )
-        )
-        handlers = captured_handlers(service_factory=lambda: service)
+class LegacyRouteRemovalTests(unittest.TestCase):
+    def test_superseded_quote_and_attempt_routes_are_not_registered(self):
+        routes = set(captured_handlers())
 
-        quote_response = asyncio.run(
-            handlers[("POST", "/cloud-run/api/quotes")](
-                FakeRequest(
-                    {
-                        "offer_id": 42,
-                        "idempotency_key": "browser-idempotency-key",
-                    }
-                )
-            )
-        )
-        confirm_response = asyncio.run(
-            handlers[
-                ("POST", "/cloud-run/api/attempts/{attempt_id}/confirm")
-            ](
-                FakeRequest(
-                    {"idempotency_key": "browser-idempotency-key"},
-                    match_info={"attempt_id": "attempt-1"},
-                )
-            )
-        )
-        get_response = asyncio.run(
-            handlers[("GET", "/cloud-run/api/attempts/{attempt_id}")](
-                FakeRequest(match_info={"attempt_id": "attempt-1"})
-            )
-        )
-        cancel_response = asyncio.run(
-            handlers[
-                ("POST", "/cloud-run/api/attempts/{attempt_id}/cancel")
-            ](
-                FakeRequest(match_info={"attempt_id": "attempt-1"})
-            )
-        )
-        destroy_response = asyncio.run(
-            handlers[("DELETE", "/cloud-run/api/attempts/{attempt_id}")](
-                FakeRequest(match_info={"attempt_id": "attempt-1"})
-            )
-        )
-
-        service.preview_offer.assert_awaited_once_with(
-            offer_id=42,
-            idempotency_key="browser-idempotency-key",
-        )
-        service.confirm.assert_awaited_once_with(
-            "attempt-1",
-            idempotency_key="browser-idempotency-key",
-        )
-        service.refresh.assert_awaited_once_with("attempt-1")
-        service.cancel.assert_awaited_once_with("attempt-1")
-        service.destroy.assert_awaited_once_with("attempt-1")
-        self.assertEqual(quote_response.status, 200)
-        self.assertEqual(confirm_response.payload["status"], "starting")
-        self.assertEqual(get_response.payload["instance_id"], "instance-9")
-        self.assertEqual(cancel_response.payload["status"], "cancel_requested")
-        self.assertEqual(destroy_response.payload["status"], "cancelled")
-        for response in (
-            quote_response,
-            confirm_response,
-            get_response,
-            cancel_response,
-            destroy_response,
-        ):
-            self.assertEqual(
-                response.payload["official_template_id"],
-                "027fba7753c024be019030fb42aed900",
-            )
-            self.assertNotIn("idempotency", repr(response.payload))
-
-    def test_lifecycle_routes_validate_json_and_map_safe_service_errors(self):
-        service = mock.Mock()
-        service.preview_offer = mock.AsyncMock(
-            side_effect=CloudRunValidationError("Invalid confirmation.")
-        )
-        service.confirm = mock.AsyncMock(
-            side_effect=QuoteUnavailable("The quote expired.")
-        )
-        service.refresh = mock.AsyncMock(
-            side_effect=AttemptNotFound("Attempt not found.")
-        )
-        service.cancel = mock.AsyncMock(
-            side_effect=AttemptNotFound("Attempt not found.")
-        )
-        service.destroy = mock.AsyncMock(
-            side_effect=AttemptNotFound("Attempt not found.")
-        )
-        handlers = captured_handlers(service_factory=lambda: service)
-
-        invalid_json = asyncio.run(
-            handlers[("POST", "/cloud-run/api/quotes")](
-                FakeRequest(error=ValueError("sensitive"))
-            )
-        )
-        invalid_payload = asyncio.run(
-            handlers[("POST", "/cloud-run/api/quotes")](
-                FakeRequest({"offer_id": 42, "unexpected": "sensitive"})
-            )
-        )
-        expired = asyncio.run(
-            handlers[
-                ("POST", "/cloud-run/api/attempts/{attempt_id}/confirm")
-            ](
-                FakeRequest(
-                    {"idempotency_key": "browser-idempotency-key"},
-                    match_info={"attempt_id": "attempt-1"},
-                )
-            )
-        )
-        missing = asyncio.run(
-            handlers[("GET", "/cloud-run/api/attempts/{attempt_id}")](
-                FakeRequest(match_info={"attempt_id": "missing"})
-            )
-        )
-
-        self.assertEqual(invalid_json.status, 400)
-        self.assertEqual(invalid_payload.status, 400)
-        self.assertEqual(expired.status, 409)
-        self.assertEqual(missing.status, 404)
-        self.assertNotIn(
-            "sensitive",
-            repr(
-                [
-                    invalid_json.payload,
-                    invalid_payload.payload,
-                    expired.payload,
-                    missing.payload,
-                ]
-            ),
+        self.assertNotIn(("POST", "/cloud-run/api/quotes"), routes)
+        self.assertFalse(
+            any("/cloud-run/api/attempts/" in path for _method, path in routes)
         )
 
 
@@ -1134,6 +1033,31 @@ class RelayMediaRouteTests(unittest.TestCase):
         self.service = types.SimpleNamespace(
             job_repository=repository,
             relay=relay,
+            get_job=lambda session_id, job_id: (
+                repository.get_job(job_id)
+                if session_id == "session-1"
+                else None
+            ),
+        )
+        ready = CloudSession.new(
+            "session-key",
+            session_id="session-1",
+            quote=attempt().quote,
+            manifest_digest="c" * 64,
+            deadline_at=7_300.0,
+            deadline_mode="finite",
+            disk_gb=80,
+            now=100.0,
+            state=SessionState.READY,
+        ).transition(
+            SessionState.READY,
+            now=100.0,
+            instance_id="77",
+        )
+        self.service.refresh_session = mock.AsyncMock(return_value=ready)
+        self.service.clock = lambda: 7_000.0
+        self.service.session_service = types.SimpleNamespace(
+            alerts=lambda session, now: ["5_minutes"]
         )
         self.handlers = captured_handlers(
             service_factory=lambda: self.service
@@ -1206,6 +1130,84 @@ class RelayMediaRouteTests(unittest.TestCase):
         self.assertNotIn(str(self.root), repr(events.payload))
         self.assertNotIn(str(self.root), repr(preview.headers))
         self.assertNotIn(str(self.root), repr(output.headers))
+
+    def test_job_status_lists_only_safe_verified_outputs_and_previews(self):
+        response = asyncio.run(
+            self.handlers[
+                (
+                    "GET",
+                    (
+                        "/cloud-run/api/sessions/{session_id}/jobs/"
+                        "{job_id}"
+                    ),
+                )
+            ](
+                FakeRequest(
+                    match_info={
+                        "session_id": "session-1",
+                        "job_id": "job-1",
+                    }
+                )
+            )
+        )
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.payload["status"], "succeeded")
+        self.assertEqual(response.payload["previews"], [
+            {
+                "id": "preview-1",
+                "state": "verified",
+                "size_bytes": len(b"\x89PNG\r\n\x1a\npreview"),
+            }
+        ])
+        self.assertEqual(
+            response.payload["outputs"][0]["id"],
+            "output-1",
+        )
+        self.assertEqual(
+            response.payload["outputs"][0]["state"],
+            "local_verified",
+        )
+        self.assertEqual(
+            response.payload["outputs"][0]["filename"],
+            "wallpaper.png",
+        )
+        self.assertNotIn(str(self.root), repr(response.payload))
+
+    def test_session_status_aggregates_cost_alerts_job_and_local_history(self):
+        response = asyncio.run(
+            self.handlers[
+                ("GET", "/cloud-run/api/sessions/{session_id}")
+            ](
+                FakeRequest(
+                    match_info={"session_id": "session-1"}
+                )
+            )
+        )
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.payload["elapsed_seconds"], 6_900.0)
+        self.assertAlmostEqual(
+            response.payload["approximate_spend"],
+            0.42 * 6_900 / 3_600,
+        )
+        self.assertEqual(
+            response.payload["deadline_alerts"],
+            ["5_minutes"],
+        )
+        self.assertEqual(
+            response.payload["current_job"]["job_id"],
+            "job-1",
+        )
+        self.assertEqual(
+            response.payload["current_job"]["outputs"][0]["state"],
+            "local_verified",
+        )
+        self.assertEqual(
+            [item["job_id"] for item in response.payload["history"]],
+            ["job-1"],
+        )
+        self.assertNotIn(str(self.root), repr(response.payload))
 
     def test_wrong_session_cannot_read_an_existing_job(self):
         response = asyncio.run(

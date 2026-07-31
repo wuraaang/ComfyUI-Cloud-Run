@@ -47,6 +47,18 @@ _SOURCE_KINDS = {
     "r2",
     "registry",
 }
+_MAPPING_CANDIDATE_FIELDS = {
+    "approved",
+    "archive_complete",
+    "candidate_digest",
+    "class_type",
+    "origin_source_kind",
+    "package_id",
+    "repository_url",
+    "revision",
+    "source_kind",
+    "wheels_complete",
+}
 _JOB_TASKS = {}
 DEADLINE_ACTION_SECONDS = {
     "add_30_minutes": 30 * 60,
@@ -157,6 +169,7 @@ class PreflightRow:
     sha256: str | None
     destination: str | None
     reason: str | None
+    mapping_candidate: dict | None = None
 
     def __post_init__(self):
         _identifier(self.dependency_id, "dependency ID")
@@ -197,6 +210,53 @@ class PreflightRow:
             ):
                 raise SessionServiceError("Invalid dependency destination.")
         _safe_text(self.reason, "dependency reason", optional=True)
+        candidate = self.mapping_candidate
+        if candidate is not None:
+            if (
+                not isinstance(candidate, dict)
+                or set(candidate) != _MAPPING_CANDIDATE_FIELDS
+                or candidate.get("class_type") != self.display_name
+                or not _IDENTIFIER.fullmatch(
+                    str(candidate.get("class_type") or "")
+                )
+                or candidate.get("source_kind") not in _SOURCE_KINDS
+                or candidate.get("origin_source_kind")
+                not in _SOURCE_KINDS
+                or not isinstance(candidate.get("candidate_digest"), str)
+                or not _HEX_64.fullmatch(candidate["candidate_digest"])
+                or not isinstance(candidate.get("revision"), str)
+                or not _HEX_40.fullmatch(candidate["revision"])
+                or not isinstance(candidate.get("repository_url"), str)
+                or not re.fullmatch(
+                    r"https://github\.com/"
+                    r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\.git)?",
+                    candidate["repository_url"],
+                )
+                or (
+                    candidate.get("package_id") is not None
+                    and not _IDENTIFIER.fullmatch(
+                        str(candidate["package_id"])
+                    )
+                )
+                or not isinstance(
+                    candidate.get("archive_complete"),
+                    bool,
+                )
+                or not isinstance(
+                    candidate.get("wheels_complete"),
+                    bool,
+                )
+                or candidate.get("approved") is not False
+                or self.status != "mapping_required"
+            ):
+                raise SessionServiceError(
+                    "Invalid mapping approval candidate."
+                )
+            object.__setattr__(
+                self,
+                "mapping_candidate",
+                dict(candidate),
+            )
 
     def public_payload(self):
         return {
@@ -210,6 +270,11 @@ class PreflightRow:
             "sha256": self.sha256,
             "destination": self.destination,
             "reason": self.reason,
+            "mapping_candidate": (
+                dict(self.mapping_candidate)
+                if self.mapping_candidate is not None
+                else None
+            ),
         }
 
     @classmethod
@@ -226,9 +291,17 @@ class PreflightRow:
             "destination",
             "reason",
         }
-        if not isinstance(payload, dict) or set(payload) != fields:
+        if (
+            not isinstance(payload, dict)
+            or frozenset(payload) not in {
+                frozenset(fields),
+                frozenset(fields | {"mapping_candidate"}),
+            }
+        ):
             raise SessionServiceError("Stored preflight row is invalid.")
-        return cls(**payload)
+        values = dict(payload)
+        values.setdefault("mapping_candidate", None)
+        return cls(**values)
 
 
 @dataclass(frozen=True)
@@ -387,6 +460,17 @@ def _preflight_rows(resolution, mapping_repository):
                 sha256=digest,
                 destination=destination,
                 reason=node_row.reason,
+                mapping_candidate=(
+                    candidate.public_payload()
+                    if (
+                        node_row.status == "mapping_required"
+                        and candidate is not None
+                        and callable(
+                            getattr(candidate, "public_payload", None)
+                        )
+                    )
+                    else None
+                ),
             )
         )
 

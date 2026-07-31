@@ -1,16 +1,17 @@
 import { captureOfficialQueuePayload } from "./canvas-adapter.js";
-import { fetchJson, postCapture } from "./cloud-run-api.js";
+import {
+  createCloudRunApi,
+  OFFERS_ENDPOINT,
+  PREFLIGHTS_ENDPOINT,
+  SETTINGS_ENDPOINT,
+  SESSIONS_ENDPOINT,
+} from "./cloud-run-api.js";
 import { createSessionConsole } from "./session-console.js";
 
 
-const SETTINGS_ENDPOINT = "/cloud-run/api/settings";
-const PREFLIGHTS_ENDPOINT = "/cloud-run/api/preflights";
-const OFFERS_ENDPOINT = "/cloud-run/api/offers";
-const QUOTES_ENDPOINT = "/cloud-run/api/quotes";
-const OFFICIAL_TEMPLATE_ID = "027fba7753c024be019030fb42aed900";
-const OFFICIAL_TEMPLATE_NAME = "Official ComfyUI";
 const OPEN_COMMAND_ID = "vast-cloud-run.open";
 const POLL_INTERVAL_MS = 1000;
+const DEFAULT_SESSION_SECONDS = 2 * 60 * 60;
 const mountedCloudRuns = new WeakMap();
 
 
@@ -26,7 +27,9 @@ function createElement(document, tagName, options = {}) {
 
 
 function appendField(document, parent, labelText, input) {
-  const field = createElement(document, "div", { className: "cloud-run-field" });
+  const field = createElement(document, "div", {
+    className: "cloud-run-field",
+  });
   const label = createElement(document, "label", { text: labelText });
   label.setAttribute("for", input.id);
   field.append(label, input);
@@ -71,7 +74,7 @@ function ensureStyles(document) {
   }
 }
 #cloud-run-modal {
-  width: min(560px, calc(100vw - 32px));
+  width: min(680px, calc(100vw - 32px));
   max-height: calc(100vh - 48px);
   overflow: auto;
   border: 1px solid var(--border-color, #4b5563);
@@ -103,7 +106,13 @@ function ensureStyles(document) {
   background: var(--comfy-input-bg, #171a1f);
   color: inherit;
 }
-.cloud-run-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
+.cloud-run-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 12px 0;
+}
 .cloud-run-actions button,
 .cloud-run-actions a {
   box-sizing: border-box;
@@ -120,39 +129,48 @@ function ensureStyles(document) {
 .cloud-run-danger { border-color: #dc2626 !important; color: #fecaca !important; }
 .cloud-run-status { min-height: 1.4em; color: var(--input-text, #d1d5db); }
 .cloud-run-offers { display: grid; gap: 7px; margin: 10px 0; }
-.cloud-run-preview {
-  display: grid;
-  gap: 5px;
-  margin-top: 10px;
-  padding: 10px;
-  border-radius: 7px;
-  background: rgba(127,127,127,.12);
-}
 .cloud-run-session-console {
   margin: 12px 0;
   padding: 10px;
   border: 1px solid var(--border-color, #4b5563);
   border-radius: 7px;
 }
-.cloud-run-session-console h3 { margin: 0 0 8px; }
-.cloud-run-preflight-rows { display: grid; gap: 4px; margin: 8px 0; }
+.cloud-run-session-console h3,
+.cloud-run-session-console h4 { margin: 8px 0; }
+.cloud-run-preflight-rows,
+.cloud-run-history,
+.cloud-run-outputs { display: grid; gap: 4px; margin: 8px 0; }
+.cloud-run-paid-review,
+.cloud-run-live-session,
+.cloud-run-job,
+.cloud-run-destroy-review {
+  margin: 10px 0;
+  padding: 10px;
+  border-radius: 7px;
+  background: rgba(127,127,127,.12);
+}
+.cloud-run-previews {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 6px;
+}
+.cloud-run-previews img { width: 100%; height: auto; }
 `;
   document.head.appendChild(style);
 }
 
 
 function decimalText(value) {
-  return Number(value).toFixed(1).replace(/\.0$/, "");
+  const number = Number(value);
+  return Number.isFinite(number)
+    ? number.toFixed(1).replace(/\.0$/, "")
+    : "unknown";
 }
 
 
 function hourlyText(value) {
-  return `$${Number(value).toFixed(2)}/h`;
-}
-
-
-function attemptEndpoint(attemptId) {
-  return `/cloud-run/api/attempts/${encodeURIComponent(String(attemptId))}`;
+  const number = Number(value);
+  return Number.isFinite(number) ? `$${number.toFixed(2)}/h` : "unknown rate";
 }
 
 
@@ -179,7 +197,6 @@ export function renderOffers(document, container, offers, onSelect) {
     container.textContent = "No matching offers found.";
     return;
   }
-
   offers.forEach((offer, index) => {
     const row = createElement(document, "label", {
       className: "cloud-run-offer",
@@ -191,174 +208,23 @@ export function renderOffers(document, container, offers, onSelect) {
     });
     selector.setAttribute("name", "cloud-run-offer");
     const details = createElement(document, "span");
-    const reliability = Number.isFinite(Number(offer.reliability))
+    const reliability = Number.isFinite(Number(offer?.reliability))
       ? `${(Number(offer.reliability) * 100).toFixed(1)}% reliability`
       : "reliability unavailable";
+    const down = Number.isFinite(Number(offer?.inet_down_cost))
+      ? `$${Number(offer.inet_down_cost).toFixed(3)}/GB down`
+      : "download price unavailable";
+    const up = Number.isFinite(Number(offer?.inet_up_cost))
+      ? `$${Number(offer.inet_up_cost).toFixed(3)}/GB up`
+      : "upload price unavailable";
     details.textContent =
-      `${String(offer.gpu_name)} — ` +
-      `${decimalText(offer.gpu_ram_gb)} GB — ` +
-      `${hourlyText(offer.dph_total)} — ${reliability}`;
+      `${String(offer?.gpu_name ?? "Unknown GPU")} — ` +
+      `${decimalText(offer?.gpu_ram_gb)} GB — ` +
+      `${hourlyText(offer?.dph_total)} — ${reliability} — ${down}, ${up}`;
     selector.addEventListener("click", () => onSelect(offer));
     row.append(selector, details);
     container.appendChild(row);
   });
-}
-
-
-export function attemptPresentation(attempt) {
-  const status = String(attempt?.status ?? "idle");
-  const presentations = {
-    idle: { message: "Idle." },
-    searching: { message: "Searching eligible Vast GPUs…", poll: true },
-    offer_selected: {
-      message: "Quote ready. Review the paid rate before confirmation.",
-      confirm: true,
-    },
-    confirming: {
-      message: "Revalidating the exact offer before rental…",
-      poll: true,
-    },
-    creating: {
-      message: "Vast is creating the instance; billing may have started.",
-      cancel: true,
-      poll: true,
-    },
-    starting: {
-      message: "Instance created. Waiting for ComfyUI; billing is active.",
-      cancel: true,
-      poll: true,
-    },
-    cancel_requested: {
-      message: "Cancellation requested. Verifying destruction and inventory…",
-      poll: true,
-    },
-    destroying: {
-      message: "Destroying the Vast instance and verifying it is absent…",
-      poll: true,
-    },
-    retrying: {
-      message: "Preparing the single safe replacement after verified cleanup…",
-      cancel: true,
-      poll: true,
-    },
-    ready: {
-      message: "ComfyUI is ready. Billing continues until you choose Destroy.",
-      open: Boolean(attempt?.ready_url),
-      destroy: Boolean(attempt?.instance_id),
-    },
-    cancelled: {
-      message: "Cancelled. Vast inventory is confirmed empty.",
-    },
-    failed: {
-      message: "Cloud Run failed.",
-      destroy: Boolean(attempt?.instance_id),
-    },
-  };
-  const presentation = {
-    confirm: false,
-    cancel: false,
-    open: false,
-    destroy: false,
-    poll: false,
-    ...(presentations[status] ?? {
-      message: "Cloud Run returned an unknown state.",
-    }),
-  };
-  if (attempt?.error) {
-    presentation.message += ` ${String(attempt.error)}`;
-  }
-  if (attempt?.billing_may_continue && attempt?.instance_id) {
-    presentation.message +=
-      ` Residual Vast instance: ${String(attempt.instance_id)}; ` +
-      "billing may continue.";
-  }
-  if (attempt?.emergency_action) {
-    presentation.message += ` ${String(attempt.emergency_action)}`;
-  }
-  return presentation;
-}
-
-
-export function renderSelectionPreview(document, container, attempt) {
-  container.replaceChildren();
-  const quote = attempt?.offer;
-  if (!quote) return;
-  const rows = [
-    ["Paid rental confirmation", "Review every value before confirming."],
-    ["Offer", String(quote.offer_id)],
-    ["GPU", String(quote.gpu_name)],
-    ["VRAM", `${decimalText(quote.gpu_ram_gb)} GB`],
-    ["Rate", hourlyText(quote.dph_total)],
-    ["Configured cap", hourlyText(quote.max_price_per_hour)],
-    [
-      "Template",
-      `${OFFICIAL_TEMPLATE_NAME} (${OFFICIAL_TEMPLATE_ID})`,
-    ],
-  ];
-  for (const [label, value] of rows) {
-    const row = createElement(document, "div");
-    row.textContent = `${label}: ${value}`;
-    container.appendChild(row);
-  }
-  const cost = createElement(document, "strong", {
-    text:
-      attempt.status === "offer_selected"
-        ? "No rental exists until you confirm the paid rate above."
-        : "Billing can continue until Vast inventory confirms destruction.",
-  });
-  container.appendChild(cost);
-  if (attempt.instance_id) {
-    const instance = createElement(document, "div", {
-      text: `Vast instance: ${String(attempt.instance_id)}`,
-    });
-    container.appendChild(instance);
-  }
-  if (attempt.emergency_action) {
-    const emergency = createElement(document, "strong", {
-      text: String(attempt.emergency_action),
-    });
-    container.appendChild(emergency);
-  }
-}
-
-
-export function renderAttemptState(document, elements, attempt, busy = false) {
-  const presentation = attemptPresentation(attempt);
-  elements.status.textContent = presentation.message;
-  elements.banner.textContent = attempt?.billing_may_continue
-    ? "Warning — Vast billing may still be active."
-    : "Paid Vast.ai rental — Destroy is the billing-safe terminal action.";
-  renderSelectionPreview(document, elements.selectionPreview, attempt);
-
-  elements.confirmButton.hidden = !presentation.confirm;
-  elements.cancelButton.hidden = !presentation.cancel;
-  elements.openLink.hidden = !presentation.open;
-  elements.destroyButton.hidden = !presentation.destroy;
-
-  const lifecycleLocked = new Set([
-    "confirming",
-    "creating",
-    "cancel_requested",
-    "destroying",
-    "retrying",
-  ]).has(String(attempt?.status));
-  elements.saveButton.disabled = busy || lifecycleLocked;
-  elements.searchButton.disabled = busy || lifecycleLocked;
-  elements.previewButton.disabled =
-    busy || lifecycleLocked || !elements.selectedOffer();
-  elements.confirmButton.disabled = busy || !presentation.confirm;
-  elements.cancelButton.disabled =
-    busy ||
-    ["cancel_requested", "destroying"].includes(String(attempt?.status));
-  elements.destroyButton.disabled = busy || !presentation.destroy;
-
-  if (presentation.open) {
-    elements.openLink.setAttribute("href", String(attempt.ready_url));
-    elements.openLink.setAttribute("target", "_blank");
-    elements.openLink.setAttribute("rel", "noopener noreferrer");
-  } else {
-    elements.openLink.setAttribute("href", "");
-  }
 }
 
 
@@ -368,8 +234,8 @@ function placeLauncherBesideLocalRun(document, launcher) {
   const actionbar = queueGroup?.parentElement;
   if (!actionbar) return false;
   if (
-    launcher.parentElement === actionbar &&
-    queueGroup.nextSibling === launcher
+    launcher.parentElement === actionbar
+    && queueGroup.nextSibling === launcher
   ) {
     return true;
   }
@@ -381,8 +247,8 @@ function placeLauncherBesideLocalRun(document, launcher) {
 function ensureLauncherPlacement(browserWindow, document, mounted) {
   const placed = placeLauncherBesideLocalRun(document, mounted.launcher);
   if (
-    !mounted.observer &&
-    typeof browserWindow?.MutationObserver === "function"
+    !mounted.observer
+    && typeof browserWindow?.MutationObserver === "function"
   ) {
     mounted.observer = new browserWindow.MutationObserver(() => {
       placeLauncherBesideLocalRun(document, mounted.launcher);
@@ -405,13 +271,17 @@ export function mountCloudRun(
   const mounted = mountedCloudRuns.get(document);
   if (mounted) {
     if (captureContext.app || captureContext.api || captureContext.onCapture) {
-      mounted.captureContext = { ...mounted.captureContext, ...captureContext };
+      mounted.captureContext = {
+        ...mounted.captureContext,
+        ...captureContext,
+      };
     }
     ensureLauncherPlacement(browserWindow, document, mounted);
     return mounted.launcher;
   }
 
   ensureStyles(document);
+  const cloudApi = createCloudRunApi(fetchImpl);
   const launcher = createElement(document, "button", {
     id: "cloud-run-button",
     testId: "cloud-run-button",
@@ -428,8 +298,12 @@ export function mountCloudRun(
     testId: "cloud-run-modal",
   });
   dialog.setAttribute("aria-labelledby", "cloud-run-title");
-  const card = createElement(document, "div", { className: "cloud-run-card" });
-  const header = createElement(document, "div", { className: "cloud-run-header" });
+  const card = createElement(document, "div", {
+    className: "cloud-run-card",
+  });
+  const header = createElement(document, "div", {
+    className: "cloud-run-header",
+  });
   const title = createElement(document, "h2", {
     id: "cloud-run-title",
     text: "Cloud Run",
@@ -446,7 +320,8 @@ export function mountCloudRun(
     id: "cloud-run-preview-banner",
     testId: "cloud-run-preview-banner",
     className: "cloud-run-banner",
-    text: "Paid Vast.ai rental — nothing is created until explicit confirmation.",
+    text:
+      "Paid Vast.ai rental — nothing is created until explicit confirmation.",
   });
   const configured = createElement(document, "div", {
     id: "cloud-run-configured",
@@ -475,7 +350,7 @@ export function mountCloudRun(
   vramInput.setAttribute("max", "1024");
   vramInput.setAttribute("step", "1");
 
-  const actions = createElement(document, "div", {
+  const primaryActions = createElement(document, "div", {
     className: "cloud-run-actions",
   });
   const saveButton = createElement(document, "button", {
@@ -490,72 +365,14 @@ export function mountCloudRun(
     text: "Search Vast GPUs",
     type: "button",
   });
-  const previewButton = createElement(document, "button", {
-    id: "cloud-run-preview-selection",
-    testId: "cloud-run-preview-selection",
+  const reviewButton = createElement(document, "button", {
+    id: "cloud-run-review-session",
+    testId: "cloud-run-review-session",
     text: "Review paid rental",
     type: "button",
   });
-  previewButton.disabled = true;
-  const confirmButton = createElement(document, "button", {
-    id: "cloud-run-confirm",
-    testId: "cloud-run-confirm",
-    text: "Confirm & rent GPU",
-    type: "button",
-  });
-  confirmButton.hidden = true;
-  const cancelButton = createElement(document, "button", {
-    id: "cloud-run-cancel",
-    testId: "cloud-run-cancel",
-    text: "Cancel — verify billing stopped",
-    type: "button",
-  });
-  cancelButton.hidden = true;
-  const openLink = createElement(document, "a", {
-    id: "cloud-run-open",
-    testId: "cloud-run-open",
-    text: "Open ComfyUI",
-  });
-  openLink.hidden = true;
-  const destroyButton = createElement(document, "button", {
-    id: "cloud-run-destroy",
-    testId: "cloud-run-destroy",
-    text: "Destroy — end Vast billing",
-    type: "button",
-    className: "cloud-run-danger",
-  });
-  destroyButton.hidden = true;
-  actions.append(
-    saveButton,
-    searchButton,
-    previewButton,
-    confirmButton,
-    cancelButton,
-    openLink,
-    destroyButton,
-  );
-  const preflightConsole = createSessionConsole(
-    document,
-    {
-      async preflight(captureId, explicitOutputAllowanceBytes) {
-        const payload = { capture_id: captureId };
-        if (explicitOutputAllowanceBytes !== null) {
-          payload.explicit_output_allowance_bytes =
-            explicitOutputAllowanceBytes;
-        }
-        return fetchJson(fetchImpl, PREFLIGHTS_ENDPOINT, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
-        });
-      },
-    },
-    {
-      id: "cloud-run-dependency-console",
-      searchButton,
-      manageSearch: false,
-    },
-  );
+  reviewButton.disabled = true;
+  primaryActions.append(saveButton, searchButton, reviewButton);
 
   const status = createElement(document, "div", {
     id: "cloud-run-status",
@@ -568,152 +385,131 @@ export function mountCloudRun(
     testId: "cloud-run-offers",
     className: "cloud-run-offers",
   });
-  const selectionPreview = createElement(document, "div", {
-    id: "cloud-run-selection-preview",
-    testId: "cloud-run-selection-preview",
-    className: "cloud-run-preview",
-  });
+
+  let record;
+  let selectedOffer = null;
+  let sessionIdempotencyKey = null;
+  let busy = false;
+
+  async function captureCurrentCanvas() {
+    const context = record?.captureContext ?? captureContext;
+    if (!context.app || !context.api) {
+      throw new Error("Pinned ComfyUI capture API is unavailable.");
+    }
+    const capture = await captureOfficialQueuePayload({
+      app: context.app,
+      api: context.api,
+    });
+    const persisted = typeof context.onCapture === "function"
+      ? await context.onCapture(capture)
+      : await cloudApi.capture(capture);
+    if (
+      !persisted
+      || typeof persisted.capture_id !== "string"
+      || !persisted.capture_id
+    ) {
+      throw new Error("Cloud Run capture persistence failed.");
+    }
+    record.currentCapture = capture;
+    record.sessionConsole.setCapture(persisted.capture_id);
+    return persisted;
+  }
+
+  const sessionConsole = createSessionConsole(
+    document,
+    cloudApi,
+    {
+      id: "cloud-run-dependency-console",
+      searchButton,
+      manageSearch: false,
+      capture: captureCurrentCanvas,
+      newIdempotencyKey: () => createIdempotencyKey(browserWindow),
+      setTimeout: typeof browserWindow?.setTimeout === "function"
+        ? browserWindow.setTimeout.bind(browserWindow)
+        : undefined,
+      clearTimeout: typeof browserWindow?.clearTimeout === "function"
+        ? browserWindow.clearTimeout.bind(browserWindow)
+        : undefined,
+      pollIntervalMs: POLL_INTERVAL_MS,
+      now: () => Date.now() / 1000,
+      onSession(session) {
+        if (session?.billing_may_continue === true) {
+          banner.className = "cloud-run-banner cloud-run-danger";
+          banner.textContent =
+            "Warning — Vast billing may still be active. Use Destroy GPU.";
+        } else if (session?.status === "destroyed") {
+          banner.className = "cloud-run-banner";
+          banner.textContent =
+            "Vast inventory confirms that this session no longer bills.";
+        } else if (session?.status && session.status !== "offer_selected") {
+          banner.className = "cloud-run-banner";
+          banner.textContent =
+            "Paid Vast.ai session — billing ends only after verified destruction.";
+        }
+      },
+    },
+  );
 
   card.replaceChildren(header, banner, configured);
   appendField(document, card, "Vast API key", apiKeyInput);
   appendField(document, card, "Maximum hourly price ($/h)", priceInput);
   appendField(document, card, "Minimum VRAM (GB)", vramInput);
   card.append(
-    preflightConsole.root,
-    actions,
+    primaryActions,
     status,
     offers,
-    selectionPreview,
+    sessionConsole.root,
   );
   dialog.appendChild(card);
 
-  let selectedOffer = null;
-  let currentAttempt = null;
-  let idempotencyKey = null;
-  let pollTimer = null;
-  let busy = false;
-  const elements = {
-    banner,
-    cancelButton,
-    confirmButton,
-    destroyButton,
-    openLink,
-    previewButton,
-    saveButton,
-    searchButton,
-    selectionPreview,
-    selectedOffer: () => selectedOffer,
-    status,
-  };
-
-  function requiresPreflight() {
-    const context = record?.captureContext ?? captureContext;
-    return Boolean(
-      context.app
-      && context.api
-      && typeof context.onCapture === "function"
-    );
-  }
-
-  function offersUnlocked() {
-    return !requiresPreflight() || Boolean(preflightConsole.preflightId);
-  }
-
-  function clearPoll() {
-    if (
-      pollTimer !== null &&
-      typeof browserWindow?.clearTimeout === "function"
-    ) {
-      browserWindow.clearTimeout(pollTimer);
-    }
-    pollTimer = null;
-  }
-
-  function renderCurrent() {
-    if (currentAttempt) {
-      renderAttemptState(document, elements, currentAttempt, busy);
-    } else {
-      saveButton.disabled = busy;
-      searchButton.disabled = busy;
-      previewButton.disabled = busy || !selectedOffer;
-      confirmButton.hidden = true;
-      cancelButton.hidden = true;
-      openLink.hidden = true;
-      destroyButton.hidden = true;
-    }
-    if (!offersUnlocked()) searchButton.disabled = true;
-  }
-
   function setBusy(value) {
     busy = Boolean(value);
-    renderCurrent();
-  }
-
-  async function refreshAttempt() {
-    pollTimer = null;
-    if (!currentAttempt?.attempt_id) return;
-    try {
-      currentAttempt = await fetchJson(
-        fetchImpl,
-        attemptEndpoint(currentAttempt.attempt_id),
-      );
-      renderCurrent();
-    } catch {
-      status.textContent = "Attempt status is temporarily unavailable; retrying.";
-    }
-    schedulePoll();
-  }
-
-  function schedulePoll() {
-    clearPoll();
-    if (!currentAttempt || !attemptPresentation(currentAttempt).poll) return;
-    if (typeof browserWindow?.setTimeout !== "function") return;
-    pollTimer = browserWindow.setTimeout(
-      () => refreshAttempt(),
-      POLL_INTERVAL_MS,
-    );
+    saveButton.disabled = busy;
+    searchButton.disabled = busy || !sessionConsole.preflightId;
+    reviewButton.disabled = busy || !selectedOffer;
   }
 
   async function loadSettings() {
     status.textContent = "Loading settings…";
     try {
-      const payload = await fetchJson(fetchImpl, SETTINGS_ENDPOINT);
+      const payload = await cloudApi.getSettings();
       configured.textContent = payload.configured
         ? "Vast API key is configured."
         : "Vast API key is not configured.";
       priceInput.value = String(payload.max_price_per_hour);
       vramInput.value = String(payload.min_vram_gb);
-      if (currentAttempt) renderCurrent();
-      else status.textContent = "";
+      sessionConsole.renderSettings(payload);
+      const active = Array.isArray(payload.active_sessions)
+        ? (
+          payload.active_sessions.find(
+            (session) => session?.billing_may_continue === true,
+          )
+          ?? [...payload.active_sessions].reverse().find(
+            (session) => session?.status !== "destroyed",
+          )
+        )
+        : null;
+      if (active) sessionConsole.renderSession(active);
+      status.textContent = "";
     } catch {
       status.textContent = "Settings could not be loaded.";
     }
   }
 
-  let record;
   const openDialog = async () => {
     dialog.showModal();
     await loadSettings();
     const context = record.captureContext;
-    if (!context.app && !context.api) return;
+    if (!context.app || !context.api) {
+      status.textContent =
+        "Pinned ComfyUI canvas capture is unavailable in this host.";
+      return;
+    }
     status.textContent = "Compiling the current canvas with ComfyUI…";
     try {
-      const capture = await captureOfficialQueuePayload({
-        app: context.app,
-        api: context.api,
-      });
-      let persisted = null;
-      if (typeof context.onCapture === "function") {
-        persisted = await context.onCapture(capture);
-      }
-      record.currentCapture = capture;
-      preflightConsole.setCapture(
-        typeof persisted?.capture_id === "string"
-          ? persisted.capture_id
-          : null,
-      );
+      await captureCurrentCanvas();
       status.textContent =
-        "Current canvas captured without local execution.";
+        "Current canvas captured without local execution. Run free preflight.";
     } catch (error) {
       const allowed = new Set([
         "Pinned ComfyUI queue API is unavailable.",
@@ -721,13 +517,13 @@ export function mountCloudRun(
         "A Cloud Run canvas capture is already in progress.",
         "ComfyUI was busy; no Cloud Run payload was captured.",
       ]);
-      const message =
+      status.textContent =
         error instanceof Error && allowed.has(error.message)
           ? error.message
           : "Canvas capture failed before any Cloud Run mutation.";
-      status.textContent = message;
     }
   };
+
   launcher.addEventListener("click", openDialog);
   launcher.addEventListener("keydown", async (event) => {
     if (!["Enter", " ", "Spacebar"].includes(event.key)) return;
@@ -739,14 +535,15 @@ export function mountCloudRun(
     const maxPrice = Number(priceInput.value);
     const minVram = Number(vramInput.value);
     if (
-      !Number.isFinite(maxPrice) ||
-      maxPrice < 0.01 ||
-      maxPrice > 100 ||
-      !Number.isInteger(minVram) ||
-      minVram < 1 ||
-      minVram > 1024
+      !Number.isFinite(maxPrice)
+      || maxPrice < 0.01
+      || maxPrice > 100
+      || !Number.isInteger(minVram)
+      || minVram < 1
+      || minVram > 1024
     ) {
-      status.textContent = "Enter a valid price and whole-number VRAM value.";
+      status.textContent =
+        "Enter a valid price and whole-number VRAM value.";
       return;
     }
     const payload = {
@@ -755,71 +552,50 @@ export function mountCloudRun(
     };
     const key = apiKeyInput.value.trim();
     if (key) payload.api_key = key;
-
     setBusy(true);
     status.textContent = "Saving settings…";
-    let failed = false;
     try {
-      const result = await fetchJson(fetchImpl, SETTINGS_ENDPOINT, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
+      const result = await cloudApi.updateSettings(payload);
       apiKeyInput.value = "";
       configured.textContent = result.configured
         ? "Vast API key is configured."
         : "Vast API key is not configured.";
+      sessionConsole.renderSettings(result);
+      status.textContent = "Settings saved.";
     } catch {
-      failed = true;
+      status.textContent = "Settings could not be saved.";
     } finally {
       setBusy(false);
-      status.textContent = failed
-        ? "Settings could not be saved."
-        : "Settings saved.";
     }
   });
 
   searchButton.addEventListener("click", async () => {
-    if (!offersUnlocked()) {
+    if (!sessionConsole.preflightId) {
       status.textContent =
         "Run and resolve the free dependency preflight first.";
       return;
     }
-    clearPoll();
     selectedOffer = null;
-    currentAttempt = null;
-    idempotencyKey = null;
-    selectionPreview.textContent = "";
+    sessionIdempotencyKey = null;
     offers.replaceChildren();
     setBusy(true);
-    status.textContent = "Searching Vast GPUs…";
+    status.textContent = "Searching eligible Vast GPUs…";
     try {
-      const result = await fetchJson(fetchImpl, OFFERS_ENDPOINT, {
-        method: "POST",
-        headers: requiresPreflight()
-          ? { "Content-Type": "application/json" }
-          : undefined,
-        body: requiresPreflight()
-          ? JSON.stringify({
-              preflight_id: preflightConsole.preflightId,
-            })
-          : undefined,
-      });
-      if (!Array.isArray(result.offers)) throw new Error("search failed");
+      const result = await cloudApi.searchOffers(
+        sessionConsole.preflightId,
+      );
+      if (!Array.isArray(result.offers)) throw new Error("invalid offers");
       renderOffers(document, offers, result.offers, (offer) => {
         const changed =
-          String(selectedOffer?.offer_id ?? "") !== String(offer.offer_id);
+          String(selectedOffer?.offer_id ?? "")
+          !== String(offer?.offer_id ?? "");
         selectedOffer = offer;
-        if (changed) {
-          currentAttempt = null;
-          idempotencyKey = null;
-          selectionPreview.textContent = "";
-        }
-        renderCurrent();
+        if (changed) sessionIdempotencyKey = null;
+        setBusy(false);
       });
-      const count = result.offers.length;
       status.textContent =
-        `${count} matching offer${count === 1 ? "" : "s"} found.`;
+        `${result.offers.length} matching offer` +
+        `${result.offers.length === 1 ? "" : "s"} found.`;
     } catch {
       offers.replaceChildren();
       status.textContent = "Vast offer search is unavailable.";
@@ -828,119 +604,44 @@ export function mountCloudRun(
     }
   });
 
-  previewButton.addEventListener("click", async () => {
-    if (!selectedOffer) return;
+  reviewButton.addEventListener("click", async () => {
+    if (!selectedOffer || !sessionConsole.preflightId) return;
     try {
-      if (!idempotencyKey) {
-        idempotencyKey = createIdempotencyKey(browserWindow);
+      if (!sessionIdempotencyKey) {
+        sessionIdempotencyKey = createIdempotencyKey(browserWindow);
       }
     } catch {
-      status.textContent = "A secure confirmation key could not be generated.";
+      status.textContent =
+        "A secure paid-session key could not be generated.";
       return;
     }
     setBusy(true);
-    status.textContent = "Creating a short-lived server quote…";
-    let failureMessage = null;
+    status.textContent = "Creating a short-lived paid review…";
     try {
-      currentAttempt = await fetchJson(fetchImpl, QUOTES_ENDPOINT, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          offer_id: selectedOffer.offer_id,
-          idempotency_key: idempotencyKey,
-        }),
+      const session = await cloudApi.createSession({
+        preflight_id: sessionConsole.preflightId,
+        offer_id: selectedOffer.offer_id,
+        idempotency_key: sessionIdempotencyKey,
+        deadline: {
+          mode: "finite",
+          duration_seconds: DEFAULT_SESSION_SECONDS,
+        },
       });
+      sessionConsole.renderQuote(session, {
+        idempotencyKey: sessionIdempotencyKey,
+      });
+      status.textContent =
+        "Review every bounded cost before explicit paid confirmation.";
     } catch (error) {
       const message =
-        error instanceof Error ? String(error.message).trim() : "";
-      failureMessage =
-        message && message !== "request failed"
-          ? message
-          : "The selected offer could not be quoted.";
+        error instanceof Error
+        && error.message
+        && error.message !== "request failed"
+          ? error.message
+          : "The selected offer could not be reviewed.";
+      status.textContent = message;
     } finally {
       setBusy(false);
-      if (failureMessage) {
-        status.textContent = failureMessage;
-      }
-    }
-  });
-
-  confirmButton.addEventListener("click", async () => {
-    if (!currentAttempt?.attempt_id || !idempotencyKey) return;
-    clearPoll();
-    setBusy(true);
-    status.textContent = "Submitting explicit paid confirmation…";
-    let failed = false;
-    try {
-      currentAttempt = await fetchJson(
-        fetchImpl,
-        `${attemptEndpoint(currentAttempt.attempt_id)}/confirm`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ idempotency_key: idempotencyKey }),
-        },
-      );
-    } catch {
-      failed = true;
-    } finally {
-      setBusy(false);
-      if (failed) {
-        status.textContent =
-          "The paid confirmation was not accepted. No retry was issued.";
-      } else {
-        schedulePoll();
-      }
-    }
-  });
-
-  cancelButton.addEventListener("click", async () => {
-    if (!currentAttempt?.attempt_id) return;
-    clearPoll();
-    setBusy(true);
-    status.textContent = "Requesting cancellation and verified cleanup…";
-    let failed = false;
-    try {
-      currentAttempt = await fetchJson(
-        fetchImpl,
-        `${attemptEndpoint(currentAttempt.attempt_id)}/cancel`,
-        { method: "POST" },
-      );
-    } catch {
-      failed = true;
-    } finally {
-      setBusy(false);
-      if (failed) {
-        status.textContent =
-          "Cancellation could not be confirmed. Check Vast inventory now.";
-      } else {
-        schedulePoll();
-      }
-    }
-  });
-
-  destroyButton.addEventListener("click", async () => {
-    if (!currentAttempt?.attempt_id) return;
-    clearPoll();
-    setBusy(true);
-    status.textContent = "Destroying the Vast instance and checking inventory…";
-    let failed = false;
-    try {
-      currentAttempt = await fetchJson(
-        fetchImpl,
-        attemptEndpoint(currentAttempt.attempt_id),
-        { method: "DELETE" },
-      );
-    } catch {
-      failed = true;
-    } finally {
-      setBusy(false);
-      if (failed) {
-        status.textContent =
-          "Destroy could not be verified. Use the Vast console immediately.";
-      } else {
-        schedulePoll();
-      }
     }
   });
 
@@ -957,11 +658,10 @@ export function mountCloudRun(
     launcher,
     observer: null,
     openDialog,
-    preflightConsole,
-    renderCurrent,
+    sessionConsole,
   };
   mountedCloudRuns.set(document, record);
-  renderCurrent();
+  setBusy(false);
   ensureLauncherPlacement(browserWindow, document, record);
   return launcher;
 }
@@ -983,14 +683,18 @@ export function registerCloudRunWhenReady(browserWindow, document, tries = 0) {
   const app = browserWindow.comfyAPI?.app?.app ?? browserWindow.app;
   const api = browserWindow.comfyAPI?.api?.api ?? browserWindow.api;
   if (
-    !app ||
-    typeof app.registerExtension !== "function" ||
-    !api ||
-    typeof api.fetchApi !== "function"
+    !app
+    || typeof app.registerExtension !== "function"
+    || !api
+    || typeof api.fetchApi !== "function"
   ) {
     if (tries < 500 && typeof browserWindow.setTimeout === "function") {
       browserWindow.setTimeout(
-        () => registerCloudRunWhenReady(browserWindow, document, tries + 1),
+        () => registerCloudRunWhenReady(
+          browserWindow,
+          document,
+          tries + 1,
+        ),
         10,
       );
     }
@@ -998,10 +702,11 @@ export function registerCloudRunWhenReady(browserWindow, document, tries = 0) {
   }
 
   const fetchImpl = api.fetchApi.bind(api);
+  const cloudApi = createCloudRunApi(fetchImpl);
   const captureContext = {
     app,
     api,
-    onCapture: (capture) => postCapture(fetchImpl, capture),
+    onCapture: (capture) => cloudApi.capture(capture),
   };
   app.registerExtension({
     name: "comfyui-cloud-run.lifecycle",
@@ -1033,12 +738,12 @@ export function registerCloudRunWhenReady(browserWindow, document, tries = 0) {
 
 
 export {
+  DEFAULT_SESSION_SECONDS,
   OFFERS_ENDPOINT,
-  OFFICIAL_TEMPLATE_ID,
-  OFFICIAL_TEMPLATE_NAME,
   OPEN_COMMAND_ID,
-  QUOTES_ENDPOINT,
+  POLL_INTERVAL_MS,
   PREFLIGHTS_ENDPOINT,
+  SESSIONS_ENDPOINT,
   SETTINGS_ENDPOINT,
 };
 

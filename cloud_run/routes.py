@@ -2,19 +2,20 @@
 
 import os
 from pathlib import Path
+import math
 import re
 import stat
 
 from .artifacts import GIB
 from .capture import CaptureValidationError
 from .comfy_host import ComfyHost, FORBIDDEN_TREE, HostCompatibilityError
-from .constants import OFFICIAL_TEMPLATE_ID, OFFICIAL_TEMPLATE_NAME
 from .dependency_repository import (
     DependencyRepository,
     MappingValidationError,
 )
 from .job_repository import JobRepository
 from .lifecycle import CloudRunLifecycle
+from .models import SessionState
 from .offers import HostBlacklist
 from .repository import AttemptRepository, SessionRepository
 from .registry import RegistryClient
@@ -278,15 +279,226 @@ def build_service():
     return service
 
 
-def _attempt_payload(attempt):
-    payload = attempt.public_payload()
-    payload["official_template_id"] = OFFICIAL_TEMPLATE_ID
-    payload["official_template_name"] = OFFICIAL_TEMPLATE_NAME
+def _public_filename(path, fallback):
+    try:
+        name = Path(str(path)).name
+    except (TypeError, ValueError):
+        return str(fallback)
+    if (
+        not name
+        or name in {".", ".."}
+        or len(name.encode("utf-8")) > 1024
+        or any(ord(character) < 32 for character in name)
+    ):
+        return str(fallback)
+    return name
+
+
+def _job_payload(service, job):
+    payload = job.public_payload()
+    repository = getattr(service, "job_repository", None)
+    if not isinstance(repository, JobRepository):
+        return payload
+    previews = []
+    outputs = []
+    transfers = repository.list_transfers(job.job_id)
+    for transfer in transfers:
+        if transfer.direction != "download":
+            continue
+        if transfer.artifact_id.startswith("preview:"):
+            if transfer.state.value == "verified":
+                previews.append(
+                    {
+                        "id": transfer.artifact_id.removeprefix(
+                            "preview:"
+                        ),
+                        "state": "verified",
+                        "size_bytes": transfer.expected_size,
+                    }
+                )
+            continue
+        outputs.append(
+            {
+                "id": transfer.artifact_id,
+                "state": (
+                    "local_verified"
+                    if transfer.state.value == "verified"
+                    else transfer.state.value
+                ),
+                "filename": (
+                    _public_filename(
+                        transfer.private_path,
+                        transfer.artifact_id,
+                    )
+                    if transfer.state.value == "verified"
+                    else transfer.artifact_id
+                ),
+                "size_bytes": transfer.expected_size,
+                "transferred_bytes": transfer.offset,
+                "sha256": transfer.sha256,
+            }
+        )
+    payload["previews"] = previews
+    payload["outputs"] = outputs
+    payload["transfers"] = [
+        {
+            "id": transfer.artifact_id,
+            "direction": transfer.direction,
+            "state": transfer.state.value,
+            "transferred_bytes": transfer.offset,
+            "size_bytes": transfer.expected_size,
+        }
+        for transfer in transfers
+    ]
+    payload["current_node"] = None
+    payload["progress"] = None
+    payload["progress_text"] = None
+    payload["last_sequence"] = repository.last_event_sequence(
+        job.job_id
+    )
     return payload
 
 
-def _session_payload(session):
-    return session.public_payload()
+def _session_payload(session, service=None):
+    payload = session.public_payload()
+    if service is None:
+        return payload
+    try:
+        now = float(service.clock())
+    except (AttributeError, TypeError, ValueError):
+        now = session.updated_at
+    if not math.isfinite(now) or now < 0:
+        now = session.updated_at
+    public_state = payload
+    if session.state in {
+        SessionState.PREFLIGHT,
+        SessionState.OFFER_SELECTED,
+    }:
+        elapsed = 0.0
+    else:
+        billing_active = (
+            session.state
+            not in {
+                SessionState.DESTROYED,
+                SessionState.FAILED,
+            }
+            or public_state["billing_may_continue"]
+        )
+        end = (
+            now if billing_active else session.updated_at
+        )
+        elapsed = max(0.0, end - session.created_at)
+    payload["elapsed_seconds"] = elapsed
+    payload["approximate_spend"] = (
+        session.quote.dph_total * elapsed / 3600
+        if session.quote is not None
+        else None
+    )
+    alerts = getattr(
+        getattr(service, "session_service", None),
+        "alerts",
+        None,
+    )
+    try:
+        payload["deadline_alerts"] = (
+            list(alerts(session, now=now))
+            if callable(alerts)
+            else []
+        )
+    except Exception:
+        payload["deadline_alerts"] = []
+
+    repository = getattr(service, "job_repository", None)
+    if not isinstance(repository, JobRepository):
+        payload["current_job"] = None
+        payload["history"] = []
+        payload["provisioning"] = {
+            "phase": session.state.value,
+            "transferred_bytes": 0,
+            "total_bytes": 0,
+            "installed_units": 0,
+            "validated_units": 0,
+            "seconds_without_progress": max(
+                0.0,
+                now - session.updated_at,
+            ),
+            "stall_budget_seconds": 600,
+        }
+        return payload
+
+    jobs = repository.list_jobs(session.session_id)[-100:]
+    job_payloads = [_job_payload(service, job) for job in jobs]
+    active_states = {
+        "captured",
+        "resolving",
+        "queued",
+        "running",
+        "harvesting",
+    }
+    current = next(
+        (
+            item
+            for item in reversed(job_payloads)
+            if item["status"] in active_states
+        ),
+        job_payloads[-1] if job_payloads else None,
+    )
+    payload["current_job"] = current
+    payload["history"] = job_payloads
+
+    transfer_records = []
+    for transfer_job_id in (
+        "bootstrap:" + session.session_id,
+        "recovery:" + session.session_id,
+    ):
+        transfer_records.extend(
+            repository.list_transfers(transfer_job_id)
+        )
+    if current is not None:
+        transfer_records.extend(
+            repository.list_transfers(current["job_id"])
+        )
+    installed = repository.installed_set(session.session_id)
+    payload["provisioning"] = {
+        "phase": session.state.value,
+        "transferred_bytes": sum(
+            transfer.offset for transfer in transfer_records
+        ),
+        "total_bytes": sum(
+            transfer.expected_size for transfer in transfer_records
+        ),
+        "installed_units": len(installed),
+        "validated_units": (
+            len(installed)
+            if session.state
+            in {
+                SessionState.READY,
+                SessionState.RUNNING,
+                SessionState.HARVESTING,
+            }
+            else 0
+        ),
+        "seconds_without_progress": max(
+            0.0,
+            now - session.updated_at,
+        ),
+        "stall_budget_seconds": 600,
+    }
+    return payload
+
+
+def _active_session_payloads(service):
+    repository = getattr(service, "session_repository", None)
+    if not isinstance(repository, SessionRepository):
+        return []
+    try:
+        sessions = repository.list_recoverable()[-20:]
+        return [
+            _session_payload(session, service)
+            for session in sessions
+        ]
+    except Exception:
+        return []
 
 
 async def _request_payload(request, *, allowed, required):
@@ -397,9 +609,24 @@ def register_routes(service_factory=None):
             raise CloudRunValidationError("Invalid event cursor.")
         return int(values[0])
 
+    def browser_settings(settings):
+        payload = public_settings(settings)
+        try:
+            service = make_service()
+        except Exception:
+            service = None
+        payload["active_sessions"] = (
+            _active_session_payloads(service)
+            if service is not None
+            else []
+        )
+        return payload
+
     @routes.get("/cloud-run/api/settings")
     async def get_settings(_request):
-        return web.json_response(public_settings(SettingsStore().load()))
+        return web.json_response(
+            browser_settings(SettingsStore().load())
+        )
 
     @routes.put("/cloud-run/api/settings")
     async def put_settings(request):
@@ -420,7 +647,7 @@ def register_routes(service_factory=None):
                 {"error": "Settings could not be saved."},
                 status=500,
             )
-        return web.json_response(public_settings(settings))
+        return web.json_response(browser_settings(settings))
 
     @routes.post("/cloud-run/api/captures")
     async def post_capture(request):
@@ -528,24 +755,9 @@ def register_routes(service_factory=None):
             return service_error(error)
         return web.json_response({"offers": offers})
 
-    @routes.post("/cloud-run/api/quotes")
-    async def post_quote(request):
-        try:
-            payload = await _request_payload(
-                request,
-                allowed={"offer_id", "idempotency_key"},
-                required={"offer_id", "idempotency_key"},
-            )
-            attempt = await make_service().preview_offer(
-                offer_id=payload["offer_id"],
-                idempotency_key=payload["idempotency_key"],
-            )
-        except Exception as error:
-            return service_error(error)
-        return web.json_response(_attempt_payload(attempt))
-
     @routes.post("/cloud-run/api/sessions")
     async def post_session(request):
+        service = make_service()
         try:
             payload = await _request_payload(
                 request,
@@ -562,7 +774,7 @@ def register_routes(service_factory=None):
                     "deadline",
                 },
             )
-            session = await make_service().preview_session(
+            session = await service.preview_session(
                 preflight_id=payload["preflight_id"],
                 offer_id=payload["offer_id"],
                 idempotency_key=payload["idempotency_key"],
@@ -570,79 +782,84 @@ def register_routes(service_factory=None):
             )
         except Exception as error:
             return service_error(error)
-        return web.json_response(_session_payload(session))
+        return web.json_response(_session_payload(session, service))
 
     @routes.post("/cloud-run/api/sessions/{session_id}/confirm")
     async def post_session_confirm(request):
+        service = make_service()
         try:
             payload = await _request_payload(
                 request,
                 allowed={"idempotency_key"},
                 required={"idempotency_key"},
             )
-            session = await make_service().confirm_session(
+            session = await service.confirm_session(
                 request.match_info.get("session_id", ""),
                 idempotency_key=payload["idempotency_key"],
             )
         except Exception as error:
             return service_error(error)
-        return web.json_response(_session_payload(session))
+        return web.json_response(_session_payload(session, service))
 
     @routes.get("/cloud-run/api/sessions/{session_id}")
     async def get_session(request):
+        service = make_service()
         try:
-            session = await make_service().refresh_session(
+            session = await service.refresh_session(
                 request.match_info.get("session_id", "")
             )
         except Exception as error:
             return service_error(error)
-        return web.json_response(_session_payload(session))
+        return web.json_response(_session_payload(session, service))
 
     @routes.post("/cloud-run/api/sessions/{session_id}/jobs")
     async def post_session_job(request):
+        service = make_service()
         try:
             payload = await _request_payload(
                 request,
                 allowed={"capture_id", "idempotency_key"},
                 required={"capture_id", "idempotency_key"},
             )
-            job = await make_service().submit_job(
+            job = await service.submit_job(
                 request.match_info.get("session_id", ""),
                 capture_id=payload["capture_id"],
                 idempotency_key=payload["idempotency_key"],
             )
         except Exception as error:
             return service_error(error)
-        return web.json_response(job.public_payload())
+        return web.json_response(_job_payload(service, job))
 
     @routes.get(
         "/cloud-run/api/sessions/{session_id}/jobs/{job_id}"
     )
     async def get_session_job(request):
+        service = make_service()
         try:
-            job = make_service().get_job(
+            job = service.get_job(
                 request.match_info.get("session_id", ""),
                 request.match_info.get("job_id", ""),
             )
         except Exception as error:
             return service_error(error)
-        return web.json_response(job.public_payload())
+        return web.json_response(_job_payload(service, job))
 
     @routes.put("/cloud-run/api/sessions/{session_id}/deadline")
     async def put_session_deadline(request):
+        service = make_service()
         try:
             payload = await _request_payload(
                 request,
                 allowed={"action", "acknowledged"},
                 required={"action"},
             )
-            session = await make_service().update_session_deadline(
+            session = await service.update_session_deadline(
                 request.match_info.get("session_id", ""),
                 payload,
             )
         except Exception as error:
             return service_error(error)
-        return web.json_response(_session_payload(session))
+        return web.json_response(_session_payload(session, service))
 
     @routes.post(
         "/cloud-run/api/sessions/{session_id}/destroy-review"
@@ -663,6 +880,7 @@ def register_routes(service_factory=None):
 
     @routes.delete("/cloud-run/api/sessions/{session_id}")
     async def delete_session(request):
+        service = make_service()
         try:
             payload = await _request_payload(
                 request,
@@ -675,13 +893,13 @@ def register_routes(service_factory=None):
                     "acknowledge_data_loss",
                 },
             )
-            session = await make_service().destroy_session(
+            session = await service.destroy_session(
                 request.match_info.get("session_id", ""),
                 payload,
             )
         except Exception as error:
             return service_error(error)
-        return web.json_response(_session_payload(session))
+        return web.json_response(_session_payload(session, service))
 
     @routes.get(
         "/cloud-run/api/sessions/{session_id}/jobs/{job_id}/events"
@@ -806,52 +1024,6 @@ def register_routes(service_factory=None):
                 "X-Content-Type-Options": "nosniff",
             },
         )
-
-    @routes.get("/cloud-run/api/attempts/{attempt_id}")
-    async def get_attempt(request):
-        try:
-            attempt = await make_service().refresh(
-                request.match_info.get("attempt_id", "")
-            )
-        except Exception as error:
-            return service_error(error)
-        return web.json_response(_attempt_payload(attempt))
-
-    @routes.post("/cloud-run/api/attempts/{attempt_id}/confirm")
-    async def post_confirm(request):
-        try:
-            payload = await _request_payload(
-                request,
-                allowed={"idempotency_key"},
-                required={"idempotency_key"},
-            )
-            attempt = await make_service().confirm(
-                request.match_info.get("attempt_id", ""),
-                idempotency_key=payload["idempotency_key"],
-            )
-        except Exception as error:
-            return service_error(error)
-        return web.json_response(_attempt_payload(attempt))
-
-    @routes.post("/cloud-run/api/attempts/{attempt_id}/cancel")
-    async def post_cancel(request):
-        try:
-            attempt = await make_service().cancel(
-                request.match_info.get("attempt_id", "")
-            )
-        except Exception as error:
-            return service_error(error)
-        return web.json_response(_attempt_payload(attempt))
-
-    @routes.delete("/cloud-run/api/attempts/{attempt_id}")
-    async def delete_attempt(request):
-        try:
-            attempt = await make_service().destroy(
-                request.match_info.get("attempt_id", "")
-            )
-        except Exception as error:
-            return service_error(error)
-        return web.json_response(_attempt_payload(attempt))
 
     app = getattr(prompt_server, "app", None)
     startup = getattr(app, "on_startup", None)

@@ -193,6 +193,55 @@ class SessionServiceTests(unittest.TestCase):
         self.assertEqual(self.offer_search.calls, 0)
         self.assertEqual(self.offer_search.mutations, [])
 
+    def test_mapping_required_row_exposes_only_the_pinned_candidate_for_approval(self):
+        candidate_payload = {
+            "class_type": "Fancy",
+            "source_kind": "registry",
+            "candidate_digest": "d" * 64,
+            "repository_url": "https://github.com/example/fancy",
+            "revision": "e" * 40,
+            "package_id": "example.fancy",
+            "archive_complete": True,
+            "wheels_complete": True,
+            "approved": False,
+            "origin_source_kind": "registry",
+        }
+        candidate = types.SimpleNamespace(
+            revision="e" * 40,
+            source_kind="registry",
+            public_payload=lambda: dict(candidate_payload),
+        )
+        mapping_repository = types.SimpleNamespace(
+            candidates=lambda class_type: (
+                [candidate] if class_type == "Fancy" else []
+            ),
+            approved=lambda _class_type: None,
+        )
+        service = SessionService(
+            job_repository=self.repository,
+            resolver=FakeResolver(blocked_resolution()),
+            offer_search=self.offer_search,
+            mapping_repository=mapping_repository,
+            release=worker_release(),
+            clock=lambda: 100.0,
+            id_factory=lambda: "preflight-mapping",
+        )
+
+        result = asyncio.run(service.preflight(self.capture.capture_id))
+        public = result.public_payload()
+        reopened = service.get_preflight(result.preflight_id)
+
+        self.assertEqual(
+            public["rows"][1]["mapping_candidate"],
+            candidate_payload,
+        )
+        self.assertEqual(
+            reopened.rows[1].mapping_candidate,
+            candidate_payload,
+        )
+        self.assertNotIn("candidate_json", repr(public))
+        self.assertNotIn("payload", repr(public))
+
     def test_resolved_preflight_persists_manifest_and_exact_totals(self):
         service = self.service(resolved_resolution())
 

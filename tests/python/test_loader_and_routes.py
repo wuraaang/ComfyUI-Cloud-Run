@@ -109,7 +109,6 @@ class LoaderContractTests(unittest.TestCase):
                     "/cloud-run/api/cache/artifacts/{artifact_id}",
                 ),
                 ("POST", "/cloud-run/api/offers"),
-                ("POST", "/cloud-run/api/quotes"),
                 ("POST", "/cloud-run/api/sessions"),
                 (
                     "POST",
@@ -151,10 +150,6 @@ class LoaderContractTests(unittest.TestCase):
                     "GET",
                     "/cloud-run/api/sessions/{session_id}/jobs/{job_id}/artifacts/{artifact_id}",
                 ),
-                ("GET", "/cloud-run/api/attempts/{attempt_id}"),
-                ("POST", "/cloud-run/api/attempts/{attempt_id}/confirm"),
-                ("POST", "/cloud-run/api/attempts/{attempt_id}/cancel"),
-                ("DELETE", "/cloud-run/api/attempts/{attempt_id}"),
             ],
         )
         self.assertTrue(all(callable(item[2]) for item in routes.registered))

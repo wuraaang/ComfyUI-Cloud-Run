@@ -148,6 +148,10 @@ export class FakeElement {
   querySelector(selector) {
     return findBySelector(this, selector);
   }
+
+  querySelectorAll(selector) {
+    return findAllBySelector(this, selector);
+  }
 }
 
 function findById(root, id) {
@@ -160,6 +164,7 @@ function findById(root, id) {
 }
 
 function findBySelector(root, selector) {
+  if (root.tagName === selector.toUpperCase()) return root;
   const attributeMatch = selector.match(/^\[([^=]+)="([^"]+)"\]$/);
   if (
     attributeMatch &&
@@ -173,6 +178,26 @@ function findBySelector(root, selector) {
     if (found) return found;
   }
   return null;
+}
+
+function findAllBySelector(root, selector) {
+  const matches = [];
+  const visit = (element) => {
+    const attributeMatch = selector.match(/^\[([^=]+)="([^"]+)"\]$/);
+    if (
+      element.tagName === selector.toUpperCase()
+      || (selector.startsWith("#") && element.id === selector.slice(1))
+      || (
+        attributeMatch
+        && element.getAttribute(attributeMatch[1]) === attributeMatch[2]
+      )
+    ) {
+      matches.push(element);
+    }
+    for (const child of element.children) visit(child);
+  };
+  visit(root);
+  return matches;
 }
 
 export class FakeDocument {
@@ -195,5 +220,12 @@ export class FakeDocument {
       findBySelector(this.head, selector) ??
       findBySelector(this.body, selector)
     );
+  }
+
+  querySelectorAll(selector) {
+    return [
+      ...findAllBySelector(this.head, selector),
+      ...findAllBySelector(this.body, selector),
+    ];
   }
 }
