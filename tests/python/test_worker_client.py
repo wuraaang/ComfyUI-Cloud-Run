@@ -1,6 +1,8 @@
 import asyncio
 import hashlib
 import json
+from pathlib import Path
+import tempfile
 import unittest
 
 from cloud_run.worker_protocol import verify_request
@@ -286,6 +288,191 @@ class WorkerClientTests(unittest.TestCase):
                 "/worker/v1/health",
                 extra={"Authorization": "Bearer attacker"},
             )
+
+    def test_upload_resumes_in_bounded_signed_chunks_and_verifies_source(self):
+        from cloud_run.worker_client import (
+            MAX_WORKER_UPLOAD_CHUNK_BYTES,
+            WorkerClient,
+            WorkerTransportResponse,
+        )
+
+        content = b"x" * (MAX_WORKER_UPLOAD_CHUNK_BYTES + 3)
+        digest = hashlib.sha256(content).hexdigest()
+
+        class UploadTransport:
+            def __init__(self):
+                self.requests = []
+
+            async def request(self, request, *, max_bytes):
+                self.requests.append(request)
+                content_range = request.headers["Content-Range"]
+                start = int(content_range.split(" ", 1)[1].split("-", 1)[0])
+                next_offset = start + len(request.body)
+                return WorkerTransportResponse(
+                    status=200,
+                    headers={"Content-Type": "application/json"},
+                    body=json.dumps(
+                        {
+                            "artifact_id": "input-1",
+                            "state": (
+                                "verified"
+                                if next_offset == len(content)
+                                else "receiving"
+                            ),
+                            "next_offset": next_offset,
+                            "size_bytes": len(content),
+                            "sha256": digest,
+                        },
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ).encode("utf-8"),
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "input.bin"
+            path.write_bytes(content)
+            transport = UploadTransport()
+            client = WorkerClient(
+                base_url="http://8.8.8.8:30000",
+                provider_token="provider-token",
+                session_id="session-1",
+                session_secret=b"s" * 32,
+                transport=transport,
+                clock=lambda: 1000,
+                nonce=iter(("upload-1", "upload-2")).__next__,
+            )
+            offsets = []
+
+            receipt = asyncio.run(
+                client.upload_artifact(
+                    "input-1",
+                    path=str(path),
+                    size_bytes=len(content),
+                    sha256=digest,
+                    start=2,
+                    on_progress=lambda value: offsets.append(value),
+                )
+            )
+
+        self.assertEqual(
+            [request.headers["Content-Range"] for request in transport.requests],
+            [
+                (
+                    "bytes 2-"
+                    + str(2 + MAX_WORKER_UPLOAD_CHUNK_BYTES - 1)
+                    + "/"
+                    + str(len(content))
+                ),
+                (
+                    "bytes "
+                    + str(2 + MAX_WORKER_UPLOAD_CHUNK_BYTES)
+                    + "-"
+                    + str(len(content) - 1)
+                    + "/"
+                    + str(len(content))
+                ),
+            ],
+        )
+        self.assertTrue(
+            all(
+                request.headers["Content-Type"]
+                == "application/octet-stream"
+                for request in transport.requests
+            )
+        )
+        self.assertEqual(offsets[-1], len(content))
+        self.assertEqual(receipt["state"], "verified")
+        for request in transport.requests:
+            path_qs = "/worker/v1/artifacts/input-1"
+            verify_request(
+                b"s" * 32,
+                "PUT",
+                path_qs,
+                request.body,
+                {
+                    "protocol_version": request.headers[
+                        "X-Cloud-Run-Protocol-Version"
+                    ],
+                    "timestamp": int(
+                        request.headers["X-Cloud-Run-Timestamp"]
+                    ),
+                    "nonce": request.headers["X-Cloud-Run-Nonce"],
+                    "signature": request.headers[
+                        "X-Cloud-Run-Signature"
+                    ],
+                },
+                now=1000,
+                seen_nonces=set(),
+            )
+
+    def test_upload_status_reads_only_the_bound_transfer_transaction(self):
+        from cloud_run.worker_client import (
+            WorkerClient,
+            WorkerTransportResponse,
+        )
+
+        class StatusTransport:
+            def __init__(self):
+                self.requests = []
+
+            async def request(self, request, *, max_bytes):
+                self.requests.append(request)
+                return WorkerTransportResponse(
+                    status=200,
+                    headers={"Content-Type": "application/json"},
+                    body=json.dumps(
+                        {
+                            "artifact_id": "input-1",
+                            "state": "receiving",
+                            "next_offset": 5,
+                            "size_bytes": 10,
+                            "sha256": "a" * 64,
+                        },
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ).encode("utf-8"),
+                )
+
+        transport = StatusTransport()
+        client = WorkerClient(
+            base_url="http://8.8.8.8:30000",
+            provider_token="provider-token",
+            session_id="session-1",
+            session_secret=b"s" * 32,
+            transport=transport,
+            clock=lambda: 1000,
+            nonce=lambda: "status-1",
+        )
+
+        status = asyncio.run(client.upload_status("input-1"))
+
+        self.assertEqual(status["next_offset"], 5)
+        request = transport.requests[0]
+        self.assertEqual(
+            request.url,
+            (
+                "http://8.8.8.8:30000/worker/v1/transactions/"
+                "transfer:input-1"
+            ),
+        )
+        verify_request(
+            b"s" * 32,
+            "GET",
+            "/worker/v1/transactions/transfer:input-1",
+            b"",
+            {
+                "protocol_version": request.headers[
+                    "X-Cloud-Run-Protocol-Version"
+                ],
+                "timestamp": int(
+                    request.headers["X-Cloud-Run-Timestamp"]
+                ),
+                "nonce": request.headers["X-Cloud-Run-Nonce"],
+                "signature": request.headers["X-Cloud-Run-Signature"],
+            },
+            now=1000,
+            seen_nonces=set(),
+        )
 
 
 if __name__ == "__main__":

@@ -5,11 +5,15 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 import hashlib
+import hmac
 import ipaddress
 import json
 import math
+import os
+from pathlib import Path
 import re
 import secrets
+import stat
 from urllib.parse import urlsplit
 
 from .manifest import PROTOCOL_VERSION
@@ -20,6 +24,8 @@ from .worker_protocol import sign_request
 MAX_WORKER_JSON_BYTES = 16 * 1024 * 1024
 MAX_WORKER_PREVIEW_BYTES = 16 * 1024 * 1024
 MAX_WORKER_ERROR_BYTES = 64 * 1024
+MAX_WORKER_UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024
+MAX_WORKER_ARTIFACT_BYTES = 4 * 1024 * 1024 * 1024 * 1024
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}")
 _HEX_64 = re.compile(r"[0-9a-f]{64}")
 _CONTENT_RANGE = re.compile(
@@ -337,7 +343,16 @@ class WorkerClient:
             raise _client_error()
         return int(value)
 
-    def _request(self, method, path, body=b"", *, signed=True, extra=None):
+    def _request(
+        self,
+        method,
+        path,
+        body=b"",
+        *,
+        signed=True,
+        extra=None,
+        content_type="application/json",
+    ):
         if (
             not isinstance(method, str)
             or not isinstance(path, str)
@@ -345,6 +360,8 @@ class WorkerClient:
             or "\r" in path
             or "\n" in path
             or not isinstance(body, bytes)
+            or content_type
+            not in {"application/json", "application/octet-stream"}
         ):
             raise _client_error()
         headers = {
@@ -352,7 +369,7 @@ class WorkerClient:
             "Accept": "application/json",
         }
         if body:
-            headers["Content-Type"] = "application/json"
+            headers["Content-Type"] = content_type
         if signed:
             timestamp = self._timestamp()
             nonce = self.nonce()
@@ -383,7 +400,7 @@ class WorkerClient:
                 for key, value in extra.items()
             ):
                 raise _client_error()
-            allowed_headers = {"accept", "range"}
+            allowed_headers = {"accept", "content-range", "range"}
             if any(key.casefold() not in allowed_headers for key in extra):
                 raise _client_error()
             headers.update(extra)
@@ -639,6 +656,186 @@ class WorkerClient:
             sha256=metadata["sha256"],
             mime_type=metadata["mime_type"],
         )
+
+    async def upload_artifact(
+        self,
+        artifact_id,
+        *,
+        path,
+        size_bytes,
+        sha256,
+        start,
+        on_progress,
+    ):
+        if (
+            not _identifier(artifact_id)
+            or not isinstance(path, str)
+            or not path
+            or isinstance(size_bytes, bool)
+            or not isinstance(size_bytes, int)
+            or not 0 < size_bytes <= MAX_WORKER_ARTIFACT_BYTES
+            or not isinstance(sha256, str)
+            or not _HEX_64.fullmatch(sha256)
+            or isinstance(start, bool)
+            or not isinstance(start, int)
+            or not 0 <= start < size_bytes
+            or not callable(on_progress)
+        ):
+            raise _client_error()
+        descriptor = None
+        try:
+            flags = os.O_RDONLY
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            descriptor = os.open(Path(path), flags)
+            before = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_uid != os.getuid()
+                or before.st_size != size_bytes
+            ):
+                raise _client_error()
+            digest = hashlib.sha256()
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+            if not hmac.compare_digest(digest.hexdigest(), sha256):
+                raise _client_error()
+            os.lseek(descriptor, start, os.SEEK_SET)
+            offset = start
+            last = None
+            request_path = "/worker/v1/artifacts/" + artifact_id
+            while offset < size_bytes:
+                chunk = os.read(
+                    descriptor,
+                    min(
+                        MAX_WORKER_UPLOAD_CHUNK_BYTES,
+                        size_bytes - offset,
+                    ),
+                )
+                if not chunk:
+                    raise _client_error()
+                end = offset + len(chunk) - 1
+                request = self._request(
+                    "PUT",
+                    request_path,
+                    chunk,
+                    extra={
+                        "Accept": "application/json",
+                        "Content-Range": (
+                            "bytes "
+                            + str(offset)
+                            + "-"
+                            + str(end)
+                            + "/"
+                            + str(size_bytes)
+                        ),
+                    },
+                    content_type="application/octet-stream",
+                )
+                try:
+                    response = await self.transport.request(
+                        request,
+                        max_bytes=MAX_WORKER_ERROR_BYTES,
+                    )
+                except (asyncio.CancelledError, KeyboardInterrupt):
+                    raise
+                except Exception:
+                    raise _client_error() from None
+                payload = _parse_json_response(
+                    response,
+                    maximum=MAX_WORKER_ERROR_BYTES,
+                )
+                expected_offset = end + 1
+                expected_state = (
+                    "verified"
+                    if expected_offset == size_bytes
+                    else "receiving"
+                )
+                if (
+                    set(payload)
+                    != {
+                        "artifact_id",
+                        "state",
+                        "next_offset",
+                        "size_bytes",
+                        "sha256",
+                    }
+                    or payload.get("artifact_id") != artifact_id
+                    or payload.get("state") != expected_state
+                    or payload.get("next_offset") != expected_offset
+                    or payload.get("size_bytes") != size_bytes
+                    or not hmac.compare_digest(
+                        str(payload.get("sha256") or ""),
+                        sha256,
+                    )
+                ):
+                    raise _client_error()
+                offset = expected_offset
+                progress = on_progress(offset)
+                if asyncio.iscoroutine(progress):
+                    await progress
+                last = payload
+            after = os.fstat(descriptor)
+            if (
+                after.st_dev != before.st_dev
+                or after.st_ino != before.st_ino
+                or after.st_size != before.st_size
+                or after.st_mtime_ns != before.st_mtime_ns
+            ):
+                raise _client_error()
+            return last
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            raise
+        except WorkerClientError:
+            raise
+        except OSError:
+            raise _client_error() from None
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
+    async def upload_status(self, artifact_id):
+        if not _identifier(artifact_id):
+            raise _client_error()
+        payload = await self._json(
+            "GET",
+            "/worker/v1/transactions/transfer:" + artifact_id,
+        )
+        if (
+            set(payload)
+            != {
+                "artifact_id",
+                "state",
+                "next_offset",
+                "size_bytes",
+                "sha256",
+            }
+            or payload.get("artifact_id") != artifact_id
+            or payload.get("state") not in {"receiving", "verified"}
+            or isinstance(payload.get("next_offset"), bool)
+            or not isinstance(payload.get("next_offset"), int)
+            or isinstance(payload.get("size_bytes"), bool)
+            or not isinstance(payload.get("size_bytes"), int)
+            or not 0
+            <= payload["next_offset"]
+            <= payload["size_bytes"]
+            <= MAX_WORKER_ARTIFACT_BYTES
+            or (
+                payload["state"] == "receiving"
+                and payload["next_offset"] >= payload["size_bytes"]
+            )
+            or (
+                payload["state"] == "verified"
+                and payload["next_offset"] != payload["size_bytes"]
+            )
+            or not isinstance(payload.get("sha256"), str)
+            or not _HEX_64.fullmatch(payload["sha256"])
+        ):
+            raise _client_error()
+        return payload
 
     async def update_deadline(self, payload):
         return await self._json(

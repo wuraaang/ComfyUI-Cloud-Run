@@ -505,6 +505,44 @@ class WorkerApplication:
             return await self._apply_manifest_locked(body)
 
     async def _transaction(self, transaction_id):
+        if (
+            isinstance(transaction_id, str)
+            and transaction_id.startswith("transfer:")
+        ):
+            artifact_id = transaction_id.removeprefix("transfer:")
+            try:
+                record = self.state.load()["transactions"].get(
+                    transaction_id
+                )
+            except (KeyError, TypeError, WorkerStateError):
+                return _error(503, "Worker transaction is unavailable.")
+            if record is None:
+                return _error(404, "Worker transaction was not found.")
+            if (
+                not isinstance(record, dict)
+                or set(record)
+                != {
+                    "kind",
+                    "artifact_id",
+                    "state",
+                    "offset",
+                    "size_bytes",
+                    "sha256",
+                }
+                or record.get("kind") != "artifact_transfer"
+                or record.get("artifact_id") != artifact_id
+            ):
+                return _error(503, "Worker transaction is unavailable.")
+            return _response(
+                200,
+                {
+                    "artifact_id": artifact_id,
+                    "state": record["state"],
+                    "next_offset": record["offset"],
+                    "size_bytes": record["size_bytes"],
+                    "sha256": record["sha256"],
+                },
+            )
         if self.provisioner is None:
             return _error(501, "Worker route is not implemented.")
         try:

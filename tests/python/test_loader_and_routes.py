@@ -117,6 +117,18 @@ class LoaderContractTests(unittest.TestCase):
                 ),
                 (
                     "GET",
+                    "/cloud-run/api/sessions/{session_id}",
+                ),
+                (
+                    "POST",
+                    "/cloud-run/api/sessions/{session_id}/jobs",
+                ),
+                (
+                    "GET",
+                    "/cloud-run/api/sessions/{session_id}/jobs/{job_id}",
+                ),
+                (
+                    "GET",
                     "/cloud-run/api/sessions/{session_id}/jobs/{job_id}/events",
                 ),
                 (

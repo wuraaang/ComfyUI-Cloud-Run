@@ -1,4 +1,5 @@
 import asyncio
+import json
 import tempfile
 import types
 import unittest
@@ -7,9 +8,24 @@ from pathlib import Path
 from cloud_run.artifacts import ArtifactResolution
 from cloud_run.capture import CompiledCapture
 from cloud_run.job_repository import JobRepository
-from cloud_run.manifest import ArtifactSpec, SourceSpec
+from cloud_run.manifest import (
+    ArtifactSpec,
+    CustomNodeSpec,
+    DependencyManifest,
+    PythonWheelSpec,
+    SourceSpec,
+)
+from cloud_run.models import CloudJob, CloudSession, JobState, SessionState
+from cloud_run.relay import RelaySyncResult
+from cloud_run.repository import SessionRepository
 from cloud_run.resolver import NodeResolution
-from cloud_run.session_service import PreflightBlocked, SessionService
+from cloud_run.session_service import (
+    IncompatibleSession,
+    PreflightBlocked,
+    SessionBusy,
+    SessionService,
+    SessionServiceError,
+)
 from cloud_run.worker_release import WorkerRelease
 
 
@@ -243,6 +259,707 @@ class SessionServiceTests(unittest.TestCase):
         with self.assertRaises(PreflightBlocked):
             asyncio.run(service.search_offers(result.preflight_id))
         self.assertEqual(self.offer_search.calls, 0)
+
+    def test_unavailable_direct_upload_is_blocked_before_offer_search(self):
+        resolution = resolved_resolution()
+        resolution.local_artifacts = ()
+        service = self.service(resolution)
+
+        result = asyncio.run(service.preflight(self.capture.capture_id))
+
+        self.assertFalse(result.rentable)
+        self.assertIsNone(result.manifest_digest)
+        with self.assertRaises(PreflightBlocked):
+            asyncio.run(service.search_offers(result.preflight_id))
+        self.assertEqual(self.offer_search.calls, 0)
+
+
+def capture_with_seed(seed):
+    payload = capture_payload()
+    payload["output"]["1"]["inputs"]["seed"] = seed
+    return CompiledCapture.from_payload(payload)
+
+
+def artifact_resolution(*artifacts, custom_nodes=()):
+    return types.SimpleNamespace(
+        node_rows=(NodeResolution("KSampler", "resolved", "core"),),
+        artifact_rows=tuple(
+            ArtifactResolution(
+                node_id="1",
+                class_type="KSampler",
+                input_name=artifact.logical_name,
+                kind=artifact.kind,
+                status="resolved",
+                destination=artifact.destination,
+                size_bytes=artifact.size_bytes,
+                sha256=artifact.sha256,
+                artifact_id=artifact.artifact_id,
+            )
+            for artifact in artifacts
+        ),
+        custom_nodes=tuple(custom_nodes),
+        artifacts=tuple(artifacts),
+        output_allowance_bytes=1024,
+        disk_gb=80,
+        rentable=True,
+    )
+
+
+def local_artifact(name, digest_character, *, kind="input"):
+    digest = digest_character * 64
+    return ArtifactSpec(
+        artifact_id=name,
+        kind=kind,
+        logical_name=name,
+        destination=(
+            "models/checkpoints/" + name
+            if kind == "model"
+            else "input/" + name
+        ),
+        size_bytes=10,
+        sha256=digest,
+        source=SourceSpec("local-upload", "local-upload:" + name),
+    )
+
+
+def custom_node(revision_character):
+    revision = revision_character * 40
+    archive = ArtifactSpec(
+        artifact_id="custom-node-acme-" + revision_character,
+        kind="custom_node_archive",
+        logical_name="acme.nodes",
+        destination="custom_nodes/acme.nodes",
+        size_bytes=10,
+        sha256=revision_character * 64,
+        source=SourceSpec(
+            "local-upload",
+            "local-upload:custom-node-acme-" + revision_character,
+        ),
+    )
+    return CustomNodeSpec(
+        package_id="acme.nodes",
+        repository_url="https://github.com/acme/nodes",
+        revision=revision,
+        archive=archive,
+        wheels=tuple(),
+        provided_class_types=("KSampler",),
+    )
+
+
+class PerCaptureResolver:
+    def __init__(self, resolutions):
+        self.resolutions = resolutions
+        self.calls = []
+
+    async def resolve_preflight(
+        self,
+        capture,
+        *,
+        explicit_output_allowance_bytes,
+    ):
+        self.calls.append(
+            (capture.capture_id, explicit_output_allowance_bytes)
+        )
+        return self.resolutions[capture.capture_id]
+
+
+class SequentialWorker:
+    def __init__(self, *, terminal_state="succeeded", error=None):
+        self.manifest_calls = []
+        self.job_calls = []
+        self.terminal_state = terminal_state
+        self.error = error
+        self.claimed = False
+        self.claim_calls = 0
+        self.deadline_calls = []
+
+    async def health(self):
+        return {
+            "protocol_version": "1",
+            "claimed": self.claimed,
+        }
+
+    async def claim(self):
+        self.claimed = True
+        self.claim_calls += 1
+        return {
+            "protocol_version": "1",
+            "session_id": "session-boot",
+            "claimed": True,
+        }
+
+    async def update_deadline(self, payload):
+        self.deadline_calls.append(payload)
+        return {
+            "mode": payload["mode"],
+            "deadline_at": payload.get("deadline_at"),
+            "retrieval_grace_seconds": payload.get(
+                "retrieval_grace_seconds",
+                0,
+            ),
+            "destroy_intent": False,
+            "destroy_requested": False,
+        }
+
+    async def apply_manifest(self, payload):
+        self.manifest_calls.append(payload)
+        return {
+            "transaction_id": "provision-" + payload["manifest_digest"],
+            "manifest_digest": payload["manifest_digest"],
+            "state": "ready",
+            "planned_restarts": 0,
+            "repair_restarts": 0,
+            "missing_class_types": [],
+            "missing_artifacts": [],
+        }
+
+    async def start_job(self, payload):
+        self.job_calls.append(payload)
+        return {
+            "job_id": payload["job_id"],
+            "state": self.terminal_state,
+            "prompt_id": "11111111-1111-1111-1111-111111111111",
+            "last_sequence": 0,
+            "outputs": [],
+            "error": self.error,
+        }
+
+
+class SequentialRelay:
+    def __init__(self, worker):
+        self.worker = worker
+        self.calls = []
+
+    async def sync_job(self, job_id):
+        self.calls.append(job_id)
+        return RelaySyncResult(
+            job_id=job_id,
+            state=self.worker.terminal_state,
+            last_sequence=0,
+            events=(),
+            outputs=(),
+            error=self.worker.error,
+        )
+
+
+class ReusableSessionTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.path = Path(temporary.name) / "private" / "sessions.sqlite3"
+        self.jobs = JobRepository(self.path)
+        self.sessions = SessionRepository(self.path)
+        self.first_capture = capture_with_seed(11)
+        self.second_capture = capture_with_seed(12)
+        self.third_capture = capture_with_seed(13)
+        self.jobs.save_capture(self.first_capture, created_at=100.0)
+        self.jobs.save_capture(self.second_capture, created_at=100.0)
+        self.jobs.save_capture(self.third_capture, created_at=100.0)
+        self.model = local_artifact("model-a.safetensors", "a", kind="model")
+        self.input_a = local_artifact("input-a.jpg", "b")
+        self.input_b = local_artifact("input-b.jpg", "c")
+        self.first_resolution = artifact_resolution(
+            self.model,
+            self.input_a,
+        )
+        self.second_resolution = artifact_resolution(
+            self.model,
+            self.input_a,
+            self.input_b,
+        )
+        self.worker = SequentialWorker()
+        self.ids = iter(
+            (
+                "preflight-first",
+                "job-first",
+                "preflight-second",
+                "job-second",
+                "preflight-extra",
+                "job-extra",
+            )
+        )
+        self.service = SessionService(
+            job_repository=self.jobs,
+            session_repository=self.sessions,
+            resolver=PerCaptureResolver(
+                {
+                    self.first_capture.capture_id: self.first_resolution,
+                    self.second_capture.capture_id: self.second_resolution,
+                    self.third_capture.capture_id: self.first_resolution,
+                }
+            ),
+            release=worker_release(),
+            worker_factory=lambda _session: self.worker,
+            relay_factory=lambda worker, _session: SequentialRelay(worker),
+            clock=lambda: 100.0,
+            id_factory=lambda: next(self.ids),
+        )
+        initial = DependencyManifest(
+            schema_version=1,
+            protocol_version="1",
+            comfyui_core_version="0.29.0",
+            comfyui_frontend_version="1.47.10",
+            worker_version="a" * 40,
+            prompt_digest=self.first_capture.prompt_digest,
+            custom_nodes=(),
+            artifacts=(self.model, self.input_a),
+            output_allowance_bytes=1024,
+            disk_gb=80,
+        )
+        self.jobs.save_manifest(
+            initial.digest,
+            initial.canonical_bytes().decode("utf-8"),
+            created_at=100.0,
+        )
+        session = CloudSession.new(
+            "session-key",
+            session_id="session-1",
+            manifest_digest=initial.digest,
+            deadline_at=7300.0,
+            deadline_mode="finite",
+            disk_gb=80,
+            now=100.0,
+            state=SessionState.READY,
+        ).transition(
+            SessionState.READY,
+            now=100.0,
+            installed_manifest_digest=initial.digest,
+            instance_id="77",
+            worker_base_url="http://8.8.8.8:30000",
+            provider_token="provider-token",
+            session_secret_hex="d" * 64,
+        )
+        self.sessions.create_or_get(session)
+
+    def test_two_compatible_jobs_reuse_one_session_and_transfer_only_delta(self):
+        first = asyncio.run(
+            self.service.submit_job(
+                "session-1",
+                capture_id=self.first_capture.capture_id,
+                idempotency_key="job-key-1",
+            )
+        )
+        second = asyncio.run(
+            self.service.submit_job(
+                "session-1",
+                capture_id=self.second_capture.capture_id,
+                idempotency_key="job-key-2",
+            )
+        )
+
+        self.assertEqual(first.state, JobState.SUCCEEDED)
+        self.assertEqual(second.state, JobState.SUCCEEDED)
+        self.assertEqual(len(self.worker.job_calls), 2)
+        self.assertEqual(len(self.worker.manifest_calls), 1)
+        self.assertEqual(
+            [
+                item["artifact_id"]
+                for item in self.worker.manifest_calls[0]["manifest"][
+                    "artifacts"
+                ]
+            ],
+            ["input-a.jpg", "input-b.jpg", "model-a.safetensors"],
+        )
+        self.assertEqual(
+            self.sessions.get("session-1").state,
+            SessionState.READY,
+        )
+        self.assertEqual(
+            self.sessions.get("session-1").instance_id,
+            "77",
+        )
+
+    def test_changed_package_revision_requires_new_session_without_mutation(self):
+        first_node = custom_node("e")
+        second_node = custom_node("f")
+        initial = DependencyManifest(
+            schema_version=1,
+            protocol_version="1",
+            comfyui_core_version="0.29.0",
+            comfyui_frontend_version="1.47.10",
+            worker_version="a" * 40,
+            prompt_digest=self.first_capture.prompt_digest,
+            custom_nodes=(first_node,),
+            artifacts=(),
+            output_allowance_bytes=1024,
+            disk_gb=80,
+        )
+        self.jobs.save_manifest(
+            initial.digest,
+            initial.canonical_bytes().decode("utf-8"),
+            created_at=100.0,
+        )
+        session = self.sessions.get("session-1")
+        self.sessions.save(
+            session.transition(
+                SessionState.READY,
+                installed_manifest_digest=initial.digest,
+                manifest_digest=initial.digest,
+                now=100.0,
+            )
+        )
+        self.service.resolver.resolutions[
+            self.second_capture.capture_id
+        ] = artifact_resolution(custom_nodes=(second_node,))
+
+        with self.assertRaises(IncompatibleSession):
+            asyncio.run(
+                self.service.submit_job(
+                    "session-1",
+                    capture_id=self.second_capture.capture_id,
+                    idempotency_key="incompatible-key",
+                )
+            )
+
+        self.assertEqual(self.worker.manifest_calls, [])
+        self.assertEqual(self.worker.job_calls, [])
+        self.assertEqual(
+            self.sessions.get("session-1").state,
+            SessionState.READY,
+        )
+
+    def test_empty_dependency_delta_refreshes_prompt_identity_without_provisioning_state(self):
+        job = asyncio.run(
+            self.service.submit_job(
+                "session-1",
+                capture_id=self.third_capture.capture_id,
+                idempotency_key="fresh-prompt-key",
+            )
+        )
+
+        self.assertEqual(job.state, JobState.SUCCEEDED)
+        self.assertEqual(len(self.worker.manifest_calls), 1)
+        self.assertEqual(
+            self.worker.manifest_calls[0]["manifest_digest"],
+            job.manifest_digest,
+        )
+        self.assertEqual(
+            self.sessions.get("session-1").installed_manifest_digest,
+            job.manifest_digest,
+        )
+
+    def test_boot_claims_provisions_deadline_and_records_verified_installed_set(self):
+        initial_digest = self.sessions.get(
+            "session-1"
+        ).installed_manifest_digest
+        boot = CloudSession.new(
+            "boot-key",
+            session_id="session-boot",
+            manifest_digest=initial_digest,
+            deadline_at=7300.0,
+            deadline_mode="finite",
+            disk_gb=80,
+            now=100.0,
+            state=SessionState.BOOTSTRAPPING,
+        ).transition(
+            SessionState.BOOTSTRAPPING,
+            now=100.0,
+            instance_id="88",
+            worker_base_url="http://8.8.8.8:30001",
+            provider_token="provider-token-boot",
+            session_secret_hex="e" * 64,
+        )
+        self.sessions.create_or_get(boot)
+
+        ready = asyncio.run(
+            self.service.bootstrap_session("session-boot")
+        )
+
+        self.assertEqual(ready.state, SessionState.READY)
+        self.assertEqual(ready.installed_manifest_digest, initial_digest)
+        self.assertEqual(self.worker.claim_calls, 1)
+        self.assertEqual(len(self.worker.manifest_calls), 1)
+        self.assertEqual(
+            self.worker.deadline_calls,
+            [
+                {
+                    "mode": "finite",
+                    "deadline_at": 7300.0,
+                    "retrieval_grace_seconds": 300,
+                }
+            ],
+        )
+        self.assertEqual(
+            [
+                item.dependency_id
+                for item in self.jobs.installed_set("session-boot")
+            ],
+            ["input-a.jpg", "model-a.safetensors"],
+        )
+
+    def test_ready_recovery_reauthenticates_manifest_and_deadline_without_create(self):
+        self.worker.claimed = True
+
+        recovered = asyncio.run(
+            self.service.recover_session("session-1")
+        )
+
+        self.assertEqual(recovered.state, SessionState.READY)
+        self.assertEqual(self.worker.claim_calls, 0)
+        self.assertEqual(len(self.worker.manifest_calls), 1)
+        self.assertEqual(
+            self.worker.deadline_calls,
+            [
+                {
+                    "mode": "finite",
+                    "deadline_at": 7300.0,
+                    "retrieval_grace_seconds": 300,
+                }
+            ],
+        )
+
+    def test_running_recovery_idempotently_resumes_remote_job_and_harvest(self):
+        session = self.sessions.get("session-1")
+        session = self.sessions.save(
+            session.transition(SessionState.RUNNING, now=101.0)
+        )
+        running = CloudJob(
+            job_id="recover-job",
+            session_id=session.session_id,
+            idempotency_key="recover-key",
+            state=JobState.RUNNING,
+            prompt_digest=self.first_capture.prompt_digest,
+            capture_json=self.first_capture.canonical_payload(),
+            manifest_digest=session.installed_manifest_digest,
+            remote_prompt_id=(
+                "11111111-1111-1111-1111-111111111111"
+            ),
+            sanitized_error=None,
+            created_at=100.0,
+            updated_at=101.0,
+            version=1,
+        )
+        self.jobs.create_job(running)
+        self.worker.claimed = True
+
+        recovered = asyncio.run(
+            self.service.recover_session("session-1")
+        )
+
+        self.assertEqual(recovered.state, SessionState.READY)
+        self.assertEqual(
+            self.sessions.get("session-1").state,
+            SessionState.READY,
+        )
+        self.assertEqual(
+            self.jobs.get_job("recover-job").state,
+            JobState.SUCCEEDED,
+        )
+        self.assertEqual(len(self.worker.job_calls), 1)
+        self.assertEqual(self.worker.manifest_calls, [])
+
+    def test_execution_failure_returns_the_healthy_session_to_ready(self):
+        self.worker.terminal_state = "failed"
+        self.worker.error = {
+            "code": "out_of_memory",
+            "message": "Remote execution ran out of GPU memory.",
+        }
+
+        failed = asyncio.run(
+            self.service.submit_job(
+                "session-1",
+                capture_id=self.first_capture.capture_id,
+                idempotency_key="failed-key",
+            )
+        )
+
+        self.assertEqual(failed.state, JobState.FAILED)
+        self.assertEqual(
+            failed.sanitized_error,
+            "Remote execution ran out of GPU memory.",
+        )
+        self.assertEqual(
+            self.sessions.get("session-1").state,
+            SessionState.READY,
+        )
+
+    def test_running_remote_job_returns_immediately_then_finishes_in_background(self):
+        async def scenario():
+            released = asyncio.Event()
+            self.worker.terminal_state = "running"
+
+            class PendingRelay:
+                async def sync_job(inner_self, job_id):
+                    await released.wait()
+                    return RelaySyncResult(
+                        job_id=job_id,
+                        state="succeeded",
+                        last_sequence=1,
+                        events=(),
+                        outputs=(),
+                        error=None,
+                    )
+
+            self.service.relay_factory = (
+                lambda _worker, _session: PendingRelay()
+            )
+            running = await self.service.submit_job(
+                "session-1",
+                capture_id=self.first_capture.capture_id,
+                idempotency_key="background-key",
+            )
+
+            self.assertEqual(running.state, JobState.RUNNING)
+            self.assertEqual(
+                self.sessions.get("session-1").state,
+                SessionState.RUNNING,
+            )
+            released.set()
+            for _ in range(20):
+                if (
+                    self.jobs.get_job(running.job_id).state
+                    == JobState.SUCCEEDED
+                ):
+                    break
+                await asyncio.sleep(0)
+            return running.job_id
+
+        job_id = asyncio.run(scenario())
+
+        self.assertEqual(
+            self.jobs.get_job(job_id).state,
+            JobState.SUCCEEDED,
+        )
+        self.assertEqual(
+            self.sessions.get("session-1").state,
+            SessionState.READY,
+        )
+
+    def test_duplicate_key_is_idempotent_and_busy_session_rejects_new_job(self):
+        first = asyncio.run(
+            self.service.submit_job(
+                "session-1",
+                capture_id=self.first_capture.capture_id,
+                idempotency_key="same-key",
+            )
+        )
+        duplicate = asyncio.run(
+            self.service.submit_job(
+                "session-1",
+                capture_id=self.second_capture.capture_id,
+                idempotency_key="same-key",
+            )
+        )
+        current = self.sessions.get("session-1")
+        self.sessions.save(
+            current.transition(SessionState.RUNNING, now=101.0)
+        )
+
+        with self.assertRaises(SessionBusy):
+            asyncio.run(
+                self.service.submit_job(
+                    "session-1",
+                    capture_id=self.second_capture.capture_id,
+                    idempotency_key="busy-key",
+                )
+            )
+
+        self.assertEqual(duplicate.job_id, first.job_id)
+        self.assertEqual(len(self.worker.job_calls), 1)
+
+    def test_job_submission_rejects_non_string_identifiers_before_resolution(self):
+        calls = len(self.service.resolver.calls)
+
+        with self.assertRaisesRegex(SessionServiceError, "idempotency"):
+            asyncio.run(
+                self.service.submit_job(
+                    "session-1",
+                    capture_id=self.first_capture.capture_id,
+                    idempotency_key=7,
+                )
+            )
+
+        self.assertEqual(len(self.service.resolver.calls), calls)
+
+    def test_compatible_delta_resumes_required_local_upload_before_job(self):
+        content = b"new-private-input"
+        path = self.path.parent / "new-input.jpg"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+        digest = __import__("hashlib").sha256(content).hexdigest()
+        artifact = ArtifactSpec(
+            artifact_id="new-input",
+            kind="input",
+            logical_name="new-input.jpg",
+            destination="input/new-input.jpg",
+            size_bytes=len(content),
+            sha256=digest,
+            source=SourceSpec(
+                "local-upload",
+                "local-upload:new-input",
+            ),
+        )
+        self.jobs.register_local_artifact(
+            types.SimpleNamespace(
+                artifact_id="new-input",
+                private_path=str(path),
+                size_bytes=len(content),
+                sha256=digest,
+            )
+        )
+        self.service.resolver.resolutions[
+            self.second_capture.capture_id
+        ] = artifact_resolution(self.model, self.input_a, artifact)
+        apply_count = 0
+
+        async def apply_manifest(payload):
+            nonlocal apply_count
+            apply_count += 1
+            self.worker.manifest_calls.append(payload)
+            response = {
+                "transaction_id": (
+                    "provision-" + payload["manifest_digest"]
+                ),
+                "manifest_digest": payload["manifest_digest"],
+                "state": (
+                    "awaiting_upload" if apply_count == 1 else "ready"
+                ),
+                "planned_restarts": 0,
+                "repair_restarts": 0,
+                "missing_class_types": [],
+                "missing_artifacts": [],
+            }
+            if apply_count == 1:
+                response["required_uploads"] = ["new-input"]
+            return response
+
+        async def upload_artifact(
+            artifact_id,
+            *,
+            path,
+            size_bytes,
+            sha256,
+            start,
+            on_progress,
+        ):
+            self.assertEqual(artifact_id, "new-input")
+            self.assertEqual(start, 0)
+            self.assertEqual(Path(path).read_bytes(), content)
+            await on_progress(size_bytes)
+            return {
+                "artifact_id": artifact_id,
+                "state": "verified",
+                "next_offset": size_bytes,
+                "size_bytes": size_bytes,
+                "sha256": sha256,
+            }
+
+        self.worker.apply_manifest = apply_manifest
+        self.worker.upload_artifact = upload_artifact
+
+        job = asyncio.run(
+            self.service.submit_job(
+                "session-1",
+                capture_id=self.second_capture.capture_id,
+                idempotency_key="upload-key",
+            )
+        )
+
+        transfer = self.jobs.get_transfer(job.job_id, "new-input")
+        self.assertEqual(job.state, JobState.SUCCEEDED)
+        self.assertEqual(transfer.state.value, "verified")
+        self.assertEqual(transfer.offset, len(content))
+        self.assertEqual(apply_count, 2)
 
 
 if __name__ == "__main__":

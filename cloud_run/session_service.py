@@ -2,21 +2,31 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 import hashlib
+import inspect
 import json
+import math
+from pathlib import Path
 from pathlib import PurePosixPath
 import re
 import time
 import uuid
 
+from .artifacts import ArtifactPathError, hash_file
+from .capture import CompiledCapture
 from .manifest import (
     DependencyManifest,
+    ManifestDelta,
     MANIFEST_SCHEMA_VERSION,
     PINNED_COMFYUI_CORE_VERSION,
     PINNED_COMFYUI_FRONTEND_VERSION,
     PROTOCOL_VERSION,
 )
+from .models import CloudJob, JobState, SessionState, TransferState
+from .relay import RelaySyncResult
+from .repository import ConcurrentSessionUpdate, SessionRepository
 from .worker_release import WorkerRelease
 
 
@@ -36,6 +46,7 @@ _SOURCE_KINDS = {
     "r2",
     "registry",
 }
+_JOB_TASKS = {}
 
 
 class SessionServiceError(RuntimeError):
@@ -54,11 +65,29 @@ class PreflightBlocked(SessionServiceError):
     pass
 
 
+class SessionBusy(SessionServiceError):
+    pass
+
+
+class IncompatibleSession(SessionServiceError):
+    pass
+
+
+class SessionExecutionError(SessionServiceError):
+    pass
+
+
 def _identifier(value, name):
     normalized = str(value or "")
     if not _IDENTIFIER.fullmatch(normalized):
         raise SessionServiceError(f"Invalid {name}.")
     return normalized
+
+
+def _strict_identifier(value, name):
+    if not isinstance(value, str) or not _IDENTIFIER.fullmatch(value):
+        raise SessionServiceError(f"Invalid {name}.")
+    return value
 
 
 def _safe_text(value, name, *, optional=False):
@@ -373,6 +402,37 @@ def _transfer_bytes(resolution):
     return sum(identities.values())
 
 
+def _required_local_upload_ids(resolution):
+    identifiers = []
+    for artifact in resolution.artifacts:
+        if artifact.source.kind == "local-upload":
+            identifiers.append(
+                (
+                    artifact.artifact_id,
+                    artifact.source.locator.removeprefix(
+                        "local-upload:"
+                    ),
+                )
+            )
+    for node in resolution.custom_nodes:
+        if node.archive.source.kind == "local-upload":
+            identifiers.append(
+                (
+                    node.archive.artifact_id,
+                    node.archive.source.locator.removeprefix(
+                        "local-upload:"
+                    ),
+                )
+            )
+        for wheel in node.wheels:
+            if wheel.source.kind == "local-upload":
+                identifier = wheel.source.locator.removeprefix(
+                    "local-upload:"
+                )
+                identifiers.append((identifier,))
+    return tuple(identifiers)
+
+
 def _manifest_transfer_bytes(payload):
     total = 0
     seen = set()
@@ -398,6 +458,152 @@ def _manifest_transfer_bytes(payload):
     return total
 
 
+def _stored_manifest(repository, manifest_digest):
+    if not isinstance(manifest_digest, str) or not _HEX_64.fullmatch(
+        manifest_digest
+    ):
+        raise SessionExecutionError(
+            "Stored session manifest is unavailable."
+        )
+    encoded = repository.get_manifest(manifest_digest)
+    if not isinstance(encoded, str) or hashlib.sha256(
+        encoded.encode("utf-8")
+    ).hexdigest() != manifest_digest:
+        raise SessionExecutionError(
+            "Stored session manifest is unavailable."
+        )
+    try:
+        payload = json.loads(encoded)
+        from remote_worker.provision import dependency_manifest_from_record
+
+        manifest = dependency_manifest_from_record(payload)
+    except Exception:
+        raise SessionExecutionError(
+            "Stored session manifest is unavailable."
+        ) from None
+    if manifest.digest != manifest_digest:
+        raise SessionExecutionError(
+            "Stored session manifest is unavailable."
+        )
+    return manifest
+
+
+def _manifest_payload(manifest):
+    try:
+        return json.loads(manifest.canonical_bytes().decode("utf-8"))
+    except (TypeError, ValueError, UnicodeError, json.JSONDecodeError):
+        raise SessionExecutionError(
+            "Dependency manifest could not be prepared."
+        ) from None
+
+
+def _transfer_catalog(manifest):
+    try:
+        from remote_worker.transfers import wheel_artifact
+
+        artifacts = [
+            *manifest.artifacts,
+            *(node.archive for node in manifest.custom_nodes),
+            *(
+                wheel_artifact(wheel)
+                for node in manifest.custom_nodes
+                for wheel in node.wheels
+            ),
+        ]
+    except Exception:
+        raise SessionExecutionError(
+            "Dependency transfer plan is unavailable."
+        ) from None
+    catalog = {}
+    for artifact in artifacts:
+        prior = catalog.get(artifact.artifact_id)
+        if prior is not None and prior != artifact:
+            raise SessionExecutionError(
+                "Dependency transfer identities conflict."
+            )
+        catalog[artifact.artifact_id] = artifact
+    return catalog
+
+
+def _installed_records(manifest):
+    records = []
+    for artifact_id, artifact in sorted(_transfer_catalog(manifest).items()):
+        revision = None
+        for node in manifest.custom_nodes:
+            if node.archive.artifact_id == artifact_id:
+                revision = node.revision
+                break
+        records.append(
+            {
+                "dependency_id": artifact_id,
+                "digest": artifact.sha256,
+                "revision": revision,
+                "destination": artifact.destination,
+            }
+        )
+    return records
+
+
+def _safe_remote_error(error):
+    if not isinstance(error, dict):
+        return "Remote execution failed."
+    message = error.get("message")
+    allowed = {
+        "Remote ComfyUI rejected the compiled prompt.",
+        "Remote execution ran out of GPU memory.",
+        "Remote execution failed.",
+        "Remote execution was interrupted.",
+        "Remote execution was interrupted by a worker restart.",
+    }
+    return message if message in allowed else "Remote execution failed."
+
+
+def _provision_payload_valid(payload, manifest_digest):
+    required = {
+        "transaction_id",
+        "manifest_digest",
+        "state",
+        "planned_restarts",
+        "repair_restarts",
+        "missing_class_types",
+        "missing_artifacts",
+    }
+    if not isinstance(payload, dict) or frozenset(payload) not in {
+        frozenset(required),
+        frozenset(required | {"required_uploads"}),
+    }:
+        return False
+    if (
+        not isinstance(payload.get("transaction_id"), str)
+        or not _IDENTIFIER.fullmatch(payload["transaction_id"])
+        or payload.get("manifest_digest") != manifest_digest
+        or payload.get("state")
+        not in {"applying", "awaiting_upload", "ready", "failed", "stalled"}
+        or payload.get("planned_restarts") not in {0, 1}
+        or isinstance(payload.get("planned_restarts"), bool)
+        or payload.get("repair_restarts") not in {0, 1}
+        or isinstance(payload.get("repair_restarts"), bool)
+    ):
+        return False
+    for name in (
+        "missing_class_types",
+        "missing_artifacts",
+        "required_uploads",
+    ):
+        values = payload.get(name, [])
+        if (
+            not isinstance(values, list)
+            or len(values) > 100_000
+            or not all(
+                isinstance(value, str) and _IDENTIFIER.fullmatch(value)
+                for value in values
+            )
+            or len(set(values)) != len(values)
+        ):
+            return False
+    return True
+
+
 class SessionService:
     def __init__(
         self,
@@ -407,16 +613,42 @@ class SessionService:
         offer_search=None,
         mapping_repository=None,
         release,
+        session_repository=None,
+        worker_factory=None,
+        relay_factory=None,
+        source_url_resolver=None,
         clock=None,
         id_factory=None,
+        sleep=None,
+        job_poll_interval_seconds=1,
+        max_job_polls=86_400,
     ):
         self.job_repository = job_repository
         self.resolver = resolver
         self.offer_search = offer_search
         self.mapping_repository = mapping_repository
         self.release = release if isinstance(release, WorkerRelease) else None
+        self.session_repository = session_repository
+        self.worker_factory = worker_factory
+        self.relay_factory = relay_factory
+        self.source_url_resolver = source_url_resolver
         self.clock = clock or time.time
         self.id_factory = id_factory or (lambda: str(uuid.uuid4()))
+        self.sleep = sleep or asyncio.sleep
+        if (
+            isinstance(job_poll_interval_seconds, bool)
+            or not isinstance(job_poll_interval_seconds, (int, float))
+            or not math.isfinite(job_poll_interval_seconds)
+            or job_poll_interval_seconds < 0
+            or isinstance(max_job_polls, bool)
+            or not isinstance(max_job_polls, int)
+            or not 1 <= max_job_polls <= 1_000_000
+        ):
+            raise ValueError("Invalid session polling policy.")
+        self.job_poll_interval_seconds = float(
+            job_poll_interval_seconds
+        )
+        self.max_job_polls = max_job_polls
 
     async def preflight(
         self,
@@ -433,6 +665,30 @@ class SessionService:
                 explicit_output_allowance_bytes
             ),
         )
+        local_artifacts = getattr(resolution, "local_artifacts", None)
+        local_uploads_available = True
+        if local_artifacts is not None:
+            for artifact in local_artifacts:
+                try:
+                    self.job_repository.register_local_artifact(
+                        artifact,
+                        created_at=float(self.clock()),
+                    )
+                except Exception:
+                    continue
+            lookup = getattr(
+                self.job_repository,
+                "get_local_artifact",
+                None,
+            )
+            required_local = _required_local_upload_ids(resolution)
+            local_uploads_available = callable(lookup) and all(
+                any(
+                    lookup(identifier) is not None
+                    for identifier in alternatives
+                )
+                for alternatives in required_local
+            )
         rows = _preflight_rows(resolution, self.mapping_repository)
         output_allowance = getattr(
             resolution,
@@ -443,6 +699,7 @@ class SessionService:
         rentable = bool(
             resolution.rentable
             and self.release is not None
+            and local_uploads_available
             and rows
             and all(row.status == "resolved" for row in rows)
             and isinstance(output_allowance, int)
@@ -575,3 +832,1061 @@ class SessionService:
     def register_agent_suggestion(self, payload):
         candidate = self.resolver.register_agent_suggestion(payload)
         return candidate.public_payload()
+
+    def _now(self):
+        value = self.clock()
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < 0
+        ):
+            raise SessionExecutionError("Session clock is unavailable.")
+        return float(value)
+
+    def _sessions(self):
+        if not isinstance(self.session_repository, SessionRepository):
+            raise SessionExecutionError(
+                "Cloud Run session storage is unavailable."
+            )
+        return self.session_repository
+
+    def session(self, session_id):
+        identifier = _strict_identifier(session_id, "session ID")
+        session = self._sessions().get(identifier)
+        if session is None:
+            raise SessionExecutionError(
+                "Cloud Run session was not found."
+            )
+        return session
+
+    def get_job(self, session_id, job_id):
+        session = self.session(session_id)
+        job = self.job_repository.get_job(
+            _strict_identifier(job_id, "job ID")
+        )
+        if job is None or job.session_id != session.session_id:
+            raise SessionExecutionError("Cloud Run job was not found.")
+        return job
+
+    def _worker(self, session):
+        if not callable(self.worker_factory):
+            raise SessionExecutionError("Remote worker is unavailable.")
+        try:
+            worker = self.worker_factory(session)
+        except Exception:
+            raise SessionExecutionError("Remote worker is unavailable.") from None
+        required = ("apply_manifest", "start_job")
+        if not all(callable(getattr(worker, name, None)) for name in required):
+            raise SessionExecutionError("Remote worker is unavailable.")
+        return worker
+
+    def _relay(self, worker, session):
+        if not callable(self.relay_factory):
+            raise SessionExecutionError("Local relay is unavailable.")
+        try:
+            relay = self.relay_factory(worker, session)
+        except Exception:
+            raise SessionExecutionError("Local relay is unavailable.") from None
+        if not callable(getattr(relay, "sync_job", None)):
+            raise SessionExecutionError("Local relay is unavailable.")
+        return relay
+
+    def _new_job(self, session, capture, manifest_digest, key):
+        now = self._now()
+        return CloudJob(
+            job_id=_strict_identifier(self.id_factory(), "job ID"),
+            session_id=session.session_id,
+            idempotency_key=_strict_identifier(
+                key,
+                "job idempotency key",
+            ),
+            state=JobState.CAPTURED,
+            prompt_digest=capture.prompt_digest,
+            capture_json=capture.canonical_payload(),
+            manifest_digest=manifest_digest,
+            remote_prompt_id=None,
+            sanitized_error=None,
+            created_at=now,
+            updated_at=now,
+            version=1,
+        )
+
+    def _transition_job(self, job, state, **changes):
+        return self.job_repository.save_job(
+            job.transition(
+                state,
+                now=self._now(),
+                **changes,
+            )
+        )
+
+    async def _fresh_manifest(self, session, capture):
+        installed = _stored_manifest(
+            self.job_repository,
+            session.installed_manifest_digest,
+        )
+        result = await self.preflight(
+            capture.capture_id,
+            explicit_output_allowance_bytes=(
+                installed.output_allowance_bytes
+            ),
+        )
+        if (
+            not result.rentable
+            or result.manifest_digest is None
+            or result.disk_gb is None
+            or result.disk_gb > session.disk_gb
+        ):
+            raise PreflightBlocked(
+                "The fresh canvas is not compatible with this session."
+            )
+        desired = _stored_manifest(
+            self.job_repository,
+            result.manifest_digest,
+        )
+        return installed, desired
+
+    async def _source_url(self, artifact, session):
+        locator = artifact.source.locator
+        if (
+            artifact.source.kind in {"huggingface", "civitai"}
+            and artifact.source.secret_handle is None
+            and isinstance(locator, str)
+            and locator.startswith("https://")
+        ):
+            return locator
+        if not callable(self.source_url_resolver):
+            raise SessionExecutionError(
+                "A temporary dependency source is unavailable."
+            )
+        try:
+            value = self.source_url_resolver(artifact, session)
+            if inspect.isawaitable(value):
+                value = await value
+        except Exception:
+            raise SessionExecutionError(
+                "A temporary dependency source is unavailable."
+            ) from None
+        if (
+            not isinstance(value, str)
+            or not value.startswith("https://")
+            or len(value.encode("utf-8")) > 8192
+        ):
+            raise SessionExecutionError(
+                "A temporary dependency source is unavailable."
+            )
+        return value
+
+    async def _source_urls(self, manifest, session):
+        result = {}
+        for artifact_id, artifact in sorted(
+            _transfer_catalog(manifest).items()
+        ):
+            if artifact.source.kind == "local-upload":
+                continue
+            result[artifact_id] = await self._source_url(
+                artifact,
+                session,
+            )
+        return result
+
+    def _local_artifact(self, artifact):
+        lookup = getattr(self.job_repository, "get_local_artifact", None)
+        if not callable(lookup):
+            raise SessionExecutionError(
+                "A local dependency artifact is unavailable."
+            )
+        candidates = [artifact.artifact_id]
+        locator = artifact.source.locator
+        if (
+            artifact.source.kind == "local-upload"
+            and isinstance(locator, str)
+            and locator.startswith("local-upload:")
+        ):
+            candidates.append(locator.removeprefix("local-upload:"))
+        record = None
+        for candidate in candidates:
+            record = lookup(candidate)
+            if record is not None:
+                break
+        if (
+            record is None
+            or record.size_bytes != artifact.size_bytes
+            or record.sha256 != artifact.sha256
+        ):
+            raise SessionExecutionError(
+                "A local dependency artifact is unavailable."
+            )
+        try:
+            current = hash_file(record.private_path)
+        except ArtifactPathError:
+            raise SessionExecutionError(
+                "A local dependency artifact is unavailable."
+            ) from None
+        if (
+            current.size_bytes != artifact.size_bytes
+            or current.sha256 != artifact.sha256
+        ):
+            raise SessionExecutionError(
+                "A local dependency artifact changed."
+            )
+        return record
+
+    async def _upload_artifact(self, worker, job_id, artifact):
+        upload = getattr(worker, "upload_artifact", None)
+        if not callable(upload):
+            raise SessionExecutionError(
+                "Remote dependency upload is unavailable."
+            )
+        local = self._local_artifact(artifact)
+        existing = self.job_repository.get_transfer(
+            job_id,
+            artifact.artifact_id,
+        )
+        if existing is not None and (
+            existing.direction != "upload"
+            or existing.expected_size != artifact.size_bytes
+            or existing.sha256 != artifact.sha256
+        ):
+            raise SessionExecutionError(
+                "Stored dependency upload identity changed."
+            )
+        offset = existing.offset if existing is not None else 0
+        if existing is not None and existing.state == TransferState.VERIFIED:
+            return
+        upload_status = getattr(worker, "upload_status", None)
+        if callable(upload_status):
+            try:
+                remote_status = await upload_status(
+                    artifact.artifact_id
+                )
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                raise
+            except Exception:
+                remote_status = None
+            if remote_status is not None:
+                if (
+                    not isinstance(remote_status, dict)
+                    or remote_status.get("artifact_id")
+                    != artifact.artifact_id
+                    or remote_status.get("size_bytes")
+                    != artifact.size_bytes
+                    or remote_status.get("sha256") != artifact.sha256
+                    or remote_status.get("state")
+                    not in {"receiving", "verified"}
+                    or isinstance(
+                        remote_status.get("next_offset"),
+                        bool,
+                    )
+                    or not isinstance(
+                        remote_status.get("next_offset"),
+                        int,
+                    )
+                    or not 0
+                    <= remote_status["next_offset"]
+                    <= artifact.size_bytes
+                    or (
+                        remote_status["state"] == "verified"
+                        and remote_status["next_offset"]
+                        != artifact.size_bytes
+                    )
+                    or (
+                        remote_status["state"] == "receiving"
+                        and remote_status["next_offset"]
+                        >= artifact.size_bytes
+                    )
+                ):
+                    raise SessionExecutionError(
+                        "Remote dependency upload identity changed."
+                    )
+                remote_offset = remote_status["next_offset"]
+                if existing is not None and remote_offset < existing.offset:
+                    self.job_repository.reset_transfer(
+                        job_id,
+                        artifact.artifact_id,
+                    )
+                offset = remote_offset
+                if (
+                    remote_status["state"] == "verified"
+                    and offset == artifact.size_bytes
+                ):
+                    self.job_repository.save_transfer(
+                        job_id=job_id,
+                        artifact_id=artifact.artifact_id,
+                        direction="upload",
+                        expected_size=artifact.size_bytes,
+                        sha256=artifact.sha256,
+                        offset=offset,
+                        state=TransferState.VERIFIED,
+                        private_path=local.private_path,
+                    )
+                    return
+        self.job_repository.save_transfer(
+            job_id=job_id,
+            artifact_id=artifact.artifact_id,
+            direction="upload",
+            expected_size=artifact.size_bytes,
+            sha256=artifact.sha256,
+            offset=offset,
+            state=TransferState.TRANSFERRING,
+            private_path=local.private_path,
+        )
+
+        async def progress(next_offset):
+            if (
+                isinstance(next_offset, bool)
+                or not isinstance(next_offset, int)
+                or not offset <= next_offset <= artifact.size_bytes
+            ):
+                raise SessionExecutionError(
+                    "Remote dependency upload made invalid progress."
+                )
+            self.job_repository.save_transfer(
+                job_id=job_id,
+                artifact_id=artifact.artifact_id,
+                direction="upload",
+                expected_size=artifact.size_bytes,
+                sha256=artifact.sha256,
+                offset=next_offset,
+                state=(
+                    TransferState.VERIFIED
+                    if next_offset == artifact.size_bytes
+                    else TransferState.TRANSFERRING
+                ),
+                private_path=local.private_path,
+            )
+
+        try:
+            receipt = await upload(
+                artifact.artifact_id,
+                path=local.private_path,
+                size_bytes=artifact.size_bytes,
+                sha256=artifact.sha256,
+                start=offset,
+                on_progress=progress,
+            )
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            raise
+        except Exception:
+            current = self.job_repository.get_transfer(
+                job_id,
+                artifact.artifact_id,
+            )
+            current_offset = current.offset if current is not None else offset
+            self.job_repository.save_transfer(
+                job_id=job_id,
+                artifact_id=artifact.artifact_id,
+                direction="upload",
+                expected_size=artifact.size_bytes,
+                sha256=artifact.sha256,
+                offset=current_offset,
+                state=TransferState.FAILED,
+                private_path=local.private_path,
+            )
+            raise SessionExecutionError(
+                "Remote dependency upload failed."
+            ) from None
+        if (
+            not isinstance(receipt, dict)
+            or set(receipt)
+            != {
+                "artifact_id",
+                "state",
+                "next_offset",
+                "size_bytes",
+                "sha256",
+            }
+            or receipt.get("artifact_id") != artifact.artifact_id
+            or receipt.get("state") != "verified"
+            or receipt.get("next_offset") != artifact.size_bytes
+            or receipt.get("size_bytes") != artifact.size_bytes
+            or receipt.get("sha256") != artifact.sha256
+        ):
+            raise SessionExecutionError(
+                "Remote dependency upload was not verified."
+            )
+        await progress(artifact.size_bytes)
+
+    async def _apply_manifest(
+        self,
+        worker,
+        session,
+        manifest,
+        *,
+        transfer_job_id,
+        capture,
+    ):
+        request = {
+            "manifest": _manifest_payload(manifest),
+            "manifest_digest": manifest.digest,
+            "required_class_types": sorted(
+                set(capture.executable_class_types)
+            ),
+            "source_urls": await self._source_urls(manifest, session),
+        }
+        catalog = _transfer_catalog(manifest)
+        for _attempt in range(3):
+            try:
+                response = await worker.apply_manifest(request)
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                raise
+            except Exception:
+                raise SessionExecutionError(
+                    "Remote provisioning failed."
+                ) from None
+            if not _provision_payload_valid(response, manifest.digest):
+                raise SessionExecutionError(
+                    "Remote provisioning response was invalid."
+                )
+            required_uploads = response.get("required_uploads", [])
+            if required_uploads:
+                for artifact_id in required_uploads:
+                    artifact = catalog.get(artifact_id)
+                    if (
+                        artifact is None
+                        or artifact.source.kind != "local-upload"
+                    ):
+                        raise SessionExecutionError(
+                            "Remote provisioning requested an unknown upload."
+                        )
+                    await self._upload_artifact(
+                        worker,
+                        transfer_job_id,
+                        artifact,
+                    )
+                continue
+            if response["state"] == "ready":
+                return response
+            if response["state"] in {"failed", "stalled"}:
+                raise SessionExecutionError(
+                    "Remote provisioning did not become ready."
+                )
+            transaction = getattr(worker, "transaction", None)
+            if not callable(transaction):
+                raise SessionExecutionError(
+                    "Remote provisioning is incomplete."
+                )
+            try:
+                response = await transaction(response["transaction_id"])
+            except Exception:
+                raise SessionExecutionError(
+                    "Remote provisioning status is unavailable."
+                ) from None
+            if (
+                not _provision_payload_valid(response, manifest.digest)
+                or response["state"] != "ready"
+            ):
+                raise SessionExecutionError(
+                    "Remote provisioning is incomplete."
+                )
+            return response
+        raise SessionExecutionError(
+            "Remote provisioning did not accept required uploads."
+        )
+
+    async def bootstrap_session(self, session_id):
+        session = self.session(session_id)
+        if session.state not in {
+            SessionState.BOOTSTRAPPING,
+            SessionState.PROVISIONING,
+            SessionState.VALIDATING,
+        }:
+            return session
+        if (
+            not session.worker_base_url
+            or not session.provider_token
+            or not session.session_secret_hex
+        ):
+            raise SessionExecutionError(
+                "Remote worker connection is unavailable."
+            )
+        worker = self._worker(session)
+        health = getattr(worker, "health", None)
+        claim = getattr(worker, "claim", None)
+        deadline = getattr(worker, "update_deadline", None)
+        if not all(callable(item) for item in (health, claim, deadline)):
+            raise SessionExecutionError("Remote worker is unavailable.")
+        try:
+            health_payload = await health()
+            if health_payload.get("claimed") is not True:
+                await claim()
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            raise
+        except Exception:
+            raise SessionExecutionError(
+                "Remote worker authentication failed."
+            ) from None
+        if session.state == SessionState.BOOTSTRAPPING:
+            session = self._sessions().transition_if_state(
+                session.session_id,
+                SessionState.BOOTSTRAPPING,
+                SessionState.PROVISIONING,
+                now=self._now(),
+            )
+        manifest = _stored_manifest(
+            self.job_repository,
+            session.manifest_digest,
+        )
+        capture = self.job_repository.get_capture_by_prompt_digest(
+            manifest.prompt_digest
+        )
+        if capture is None:
+            raise SessionExecutionError(
+                "Initial session capture is unavailable."
+            )
+        if session.state == SessionState.PROVISIONING:
+            await self._apply_manifest(
+                worker,
+                session,
+                manifest,
+                transfer_job_id="bootstrap:" + session.session_id,
+                capture=capture,
+            )
+            session = self._sessions().transition(
+                session.session_id,
+                SessionState.VALIDATING,
+                now=self._now(),
+            )
+        policy = (
+            {
+                "mode": "finite",
+                "deadline_at": session.deadline_at,
+                "retrieval_grace_seconds": 300,
+            }
+            if session.deadline_mode == "finite"
+            else {"mode": "none", "acknowledged": True}
+        )
+        try:
+            deadline_result = await deadline(policy)
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            raise
+        except Exception:
+            raise SessionExecutionError(
+                "Remote deadline enforcement failed."
+            ) from None
+        if (
+            not isinstance(deadline_result, dict)
+            or deadline_result.get("mode") != session.deadline_mode
+            or (
+                session.deadline_mode == "finite"
+                and deadline_result.get("deadline_at")
+                != session.deadline_at
+            )
+        ):
+            raise SessionExecutionError(
+                "Remote deadline enforcement failed."
+            )
+        self.job_repository.replace_installed_set(
+            session.session_id,
+            _installed_records(manifest),
+        )
+        return self._sessions().transition(
+            session.session_id,
+            SessionState.READY,
+            now=self._now(),
+            installed_manifest_digest=manifest.digest,
+            sanitized_error=None,
+        )
+
+    async def recover_session(self, session_id):
+        session = self.session(session_id)
+        if session.state not in {
+            SessionState.READY,
+            SessionState.RUNNING,
+            SessionState.HARVESTING,
+            SessionState.PROVISIONING,
+            SessionState.VALIDATING,
+        }:
+            return session
+        if (
+            not session.worker_base_url
+            or not session.provider_token
+            or not session.session_secret_hex
+        ):
+            raise SessionExecutionError(
+                "Remote worker connection is unavailable."
+            )
+        worker = self._worker(session)
+        health = getattr(worker, "health", None)
+        claim = getattr(worker, "claim", None)
+        deadline = getattr(worker, "update_deadline", None)
+        if not all(callable(item) for item in (health, claim, deadline)):
+            raise SessionExecutionError("Remote worker is unavailable.")
+        try:
+            health_payload = await health()
+            if health_payload.get("claimed") is not True:
+                await claim()
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            raise
+        except Exception:
+            raise SessionExecutionError(
+                "Remote worker authentication failed."
+            ) from None
+        manifest = _stored_manifest(
+            self.job_repository,
+            session.installed_manifest_digest,
+        )
+        if session.state == SessionState.READY:
+            capture = self.job_repository.get_capture_by_prompt_digest(
+                manifest.prompt_digest
+            )
+            if capture is None:
+                raise SessionExecutionError(
+                    "Installed session capture is unavailable."
+                )
+            await self._apply_manifest(
+                worker,
+                session,
+                manifest,
+                transfer_job_id="recovery:" + session.session_id,
+                capture=capture,
+            )
+        policy = (
+            {
+                "mode": "finite",
+                "deadline_at": session.deadline_at,
+                "retrieval_grace_seconds": 300,
+            }
+            if session.deadline_mode == "finite"
+            else {"mode": "none", "acknowledged": True}
+        )
+        try:
+            deadline_result = await deadline(policy)
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            raise
+        except Exception:
+            raise SessionExecutionError(
+                "Remote deadline enforcement failed."
+            ) from None
+        if (
+            not isinstance(deadline_result, dict)
+            or deadline_result.get("mode") != session.deadline_mode
+            or (
+                session.deadline_mode == "finite"
+                and deadline_result.get("deadline_at")
+                != session.deadline_at
+            )
+        ):
+            raise SessionExecutionError(
+                "Remote deadline enforcement failed."
+            )
+        self.job_repository.replace_installed_set(
+            session.session_id,
+            _installed_records(manifest),
+        )
+        session = self._sessions().transition(
+            session.session_id,
+            session.state,
+            now=self._now(),
+            installed_manifest_digest=manifest.digest,
+            sanitized_error=None,
+        )
+        if session.state in {
+            SessionState.RUNNING,
+            SessionState.HARVESTING,
+            SessionState.PROVISIONING,
+            SessionState.VALIDATING,
+        }:
+            await self.resume_session(session.session_id)
+            return self.session(session.session_id)
+        return session
+
+    async def _finish_remote_job(self, session, job, worker):
+        relay = self._relay(worker, session)
+        for poll in range(self.max_job_polls):
+            try:
+                result = await relay.sync_job(job.job_id)
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                raise
+            except Exception:
+                raise SessionExecutionError(
+                    "Remote job synchronization failed."
+                ) from None
+            if (
+                not isinstance(result, RelaySyncResult)
+                or result.job_id != job.job_id
+            ):
+                raise SessionExecutionError(
+                    "Remote job synchronization failed."
+                )
+            if result.state in {"queued", "running"}:
+                if poll + 1 >= self.max_job_polls:
+                    break
+                await self.sleep(self.job_poll_interval_seconds)
+                continue
+            if result.state == "succeeded":
+                if session.state == SessionState.RUNNING:
+                    session = self._sessions().transition_if_state(
+                        session.session_id,
+                        SessionState.RUNNING,
+                        SessionState.HARVESTING,
+                        now=self._now(),
+                    )
+                if job.state == JobState.RUNNING:
+                    job = self._transition_job(
+                        job,
+                        JobState.HARVESTING,
+                    )
+                if (
+                    session.state != SessionState.HARVESTING
+                    or job.state != JobState.HARVESTING
+                ):
+                    raise SessionExecutionError(
+                        "Local harvesting state is inconsistent."
+                    )
+                job = self._transition_job(job, JobState.SUCCEEDED)
+                self._sessions().transition_if_state(
+                    session.session_id,
+                    SessionState.HARVESTING,
+                    SessionState.READY,
+                    now=self._now(),
+                    sanitized_error=None,
+                )
+                return job
+            if result.state in {"failed", "interrupted"}:
+                job = self._transition_job(
+                    job,
+                    JobState.FAILED,
+                    sanitized_error=_safe_remote_error(result.error),
+                )
+                self._sessions().transition_if_state(
+                    session.session_id,
+                    session.state,
+                    SessionState.READY,
+                    now=self._now(),
+                    sanitized_error=None,
+                )
+                return job
+            raise SessionExecutionError(
+                "Remote job state was invalid."
+            )
+        raise SessionExecutionError("Remote job polling limit was reached.")
+
+    def _schedule_remote_job(self, session, job, worker):
+        existing = _JOB_TASKS.get(job.job_id)
+        if existing is not None and not existing.done():
+            return existing
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return None
+        task = loop.create_task(
+            self._finish_remote_job(session, job, worker)
+        )
+        _JOB_TASKS[job.job_id] = task
+
+        def completed(done):
+            if _JOB_TASKS.get(job.job_id) is done:
+                _JOB_TASKS.pop(job.job_id, None)
+            if not done.cancelled():
+                try:
+                    done.exception()
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+        task.add_done_callback(completed)
+        return task
+
+    async def submit_job(
+        self,
+        session_id,
+        *,
+        capture_id,
+        idempotency_key,
+    ):
+        session = self.session(session_id)
+        key = _strict_identifier(
+            idempotency_key,
+            "job idempotency key",
+        )
+        duplicate = self.job_repository.get_job_by_idempotency_key(
+            session.session_id,
+            key,
+        )
+        if duplicate is not None:
+            return duplicate
+        if session.state != SessionState.READY:
+            raise SessionBusy("Cloud Run session is busy.")
+        capture = self.job_repository.get_capture(
+            _strict_identifier(capture_id, "capture ID")
+        )
+        if not isinstance(capture, CompiledCapture):
+            raise CaptureNotFound("Cloud Run capture was not found.")
+        installed, desired = await self._fresh_manifest(session, capture)
+        delta = ManifestDelta.between(installed, desired)
+        if not delta.compatible:
+            raise IncompatibleSession(
+                "The fresh canvas requires a new Cloud Run session."
+            )
+        candidate = self._new_job(
+            session,
+            capture,
+            desired.digest,
+            key,
+        )
+        job, created = self.job_repository.create_job(candidate)
+        if not created:
+            return job
+        job = self._transition_job(job, JobState.RESOLVING)
+        has_delta = bool(
+            delta.custom_nodes or delta.artifacts or delta.wheels
+        )
+        try:
+            session = self._sessions().transition_if_state(
+                session.session_id,
+                SessionState.READY,
+                (
+                    SessionState.PROVISIONING
+                    if has_delta
+                    else SessionState.RUNNING
+                ),
+                now=self._now(),
+            )
+        except ConcurrentSessionUpdate:
+            self._transition_job(
+                job,
+                JobState.FAILED,
+                sanitized_error="Cloud Run session is busy.",
+            )
+            raise SessionBusy("Cloud Run session is busy.") from None
+        worker = self._worker(session)
+        if has_delta:
+            try:
+                await self._apply_manifest(
+                    worker,
+                    session,
+                    desired,
+                    transfer_job_id=job.job_id,
+                    capture=capture,
+                )
+            except Exception:
+                self._transition_job(
+                    job,
+                    JobState.FAILED,
+                    sanitized_error="Remote provisioning failed.",
+                )
+                self._sessions().transition(
+                    session.session_id,
+                    SessionState.FAILED,
+                    now=self._now(),
+                    sanitized_error="Remote provisioning failed.",
+                )
+                raise
+            session = self._sessions().transition(
+                session.session_id,
+                SessionState.VALIDATING,
+                now=self._now(),
+            )
+            self.job_repository.replace_installed_set(
+                session.session_id,
+                _installed_records(desired),
+            )
+            session = self._sessions().transition(
+                session.session_id,
+                SessionState.READY,
+                now=self._now(),
+                manifest_digest=desired.digest,
+                installed_manifest_digest=desired.digest,
+                sanitized_error=None,
+            )
+            session = self._sessions().transition_if_state(
+                session.session_id,
+                SessionState.READY,
+                SessionState.RUNNING,
+                now=self._now(),
+            )
+        elif desired.digest != installed.digest:
+            try:
+                await self._apply_manifest(
+                    worker,
+                    session,
+                    desired,
+                    transfer_job_id=job.job_id,
+                    capture=capture,
+                )
+            except Exception:
+                self._transition_job(
+                    job,
+                    JobState.FAILED,
+                    sanitized_error="Remote manifest validation failed.",
+                )
+                self._sessions().transition(
+                    session.session_id,
+                    SessionState.FAILED,
+                    now=self._now(),
+                    sanitized_error="Remote manifest validation failed.",
+                )
+                raise
+            self.job_repository.replace_installed_set(
+                session.session_id,
+                _installed_records(desired),
+            )
+            session = self._sessions().transition(
+                session.session_id,
+                SessionState.RUNNING,
+                now=self._now(),
+                manifest_digest=desired.digest,
+                installed_manifest_digest=desired.digest,
+                sanitized_error=None,
+            )
+        job = self._transition_job(job, JobState.QUEUED)
+        payload = json.loads(job.capture_json)
+        request = {
+            "job_id": job.job_id,
+            "manifest_digest": job.manifest_digest,
+            "workflow": payload["workflow"],
+            "output": payload["output"],
+            "queue_options": payload["queue_options"],
+        }
+        try:
+            remote = await worker.start_job(request)
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            raise
+        except Exception:
+            raise SessionExecutionError(
+                "Remote job submission is unavailable."
+            ) from None
+        if (
+            not isinstance(remote, dict)
+            or set(remote)
+            != {
+                "job_id",
+                "state",
+                "prompt_id",
+                "last_sequence",
+                "outputs",
+                "error",
+            }
+            or remote.get("job_id") != job.job_id
+            or remote.get("state")
+            not in {
+                "queued",
+                "running",
+                "succeeded",
+                "failed",
+                "interrupted",
+            }
+        ):
+            raise SessionExecutionError(
+                "Remote job submission response was invalid."
+            )
+        prompt_id = remote.get("prompt_id")
+        if prompt_id is not None:
+            try:
+                if str(uuid.UUID(prompt_id)) != prompt_id:
+                    raise ValueError("Non-canonical remote prompt ID.")
+            except (AttributeError, TypeError, ValueError):
+                raise SessionExecutionError(
+                    "Remote job submission response was invalid."
+                ) from None
+        job = self._transition_job(
+            job,
+            JobState.RUNNING,
+            remote_prompt_id=prompt_id,
+        )
+        if remote["state"] in {"queued", "running"}:
+            self._schedule_remote_job(session, job, worker)
+            return job
+        return await self._finish_remote_job(
+            session,
+            job,
+            worker,
+        )
+
+    async def resume_session(self, session_id):
+        session = self.session(session_id)
+        active = [
+            job
+            for job in self.job_repository.list_jobs(session.session_id)
+            if job.state
+            in {
+                JobState.CAPTURED,
+                JobState.RESOLVING,
+                JobState.QUEUED,
+                JobState.RUNNING,
+                JobState.HARVESTING,
+            }
+        ]
+        if len(active) != 1:
+            if not active:
+                return session
+            raise SessionExecutionError(
+                "Multiple active jobs were found for one session."
+            )
+        job = active[0]
+        worker = self._worker(session)
+        if session.state in {
+            SessionState.PROVISIONING,
+            SessionState.VALIDATING,
+        }:
+            capture = CompiledCapture.from_record(
+                job.job_id,
+                job.capture_json,
+                job.prompt_digest,
+            )
+            desired = _stored_manifest(
+                self.job_repository,
+                job.manifest_digest,
+            )
+            if session.state == SessionState.PROVISIONING:
+                await self._apply_manifest(
+                    worker,
+                    session,
+                    desired,
+                    transfer_job_id=job.job_id,
+                    capture=capture,
+                )
+                session = self._sessions().transition(
+                    session.session_id,
+                    SessionState.VALIDATING,
+                    now=self._now(),
+                )
+            self.job_repository.replace_installed_set(
+                session.session_id,
+                _installed_records(desired),
+            )
+            session = self._sessions().transition(
+                session.session_id,
+                SessionState.READY,
+                now=self._now(),
+                manifest_digest=desired.digest,
+                installed_manifest_digest=desired.digest,
+            )
+            session = self._sessions().transition_if_state(
+                session.session_id,
+                SessionState.READY,
+                SessionState.RUNNING,
+                now=self._now(),
+            )
+        if session.state not in {
+            SessionState.RUNNING,
+            SessionState.HARVESTING,
+        }:
+            return session
+        if job.state == JobState.CAPTURED:
+            job = self._transition_job(job, JobState.RESOLVING)
+        if job.state == JobState.RESOLVING:
+            job = self._transition_job(job, JobState.QUEUED)
+        remote = None
+        if session.state != SessionState.HARVESTING:
+            payload = json.loads(job.capture_json)
+            remote = await worker.start_job(
+                {
+                    "job_id": job.job_id,
+                    "manifest_digest": job.manifest_digest,
+                    "workflow": payload["workflow"],
+                    "output": payload["output"],
+                    "queue_options": payload["queue_options"],
+                }
+            )
+            if job.state == JobState.QUEUED:
+                job = self._transition_job(job, JobState.RUNNING)
+        if (
+            session.state == SessionState.HARVESTING
+            or not isinstance(remote, dict)
+            or remote.get("state") in {"queued", "running"}
+        ):
+            self._schedule_remote_job(session, job, worker)
+            return job
+        return await self._finish_remote_job(session, job, worker)

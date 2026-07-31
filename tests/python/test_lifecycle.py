@@ -3,9 +3,16 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from cloud_run.models import AttemptState, CloudAttempt, OfferQuote
+from cloud_run.models import (
+    AttemptState,
+    CloudAttempt,
+    CloudSession,
+    OfferQuote,
+    SessionState,
+)
 from cloud_run.offers import HostBlacklist
-from cloud_run.repository import AttemptRepository
+from cloud_run.repository import AttemptRepository, SessionRepository
+from cloud_run.vast import VastError
 from cloud_run.worker_release import WorkerRelease
 
 
@@ -772,6 +779,308 @@ class RecoveryAndReplacementTests(LifecycleTestCase):
                     ],
                     [],
                 )
+
+
+class RecoveringSessionService:
+    def __init__(self, repository):
+        self.repository = repository
+        self.bootstrap_calls = []
+        self.recovery_calls = []
+
+    async def bootstrap_session(self, session_id):
+        session = self.repository.get(session_id)
+        self.bootstrap_calls.append(session)
+        return session
+
+    async def recover_session(self, session_id):
+        session = self.repository.get(session_id)
+        self.recovery_calls.append(session)
+        return session
+
+
+class ReadySessionService(RecoveringSessionService):
+    async def bootstrap_session(self, session_id):
+        session = await super().bootstrap_session(session_id)
+        if session.state == SessionState.BOOTSTRAPPING:
+            session = self.repository.transition(
+                session.session_id,
+                SessionState.PROVISIONING,
+                now=session.updated_at + 1,
+            )
+        if session.state == SessionState.PROVISIONING:
+            session = self.repository.transition(
+                session.session_id,
+                SessionState.VALIDATING,
+                now=session.updated_at + 1,
+            )
+        if session.state == SessionState.VALIDATING:
+            session = self.repository.transition(
+                session.session_id,
+                SessionState.READY,
+                now=session.updated_at + 1,
+                installed_manifest_digest=session.manifest_digest,
+            )
+        return session
+
+
+class SessionLifecycleTests(LifecycleTestCase):
+    def setUp(self):
+        super().setUp()
+        self.sessions = SessionRepository(
+            self.data_directory / "attempts.sqlite3"
+        )
+        self.session_service = RecoveringSessionService(self.sessions)
+
+    def session_lifecycle(self):
+        from cloud_run.lifecycle import CloudRunLifecycle
+
+        return CloudRunLifecycle(
+            FakeSettings(),
+            self.repository,
+            provider=self.provider,
+            blacklist=self.blacklist,
+            clock=self.clock,
+            sleep=self.clock.sleep,
+            readiness_probe=self.probe,
+            release=worker_release(),
+            session_repository=self.sessions,
+            session_service=self.session_service,
+        )
+
+    def save_session(
+        self,
+        state=SessionState.BOOTSTRAPPING,
+        *,
+        session_id="session-1",
+        instance_id="instance-1",
+        retry_count=0,
+    ):
+        selected = quote()
+        session = CloudSession.new(
+            "key-" + session_id,
+            session_id=session_id,
+            quote=selected,
+            manifest_digest=selected.manifest_digest,
+            deadline_at=self.clock() + 7200,
+            deadline_mode="finite",
+            disk_gb=80,
+            now=self.clock(),
+            state=state,
+        ).transition(
+            state,
+            now=self.clock(),
+            instance_id=instance_id,
+            retry_count=retry_count,
+            session_secret_hex="d" * 64,
+        )
+        return self.sessions.create_or_get(session)[0]
+
+    @staticmethod
+    def worker_instance(instance_id, label):
+        return {
+            "instance_id": instance_id,
+            "label": label,
+            "actual_status": "running",
+            "public_ipaddr": "8.8.8.8",
+            "ports": {"8765/tcp": [{"HostPort": "32100"}]},
+            "status_msg": None,
+            "jupyter_token": "instance-boundary-token",
+        }
+
+    def test_boot_adopts_exact_worker_mapping_and_private_boundary_token(self):
+        session = self.save_session()
+        self.provider.instances = [
+            self.worker_instance("instance-1", session.label)
+        ]
+
+        connected = asyncio.run(
+            self.session_lifecycle().reconcile_session_once(
+                session.session_id
+            )
+        )
+
+        self.assertEqual(
+            connected.worker_base_url,
+            "http://8.8.8.8:32100",
+        )
+        self.assertEqual(
+            connected.provider_token,
+            "instance-boundary-token",
+        )
+        self.assertEqual(len(self.session_service.bootstrap_calls), 1)
+        self.assertNotIn(
+            "instance-boundary-token",
+            repr(connected.public_payload()),
+        )
+
+    def test_session_watchdog_reaches_ready_without_browser_polling(self):
+        self.session_service = ReadySessionService(self.sessions)
+        session = self.save_session()
+        self.provider.instances = [
+            self.worker_instance("instance-1", session.label)
+        ]
+        lifecycle = self.session_lifecycle()
+
+        async def scenario():
+            task = lifecycle.schedule_session_watchdog(
+                session.session_id
+            )
+            self.assertIsNotNone(task)
+            return await task
+
+        ready = asyncio.run(scenario())
+
+        self.assertEqual(ready.state, SessionState.READY)
+        self.assertEqual(
+            self.sessions.get(session.session_id).state,
+            SessionState.READY,
+        )
+        self.assertEqual(len(self.session_service.bootstrap_calls), 1)
+
+    def test_recovery_lists_once_and_fails_closed_on_duplicate_label(self):
+        session = self.save_session()
+        self.provider.instances = [
+            self.worker_instance("instance-1", session.label),
+            self.worker_instance("instance-2", session.label),
+        ]
+
+        recovered = asyncio.run(
+            self.session_lifecycle().recover_sessions()
+        )
+
+        failed = self.sessions.get(session.session_id)
+        self.assertEqual(failed.state, SessionState.FAILED)
+        self.assertEqual(
+            failed.residual_inventory,
+            ("instance-1", "instance-2"),
+        )
+        self.assertEqual(
+            [call[0] for call in self.provider.calls],
+            ["list"],
+        )
+        self.assertEqual(recovered, [failed])
+        self.assertEqual(self.session_service.bootstrap_calls, [])
+
+    def test_restart_adopts_one_instance_and_reenforces_session_recovery(self):
+        session = self.save_session(state=SessionState.READY)
+        self.provider.instances = [
+            self.worker_instance("instance-1", session.label)
+        ]
+
+        recovered = asyncio.run(
+            self.session_lifecycle().recover_sessions()
+        )
+
+        self.assertEqual(len(recovered), 1)
+        self.assertEqual(
+            self.sessions.get(session.session_id).worker_base_url,
+            "http://8.8.8.8:32100",
+        )
+        self.assertEqual(len(self.session_service.recovery_calls), 1)
+        self.assertEqual(
+            [call[0] for call in self.provider.calls],
+            ["list"],
+        )
+
+    def test_only_boot_failure_replaces_once_after_inventory_absence(self):
+        session = self.save_session()
+        self.provider.instances = [
+            self.worker_instance("instance-1", session.label)
+        ]
+        self.provider.search_results = [
+            {
+                "offer_id": 43,
+                "gpu_name": "RTX 4090",
+                "gpu_ram_gb": 24.0,
+                "dph_total": 0.44,
+                "reliability": 0.995,
+                "machine_id": "machine-8",
+                "host_id": "host-4",
+                "public_ipaddr": "1.1.1.1",
+            }
+        ]
+
+        replacement = asyncio.run(
+            self.session_lifecycle().handle_session_boot_failure(
+                session.session_id,
+                failure_code="boot_timeout",
+            )
+        )
+
+        self.assertEqual(replacement.state, SessionState.BOOTSTRAPPING)
+        self.assertEqual(replacement.retry_count, 1)
+        self.assertEqual(replacement.instance_id, "instance-2")
+        self.assertEqual(replacement.quote.offer_id, "43")
+        actions = [call[0] for call in self.provider.calls]
+        self.assertEqual(actions, ["destroy", "list", "search", "create"])
+
+        self.provider.instances = [
+            self.worker_instance("instance-2", replacement.label)
+        ]
+        exhausted = asyncio.run(
+            self.session_lifecycle().handle_session_boot_failure(
+                session.session_id,
+                failure_code="healthcheck_failure",
+            )
+        )
+        self.assertEqual(exhausted.state, SessionState.FAILED)
+        self.assertEqual(
+            len([call for call in self.provider.calls if call[0] == "create"]),
+            1,
+        )
+
+    def test_ambiguous_replacement_create_adopts_inventory_without_second_create(self):
+        session = self.save_session()
+        self.provider.instances = [
+            self.worker_instance("instance-1", session.label)
+        ]
+        self.provider.search_results = [
+            {
+                "offer_id": 43,
+                "gpu_name": "RTX 4090",
+                "gpu_ram_gb": 24.0,
+                "dph_total": 0.44,
+                "reliability": 0.995,
+                "machine_id": "machine-8",
+                "host_id": "host-4",
+                "public_ipaddr": "1.1.1.1",
+            }
+        ]
+        original_create = self.provider.create_instance
+
+        async def ambiguous_create(*args, **kwargs):
+            await original_create(*args, **kwargs)
+            self.provider.instances = [
+                self.worker_instance(
+                    "instance-2",
+                    session.label,
+                )
+            ]
+            raise VastError(
+                "Synthetic lost response.",
+                retryable=True,
+            )
+
+        self.provider.create_instance = ambiguous_create
+
+        replacement = asyncio.run(
+            self.session_lifecycle().handle_session_boot_failure(
+                session.session_id,
+                failure_code="boot_timeout",
+            )
+        )
+
+        self.assertEqual(replacement.state, SessionState.BOOTSTRAPPING)
+        self.assertEqual(replacement.instance_id, "instance-2")
+        self.assertEqual(replacement.retry_count, 1)
+        self.assertEqual(
+            [call[0] for call in self.provider.calls],
+            ["destroy", "list", "search", "create", "list"],
+        )
+        self.assertEqual(
+            len([call for call in self.provider.calls if call[0] == "create"]),
+            1,
+        )
 
 
 if __name__ == "__main__":

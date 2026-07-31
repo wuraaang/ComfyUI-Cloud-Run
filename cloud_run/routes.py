@@ -33,7 +33,12 @@ from .service import (
     SessionNotFound,
     VastProvider,
 )
-from .session_service import SessionService, SessionServiceError
+from .session_service import (
+    IncompatibleSession,
+    SessionBusy,
+    SessionService,
+    SessionServiceError,
+)
 from .settings import (
     SettingsStore,
     SettingsValidationError,
@@ -49,6 +54,7 @@ from .worker_release import (
     WorkerReleaseUnavailable,
     load_worker_release,
 )
+from .worker_client import WorkerClient
 
 
 _MODEL_CATEGORY = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}")
@@ -158,8 +164,9 @@ def _runtime_output_root(data_directory):
 
 
 class _RuntimeResolver:
-    def __init__(self, dependency_repository):
+    def __init__(self, dependency_repository, artifact_catalog=None):
         self.dependency_repository = dependency_repository
+        self.artifact_catalog = artifact_catalog
 
     async def resolve_preflight(
         self,
@@ -172,6 +179,7 @@ class _RuntimeResolver:
             host=host,
             repository=self.dependency_repository,
             registry=RegistryClient(),
+            cache_catalog=self.artifact_catalog,
             resolution_context=_runtime_resolution_context(host),
         )
         return await resolver.resolve_preflight(
@@ -215,6 +223,7 @@ def build_service():
         provider=provider,
         blacklist=blacklist,
         release=release,
+        session_repository=session_repository,
     )
     service = CloudRunService(
         settings_store,
@@ -226,19 +235,44 @@ def build_service():
         session_repository=session_repository,
         release=release,
     )
-    resolver = _RuntimeResolver(dependency_repository)
+    resolver = _RuntimeResolver(
+        dependency_repository,
+        artifact_catalog=job_repository,
+    )
+    output_root = _runtime_output_root(data_directory)
+
+    def worker_factory(session):
+        return WorkerClient(
+            base_url=session.worker_base_url,
+            provider_token=session.provider_token,
+            session_id=session.session_id,
+            session_secret=bytes.fromhex(session.session_secret_hex),
+        )
+
+    def relay_factory(worker, _session):
+        return LocalRelay(
+            worker=worker,
+            repository=job_repository,
+            private_root=data_directory / "relay",
+            output_root=output_root,
+        )
+
     service.session_service = SessionService(
         job_repository=job_repository,
+        session_repository=session_repository,
         resolver=resolver,
         offer_search=service._search_without_preflight,
         mapping_repository=dependency_repository,
         release=release,
+        worker_factory=worker_factory,
+        relay_factory=relay_factory,
     )
+    lifecycle.session_service = service.session_service
     service.relay = LocalRelay(
         worker=None,
         repository=job_repository,
         private_root=data_directory / "relay",
-        output_root=_runtime_output_root(data_directory),
+        output_root=output_root,
     )
     return service
 
@@ -281,6 +315,8 @@ def register_routes(service_factory=None):
     make_service = service_factory or build_service
 
     def service_error(error):
+        if isinstance(error, (SessionBusy, IncompatibleSession)):
+            return web.json_response({"error": str(error)}, status=409)
         if isinstance(
             error,
             (
@@ -550,6 +586,46 @@ def register_routes(service_factory=None):
         except Exception as error:
             return service_error(error)
         return web.json_response(_session_payload(session))
+
+    @routes.get("/cloud-run/api/sessions/{session_id}")
+    async def get_session(request):
+        try:
+            session = await make_service().refresh_session(
+                request.match_info.get("session_id", "")
+            )
+        except Exception as error:
+            return service_error(error)
+        return web.json_response(_session_payload(session))
+
+    @routes.post("/cloud-run/api/sessions/{session_id}/jobs")
+    async def post_session_job(request):
+        try:
+            payload = await _request_payload(
+                request,
+                allowed={"capture_id", "idempotency_key"},
+                required={"capture_id", "idempotency_key"},
+            )
+            job = await make_service().submit_job(
+                request.match_info.get("session_id", ""),
+                capture_id=payload["capture_id"],
+                idempotency_key=payload["idempotency_key"],
+            )
+        except Exception as error:
+            return service_error(error)
+        return web.json_response(job.public_payload())
+
+    @routes.get(
+        "/cloud-run/api/sessions/{session_id}/jobs/{job_id}"
+    )
+    async def get_session_job(request):
+        try:
+            job = make_service().get_job(
+                request.match_info.get("session_id", ""),
+                request.match_info.get("job_id", ""),
+            )
+        except Exception as error:
+            return service_error(error)
+        return web.json_response(job.public_payload())
 
     @routes.get(
         "/cloud-run/api/sessions/{session_id}/jobs/{job_id}/events"

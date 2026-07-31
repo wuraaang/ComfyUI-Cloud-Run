@@ -587,6 +587,23 @@ class WorkerUploadRouteTests(unittest.TestCase):
                     )
                 )
             )
+            transfer_path = "/worker/v1/transactions/transfer:model-1"
+            transfer_status = asyncio.run(
+                worker.handle(
+                    FakeWorkerRequest(
+                        "GET",
+                        transfer_path,
+                        envelope=sign_request(
+                            bytes.fromhex("a" * 64),
+                            "GET",
+                            transfer_path,
+                            b"",
+                            timestamp=1000,
+                            nonce="upload-status",
+                        ),
+                    )
+                )
+            )
 
             unknown_path = "/worker/v1/artifacts/not-in-manifest"
             unknown = asyncio.run(
@@ -620,6 +637,7 @@ class WorkerUploadRouteTests(unittest.TestCase):
                     "sha256": hashlib.sha256(payload).hexdigest(),
                 },
             )
+            self.assertEqual(transfer_status.payload, accepted.payload)
             self.assertEqual(unknown.status, 404)
             transfer_record = (
                 worker.state.load()["transactions"]["transfer:model-1"]

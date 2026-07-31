@@ -264,6 +264,46 @@ class CloudRunService:
             raise SessionNotFound("Cloud Run session was not found.")
         return session
 
+    async def refresh_session(self, session_id):
+        session = self.get_session(session_id)
+        refresh = getattr(self.lifecycle, "reconcile_session_once", None)
+        if callable(refresh) and session.state in {
+            SessionState.CREATING,
+            SessionState.BOOTSTRAPPING,
+            SessionState.PROVISIONING,
+            SessionState.VALIDATING,
+        }:
+            return await refresh(session.session_id)
+        return session
+
+    async def submit_job(
+        self,
+        session_id,
+        *,
+        capture_id,
+        idempotency_key,
+    ):
+        if self.session_service is None or not callable(
+            getattr(self.session_service, "submit_job", None)
+        ):
+            raise CloudRunValidationError(
+                "Cloud Run job execution is unavailable."
+            )
+        return await self.session_service.submit_job(
+            session_id,
+            capture_id=capture_id,
+            idempotency_key=idempotency_key,
+        )
+
+    def get_job(self, session_id, job_id):
+        if self.session_service is None or not callable(
+            getattr(self.session_service, "get_job", None)
+        ):
+            raise CloudRunValidationError(
+                "Cloud Run job storage is unavailable."
+            )
+        return self.session_service.get_job(session_id, job_id)
+
     def _validated_session(self, session_id, idempotency_key):
         key = _idempotency_key(idempotency_key)
         session = self.get_session(session_id)
@@ -419,13 +459,21 @@ class CloudRunService:
         current = self.get_session(session_id)
         if current.state != SessionState.CREATING:
             return current
-        return self._session_repository().transition(
+        session = self._session_repository().transition(
             current.session_id,
             SessionState.BOOTSTRAPPING,
             now=float(self.clock()),
             instance_id=str(instance_id),
             sanitized_error=None,
         )
+        schedule = getattr(
+            self.lifecycle,
+            "schedule_session_watchdog",
+            None,
+        )
+        if callable(schedule):
+            schedule(session.session_id)
+        return session
 
     async def confirm_session(self, session_id, *, idempotency_key):
         session = self._validated_session(session_id, idempotency_key)
@@ -509,7 +557,7 @@ class CloudRunService:
                 )
             retryable = isinstance(error, vast.VastError) and error.retryable
             if retryable:
-                return repository.transition(
+                session = repository.transition(
                     session.session_id,
                     SessionState.CREATING,
                     now=float(self.clock()),
@@ -518,6 +566,14 @@ class CloudRunService:
                         "before taking another action."
                     ),
                 )
+                schedule = getattr(
+                    self.lifecycle,
+                    "schedule_session_watchdog",
+                    None,
+                )
+                if callable(schedule):
+                    schedule(session.session_id)
+                return session
             return repository.transition(
                 session.session_id,
                 SessionState.FAILED,
@@ -834,6 +890,17 @@ class CloudRunService:
     async def recover(self):
         if self.lifecycle is None:
             return []
+        recover_sessions = getattr(
+            self.lifecycle,
+            "recover_sessions",
+            None,
+        )
+        if (
+            getattr(self.lifecycle, "session_repository", None)
+            is not None
+            and callable(recover_sessions)
+        ):
+            return await recover_sessions()
         attempts = await self.lifecycle.recover()
         for attempt in attempts:
             if attempt.state == AttemptState.STARTING:

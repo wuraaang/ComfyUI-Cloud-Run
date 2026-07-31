@@ -1,6 +1,7 @@
 import json
 import os
 import tempfile
+import types
 import unittest
 from pathlib import Path
 
@@ -202,6 +203,39 @@ class JobRepositoryTests(unittest.TestCase):
             [item.artifact_id for item in jobs.list_transfers("job-1")],
             ["output-1", "preview:preview-1"],
         )
+
+    def test_local_artifact_catalog_is_content_verified_and_durable(self):
+        content = b"private-input"
+        source = self.path.parent / "input.jpg"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_bytes(content)
+        digest = __import__("hashlib").sha256(content).hexdigest()
+        jobs = JobRepository(self.path)
+
+        saved = jobs.register_local_artifact(
+            types.SimpleNamespace(
+                artifact_id="input-1",
+                private_path=str(source),
+                size_bytes=len(content),
+                sha256=digest,
+            ),
+            created_at=10.0,
+        )
+        reopened = JobRepository(self.path).get_local_artifact("input-1")
+
+        self.assertEqual(reopened.artifact_id, saved.artifact_id)
+        self.assertEqual(reopened.sha256, digest)
+        self.assertNotIn(str(source), repr(reopened))
+        source.write_bytes(b"changed")
+        with self.assertRaisesRegex(ValueError, "content changed"):
+            jobs.register_local_artifact(
+                types.SimpleNamespace(
+                    artifact_id="input-1",
+                    private_path=str(source),
+                    size_bytes=len(content),
+                    sha256=digest,
+                )
+            )
 
 
 if __name__ == "__main__":

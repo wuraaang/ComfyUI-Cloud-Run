@@ -216,6 +216,42 @@ class SessionRepositoryTests(unittest.TestCase):
             0o700,
         )
 
+    def test_ready_session_can_be_claimed_by_exactly_one_concurrent_job(self):
+        sessions = repository.SessionRepository(self.database_path)
+        selected = make_attempt().quote
+        ready = CloudSession.new(
+            "ready-key",
+            session_id="ready-session",
+            quote=selected,
+            manifest_digest=selected.manifest_digest,
+            deadline_at=7300.0,
+            deadline_mode="finite",
+            disk_gb=80,
+            now=100.0,
+            state=SessionState.READY,
+        )
+        sessions.create_or_get(ready)
+
+        def claim(_index):
+            try:
+                return sessions.transition_if_state(
+                    "ready-session",
+                    SessionState.READY,
+                    SessionState.RUNNING,
+                    now=101.0,
+                )
+            except repository.ConcurrentSessionUpdate:
+                return None
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            results = list(executor.map(claim, range(8)))
+
+        self.assertEqual(sum(item is not None for item in results), 1)
+        self.assertEqual(
+            sessions.get("ready-session").state,
+            SessionState.RUNNING,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

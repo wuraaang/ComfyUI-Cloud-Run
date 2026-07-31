@@ -64,6 +64,14 @@ class InstalledDependency:
     destination: str
 
 
+@dataclass(frozen=True, repr=False)
+class LocalArtifactRecord:
+    artifact_id: str
+    private_path: str
+    size_bytes: int
+    sha256: str
+
+
 @dataclass(frozen=True)
 class StoredPreflight:
     preflight_id: str
@@ -162,6 +170,19 @@ class JobRepository:
                 (str(session_id), str(idempotency_key)),
             ).fetchone()
         return self._row_to_job(row)
+
+    def list_jobs(self, session_id):
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                f"""
+                SELECT {_JOB_COLUMNS}
+                FROM jobs
+                WHERE session_id = ?
+                ORDER BY created_at, job_id
+                """,
+                (str(session_id),),
+            ).fetchall()
+        return [self._row_to_job(row) for row in rows]
 
     def create_job(self, job):
         with closing(self._connect()) as connection:
@@ -343,6 +364,122 @@ class JobRepository:
             row["capture_json"],
             row["prompt_digest"],
         )
+
+    def get_capture_by_prompt_digest(self, prompt_digest):
+        digest = _require_digest(prompt_digest, "prompt digest")
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                """
+                SELECT capture_id, prompt_digest, capture_json
+                FROM captures
+                WHERE prompt_digest = ?
+                ORDER BY created_at, capture_id
+                LIMIT 1
+                """,
+                (digest,),
+            ).fetchone()
+        if row is None:
+            return None
+        return CompiledCapture.from_record(
+            row["capture_id"],
+            row["capture_json"],
+            row["prompt_digest"],
+        )
+
+    def register_local_artifact(self, artifact, *, created_at=None):
+        try:
+            artifact_id = _require_identifier(
+                artifact.artifact_id,
+                "artifact ID",
+            )
+            private_path = str(artifact.private_path)
+            size_bytes = int(artifact.size_bytes)
+            sha256 = _require_digest(
+                artifact.sha256,
+                "artifact digest",
+            )
+        except (AttributeError, TypeError, ValueError):
+            raise ValueError("Local artifact metadata is invalid.") from None
+        if (
+            not private_path
+            or isinstance(artifact.size_bytes, bool)
+            or size_bytes <= 0
+        ):
+            raise ValueError("Local artifact metadata is invalid.")
+        from .artifacts import ArtifactPathError, hash_file
+
+        try:
+            current = hash_file(private_path)
+        except ArtifactPathError:
+            raise ValueError("Local artifact is unavailable.") from None
+        if current.size_bytes != size_bytes or current.sha256 != sha256:
+            raise ValueError("Local artifact content changed.")
+        timestamp = float(
+            time.time() if created_at is None else created_at
+        )
+        if not math.isfinite(timestamp) or timestamp < 0:
+            raise ValueError("Local artifact timestamp is invalid.")
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                """
+                SELECT private_path, size_bytes, sha256
+                FROM local_artifacts
+                WHERE artifact_id = ?
+                """,
+                (artifact_id,),
+            ).fetchone()
+            identity = (private_path, size_bytes, sha256)
+            if existing is not None and (
+                existing["private_path"],
+                int(existing["size_bytes"]),
+                existing["sha256"],
+            ) != identity:
+                connection.rollback()
+                raise ValueError("Local artifact identity cannot change.")
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO local_artifacts(
+                    artifact_id, private_path, size_bytes, sha256, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    artifact_id,
+                    private_path,
+                    size_bytes,
+                    sha256,
+                    timestamp,
+                ),
+            )
+            connection.commit()
+        return LocalArtifactRecord(
+            artifact_id=artifact_id,
+            private_path=private_path,
+            size_bytes=size_bytes,
+            sha256=sha256,
+        )
+
+    def get_local_artifact(self, artifact_id):
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                """
+                SELECT artifact_id, private_path, size_bytes, sha256
+                FROM local_artifacts
+                WHERE artifact_id = ?
+                """,
+                (str(artifact_id),),
+            ).fetchone()
+        if row is None:
+            return None
+        return LocalArtifactRecord(
+            artifact_id=row["artifact_id"],
+            private_path=row["private_path"],
+            size_bytes=int(row["size_bytes"]),
+            sha256=row["sha256"],
+        )
+
+    def cache_configured(self):
+        return False
 
     def save_preflight(
         self,

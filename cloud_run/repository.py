@@ -205,6 +205,17 @@ def _initialize_database(path):
             )
             connection.execute(
                 """
+                CREATE TABLE IF NOT EXISTS local_artifacts (
+                    artifact_id TEXT PRIMARY KEY,
+                    private_path TEXT NOT NULL,
+                    size_bytes INTEGER NOT NULL,
+                    sha256 TEXT NOT NULL,
+                    created_at REAL NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS dependency_candidates (
                     class_type TEXT NOT NULL,
                     candidate_digest TEXT NOT NULL,
@@ -767,6 +778,97 @@ class SessionRepository:
                 raise
             connection.commit()
         return saved
+
+    def transition_if_state(
+        self,
+        session_id,
+        expected_state,
+        state,
+        *,
+        now=None,
+        **changes,
+    ):
+        expected = SessionState(expected_state)
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                f"SELECT {_SESSION_COLUMNS} FROM sessions WHERE session_id = ?",
+                (str(session_id),),
+            ).fetchone()
+            if row is None:
+                connection.rollback()
+                raise KeyError(str(session_id))
+            current = self._row_to_session(row)
+            if current.state != expected:
+                connection.rollback()
+                raise ConcurrentSessionUpdate(
+                    "The session is not in the required state."
+                )
+            changed = current.transition(
+                state,
+                now=now,
+                **changes,
+            )
+            changed._validate()
+            cursor = connection.execute(
+                """
+                UPDATE sessions SET
+                    state = ?,
+                    quote_json = ?,
+                    manifest_digest = ?,
+                    installed_manifest_digest = ?,
+                    instance_id = ?,
+                    worker_base_url = ?,
+                    provider_token = ?,
+                    session_secret_hex = ?,
+                    deadline_at = ?,
+                    deadline_mode = ?,
+                    disk_gb = ?,
+                    retry_count = ?,
+                    destroy_requested = ?,
+                    residual_inventory_json = ?,
+                    sanitized_error = ?,
+                    updated_at = ?,
+                    version = version + 1
+                WHERE session_id = ? AND version = ? AND state = ?
+                """,
+                (
+                    changed.state.value,
+                    self._quote_json(changed.quote),
+                    changed.manifest_digest,
+                    changed.installed_manifest_digest,
+                    changed.instance_id,
+                    changed.worker_base_url,
+                    changed.provider_token,
+                    changed.session_secret_hex,
+                    changed.deadline_at,
+                    changed.deadline_mode,
+                    changed.disk_gb,
+                    changed.retry_count,
+                    int(changed.destroy_requested),
+                    _canonical_json(list(changed.residual_inventory)),
+                    changed.sanitized_error,
+                    changed.updated_at,
+                    changed.session_id,
+                    current.version,
+                    expected.value,
+                ),
+            )
+            if cursor.rowcount != 1:
+                connection.rollback()
+                raise ConcurrentSessionUpdate(
+                    "The session changed while it was being claimed."
+                )
+            saved_row = connection.execute(
+                f"""
+                SELECT {_SESSION_COLUMNS}
+                FROM sessions
+                WHERE session_id = ?
+                """,
+                (changed.session_id,),
+            ).fetchone()
+            connection.commit()
+        return self._row_to_session(saved_row)
 
     def list_all(self):
         with closing(self._connect()) as connection:

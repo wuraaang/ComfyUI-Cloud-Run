@@ -14,7 +14,9 @@ from cloud_run.routes import build_service, register_routes
 from cloud_run.models import (
     AttemptState,
     CloudAttempt,
+    CloudJob,
     CloudSession,
+    JobState,
     OfferQuote,
     SessionState,
 )
@@ -810,6 +812,112 @@ class PaidSessionRouteTests(unittest.TestCase):
             encoded = repr(response.payload)
             self.assertNotIn("private-session-idempotency-key", encoded)
             self.assertNotIn("d" * 64, encoded)
+
+    def test_session_and_job_routes_are_owned_idempotent_and_browser_safe(self):
+        session = CloudSession.new(
+            "private-session-key",
+            session_id="session-1",
+            manifest_digest="c" * 64,
+            deadline_at=7300.0,
+            deadline_mode="finite",
+            disk_gb=80,
+            now=100.0,
+            state=SessionState.READY,
+        )
+        job = CloudJob(
+            job_id="job-1",
+            session_id="session-1",
+            idempotency_key="private-job-key",
+            state=JobState.SUCCEEDED,
+            prompt_digest="d" * 64,
+            capture_json='{"output":{},"queue_options":{},"workflow":{}}',
+            manifest_digest="e" * 64,
+            remote_prompt_id="11111111-1111-1111-1111-111111111111",
+            sanitized_error=None,
+            created_at=101.0,
+            updated_at=102.0,
+            version=5,
+        )
+        service = mock.Mock()
+        service.refresh_session = mock.AsyncMock(return_value=session)
+        service.submit_job = mock.AsyncMock(return_value=job)
+        service.get_job.return_value = job
+        handlers = captured_handlers(service_factory=lambda: service)
+
+        session_response = asyncio.run(
+            handlers[
+                ("GET", "/cloud-run/api/sessions/{session_id}")
+            ](
+                FakeRequest(match_info={"session_id": "session-1"})
+            )
+        )
+        submit_response = asyncio.run(
+            handlers[
+                ("POST", "/cloud-run/api/sessions/{session_id}/jobs")
+            ](
+                FakeRequest(
+                    {
+                        "capture_id": "capture-2",
+                        "idempotency_key": "private-job-key",
+                    },
+                    match_info={"session_id": "session-1"},
+                )
+            )
+        )
+        job_response = asyncio.run(
+            handlers[
+                (
+                    "GET",
+                    (
+                        "/cloud-run/api/sessions/{session_id}/jobs/"
+                        "{job_id}"
+                    ),
+                )
+            ](
+                FakeRequest(
+                    match_info={
+                        "session_id": "session-1",
+                        "job_id": "job-1",
+                    }
+                )
+            )
+        )
+        invalid = asyncio.run(
+            handlers[
+                ("POST", "/cloud-run/api/sessions/{session_id}/jobs")
+            ](
+                FakeRequest(
+                    {
+                        "capture_id": "capture-2",
+                        "idempotency_key": "private-job-key",
+                        "provider_token": "forbidden",
+                    },
+                    match_info={"session_id": "session-1"},
+                )
+            )
+        )
+
+        service.refresh_session.assert_awaited_once_with("session-1")
+        service.submit_job.assert_awaited_once_with(
+            "session-1",
+            capture_id="capture-2",
+            idempotency_key="private-job-key",
+        )
+        service.get_job.assert_called_once_with("session-1", "job-1")
+        self.assertEqual(session_response.payload["status"], "ready")
+        self.assertEqual(submit_response.payload["status"], "succeeded")
+        self.assertEqual(job_response.payload, submit_response.payload)
+        self.assertEqual(invalid.status, 400)
+        encoded = repr(
+            [
+                session_response.payload,
+                submit_response.payload,
+                job_response.payload,
+            ]
+        )
+        self.assertNotIn("private-session-key", encoded)
+        self.assertNotIn("private-job-key", encoded)
+        self.assertNotIn("11111111-1111-1111-1111-111111111111", encoded)
 
 
 class RelayMediaRouteTests(unittest.TestCase):

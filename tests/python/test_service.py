@@ -170,6 +170,7 @@ class CloudRunServiceTests(unittest.TestCase):
         *,
         release=_DEFAULT_RELEASE,
         session_service=None,
+        lifecycle=None,
     ):
         from cloud_run.service import CloudRunService
 
@@ -186,6 +187,7 @@ class CloudRunServiceTests(unittest.TestCase):
                 else release
             ),
             session_service=session_service,
+            lifecycle=lifecycle,
         )
 
     def test_paid_session_quote_is_complete_read_only_and_durable(self):
@@ -287,6 +289,45 @@ class CloudRunServiceTests(unittest.TestCase):
             provider.create_calls[0]["release"],
             service.release,
         )
+
+    def test_paid_confirmation_starts_the_session_boot_watchdog(self):
+        class WatchdogLifecycle:
+            def __init__(self):
+                self.calls = []
+
+            def schedule_session_watchdog(self, session_id):
+                self.calls.append(session_id)
+
+        provider = FakeProvider(
+            lookups=[offer(price=0.50), offer(price=0.50)]
+        )
+        lifecycle = WatchdogLifecycle()
+        service = self.service(
+            provider,
+            session_service=FakePreflightService(),
+            lifecycle=lifecycle,
+        )
+        quoted = asyncio.run(
+            service.preview_session(
+                preflight_id="preflight-1",
+                offer_id=42,
+                idempotency_key="session-watchdog",
+                deadline={
+                    "mode": "finite",
+                    "duration_seconds": 7_200,
+                },
+            )
+        )
+
+        started = asyncio.run(
+            service.confirm_session(
+                quoted.session_id,
+                idempotency_key="session-watchdog",
+            )
+        )
+
+        self.assertEqual(started.state.value, "bootstrapping")
+        self.assertEqual(lifecycle.calls, [started.session_id])
 
     def test_concurrent_paid_confirmations_issue_exactly_one_create(self):
         async def scenario():

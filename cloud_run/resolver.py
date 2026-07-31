@@ -47,6 +47,7 @@ class DependencyPreflightResult:
     output_allowance_bytes: int
     disk_gb: int
     rentable: bool
+    local_artifacts: tuple = ()
 
 
 def _candidate_is_complete(candidate, class_type):
@@ -387,6 +388,7 @@ class DependencyResolver:
             output_allowance_bytes=output_allowance,
             disk_gb=disk_gb,
             rentable=nodes.rentable and artifact_result.rentable,
+            local_artifacts=artifact_result.local_artifacts,
         )
 
     async def resolve_preflight(
