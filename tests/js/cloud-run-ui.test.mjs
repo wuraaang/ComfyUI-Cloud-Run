@@ -213,6 +213,67 @@ test("registers through the pinned ComfyUI extension API and mounts during setup
   assert.equal(document.getElementById("cloud-run-modal").open, true);
 });
 
+
+test("Cloud Run captures the official queue payload before the console callback", async () => {
+  const document = new FakeDocument();
+  mountLocalRunButton(document);
+  const captures = [];
+  const localSubmissions = [];
+  const api = {
+    async queuePrompt(number, data) {
+      localSubmissions.push([number, data]);
+      return { prompt_id: "local", node_errors: {} };
+    },
+  };
+  const originalQueuePrompt = api.queuePrompt;
+  const app = {
+    async queuePrompt(number, batchCount) {
+      assert.equal(batchCount, 1);
+      await api.queuePrompt(
+        number,
+        {
+          workflow: {
+            version: 1,
+            extra: { frontendVersion: "1.47.10" },
+            nodes: [{ id: 7 }],
+          },
+          output: {
+            "7": {
+              class_type: "KSampler",
+              inputs: { seed: 12 },
+            },
+          },
+        },
+        { previewMethod: "latent2rgb" },
+      );
+    },
+  };
+
+  mountCloudRun(
+    document,
+    async () => settingsResponse(),
+    {},
+    {
+      app,
+      api,
+      onCapture(capture) {
+        captures.push(capture);
+      },
+    },
+  );
+  await document.getElementById("cloud-run-button").click();
+
+  assert.equal(captures.length, 1);
+  assert.equal(captures[0].output["7"].inputs.seed, 12);
+  assert.equal(captures[0].queue_options.preview_method, "latent2rgb");
+  assert.deepEqual(localSubmissions, []);
+  assert.strictEqual(api.queuePrompt, originalQueuePrompt);
+  assert.equal(
+    document.getElementById("cloud-run-status").textContent,
+    "Current canvas captured without local execution.",
+  );
+});
+
 test("waits for a late local Run button and injects the launcher only once", async () => {
   const document = new FakeDocument();
   let extension = null;

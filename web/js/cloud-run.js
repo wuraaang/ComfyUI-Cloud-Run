@@ -1,3 +1,6 @@
+import { captureOfficialQueuePayload } from "./canvas-adapter.js";
+
+
 const SETTINGS_ENDPOINT = "/cloud-run/api/settings";
 const OFFERS_ENDPOINT = "/cloud-run/api/offers";
 const QUOTES_ENDPOINT = "/cloud-run/api/quotes";
@@ -409,9 +412,17 @@ function ensureLauncherPlacement(browserWindow, document, mounted) {
 }
 
 
-export function mountCloudRun(document, fetchImpl, browserWindow = globalThis) {
+export function mountCloudRun(
+  document,
+  fetchImpl,
+  browserWindow = globalThis,
+  captureContext = {},
+) {
   const mounted = mountedCloudRuns.get(document);
   if (mounted) {
+    if (captureContext.app || captureContext.api || captureContext.onCapture) {
+      mounted.captureContext = { ...mounted.captureContext, ...captureContext };
+    }
     ensureLauncherPlacement(browserWindow, document, mounted);
     return mounted.launcher;
   }
@@ -653,9 +664,37 @@ export function mountCloudRun(document, fetchImpl, browserWindow = globalThis) {
     }
   }
 
+  let record;
   const openDialog = async () => {
     dialog.showModal();
     await loadSettings();
+    const context = record.captureContext;
+    if (!context.app && !context.api) return;
+    status.textContent = "Compiling the current canvas with ComfyUI…";
+    try {
+      const capture = await captureOfficialQueuePayload({
+        app: context.app,
+        api: context.api,
+      });
+      if (typeof context.onCapture === "function") {
+        await context.onCapture(capture);
+      }
+      record.currentCapture = capture;
+      status.textContent =
+        "Current canvas captured without local execution.";
+    } catch (error) {
+      const allowed = new Set([
+        "Pinned ComfyUI queue API is unavailable.",
+        "Pinned ComfyUI prompt API is unavailable.",
+        "A Cloud Run canvas capture is already in progress.",
+        "ComfyUI was busy; no Cloud Run payload was captured.",
+      ]);
+      const message =
+        error instanceof Error && allowed.has(error.message)
+          ? error.message
+          : "Canvas capture failed before any Cloud Run mutation.";
+      status.textContent = message;
+    }
   };
   launcher.addEventListener("click", openDialog);
   launcher.addEventListener("keydown", async (event) => {
@@ -866,15 +905,27 @@ export function mountCloudRun(document, fetchImpl, browserWindow = globalThis) {
   });
 
   document.body.appendChild(dialog);
-  const record = { dialog, launcher, observer: null, openDialog };
+  record = {
+    captureContext: { ...captureContext },
+    currentCapture: null,
+    dialog,
+    launcher,
+    observer: null,
+    openDialog,
+  };
   mountedCloudRuns.set(document, record);
   ensureLauncherPlacement(browserWindow, document, record);
   return launcher;
 }
 
 
-export async function openCloudRun(document, fetchImpl, browserWindow = globalThis) {
-  mountCloudRun(document, fetchImpl, browserWindow);
+export async function openCloudRun(
+  document,
+  fetchImpl,
+  browserWindow = globalThis,
+  captureContext = {},
+) {
+  mountCloudRun(document, fetchImpl, browserWindow, captureContext);
   return mountedCloudRuns.get(document).openDialog();
 }
 
@@ -899,13 +950,19 @@ export function registerCloudRunWhenReady(browserWindow, document, tries = 0) {
   }
 
   const fetchImpl = api.fetchApi.bind(api);
+  const captureContext = { app, api };
   app.registerExtension({
     name: "comfyui-cloud-run.lifecycle",
     commands: [
       {
         id: OPEN_COMMAND_ID,
         label: "Cloud Run",
-        function: () => openCloudRun(document, fetchImpl, browserWindow),
+        function: () => openCloudRun(
+          document,
+          fetchImpl,
+          browserWindow,
+          captureContext,
+        ),
       },
     ],
     menuCommands: [
@@ -915,7 +972,7 @@ export function registerCloudRunWhenReady(browserWindow, document, tries = 0) {
       },
     ],
     setup() {
-      mountCloudRun(document, fetchImpl, browserWindow);
+      mountCloudRun(document, fetchImpl, browserWindow, captureContext);
     },
   });
   browserWindow.__cloudRunLifecycleRegistered = true;
