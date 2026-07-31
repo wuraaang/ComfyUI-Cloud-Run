@@ -1,9 +1,9 @@
 # Project state
 
-Status: workflow-derived reusable sessions and the workflow-embedded model
-metadata consumer bridge are implemented and offline-certified on the pinned
-local ComfyUI environment. Native missing-model visibility and the free,
-read-only Gold preflight are complete. All worker-template and real paid
+Status: workflow-derived reusable sessions implemented and fake/offline
+certified on the pinned local ComfyUI environment. The workflow-embedded model
+metadata consumer bridge, native missing-model visibility, and the free,
+read-only Gold preflight are also complete. All worker-template and real paid
 activity remains human-gated.
 
 Source of truth:
