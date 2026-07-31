@@ -11,26 +11,29 @@ its proven Vast client and lifecycle policies. Reimplement those contracts
 narrowly for ComfyUI; do not import its Flask, SQLAlchemy, dataset, training,
 checkpoint, or AI Toolkit code.
 
-## Current slice: safe Vast.ai lifecycle
+## Current slice: workflow-derived Vast GPU sessions
 
-Extend the certified preview V0 into one safe vertical lifecycle:
+Extend the certified Vast lifecycle into a local ComfyUI Desktop control plane
+for temporary remote GPU sessions:
 
-- place a separate `Cloud Run` action immediately beside local `Run/Exécuter`;
-- preserve the local run action without interception or behavior changes;
-- keep the Vast credential write-only and backend-owned;
-- search and rank offers without renting;
-- show a complete paid confirmation before the first mutation;
-- revalidate the offer and price, then create exactly one managed instance;
-- persist and expose creation, boot, cancellation, failure, and ready states;
-- support explicit cancellation and destruction with inventory verification;
-- reconcile managed instances after restart;
-- permit at most one replacement after a transient boot failure, and only after
-  destruction of the first instance has been verified.
+- capture the exact prompt compiled by the pinned frontend without posting it
+  to local `/prompt` or running a local reference generation;
+- resolve every dependency before the first paid mutation, with immutable
+  custom-node revisions and exact artifact sizes and SHA-256 digests;
+- rent one explicitly confirmed ephemeral Vast instance as a reusable session;
+- provision and validate the repository-owned Remote Worker and native ComfyUI;
+- execute one sequential job at a time and support compatible manifest deltas;
+- relay progress, previews, errors, history, and verified outputs locally;
+- enforce the finite deadline locally and from the worker;
+- create no Vast volume and never use Stop as a billing terminal action;
+- expose `Destroy GPU — stop all Vast billing` with strengthened confirmation
+  and fresh-inventory absence verification.
 
-Only the official ComfyUI Vast template
-`027fba7753c024be019030fb42aed900` may be created. No workflow transfer,
-model synchronization, custom-node resolution, other provider, telemetry, or
-Registry publication belongs to this slice.
+The project template remains fail-closed until its public worker artifact,
+bootstrap, authentication, deadline enforcement, and teardown have passed the
+offline gate and an immutable release lock is reviewed. Automated work uses
+fake providers only; live rental and publication require separate human
+authorization.
 
 ## Paid-action gate
 

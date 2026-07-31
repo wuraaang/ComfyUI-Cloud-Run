@@ -11,13 +11,16 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 
 class ProviderMutationSurfaceTests(unittest.TestCase):
-    def test_repository_contract_authorizes_only_the_human_gated_lifecycle(self):
+    def test_repository_contract_authorizes_only_human_gated_sessions(self):
         agents = (REPOSITORY_ROOT / "AGENTS.md").read_text(encoding="utf-8")
         project_state = (REPOSITORY_ROOT / "docs" / "project-state.md").read_text(
             encoding="utf-8"
         )
 
-        self.assertIn("Current slice: safe Vast.ai lifecycle", agents)
+        self.assertIn(
+            "Current slice: workflow-derived Vast GPU sessions",
+            agents,
+        )
         self.assertIn("No real Vast.ai rental without a separate human GO", agents)
         self.assertIn("managed lifecycle implemented", project_state)
         self.assertIn("fake/offline", project_state)
