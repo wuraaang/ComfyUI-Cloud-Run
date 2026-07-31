@@ -32,6 +32,121 @@ def quote(OfferQuote):
 
 
 class LifecycleModelTests(unittest.TestCase):
+    def test_session_and_job_state_contracts_are_exact(self):
+        from cloud_run.models import JobState, SessionState, TransferState
+
+        self.assertEqual(
+            {state.value for state in SessionState},
+            {
+                "preflight",
+                "offer_selected",
+                "confirming",
+                "creating",
+                "bootstrapping",
+                "provisioning",
+                "validating",
+                "ready",
+                "running",
+                "harvesting",
+                "repairing",
+                "destroy_requested",
+                "destroying",
+                "destroyed",
+                "failed",
+            },
+        )
+        self.assertEqual(
+            {state.value for state in JobState},
+            {
+                "captured",
+                "resolving",
+                "queued",
+                "running",
+                "harvesting",
+                "succeeded",
+                "failed",
+            },
+        )
+        self.assertEqual(
+            {state.value for state in TransferState},
+            {
+                "pending",
+                "transferring",
+                "verified",
+                "failed",
+                "abandoned",
+            },
+        )
+
+    def test_execution_failure_returns_a_healthy_session_to_ready(self):
+        from cloud_run.models import CloudSession, SessionState
+
+        session = CloudSession(
+            session_id="session-1",
+            idempotency_key="session-key",
+            label="comfy-cloud-run-session-1",
+            state=SessionState.RUNNING,
+            quote=None,
+            manifest_digest="a" * 64,
+            installed_manifest_digest="a" * 64,
+            instance_id="77",
+            worker_base_url="http://8.8.8.8:30000",
+            provider_token="private-provider-token",
+            session_secret_hex="b" * 64,
+            deadline_at=7200.0,
+            deadline_mode="finite",
+            disk_gb=80,
+            retry_count=0,
+            destroy_requested=False,
+            residual_inventory=(),
+            sanitized_error=None,
+            created_at=10.0,
+            updated_at=10.0,
+            version=1,
+        )
+
+        saved = session.transition(SessionState.READY, now=20.0)
+
+        self.assertEqual(saved.state, SessionState.READY)
+        with self.assertRaises(models.InvalidStateTransition):
+            saved.transition(SessionState.CREATING)
+
+    def test_session_public_payload_omits_private_connection_material(self):
+        from cloud_run.models import CloudSession, SessionState
+
+        session = CloudSession(
+            session_id="session-1",
+            idempotency_key="private-idempotency-key",
+            label="comfy-cloud-run-session-1",
+            state=SessionState.FAILED,
+            quote=None,
+            manifest_digest="a" * 64,
+            installed_manifest_digest="b" * 64,
+            instance_id="77",
+            worker_base_url="http://8.8.8.8:30000",
+            provider_token="private-provider-token",
+            session_secret_hex="c" * 64,
+            deadline_at=7200.0,
+            deadline_mode="finite",
+            disk_gb=80,
+            retry_count=0,
+            destroy_requested=False,
+            residual_inventory=("77",),
+            sanitized_error="Sanitized failure.",
+            created_at=10.0,
+            updated_at=20.0,
+            version=1,
+        )
+
+        encoded = json.dumps(session.public_payload(), sort_keys=True)
+
+        self.assertNotIn("private-idempotency-key", encoded)
+        self.assertNotIn("private-provider-token", encoded)
+        self.assertNotIn("http://8.8.8.8:30000", encoded)
+        self.assertNotIn("c" * 64, encoded)
+        self.assertNotIn("manifest_digest", encoded)
+        self.assertIn('"billing_may_continue": true', encoded)
+
     def test_new_attempt_has_a_durable_identity_and_confirming_state(self):
         AttemptState, CloudAttempt, _, OfferQuote = model_api(self)
 

@@ -4,7 +4,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from cloud_run.models import AttemptState, CloudAttempt, OfferQuote
+from cloud_run.models import (
+    AttemptState,
+    CloudAttempt,
+    CloudSession,
+    OfferQuote,
+    SessionState,
+)
 from cloud_run import repository
 
 
@@ -24,6 +30,18 @@ def make_attempt(key="idem-1", attempt_id="attempt-1", now=100.0):
             public_ipaddr="203.0.113.7",
         ),
         attempt_id=attempt_id,
+        now=now,
+    )
+
+
+def make_session(key="session-key", session_id="session-1", now=100.0):
+    return CloudSession.new(
+        key,
+        session_id=session_id,
+        quote=make_attempt().quote,
+        manifest_digest="a" * 64,
+        deadline_at=now + 7200,
+        disk_gb=80,
         now=now,
     )
 
@@ -124,6 +142,65 @@ class AttemptRepositoryTests(unittest.TestCase):
         self.assertEqual(
             [attempt.attempt_id for attempt in reopened.list_recoverable()],
             ["attempt-1"],
+        )
+
+
+class SessionRepositoryTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.database_path = (
+            Path(self.temporary_directory.name)
+            / "private"
+            / "sessions.sqlite3"
+        )
+
+    def test_legacy_attempt_is_migrated_without_losing_billing_identity(self):
+        legacy = repository.AttemptRepository(self.database_path)
+        attempt, _ = legacy.create_or_get(make_attempt())
+        attempt = legacy.transition(
+            attempt.attempt_id,
+            AttemptState.CREATING,
+            now=101.0,
+            instance_id="77",
+            provider_token="private-boundary-token",
+        )
+        legacy.transition(
+            attempt.attempt_id,
+            AttemptState.STARTING,
+            now=102.0,
+        )
+
+        sessions = repository.SessionRepository(self.database_path)
+        session = sessions.get("attempt-1")
+
+        self.assertEqual(session.state, SessionState.BOOTSTRAPPING)
+        self.assertEqual(session.instance_id, "77")
+        self.assertEqual(session.label, "comfy-cloud-run-attempt-1")
+        self.assertEqual(session.provider_token, "private-boundary-token")
+
+    def test_session_round_trip_and_optimistic_version_survive_reopen(self):
+        sessions = repository.SessionRepository(self.database_path)
+        saved, created = sessions.create_or_get(make_session())
+        first_reader = sessions.get(saved.session_id)
+        stale_reader = sessions.get(saved.session_id)
+
+        updated = sessions.save(
+            first_reader.transition(SessionState.OFFER_SELECTED, now=101.0)
+        )
+
+        self.assertTrue(created)
+        self.assertEqual(updated.version, 2)
+        with self.assertRaises(repository.ConcurrentSessionUpdate):
+            sessions.save(
+                stale_reader.transition(SessionState.FAILED, now=102.0)
+            )
+        reopened = repository.SessionRepository(self.database_path)
+        self.assertEqual(reopened.get("session-1"), updated)
+        self.assertEqual(os.stat(self.database_path).st_mode & 0o777, 0o600)
+        self.assertEqual(
+            os.stat(self.database_path.parent).st_mode & 0o777,
+            0o700,
         )
 
 
