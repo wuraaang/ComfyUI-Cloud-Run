@@ -1,0 +1,9 @@
+:8765 {
+	@unauthorized not header Authorization "Bearer {$JUPYTER_TOKEN}"
+	respond @unauthorized 401
+
+	request_header -Authorization
+	request_header -X-Cloud-Run-Boundary
+	request_header X-Cloud-Run-Boundary authenticated
+	reverse_proxy 127.0.0.1:8766
+}
