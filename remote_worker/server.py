@@ -118,6 +118,26 @@ def _response(status, payload, *, headers=None):
     )
 
 
+def _provision_result_payload(result):
+    if not isinstance(result, ProvisionResult):
+        raise ProvisionError("Worker transaction is unavailable.")
+    validated = ProvisionResult(
+        transaction_id=result.transaction_id,
+        manifest_digest=result.manifest_digest,
+        state=result.state,
+        planned_restarts=result.planned_restarts,
+        repair_restarts=result.repair_restarts,
+        missing_class_types=tuple(result.missing_class_types),
+        missing_artifacts=tuple(result.missing_artifacts),
+        progress=(
+            dict(result.progress)
+            if result.progress is not None
+            else None
+        ),
+    )
+    return validated.payload()
+
+
 def _error(status, message):
     return _response(status, {"error": message})
 
@@ -483,7 +503,7 @@ class WorkerApplication:
             )
             if result is None:
                 return _error(503, "Worker transaction is unavailable.")
-            payload = result.payload()
+            payload = _provision_result_payload(result)
             payload["required_uploads"] = list(
                 required_uploads.artifact_ids
             )
@@ -498,7 +518,7 @@ class WorkerApplication:
             return _error(503, "Worker transaction is unavailable.")
         if not isinstance(result, ProvisionResult):
             return _error(503, "Worker transaction is unavailable.")
-        return _response(200, result.payload())
+        return _response(200, _provision_result_payload(result))
 
     async def _apply_manifest(self, body):
         async with self._manifest_request_lock():
@@ -555,7 +575,7 @@ class WorkerApplication:
             return _error(404, "Worker transaction was not found.")
         if not isinstance(result, ProvisionResult):
             return _error(503, "Worker transaction is unavailable.")
-        return _response(200, result.payload())
+        return _response(200, _provision_result_payload(result))
 
     async def _start_job(self, body):
         if self.job_manager is None:

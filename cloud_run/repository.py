@@ -218,11 +218,40 @@ def _initialize_database(path):
                     planned_restart_count INTEGER NOT NULL,
                     repair_count INTEGER NOT NULL,
                     repair_restart_count INTEGER NOT NULL,
+                    phase TEXT,
+                    current_dependency_id TEXT,
+                    transferred_bytes INTEGER NOT NULL DEFAULT 0
+                        CHECK(transferred_bytes >= 0),
+                    total_bytes INTEGER NOT NULL DEFAULT 0
+                        CHECK(total_bytes >= 0),
                     last_progress_at REAL NOT NULL,
                     sanitized_error TEXT
                 )
                 """
             )
+            provision_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(provision_transactions)"
+                ).fetchall()
+            }
+            for name, declaration in (
+                ("phase", "TEXT"),
+                ("current_dependency_id", "TEXT"),
+                (
+                    "transferred_bytes",
+                    "INTEGER NOT NULL DEFAULT 0 CHECK(transferred_bytes >= 0)",
+                ),
+                (
+                    "total_bytes",
+                    "INTEGER NOT NULL DEFAULT 0 CHECK(total_bytes >= 0)",
+                ),
+            ):
+                if name not in provision_columns:
+                    connection.execute(
+                        "ALTER TABLE provision_transactions "
+                        f"ADD COLUMN {name} {declaration}"
+                    )
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS installed_dependencies (
@@ -285,7 +314,7 @@ def _initialize_database(path):
             _migrate_legacy_attempts(connection)
             connection.execute(
                 """
-                INSERT INTO schema_meta(key, value) VALUES('schema_version', '4')
+                INSERT INTO schema_meta(key, value) VALUES('schema_version', '5')
                 ON CONFLICT(key) DO UPDATE SET value = excluded.value
                 """
             )

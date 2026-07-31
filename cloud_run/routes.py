@@ -41,6 +41,8 @@ from .session_service import (
     SessionBusy,
     SessionService,
     SessionServiceError,
+    _stored_manifest,
+    _transfer_catalog,
 )
 from .settings import (
     SettingsStore,
@@ -62,6 +64,19 @@ from .worker_client import WorkerClient
 
 _MODEL_CATEGORY = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}")
 _BASE_ENVIRONMENT_BYTES = 40 * GIB
+_PROVISION_PHASES = {
+    "dependency_transfer",
+    "model_transfer",
+    "digest_verification",
+    "comfyui_startup",
+    "environment_validation",
+    "ready",
+}
+_ARTIFACT_PROVISION_PHASES = {
+    "dependency_transfer",
+    "model_transfer",
+    "digest_verification",
+}
 
 
 def _lexical_path(value):
@@ -428,6 +443,7 @@ def _session_payload(session, service=None):
         payload["history"] = []
         payload["provisioning"] = {
             "phase": session.state.value,
+            "current_model": None,
             "transferred_bytes": 0,
             "total_bytes": 0,
             "installed_units": 0,
@@ -473,14 +489,117 @@ def _session_payload(session, service=None):
             repository.list_transfers(current["job_id"])
         )
     installed = repository.installed_set(session.session_id)
-    payload["provisioning"] = {
-        "phase": session.state.value,
-        "transferred_bytes": sum(
+    manifest = None
+    catalog = {}
+    try:
+        manifest = _stored_manifest(
+            repository,
+            session.manifest_digest,
+        )
+        catalog = _transfer_catalog(manifest)
+    except Exception:
+        manifest = None
+        catalog = {}
+
+    exact_total = (
+        sum(artifact.size_bytes for artifact in catalog.values())
+        if manifest is not None
+        else sum(transfer.expected_size for transfer in transfer_records)
+    )
+    local_offsets = {}
+    if manifest is not None:
+        for transfer in transfer_records:
+            artifact = catalog.get(transfer.artifact_id)
+            if (
+                artifact is None
+                or artifact.source.kind != "local-upload"
+                or transfer.direction != "upload"
+                or transfer.expected_size != artifact.size_bytes
+                or transfer.sha256 != artifact.sha256
+                or isinstance(transfer.offset, bool)
+                or not isinstance(transfer.offset, int)
+                or not 0 <= transfer.offset <= artifact.size_bytes
+            ):
+                continue
+            local_offsets[artifact.artifact_id] = max(
+                local_offsets.get(artifact.artifact_id, 0),
+                transfer.offset,
+            )
+
+    phase = session.state.value
+    current_model = None
+    worker_bytes = 0
+    last_progress_at = session.updated_at
+    try:
+        transaction = repository.latest_provision_transaction(
+            session.session_id
+        )
+    except Exception:
+        transaction = None
+    if transaction is not None and manifest is not None:
+        current_artifact = catalog.get(
+            transaction.current_dependency_id
+        )
+        progress_valid = (
+            transaction.manifest_digest == manifest.digest
+            and transaction.phase in _PROVISION_PHASES
+            and not isinstance(transaction.transferred_bytes, bool)
+            and isinstance(transaction.transferred_bytes, int)
+            and not isinstance(transaction.total_bytes, bool)
+            and isinstance(transaction.total_bytes, int)
+            and transaction.total_bytes == exact_total
+            and 0 <= transaction.transferred_bytes <= exact_total
+            and (
+                (
+                    transaction.phase in _ARTIFACT_PROVISION_PHASES
+                    and current_artifact is not None
+                )
+                or (
+                    transaction.phase not in _ARTIFACT_PROVISION_PHASES
+                    and transaction.current_dependency_id is None
+                )
+            )
+            and not (
+                transaction.phase == "model_transfer"
+                and current_artifact.kind != "model"
+            )
+            and not (
+                transaction.phase == "dependency_transfer"
+                and current_artifact.kind == "model"
+            )
+            and (
+                transaction.phase != "ready"
+                or transaction.transferred_bytes == exact_total
+            )
+            and isinstance(transaction.last_progress_at, (int, float))
+            and not isinstance(transaction.last_progress_at, bool)
+            and math.isfinite(transaction.last_progress_at)
+            and transaction.last_progress_at >= 0
+        )
+        if progress_valid:
+            phase = transaction.phase
+            worker_bytes = transaction.transferred_bytes
+            last_progress_at = transaction.last_progress_at
+            if (
+                current_artifact is not None
+                and current_artifact.kind == "model"
+            ):
+                current_model = current_artifact.logical_name
+
+    if manifest is not None:
+        transferred_bytes = min(
+            exact_total,
+            worker_bytes + sum(local_offsets.values()),
+        )
+    else:
+        transferred_bytes = sum(
             transfer.offset for transfer in transfer_records
-        ),
-        "total_bytes": sum(
-            transfer.expected_size for transfer in transfer_records
-        ),
+        )
+    payload["provisioning"] = {
+        "phase": phase,
+        "current_model": current_model,
+        "transferred_bytes": transferred_bytes,
+        "total_bytes": exact_total,
         "installed_units": len(installed),
         "validated_units": (
             len(installed)
@@ -494,7 +613,7 @@ def _session_payload(session, service=None):
         ),
         "seconds_without_progress": max(
             0.0,
-            now - session.updated_at,
+            now - last_progress_at,
         ),
         "stall_budget_seconds": 600,
     }

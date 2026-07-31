@@ -540,6 +540,55 @@ test("provisioning shows the meaningful-progress clock and ten-minute stall", ()
 });
 
 
+test("provisioning renders only bounded worker phase and inert model text", () => {
+  const document = new FakeDocument();
+  const view = createSessionConsole(document, fakeApi());
+  document.body.appendChild(view.root);
+  const hostileModel = "<script>Gold model</script>.safetensors";
+
+  view.renderSession(sessionPayload({
+    status: "provisioning",
+    provisioning: {
+      phase: "model_transfer",
+      current_model: hostileModel,
+      transferred_bytes: 4_096,
+      total_bytes: 8_192,
+      installed_units: 0,
+      validated_units: 0,
+      seconds_without_progress: 5,
+      stall_budget_seconds: 600,
+      source_url: "https://huggingface.co/private?token=secret",
+    },
+  }));
+
+  assert.match(view.root.textContent, /Model transfer/);
+  assert.ok(view.root.textContent.includes(hostileModel));
+  assert.match(view.root.textContent, /4 KB of 8 KB/);
+  assert.doesNotMatch(view.root.textContent, /huggingface\.co/);
+  assert.doesNotMatch(view.root.textContent, /token=secret/);
+  assert.equal(view.root.querySelector("script"), null);
+  assert.equal(view.root.querySelector("a"), null);
+
+  view.renderSession(sessionPayload({
+    status: "provisioning",
+    provisioning: {
+      phase: "unknown_phase",
+      current_model: "https://example.com/private-model",
+      transferred_bytes: 9_999,
+      total_bytes: 10,
+      installed_units: 0,
+      validated_units: 0,
+      seconds_without_progress: 5,
+      stall_budget_seconds: 600,
+    },
+  }));
+
+  assert.match(view.root.textContent, /Verified transfer\/install/);
+  assert.doesNotMatch(view.root.textContent, /9\.8 KB of 10 bytes/);
+  assert.doesNotMatch(view.root.textContent, /example\.com/);
+});
+
+
 test("no-limit stays red and destroy requires review then final acknowledgement", async () => {
   const document = new FakeDocument();
   const api = fakeApi();

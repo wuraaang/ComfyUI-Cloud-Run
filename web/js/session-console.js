@@ -780,18 +780,53 @@ export function createSessionConsole(document, api = {}, options = {}) {
       provisioningStatus.textContent = "";
       return;
     }
-    const phase = {
+    const sessionPhase = {
       bootstrapping: "Worker authentication",
       provisioning: "Verified transfer/install",
       validating: "Remote /object_info validation",
       repairing: "One approved repair",
     }[statusValue];
-    const transferred = finiteNumber(progress?.transferred_bytes);
-    const total = finiteNumber(progress?.total_bytes);
+    const workerPhases = {
+      dependency_transfer: "Dependency transfer",
+      model_transfer: "Model transfer",
+      digest_verification: "Digest verification",
+      comfyui_startup: "ComfyUI startup",
+      environment_validation: "Environment validation",
+      ready: "Provisioning ready",
+    };
+    const workerPhase = typeof progress?.phase === "string"
+      && Object.hasOwn(workerPhases, progress.phase)
+      ? progress.phase
+      : null;
+    const phase = workerPhase === null
+      ? sessionPhase
+      : workerPhases[workerPhase];
+    const transferred = Number.isSafeInteger(progress?.transferred_bytes)
+      && progress.transferred_bytes >= 0
+      ? progress.transferred_bytes
+      : null;
+    const total = Number.isSafeInteger(progress?.total_bytes)
+      && progress.total_bytes >= 0
+      && transferred !== null
+      && transferred <= progress.total_bytes
+      ? progress.total_bytes
+      : null;
     const bytes =
       transferred !== null && total !== null
         ? ` — ${bytesText(transferred)} of ${bytesText(total)}`
         : "";
+    const currentModel = (
+      workerPhase !== null
+      && ["model_transfer", "digest_verification"].includes(workerPhase)
+      && typeof progress?.current_model === "string"
+      && progress.current_model
+      && progress.current_model.length <= 500
+      && !Array.from(progress.current_model).some(
+        (character) => character.charCodeAt(0) < 32,
+      )
+    )
+      ? progress.current_model
+      : null;
     const installs = positiveInteger(progress?.installed_units);
     const validation = positiveInteger(progress?.validated_units);
     const secondsWithoutProgress = Number(progress?.seconds_without_progress);
@@ -808,6 +843,7 @@ export function createSessionConsole(document, api = {}, options = {}) {
       : "cloud-run-provisioning-status";
     provisioningStatus.textContent =
       `${phase}${bytes}` +
+      `${currentModel === null ? "" : ` — model ${currentModel}`}` +
       `${installs === null ? "" : ` — ${installs} install units`}` +
       `${validation === null ? "" : ` — ${validation} validations`}` +
       (

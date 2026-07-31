@@ -203,6 +203,61 @@ class TransferManagerTests(unittest.TestCase):
         self.assertEqual(destination.read_bytes(), payload)
         self.assertFalse(part.exists())
 
+    def test_progress_enters_verification_before_verified_completion(self):
+        payload = b"verified-progress-model"
+        artifact = artifact_for(payload)
+        destination = self.root / artifact.destination
+        events = []
+
+        def progress(artifact_id, offset, event):
+            events.append((artifact_id, offset, event))
+            if event == "verified":
+                self.assertEqual(destination.read_bytes(), payload)
+
+        result = asyncio.run(
+            self.manager(progress=progress).download(
+                artifact,
+                client=FakeRangeClient(payload),
+            )
+        )
+
+        self.assertEqual(result.state, "verified")
+        names = [event for _artifact_id, _offset, event in events]
+        self.assertIn("transferring", names)
+        self.assertLess(names.index("transferring"), names.index("verifying"))
+        self.assertLess(names.index("verifying"), names.index("verified"))
+        self.assertEqual(events[-1], (artifact.artifact_id, len(payload), "verified"))
+        self.assertTrue(
+            all(
+                artifact_id == artifact.artifact_id
+                and 0 <= offset <= artifact.size_bytes
+                for artifact_id, offset, _event in events
+            )
+        )
+
+    def test_failed_digest_never_reports_verified_completion(self):
+        from remote_worker.transfers import TransferError
+
+        payload = b"digest-mismatch"
+        artifact = artifact_for(payload, digest="0" * 64)
+        events = []
+
+        with self.assertRaises(TransferError):
+            asyncio.run(
+                self.manager(
+                    max_retries=0,
+                    progress=lambda artifact_id, offset, event: events.append(
+                        (artifact_id, offset, event)
+                    ),
+                ).download(
+                    artifact,
+                    client=FakeRangeClient(payload),
+                )
+            )
+
+        self.assertIn("verifying", [event for *_rest, event in events])
+        self.assertNotIn("verified", [event for *_rest, event in events])
+
     def test_wrong_length_hash_redirect_and_non_range_resume_are_rejected(self):
         from remote_worker.transfers import TransferError
 

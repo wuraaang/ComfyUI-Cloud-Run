@@ -28,6 +28,7 @@ from cloud_run.session_service import (
     PreflightBlocked,
     PreflightRow,
     SessionBusy,
+    SessionExecutionError,
     SessionService,
     SessionServiceError,
 )
@@ -743,6 +744,7 @@ class ReusableSessionTests(unittest.TestCase):
             output_allowance_bytes=1024,
             disk_gb=80,
         )
+        self.initial_manifest = initial
         self.jobs.save_manifest(
             initial.digest,
             initial.canonical_bytes().decode("utf-8"),
@@ -767,6 +769,289 @@ class ReusableSessionTests(unittest.TestCase):
             session_secret_hex="d" * 64,
         )
         self.sessions.create_or_get(session)
+
+    def test_apply_manifest_polls_and_persists_only_sanitized_progress(self):
+        service = self.service
+        service.job_poll_interval_seconds = 0
+        manifest = self.initial_manifest
+        session = self.sessions.get("session-1")
+        total_bytes = sum(
+            artifact.size_bytes for artifact in manifest.artifacts
+        )
+
+        class PollingWorker:
+            def __init__(self):
+                self.release = asyncio.Event()
+                self.transaction_calls = []
+                self.polls = 0
+
+            async def apply_manifest(self, _payload):
+                await self.release.wait()
+                return {
+                    "transaction_id": "provision-" + manifest.digest,
+                    "manifest_digest": manifest.digest,
+                    "state": "ready",
+                    "planned_restarts": 0,
+                    "repair_restarts": 0,
+                    "missing_class_types": [],
+                    "missing_artifacts": [],
+                    "progress": {
+                        "phase": "ready",
+                        "dependency_id": None,
+                        "transferred_bytes": total_bytes,
+                        "total_bytes": total_bytes,
+                    },
+                }
+
+            async def transaction(self, transaction_id):
+                self.transaction_calls.append(transaction_id)
+                self.polls += 1
+                if self.polls == 1:
+                    return None
+                progress = {
+                    "phase": (
+                        "model_transfer"
+                        if self.polls == 2
+                        else "digest_verification"
+                    ),
+                    "dependency_id": self_outer.model.artifact_id,
+                    "transferred_bytes": (
+                        self_outer.model.size_bytes // 2
+                        if self.polls == 2
+                        else self_outer.model.size_bytes
+                    ),
+                    "total_bytes": total_bytes,
+                }
+                if self.polls == 3:
+                    self.release.set()
+                return {
+                    "transaction_id": transaction_id,
+                    "manifest_digest": manifest.digest,
+                    "state": "applying",
+                    "planned_restarts": 0,
+                    "repair_restarts": 0,
+                    "missing_class_types": [],
+                    "missing_artifacts": [],
+                    "progress": progress,
+                }
+
+        self_outer = self
+
+        async def exercise():
+            worker = PollingWorker()
+            result = await asyncio.wait_for(
+                service._apply_manifest(
+                    worker,
+                    session,
+                    manifest,
+                    transfer_job_id="bootstrap:session-1",
+                    capture=self.first_capture,
+                ),
+                timeout=0.2,
+            )
+            return worker, result
+
+        worker, result = asyncio.run(exercise())
+        latest = self.jobs.latest_provision_transaction("session-1")
+
+        self.assertEqual(result["state"], "ready")
+        self.assertGreaterEqual(worker.polls, 3)
+        self.assertEqual(
+            set(worker.transaction_calls),
+            {"provision-" + manifest.digest},
+        )
+        self.assertEqual(latest.phase, "ready")
+        self.assertIsNone(latest.current_dependency_id)
+        self.assertEqual(latest.transferred_bytes, total_bytes)
+        self.assertEqual(latest.total_bytes, total_bytes)
+        self.assertNotIn("huggingface.co", repr(latest))
+        self.assertNotIn("provider-token", repr(latest))
+
+    def test_legacy_apply_response_without_progress_remains_accepted(self):
+        result = asyncio.run(
+            self.service._apply_manifest(
+                self.worker,
+                self.sessions.get("session-1"),
+                self.initial_manifest,
+                transfer_job_id="bootstrap:session-1",
+                capture=self.first_capture,
+            )
+        )
+
+        self.assertEqual(result["state"], "ready")
+        self.assertNotIn("progress", result)
+        self.assertIsNone(
+            self.jobs.latest_provision_transaction("session-1")
+        )
+
+    def test_hostile_worker_progress_is_rejected_without_persistence(self):
+        manifest = self.initial_manifest
+        total_bytes = sum(
+            artifact.size_bytes for artifact in manifest.artifacts
+        )
+        base_progress = {
+            "phase": "model_transfer",
+            "dependency_id": self.model.artifact_id,
+            "transferred_bytes": 1,
+            "total_bytes": total_bytes,
+        }
+        hostile = (
+            {**base_progress, "phase": "unknown"},
+            {**base_progress, "dependency_id": "https://example.com/model"},
+            {**base_progress, "transferred_bytes": total_bytes + 1},
+            {**base_progress, "total_bytes": total_bytes + 1},
+            {
+                **base_progress,
+                "source_url": "https://huggingface.co/private?token=secret",
+            },
+        )
+
+        for progress in hostile:
+            with self.subTest(progress=progress):
+                worker = SequentialWorker()
+
+                async def apply_manifest(_payload, value=progress):
+                    return {
+                        "transaction_id": "provision-" + manifest.digest,
+                        "manifest_digest": manifest.digest,
+                        "state": "ready",
+                        "planned_restarts": 0,
+                        "repair_restarts": 0,
+                        "missing_class_types": [],
+                        "missing_artifacts": [],
+                        "progress": value,
+                    }
+
+                worker.apply_manifest = apply_manifest
+                with self.assertRaises(SessionExecutionError):
+                    asyncio.run(
+                        self.service._apply_manifest(
+                            worker,
+                            self.sessions.get("session-1"),
+                            manifest,
+                            transfer_job_id="bootstrap:session-1",
+                            capture=self.first_capture,
+                        )
+                    )
+                self.assertIsNone(
+                    self.jobs.latest_provision_transaction("session-1")
+                )
+
+    def test_observed_ready_progress_cannot_replace_failed_apply_result(self):
+        self.service.job_poll_interval_seconds = 0
+        manifest = self.initial_manifest
+        total_bytes = sum(
+            artifact.size_bytes for artifact in manifest.artifacts
+        )
+
+        class FinalFailureWorker:
+            def __init__(self):
+                self.release = asyncio.Event()
+
+            async def apply_manifest(self, _payload):
+                await self.release.wait()
+                return {
+                    "transaction_id": "provision-" + manifest.digest,
+                    "manifest_digest": manifest.digest,
+                    "state": "failed",
+                    "planned_restarts": 0,
+                    "repair_restarts": 0,
+                    "missing_class_types": [],
+                    "missing_artifacts": [],
+                    "progress": {
+                        "phase": "environment_validation",
+                        "dependency_id": None,
+                        "transferred_bytes": total_bytes,
+                        "total_bytes": total_bytes,
+                    },
+                }
+
+            async def transaction(self, transaction_id):
+                self.release.set()
+                return {
+                    "transaction_id": transaction_id,
+                    "manifest_digest": manifest.digest,
+                    "state": "ready",
+                    "planned_restarts": 0,
+                    "repair_restarts": 0,
+                    "missing_class_types": [],
+                    "missing_artifacts": [],
+                    "progress": {
+                        "phase": "ready",
+                        "dependency_id": None,
+                        "transferred_bytes": total_bytes,
+                        "total_bytes": total_bytes,
+                    },
+                }
+
+        async def exercise():
+            await asyncio.wait_for(
+                self.service._apply_manifest(
+                    FinalFailureWorker(),
+                    self.sessions.get("session-1"),
+                    manifest,
+                    transfer_job_id="bootstrap:session-1",
+                    capture=self.first_capture,
+                ),
+                timeout=0.2,
+            )
+
+        with self.assertRaises(SessionExecutionError):
+            asyncio.run(exercise())
+
+        latest = self.jobs.latest_provision_transaction("session-1")
+        self.assertEqual(latest.state, "failed")
+        self.assertEqual(latest.phase, "environment_validation")
+
+    def test_invalid_polled_progress_cancels_and_consumes_active_apply(self):
+        self.service.job_poll_interval_seconds = 0
+        manifest = self.initial_manifest
+
+        class InvalidPollingWorker:
+            def __init__(self):
+                self.cancelled = False
+
+            async def apply_manifest(self, _payload):
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    self.cancelled = True
+                    raise
+
+            async def transaction(self, transaction_id):
+                return {
+                    "transaction_id": transaction_id,
+                    "manifest_digest": manifest.digest,
+                    "state": "applying",
+                    "planned_restarts": 0,
+                    "repair_restarts": 0,
+                    "missing_class_types": [],
+                    "missing_artifacts": [],
+                    "progress": {
+                        "phase": "model_transfer",
+                        "dependency_id": "https://example.com/model",
+                        "transferred_bytes": 1,
+                        "total_bytes": 20,
+                    },
+                }
+
+        async def exercise():
+            worker = InvalidPollingWorker()
+            with self.assertRaises(SessionExecutionError):
+                await self.service._apply_manifest(
+                    worker,
+                    self.sessions.get("session-1"),
+                    manifest,
+                    transfer_job_id="bootstrap:session-1",
+                    capture=self.first_capture,
+                )
+            return worker
+
+        worker = asyncio.run(exercise())
+        self.assertTrue(worker.cancelled)
+        self.assertIsNone(
+            self.jobs.latest_provision_transaction("session-1")
+        )
 
     def test_two_compatible_jobs_reuse_one_session_and_transfer_only_delta(self):
         first = asyncio.run(

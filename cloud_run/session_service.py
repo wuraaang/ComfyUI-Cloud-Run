@@ -38,6 +38,19 @@ _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}")
 _HEX_40 = re.compile(r"[0-9a-f]{40}")
 _HEX_64 = re.compile(r"[0-9a-f]{64}")
 _STATUSES = {"resolved", "mapping_required", "unsupported"}
+_PROVISION_PHASES = {
+    "dependency_transfer",
+    "model_transfer",
+    "digest_verification",
+    "comfyui_startup",
+    "environment_validation",
+    "ready",
+}
+_ARTIFACT_PROVISION_PHASES = {
+    "dependency_transfer",
+    "model_transfer",
+    "digest_verification",
+}
 _SOURCE_KINDS = {
     "agent",
     "approved",
@@ -723,7 +736,65 @@ def _safe_remote_error(error):
     return message if message in allowed else "Remote execution failed."
 
 
-def _provision_payload_valid(payload, manifest_digest):
+def _validated_provision_progress(payload, manifest):
+    progress = payload.get("progress")
+    if progress is None:
+        if "progress" in payload:
+            raise ValueError("Invalid provisioning progress.")
+        return None
+    fields = {
+        "phase",
+        "dependency_id",
+        "transferred_bytes",
+        "total_bytes",
+    }
+    if not isinstance(progress, dict) or set(progress) != fields:
+        raise ValueError("Invalid provisioning progress.")
+    phase = progress.get("phase")
+    dependency_id = progress.get("dependency_id")
+    transferred_bytes = progress.get("transferred_bytes")
+    total_bytes = progress.get("total_bytes")
+    catalog = _transfer_catalog(manifest)
+    expected_total = sum(
+        artifact.size_bytes for artifact in catalog.values()
+    )
+    artifact = (
+        catalog.get(dependency_id)
+        if isinstance(dependency_id, str)
+        else None
+    )
+    if (
+        phase not in _PROVISION_PHASES
+        or isinstance(transferred_bytes, bool)
+        or not isinstance(transferred_bytes, int)
+        or isinstance(total_bytes, bool)
+        or not isinstance(total_bytes, int)
+        or total_bytes != expected_total
+        or not 0 <= transferred_bytes <= total_bytes
+        or (
+            phase in _ARTIFACT_PROVISION_PHASES
+            and (
+                not isinstance(dependency_id, str)
+                or not _IDENTIFIER.fullmatch(dependency_id)
+                or artifact is None
+            )
+        )
+        or (
+            phase not in _ARTIFACT_PROVISION_PHASES
+            and dependency_id is not None
+        )
+        or (phase == "model_transfer" and artifact.kind != "model")
+        or (
+            phase == "dependency_transfer"
+            and artifact.kind == "model"
+        )
+        or (phase == "ready" and transferred_bytes != total_bytes)
+    ):
+        raise ValueError("Invalid provisioning progress.")
+    return dict(progress)
+
+
+def _provision_payload_valid(payload, manifest):
     required = {
         "transaction_id",
         "manifest_digest",
@@ -733,15 +804,23 @@ def _provision_payload_valid(payload, manifest_digest):
         "missing_class_types",
         "missing_artifacts",
     }
-    if not isinstance(payload, dict) or frozenset(payload) not in {
-        frozenset(required),
-        frozenset(required | {"required_uploads"}),
-    }:
+    optional = {"required_uploads", "progress"}
+    allowed = {
+        frozenset(required | subset)
+        for subset in (
+            set(),
+            {"required_uploads"},
+            {"progress"},
+            optional,
+        )
+    }
+    if not isinstance(payload, dict) or frozenset(payload) not in allowed:
         return False
     if (
         not isinstance(payload.get("transaction_id"), str)
         or not _IDENTIFIER.fullmatch(payload["transaction_id"])
-        or payload.get("manifest_digest") != manifest_digest
+        or payload["transaction_id"] != "provision-" + manifest.digest
+        or payload.get("manifest_digest") != manifest.digest
         or payload.get("state")
         not in {"applying", "awaiting_upload", "ready", "failed", "stalled"}
         or payload.get("planned_restarts") not in {0, 1}
@@ -766,6 +845,15 @@ def _provision_payload_valid(payload, manifest_digest):
             or len(set(values)) != len(values)
         ):
             return False
+    try:
+        progress = _validated_provision_progress(payload, manifest)
+    except (SessionExecutionError, TypeError, ValueError):
+        return False
+    if progress is not None and (
+        (progress["phase"] == "ready")
+        != (payload["state"] == "ready")
+    ):
+        return False
     return True
 
 
@@ -1771,6 +1859,98 @@ class SessionService:
             )
         await progress(artifact.size_bytes)
 
+    def _record_provision_progress(
+        self,
+        response,
+        *,
+        session,
+        manifest,
+        transfer_job_id,
+    ):
+        try:
+            progress = _validated_provision_progress(response, manifest)
+            if progress is None:
+                return
+            sanitized_error = {
+                "failed": "Remote provisioning failed.",
+                "stalled": "Remote provisioning stalled.",
+            }.get(response["state"])
+            self.job_repository.record_provision_progress(
+                transaction_id=response["transaction_id"],
+                session_id=session.session_id,
+                job_id=transfer_job_id,
+                manifest_digest=manifest.digest,
+                state=response["state"],
+                phase=progress["phase"],
+                current_dependency_id=progress["dependency_id"],
+                transferred_bytes=progress["transferred_bytes"],
+                total_bytes=progress["total_bytes"],
+                last_progress_at=self._now(),
+                sanitized_error=sanitized_error,
+            )
+        except (KeyError, TypeError, ValueError):
+            raise SessionExecutionError(
+                "Remote provisioning response was invalid."
+            ) from None
+
+    async def _apply_with_progress_polling(
+        self,
+        worker,
+        request,
+        *,
+        session,
+        manifest,
+        transfer_job_id,
+    ):
+        apply_task = asyncio.ensure_future(worker.apply_manifest(request))
+        transaction = getattr(worker, "transaction", None)
+        transaction_id = "provision-" + manifest.digest
+        try:
+            while True:
+                done, _pending = await asyncio.wait(
+                    {apply_task},
+                    timeout=self.job_poll_interval_seconds,
+                )
+                if apply_task in done:
+                    response = apply_task.result()
+                    break
+                if not callable(transaction):
+                    continue
+                try:
+                    observed = await transaction(transaction_id)
+                except (asyncio.CancelledError, KeyboardInterrupt):
+                    raise
+                except Exception:
+                    continue
+                if observed is None:
+                    continue
+                if not _provision_payload_valid(observed, manifest):
+                    raise SessionExecutionError(
+                        "Remote provisioning response was invalid."
+                    )
+                self._record_provision_progress(
+                    observed,
+                    session=session,
+                    manifest=manifest,
+                    transfer_job_id=transfer_job_id,
+                )
+            if not _provision_payload_valid(response, manifest):
+                raise SessionExecutionError(
+                    "Remote provisioning response was invalid."
+                )
+            self._record_provision_progress(
+                response,
+                session=session,
+                manifest=manifest,
+                transfer_job_id=transfer_job_id,
+            )
+            return response
+        except BaseException:
+            if not apply_task.done():
+                apply_task.cancel()
+            await asyncio.gather(apply_task, return_exceptions=True)
+            raise
+
     async def _apply_manifest(
         self,
         worker,
@@ -1791,14 +1971,22 @@ class SessionService:
         catalog = _transfer_catalog(manifest)
         for _attempt in range(3):
             try:
-                response = await worker.apply_manifest(request)
+                response = await self._apply_with_progress_polling(
+                    worker,
+                    request,
+                    session=session,
+                    manifest=manifest,
+                    transfer_job_id=transfer_job_id,
+                )
             except (asyncio.CancelledError, KeyboardInterrupt):
+                raise
+            except SessionExecutionError:
                 raise
             except Exception:
                 raise SessionExecutionError(
                     "Remote provisioning failed."
                 ) from None
-            if not _provision_payload_valid(response, manifest.digest):
+            if not _provision_payload_valid(response, manifest):
                 raise SessionExecutionError(
                     "Remote provisioning response was invalid."
                 )
@@ -1837,12 +2025,18 @@ class SessionService:
                     "Remote provisioning status is unavailable."
                 ) from None
             if (
-                not _provision_payload_valid(response, manifest.digest)
+                not _provision_payload_valid(response, manifest)
                 or response["state"] != "ready"
             ):
                 raise SessionExecutionError(
                     "Remote provisioning is incomplete."
                 )
+            self._record_provision_progress(
+                response,
+                session=session,
+                manifest=manifest,
+                transfer_job_id=transfer_job_id,
+            )
             return response
         raise SessionExecutionError(
             "Remote provisioning did not accept required uploads."

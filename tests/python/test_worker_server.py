@@ -130,6 +130,80 @@ class WorkerStateTests(unittest.TestCase):
             with self.assertRaises(WorkerStateError):
                 WorkerStateStore(path).load()
 
+    def test_provision_transaction_accepts_only_sanitized_progress_fields(self):
+        from remote_worker.state import WorkerStateError, WorkerStateStore
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = WorkerStateStore(Path(directory) / "worker.json")
+            store.claim(
+                session_id="session-1",
+                session_secret_hex="a" * 64,
+            )
+            transaction_id = "provision-" + "b" * 64
+            record = {
+                "kind": "provision",
+                "transaction_id": transaction_id,
+                "manifest_digest": "b" * 64,
+                "manifest": None,
+                "required_class_types": ["KSampler"],
+                "state": "applying",
+                "planned_restarts": 0,
+                "repair_restarts": 0,
+                "repair_used": False,
+                "missing_class_types": [],
+                "missing_artifacts": [],
+                "failure_code": None,
+                "updated_at": 10.0,
+                "last_progress_at": 10.0,
+                "progress": {
+                    "phase": "model_transfer",
+                    "dependency_id": "model-" + "c" * 64,
+                    "transferred_bytes": 4,
+                    "total_bytes": 10,
+                },
+            }
+
+            store.record_transaction(transaction_id, record)
+            saved = store.load()["transactions"][transaction_id]
+            self.assertEqual(saved["progress"], record["progress"])
+            with self.assertRaises(WorkerStateError):
+                store.record_transaction(
+                    transaction_id,
+                    {
+                        **record,
+                        "source_url": (
+                            "https://huggingface.co/private?token=secret"
+                        ),
+                    },
+                )
+            with self.assertRaises(WorkerStateError):
+                store.record_transaction(
+                    transaction_id,
+                    {
+                        **record,
+                        "progress": {
+                            **record["progress"],
+                            "transferred_bytes": 11,
+                        },
+                    },
+                )
+            with self.assertRaises(WorkerStateError):
+                store.record_transaction(
+                    transaction_id,
+                    {
+                        **record,
+                        "progress": {
+                            **record["progress"],
+                            "phase": [],
+                        },
+                    },
+                )
+            with self.assertRaises(WorkerStateError):
+                store.record_transaction(
+                    transaction_id,
+                    {**record, "required_class_types": [[]]},
+                )
+
 
 class WorkerApplicationTests(unittest.TestCase):
     def setUp(self):

@@ -474,11 +474,17 @@ class TransferManager:
         for parent in changed_parents:
             _fsync_directory(parent)
 
-    async def _notify_progress(self, artifact, offset):
+    async def _notify_progress(self, artifact, offset, event):
         if self.progress is None:
             return
+        if event not in {"transferring", "verifying", "verified"}:
+            raise _transfer_error()
         try:
-            result = self.progress(artifact.artifact_id, int(offset))
+            result = self.progress(
+                artifact.artifact_id,
+                int(offset),
+                event,
+            )
             if inspect.isawaitable(result):
                 await result
         except (asyncio.CancelledError, KeyboardInterrupt):
@@ -669,7 +675,11 @@ class TransferManager:
                         handle.flush()
                         os.fsync(handle.fileno())
                         _fsync_directory(part.parent)
-                        await self._notify_progress(artifact, written)
+                        await self._notify_progress(
+                            artifact,
+                            written,
+                            "transferring",
+                        )
             except (TransferError, asyncio.CancelledError, KeyboardInterrupt):
                 raise
             except Exception:
@@ -754,6 +764,11 @@ class TransferManager:
                 offset=offset,
                 response=response,
             )
+        await self._notify_progress(
+            artifact,
+            artifact.size_bytes,
+            "verifying",
+        )
         if not _verified_file(part, artifact):
             try:
                 part.unlink()
@@ -769,7 +784,11 @@ class TransferManager:
             raise
         except OSError:
             raise _transfer_error() from None
-        await self._notify_progress(artifact, artifact.size_bytes)
+        await self._notify_progress(
+            artifact,
+            artifact.size_bytes,
+            "verified",
+        )
         return self._result(
             artifact,
             destination,
@@ -908,7 +927,11 @@ class TransferManager:
 
             next_offset = end + 1
             _fsync_directory(part.parent)
-            await self._notify_progress(artifact, next_offset)
+            await self._notify_progress(
+                artifact,
+                next_offset,
+                "transferring",
+            )
             if next_offset < artifact.size_bytes:
                 return self._result(
                     artifact,
@@ -916,6 +939,11 @@ class TransferManager:
                     "receiving",
                     next_offset,
                 )
+            await self._notify_progress(
+                artifact,
+                next_offset,
+                "verifying",
+            )
             if not _verified_file(part, artifact):
                 try:
                     part.unlink()
@@ -931,6 +959,11 @@ class TransferManager:
                 raise
             except OSError:
                 raise _transfer_error() from None
+            await self._notify_progress(
+                artifact,
+                next_offset,
+                "verified",
+            )
             return self._result(
                 artifact,
                 destination,

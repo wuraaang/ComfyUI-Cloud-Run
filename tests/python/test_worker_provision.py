@@ -56,6 +56,32 @@ def artifact(
     )
 
 
+def public_artifact(
+    artifact_id,
+    *,
+    kind="model",
+    destination=None,
+    payload=None,
+):
+    revision = "b" * 40
+    return replace(
+        artifact(
+            artifact_id,
+            kind=kind,
+            destination=destination,
+            payload=payload,
+        ),
+        source=SourceSpec(
+            kind="huggingface",
+            locator=(
+                "https://huggingface.co/example/private-repository-marker/"
+                f"resolve/{revision}/{artifact_id}.bin"
+            ),
+            immutable_revision=revision,
+        ),
+    )
+
+
 def custom_node():
     archive = artifact(
         "fancy-archive",
@@ -150,7 +176,15 @@ class FakeArtifacts:
         if self.uploads_required:
             raise UploadsRequired(self.uploads_required)
         for item in artifacts:
-            progress("verified_bytes", item.size_bytes)
+            progress(
+                (
+                    "model_transfer"
+                    if item.kind == "model"
+                    else "dependency_transfer"
+                ),
+                item.artifact_id,
+                item.size_bytes,
+            )
         if force:
             self.repair_calls.append(identifiers)
         return identifiers
@@ -328,6 +362,162 @@ class ProvisionerTests(unittest.TestCase):
             persisted["transactions"][result.transaction_id]["state"],
             "ready",
         )
+
+    def test_progress_is_bounded_monotonic_sanitized_and_reaches_ready(self):
+        model = public_artifact(
+            "progress-model",
+            payload=b"progress-model-payload",
+        )
+        input_media = public_artifact(
+            "progress-input",
+            kind="input",
+            destination="input/progress-input.bin",
+            payload=b"progress-input-payload",
+        )
+        desired = manifest(artifacts=(model, input_media))
+        history = []
+        original_record = self.state.record_transaction
+
+        def record_transaction(transaction_id, record, **kwargs):
+            history.append(json.loads(json.dumps(record)))
+            return original_record(transaction_id, record, **kwargs)
+
+        self.state.record_transaction = record_transaction
+
+        class ProgressArtifacts(FakeArtifacts):
+            async def ensure_many(
+                self,
+                artifacts,
+                *,
+                source_urls,
+                progress,
+                force=False,
+            ):
+                del source_urls, force
+                for item in artifacts:
+                    phase = (
+                        "model_transfer"
+                        if item.kind == "model"
+                        else "dependency_transfer"
+                    )
+                    progress(phase, item.artifact_id, item.size_bytes // 2)
+                    progress(phase, item.artifact_id, item.size_bytes)
+                    progress(
+                        "digest_verification",
+                        item.artifact_id,
+                        item.size_bytes,
+                    )
+                    progress(phase, item.artifact_id, item.size_bytes)
+                return tuple(item.artifact_id for item in artifacts)
+
+        provisioner = self.provisioner(
+            comfy=FakeComfy([{"KSampler": {}}]),
+            artifacts=ProgressArtifacts(),
+        )
+
+        result = asyncio.run(
+            provisioner.apply_manifest(
+                desired,
+                required_class_types=("KSampler",),
+                source_urls={
+                    model.artifact_id: (
+                        "https://huggingface.co/example/"
+                        "private-repository-marker/resolve/"
+                        + "b" * 40
+                        + "/progress-model.bin?"
+                        "token=temporary-source-secret"
+                    )
+                },
+            )
+        )
+
+        total_bytes = model.size_bytes + input_media.size_bytes
+        self.assertEqual(
+            result.progress,
+            {
+                "phase": "ready",
+                "dependency_id": None,
+                "transferred_bytes": total_bytes,
+                "total_bytes": total_bytes,
+            },
+        )
+        snapshots = [
+            record.get("progress")
+            for record in history
+            if record.get("progress") is not None
+        ]
+        self.assertEqual(
+            {snapshot["phase"] for snapshot in snapshots},
+            {
+                "dependency_transfer",
+                "model_transfer",
+                "digest_verification",
+                "comfyui_startup",
+                "environment_validation",
+                "ready",
+            },
+        )
+        self.assertEqual(
+            [snapshot["transferred_bytes"] for snapshot in snapshots],
+            sorted(snapshot["transferred_bytes"] for snapshot in snapshots),
+        )
+        self.assertTrue(
+            all(
+                set(snapshot)
+                == {
+                    "phase",
+                    "dependency_id",
+                    "transferred_bytes",
+                    "total_bytes",
+                }
+                and snapshot["dependency_id"]
+                in {None, model.artifact_id, input_media.artifact_id}
+                and 0
+                <= snapshot["transferred_bytes"]
+                <= snapshot["total_bytes"]
+                == total_bytes
+                for snapshot in snapshots
+            )
+        )
+        encoded = repr(history)
+        for private_value in (
+            "https://huggingface.co/",
+            "private-repository-marker",
+            "temporary-source-secret",
+            "/Users/private/model.bin",
+            "raw transport exception",
+        ):
+            self.assertNotIn(private_value, encoded)
+
+    def test_progress_rejects_unknown_regressing_unbounded_or_invalid_events(self):
+        from remote_worker.provision import ProvisionError, _ProgressTracker
+
+        model = public_artifact(
+            "bounded-model",
+            payload=b"bounded-model-payload",
+        )
+
+        def tracker():
+            return _ProgressTracker(
+                FakeClock(),
+                (model,),
+                lambda _snapshot: None,
+            )
+
+        current = tracker()
+        current.progress("model_transfer", model.artifact_id, 2)
+        with self.assertRaises(ProvisionError):
+            current.progress("model_transfer", model.artifact_id, 1)
+
+        invalid_events = (
+            ("model_transfer", "unknown-artifact", 1),
+            ("model_transfer", model.artifact_id, model.size_bytes + 1),
+            ("untrusted_phase", model.artifact_id, 1),
+        )
+        for phase, artifact_id, offset in invalid_events:
+            with self.subTest(phase=phase, artifact_id=artifact_id):
+                with self.assertRaises(ProvisionError):
+                    tracker().progress(phase, artifact_id, offset)
 
     def test_one_approved_repair_gets_one_extra_restart_then_stops(self):
         from remote_worker.provision import ProvisionError
@@ -575,6 +765,96 @@ class ProvisionerTests(unittest.TestCase):
                 )
             )
         self.assertEqual(disk_artifacts.ensure_calls, [])
+
+
+class WorkerArtifactProviderProgressTests(unittest.TestCase):
+    def test_two_artifacts_keep_identity_and_map_transfer_phases(self):
+        from remote_worker.provision import WorkerArtifactProvider
+
+        model = public_artifact(
+            "provider-model",
+            payload=b"provider-model-payload",
+        )
+        input_media = public_artifact(
+            "provider-input",
+            kind="input",
+            destination="input/provider-input.bin",
+            payload=b"provider-input-payload",
+        )
+
+        class ProgressManager:
+            progress = None
+
+            def verify(self, _artifact):
+                return None
+
+            def reset(self, _artifact):
+                return None
+
+            async def download_many(self, artifacts, **_kwargs):
+                for item in artifacts:
+                    self.progress(
+                        item.artifact_id,
+                        item.size_bytes // 2,
+                        "transferring",
+                    )
+                    self.progress(
+                        item.artifact_id,
+                        item.size_bytes,
+                        "verifying",
+                    )
+                    self.progress(
+                        item.artifact_id,
+                        item.size_bytes,
+                        "verified",
+                    )
+                return tuple(item.artifact_id for item in artifacts)
+
+        class UnusedClient:
+            async def get(self, *_args, **_kwargs):
+                raise AssertionError("fake provider transport was bypassed")
+
+        events = []
+        provider = WorkerArtifactProvider(ProgressManager(), UnusedClient())
+        asyncio.run(
+            provider.ensure_many(
+                (model, input_media),
+                source_urls={},
+                progress=lambda phase, artifact_id, offset: events.append(
+                    (phase, artifact_id, offset)
+                ),
+            )
+        )
+
+        self.assertEqual(
+            events,
+            [
+                ("model_transfer", model.artifact_id, model.size_bytes // 2),
+                (
+                    "digest_verification",
+                    model.artifact_id,
+                    model.size_bytes,
+                ),
+                ("model_transfer", model.artifact_id, model.size_bytes),
+                (
+                    "dependency_transfer",
+                    input_media.artifact_id,
+                    input_media.size_bytes // 2,
+                ),
+                (
+                    "digest_verification",
+                    input_media.artifact_id,
+                    input_media.size_bytes,
+                ),
+                (
+                    "dependency_transfer",
+                    input_media.artifact_id,
+                    input_media.size_bytes,
+                ),
+            ],
+        )
+        self.assertNotIn("huggingface.co", repr(events))
+        self.assertNotIn(model.logical_name + ".bin", repr(events))
 
 
 class FakeProcess:
@@ -955,6 +1235,90 @@ class FakeRouteProvisioner:
         if transaction_id != self.result.transaction_id:
             return None
         return self.result
+
+
+class ProvisionResultProgressTests(unittest.TestCase):
+    def test_progress_is_optional_exact_and_sanitized(self):
+        from remote_worker.provision import ProvisionError, ProvisionResult
+
+        base = {
+            "transaction_id": "provision-1",
+            "manifest_digest": "a" * 64,
+            "state": "applying",
+            "planned_restarts": 0,
+            "repair_restarts": 0,
+            "missing_class_types": (),
+            "missing_artifacts": (),
+        }
+        old_shape = ProvisionResult(**base).payload()
+        self.assertNotIn("progress", old_shape)
+
+        progress = {
+            "phase": "model_transfer",
+            "dependency_id": "model-" + "b" * 64,
+            "transferred_bytes": 1_048_576,
+            "total_bytes": 8_388_608,
+        }
+        extended = ProvisionResult(**base, progress=progress)
+        self.assertEqual(extended.payload()["progress"], progress)
+
+        invalid_progress = (
+            {**progress, "phase": "unknown"},
+            {**progress, "phase": []},
+            {**progress, "dependency_id": "../model.bin"},
+            {**progress, "transferred_bytes": -1},
+            {**progress, "transferred_bytes": progress["total_bytes"] + 1},
+            {**progress, "source_url": "https://example.com/private"},
+        )
+        for value in invalid_progress:
+            with self.subTest(value=value):
+                with self.assertRaises(ProvisionError):
+                    ProvisionResult(**base, progress=value)
+
+    def test_server_rebuilds_the_allowlisted_result_payload(self):
+        from remote_worker.provision import ProvisionResult
+        from remote_worker.server import _provision_result_payload
+
+        class LeakyProvisionResult(ProvisionResult):
+            def payload(self):
+                return {
+                    **super().payload(),
+                    "source_url": "https://huggingface.co/private?token=secret",
+                    "raw_exception": "transport stack trace",
+                }
+
+        result = LeakyProvisionResult(
+            transaction_id="provision-1",
+            manifest_digest="a" * 64,
+            state="ready",
+            planned_restarts=0,
+            repair_restarts=0,
+            missing_class_types=(),
+            missing_artifacts=(),
+            progress={
+                "phase": "ready",
+                "dependency_id": None,
+                "transferred_bytes": 10,
+                "total_bytes": 10,
+            },
+        )
+
+        payload = _provision_result_payload(result)
+        self.assertEqual(
+            set(payload),
+            {
+                "transaction_id",
+                "manifest_digest",
+                "state",
+                "planned_restarts",
+                "repair_restarts",
+                "missing_class_types",
+                "missing_artifacts",
+                "progress",
+            },
+        )
+        self.assertNotIn("source_url", repr(payload))
+        self.assertNotIn("raw_exception", repr(payload))
 
 
 class WorkerProvisionRouteTests(unittest.TestCase):

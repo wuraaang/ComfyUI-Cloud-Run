@@ -41,8 +41,29 @@ PROVISION_STALL_SECONDS = 600
 MAX_REQUIRED_CLASS_TYPES = 100_000
 MAX_MANIFEST_REQUEST_BYTES = 16 * 1024 * 1024
 MAX_SOURCE_URL_BYTES = 8192
+PROGRESS_PERSIST_BYTES = 1024 * 1024
+PROGRESS_PERSIST_SECONDS = 1
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}")
 _HEX_64 = re.compile(r"[0-9a-f]{64}")
+_PROGRESS_FIELDS = {
+    "phase",
+    "dependency_id",
+    "transferred_bytes",
+    "total_bytes",
+}
+_PROGRESS_PHASES = {
+    "dependency_transfer",
+    "model_transfer",
+    "digest_verification",
+    "comfyui_startup",
+    "environment_validation",
+    "ready",
+}
+_ARTIFACT_PROGRESS_PHASES = {
+    "dependency_transfer",
+    "model_transfer",
+    "digest_verification",
+}
 _REQUEST_FIELDS = {
     "manifest",
     "manifest_digest",
@@ -90,6 +111,40 @@ class UploadsRequired(ProvisionError):
         super().__init__("Verified artifact uploads are required.")
 
 
+def _validated_progress(value):
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != _PROGRESS_FIELDS:
+        raise ProvisionError("Provisioning progress is invalid.")
+    phase = value.get("phase")
+    dependency_id = value.get("dependency_id")
+    transferred_bytes = value.get("transferred_bytes")
+    total_bytes = value.get("total_bytes")
+    if (
+        not isinstance(phase, str)
+        or phase not in _PROGRESS_PHASES
+        or isinstance(transferred_bytes, bool)
+        or not isinstance(transferred_bytes, int)
+        or isinstance(total_bytes, bool)
+        or not isinstance(total_bytes, int)
+        or not 0 <= transferred_bytes <= total_bytes
+        or (
+            phase in _ARTIFACT_PROGRESS_PHASES
+            and (
+                not isinstance(dependency_id, str)
+                or not _IDENTIFIER.fullmatch(dependency_id)
+            )
+        )
+        or (
+            phase not in _ARTIFACT_PROGRESS_PHASES
+            and dependency_id is not None
+        )
+        or (phase == "ready" and transferred_bytes != total_bytes)
+    ):
+        raise ProvisionError("Provisioning progress is invalid.")
+    return dict(value)
+
+
 @dataclass(frozen=True)
 class ProvisionResult:
     transaction_id: str
@@ -99,6 +154,7 @@ class ProvisionResult:
     repair_restarts: int
     missing_class_types: tuple[str, ...]
     missing_artifacts: tuple[str, ...]
+    progress: dict | None = None
 
     def __post_init__(self):
         if (
@@ -129,9 +185,14 @@ class ProvisionResult:
             )
         ):
             raise ProvisionError("Provisioning result is invalid.")
+        object.__setattr__(
+            self,
+            "progress",
+            _validated_progress(self.progress),
+        )
 
     def payload(self):
-        return {
+        payload = {
             "transaction_id": self.transaction_id,
             "manifest_digest": self.manifest_digest,
             "state": self.state,
@@ -140,6 +201,9 @@ class ProvisionResult:
             "missing_class_types": list(self.missing_class_types),
             "missing_artifacts": list(self.missing_artifacts),
         }
+        if self.progress is not None:
+            payload["progress"] = dict(self.progress)
+        return payload
 
 
 def _provision_error():
@@ -489,27 +553,50 @@ class WorkerArtifactProvider:
         artifacts = tuple(artifacts)
         if not isinstance(source_urls, Mapping):
             raise _provision_error()
+        phase_by_artifact_id = {}
+        for artifact in artifacts:
+            try:
+                validate_dependency(artifact)
+            except (TypeError, ValueError):
+                raise _provision_error() from None
+            phase_by_artifact_id[artifact.artifact_id] = (
+                "model_transfer"
+                if artifact.kind == "model"
+                else "dependency_transfer"
+            )
         local_missing = []
         downloads = []
         download_urls = {}
         previous_progress = self.manager.progress
-        self.manager.progress = (
-            lambda artifact_id, offset: progress(
-                "verified_bytes",
+
+        def report_progress(artifact_id, offset, event):
+            if (
+                artifact_id not in phase_by_artifact_id
+                or event not in {"transferring", "verifying", "verified"}
+            ):
+                raise _provision_error()
+            return progress(
+                (
+                    "digest_verification"
+                    if event == "verifying"
+                    else phase_by_artifact_id[artifact_id]
+                ),
+                artifact_id,
                 offset,
             )
-        )
+
+        self.manager.progress = report_progress
         try:
             for artifact in artifacts:
-                try:
-                    validate_dependency(artifact)
-                except (TypeError, ValueError):
-                    raise _provision_error() from None
                 if force:
                     self.manager.reset(artifact)
                 existing = self.manager.verify(artifact)
                 if existing is not None:
-                    progress("verified_bytes", existing.size_bytes)
+                    progress(
+                        phase_by_artifact_id[artifact.artifact_id],
+                        artifact.artifact_id,
+                        artifact.size_bytes,
+                    )
                     continue
                 if artifact.source.kind == "local-upload":
                     local_missing.append(artifact.artifact_id)
@@ -561,9 +648,38 @@ class WorkerArtifactProvider:
 
 
 class _ProgressTracker:
-    def __init__(self, clock):
+    def __init__(self, clock, artifacts, persist):
+        if not callable(clock) or not callable(persist):
+            raise ValueError("Provisioning progress boundary is invalid.")
+        try:
+            artifacts = tuple(artifacts)
+        except TypeError:
+            raise ValueError(
+                "Provisioning progress catalog is invalid."
+            ) from None
+        sizes = {}
+        for artifact in artifacts:
+            try:
+                validate_dependency(artifact)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    "Provisioning progress catalog is invalid."
+                ) from None
+            prior = sizes.get(artifact.artifact_id)
+            if prior is not None and prior != artifact.size_bytes:
+                raise ValueError(
+                    "Provisioning progress catalog is invalid."
+                )
+            sizes[artifact.artifact_id] = artifact.size_bytes
         self.clock = clock
+        self.persist = persist
+        self.sizes = sizes
+        self.offsets = {artifact_id: 0 for artifact_id in sizes}
+        self.total_bytes = sum(sizes.values())
+        self.snapshot = None
         self.last_progress_at = self._now()
+        self._persisted_at = self.last_progress_at
+        self._persisted_bytes = 0
 
     def _now(self):
         value = self.clock()
@@ -579,9 +695,91 @@ class _ProgressTracker:
         if self._now() - self.last_progress_at > PROVISION_STALL_SECONDS:
             raise ProvisionStalled("Provisioning stalled.")
 
-    def progress(self, _kind, _value=None):
+    def progress(
+        self,
+        phase,
+        dependency_id=None,
+        offset=None,
+        *,
+        persist=True,
+    ):
         self.check()
-        self.last_progress_at = self._now()
+        now = self._now()
+        previous = self.snapshot
+        if (
+            not isinstance(phase, str)
+            or phase not in _PROGRESS_PHASES
+            or (
+                previous is not None
+                and previous["phase"] == "ready"
+                and phase != "ready"
+            )
+        ):
+            raise ProvisionError("Provisioning progress is invalid.")
+        completed_artifact = False
+        if phase in _ARTIFACT_PROGRESS_PHASES:
+            if (
+                not isinstance(dependency_id, str)
+                or not _IDENTIFIER.fullmatch(dependency_id)
+            ):
+                raise ProvisionError("Provisioning progress is invalid.")
+            declared_size = self.sizes.get(dependency_id)
+            prior_offset = self.offsets.get(dependency_id)
+            if (
+                declared_size is None
+                or isinstance(offset, bool)
+                or not isinstance(offset, int)
+                or prior_offset is None
+                or not prior_offset <= offset <= declared_size
+            ):
+                raise ProvisionError("Provisioning progress is invalid.")
+            completed_artifact = (
+                prior_offset < declared_size and offset == declared_size
+            )
+            self.offsets[dependency_id] = offset
+        elif phase in {"comfyui_startup", "environment_validation"}:
+            if dependency_id is not None or offset is not None:
+                raise ProvisionError("Provisioning progress is invalid.")
+        elif phase == "ready":
+            if dependency_id is not None or offset is not None:
+                raise ProvisionError("Provisioning progress is invalid.")
+            self.offsets = dict(self.sizes)
+        else:
+            raise ProvisionError("Provisioning progress is invalid.")
+
+        transferred_bytes = sum(self.offsets.values())
+        snapshot = _validated_progress(
+            {
+                "phase": phase,
+                "dependency_id": (
+                    dependency_id
+                    if phase in _ARTIFACT_PROGRESS_PHASES
+                    else None
+                ),
+                "transferred_bytes": transferred_bytes,
+                "total_bytes": self.total_bytes,
+            }
+        )
+        phase_changed = (
+            previous is None
+            or previous["phase"] != snapshot["phase"]
+            or previous["dependency_id"] != snapshot["dependency_id"]
+        )
+        should_persist = (
+            phase_changed
+            or completed_artifact
+            or transferred_bytes == self.total_bytes
+            or transferred_bytes - self._persisted_bytes
+            >= PROGRESS_PERSIST_BYTES
+            or now - self._persisted_at >= PROGRESS_PERSIST_SECONDS
+        )
+        self.snapshot = snapshot
+        self.last_progress_at = now
+        if should_persist and persist:
+            self.persist(dict(snapshot))
+            self._persisted_at = now
+            self._persisted_bytes = transferred_bytes
+        return dict(snapshot)
 
 
 def _required_class_types(desired, values):
@@ -620,6 +818,34 @@ def _empty_installed(desired):
 
 def _manifest_record(desired):
     return json.loads(desired.canonical_bytes().decode("utf-8"))
+
+
+def _artifact_catalog(artifacts):
+    catalog = {}
+    for artifact in artifacts:
+        try:
+            validate_dependency(artifact)
+        except (TypeError, ValueError):
+            raise _provision_error() from None
+        prior = catalog.get(artifact.artifact_id)
+        if prior is not None and prior != artifact:
+            raise _provision_error()
+        catalog[artifact.artifact_id] = artifact
+    return catalog
+
+
+def _manifest_transfer_catalog(desired):
+    return _artifact_catalog(
+        (
+            *desired.artifacts,
+            *(node.archive for node in desired.custom_nodes),
+            *(
+                wheel_artifact(wheel)
+                for node in desired.custom_nodes
+                for wheel in node.wheels
+            ),
+        )
+    )
 
 
 class Provisioner:
@@ -837,11 +1063,7 @@ class Provisioner:
             "kind": "provision",
             "transaction_id": transaction_id,
             "manifest_digest": desired.digest,
-            "manifest": (
-                _manifest_record(desired)
-                if state_name in {"applying", "awaiting_upload"}
-                else None
-            ),
+            "manifest": None,
             "required_class_types": list(required),
             "state": state_name,
             "planned_restarts": planned_restarts,
@@ -854,9 +1076,46 @@ class Provisioner:
             "last_progress_at": (
                 tracker.last_progress_at if tracker is not None else None
             ),
+            "progress": (
+                dict(tracker.snapshot)
+                if tracker is not None and tracker.snapshot is not None
+                else None
+            ),
         }
         self.state_store.record_transaction(transaction_id, record)
         return record
+
+    def _persist_progress(
+        self,
+        transaction_id,
+        progress,
+        last_progress_at,
+    ):
+        progress = _validated_progress(progress)
+        if (
+            progress is None
+            or isinstance(last_progress_at, bool)
+            or not isinstance(last_progress_at, (int, float))
+            or not math.isfinite(last_progress_at)
+        ):
+            raise ProvisionError("Provisioning progress is invalid.")
+        record = self.state_store.load()["transactions"].get(
+            transaction_id
+        )
+        if (
+            not isinstance(record, dict)
+            or record.get("kind") != "provision"
+            or record.get("transaction_id") != transaction_id
+        ):
+            raise ProvisionError("Provisioning progress is invalid.")
+        self.state_store.record_transaction(
+            transaction_id,
+            {
+                **record,
+                "last_progress_at": float(last_progress_at),
+                "progress": dict(progress),
+            },
+        )
 
     def _ready(
         self,
@@ -868,6 +1127,7 @@ class Provisioner:
         repair_used,
         tracker,
     ):
+        tracker.progress("ready", persist=False)
         transaction_id = "provision-" + desired.digest
         record = {
             "kind": "provision",
@@ -884,6 +1144,7 @@ class Provisioner:
             "failure_code": None,
             "updated_at": float(self.clock()),
             "last_progress_at": tracker.last_progress_at,
+            "progress": dict(tracker.snapshot),
         }
         installed = {
             "manifest_digest": desired.digest,
@@ -925,9 +1186,11 @@ class Provisioner:
             repair_restarts=repair_restarts,
             missing_class_types=(),
             missing_artifacts=(),
+            progress=tracker.snapshot,
         )
 
     async def _validate(self, desired, required, tracker):
+        tracker.progress("environment_validation")
         object_info = await self._await_progress(
             self.comfy.object_info(),
             tracker,
@@ -941,7 +1204,6 @@ class Provisioner:
         missing_artifacts = tuple(
             sorted(self.artifacts.validate(desired.artifacts))
         )
-        tracker.progress("validation")
         return missing_classes, missing_artifacts
 
     def _repair_plan(
@@ -997,7 +1259,22 @@ class Provisioner:
                 source_urls = dict(source_urls)
             else:
                 raise _provision_error()
-            tracker = _ProgressTracker(self.clock)
+            transfer_catalog = _manifest_transfer_catalog(desired)
+            transaction_id = "provision-" + desired.digest
+            tracker = None
+
+            def persist_progress(snapshot):
+                self._persist_progress(
+                    transaction_id,
+                    snapshot,
+                    tracker.last_progress_at,
+                )
+
+            tracker = _ProgressTracker(
+                self.clock,
+                tuple(transfer_catalog.values()),
+                persist_progress,
+            )
             (
                 planned_restarts,
                 repair_restarts,
@@ -1030,12 +1307,7 @@ class Provisioner:
                     *(node.archive for node in delta.custom_nodes),
                     *(wheel_artifact(wheel) for wheel in delta.wheels),
                 ]
-                deduplicated = {}
-                for item in transfer_artifacts:
-                    prior = deduplicated.get(item.artifact_id)
-                    if prior is not None and prior != item:
-                        raise _provision_error()
-                    deduplicated[item.artifact_id] = item
+                deduplicated = _artifact_catalog(transfer_artifacts)
                 if deduplicated:
                     await self._await_progress(
                         self.artifacts.ensure_many(
@@ -1068,7 +1340,6 @@ class Provisioner:
                         tracker,
                     )
                     tracker.check()
-                    tracker.progress("install")
                 if standalone_wheels:
                     await self._await_progress(
                         self.installer.install_wheels(
@@ -1077,11 +1348,11 @@ class Provisioner:
                         tracker,
                     )
                     tracker.check()
-                    tracker.progress("install")
 
                 code_changed = bool(
                     delta.custom_nodes or standalone_wheels
                 )
+                tracker.progress("comfyui_startup")
                 if code_changed:
                     if planned_restarts == 0:
                         planned_restarts = 1
@@ -1104,14 +1375,12 @@ class Provisioner:
                             tracker,
                         )
                     tracker.check()
-                    tracker.progress("health")
                 else:
                     await self._await_progress(
                         self.comfy.ensure_running(),
                         tracker,
                     )
                     tracker.check()
-                    tracker.progress("health")
 
                 (
                     current_missing_classes,
@@ -1192,7 +1461,6 @@ class Provisioner:
                             tracker,
                         )
                         tracker.check()
-                        tracker.progress("install")
                     if repair_nodes:
                         repair_restarts = 1
                         self._record(
@@ -1204,12 +1472,12 @@ class Provisioner:
                             repair_used=repair_used,
                             tracker=tracker,
                         )
+                        tracker.progress("comfyui_startup")
                         await self._await_progress(
                             self.comfy.restart(),
                             tracker,
                         )
                         tracker.check()
-                        tracker.progress("health")
                     (
                         current_missing_classes,
                         current_missing_artifacts,
@@ -1333,6 +1601,7 @@ class Provisioner:
                     record["missing_class_types"]
                 ),
                 missing_artifacts=tuple(record["missing_artifacts"]),
+                progress=record.get("progress"),
             )
         except (KeyError, TypeError, ValueError):
             raise _provision_error() from None

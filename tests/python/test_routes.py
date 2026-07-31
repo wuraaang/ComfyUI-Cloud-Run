@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import replace
 import hashlib
 import json
 import os
@@ -12,7 +13,7 @@ from unittest import mock
 from cloud_run.artifacts import FileInputMetadata
 from cloud_run.capture import CompiledCapture
 from cloud_run.dependency_repository import DependencyRepository
-from cloud_run.manifest import SourceSpec
+from cloud_run.manifest import ArtifactSpec, DependencyManifest, SourceSpec
 from cloud_run.model_sources import ModelSourceResolution
 from cloud_run.routes import _RuntimeResolver, build_service, register_routes
 from cloud_run.models import (
@@ -23,6 +24,7 @@ from cloud_run.models import (
     JobState,
     OfferQuote,
     SessionState,
+    TransferState,
 )
 from cloud_run.vast import OfferSearchError
 
@@ -1307,6 +1309,155 @@ class RelayMediaRouteTests(unittest.TestCase):
             ["job-1"],
         )
         self.assertNotIn(str(self.root), repr(response.payload))
+
+    def test_session_status_maps_bounded_progress_to_safe_current_model(self):
+        repository = self.service.job_repository
+        revision = "a" * 40
+        model = ArtifactSpec(
+            artifact_id="model-" + "b" * 64,
+            kind="model",
+            logical_name="Gold-model.safetensors",
+            destination="models/diffusion_models/gold.safetensors",
+            size_bytes=10,
+            sha256="b" * 64,
+            source=SourceSpec(
+                "huggingface",
+                (
+                    "https://huggingface.co/example/public-model/resolve/"
+                    + revision
+                    + "/gold.safetensors"
+                ),
+                immutable_revision=revision,
+            ),
+        )
+        input_artifact = ArtifactSpec(
+            artifact_id="input-private",
+            kind="input",
+            logical_name="private-input.png",
+            destination="input/private-input.png",
+            size_bytes=5,
+            sha256="c" * 64,
+            source=SourceSpec(
+                "local-upload",
+                "local-upload:input-private",
+            ),
+        )
+        manifest = DependencyManifest(
+            schema_version=1,
+            protocol_version="1",
+            comfyui_core_version="0.29.0",
+            comfyui_frontend_version="1.47.10",
+            worker_version="a" * 40,
+            prompt_digest="d" * 64,
+            custom_nodes=(),
+            artifacts=(model, input_artifact),
+            output_allowance_bytes=1024,
+            disk_gb=80,
+        )
+        repository.save_manifest(
+            manifest.digest,
+            manifest.canonical_bytes().decode("utf-8"),
+            created_at=100.0,
+        )
+        repository.record_provision_progress(
+            transaction_id="provision-" + manifest.digest,
+            session_id="session-1",
+            job_id="bootstrap:session-1",
+            manifest_digest=manifest.digest,
+            state="applying",
+            phase="model_transfer",
+            current_dependency_id=model.artifact_id,
+            transferred_bytes=4,
+            total_bytes=15,
+            last_progress_at=6_995.0,
+        )
+        repository.save_transfer(
+            job_id="bootstrap:session-1",
+            artifact_id=input_artifact.artifact_id,
+            direction="upload",
+            expected_size=input_artifact.size_bytes,
+            sha256=input_artifact.sha256,
+            offset=3,
+            state=TransferState.TRANSFERRING,
+            private_path=str(self.root / "private" / "input.part"),
+        )
+        provisioning = CloudSession.new(
+            "session-key-progress",
+            session_id="session-1",
+            quote=replace(
+                attempt().quote,
+                manifest_digest=manifest.digest,
+                transfer_bytes=15,
+                output_allowance_bytes=1024,
+                disk_gb=80,
+            ),
+            manifest_digest=manifest.digest,
+            deadline_at=7_300.0,
+            deadline_mode="finite",
+            disk_gb=80,
+            now=100.0,
+            state=SessionState.PROVISIONING,
+        ).transition(
+            SessionState.PROVISIONING,
+            now=6_990.0,
+            instance_id="77",
+        )
+        self.service.refresh_session = mock.AsyncMock(
+            return_value=provisioning
+        )
+        handler = self.handlers[
+            ("GET", "/cloud-run/api/sessions/{session_id}")
+        ]
+
+        response = asyncio.run(
+            handler(FakeRequest(match_info={"session_id": "session-1"}))
+        )
+
+        self.assertEqual(
+            response.payload["provisioning"],
+            {
+                "phase": "model_transfer",
+                "current_model": "Gold-model.safetensors",
+                "transferred_bytes": 7,
+                "total_bytes": 15,
+                "installed_units": 0,
+                "validated_units": 0,
+                "seconds_without_progress": 5.0,
+                "stall_budget_seconds": 600,
+            },
+        )
+        self.assertNotIn("huggingface.co", repr(response.payload))
+        self.assertNotIn("local-upload", repr(response.payload))
+        self.assertNotIn(str(self.root), repr(response.payload))
+
+        with repository._connect() as connection:
+            connection.execute(
+                """
+                UPDATE provision_transactions
+                SET phase = 'unknown', transferred_bytes = 999
+                WHERE transaction_id = ?
+                """,
+                ("provision-" + manifest.digest,),
+            )
+            connection.commit()
+        hostile = asyncio.run(
+            handler(FakeRequest(match_info={"session_id": "session-1"}))
+        )
+        self.assertEqual(
+            hostile.payload["provisioning"]["phase"],
+            "provisioning",
+        )
+        self.assertIsNone(
+            hostile.payload["provisioning"]["current_model"]
+        )
+        self.assertEqual(
+            hostile.payload["provisioning"]["transferred_bytes"],
+            3,
+        )
+        self.assertEqual(
+            hostile.payload["provisioning"]["total_bytes"],
+            15,
+        )
 
     def test_wrong_session_cannot_read_an_existing_job(self):
         response = asyncio.run(
