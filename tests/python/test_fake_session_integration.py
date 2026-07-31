@@ -3,21 +3,24 @@
 import asyncio
 from dataclasses import dataclass
 import hashlib
+import json
 from pathlib import Path
 import tempfile
 import types
 import unittest
 import uuid
 
-from cloud_run.artifacts import ArtifactResolution
+from cloud_run.artifacts import ArtifactResolution, FileInputMetadata
 from cloud_run.dependency_repository import (
     DependencyRepository,
     MappingValidationError,
 )
 from cloud_run.job_repository import JobRepository
+from cloud_run.huggingface import HuggingFaceClient
 from cloud_run.lifecycle import CloudRunLifecycle
 from cloud_run.manifest import ArtifactSpec, CustomNodeSpec, SourceSpec
 from cloud_run.models import JobState, SessionState, TransferState
+from cloud_run.model_sources import WorkflowModelSourceResolver
 from cloud_run.offers import HostBlacklist
 from cloud_run.relay import LocalRelay
 from cloud_run.repository import AttemptRepository, SessionRepository
@@ -269,6 +272,106 @@ class FakeVastProvider:
                 if instance["instance_id"] != str(instance_id)
             ]
         return True
+
+
+class _MetadataContent:
+    def __init__(self, payload):
+        self.body = json.dumps(payload).encode("utf-8")
+        self.offset = 0
+
+    async def read(self, size):
+        start = self.offset
+        self.offset = min(len(self.body), start + size)
+        return self.body[start : self.offset]
+
+
+class _MetadataResponse:
+    def __init__(self, url, payload):
+        self.status = 200
+        self.url = url
+        self.content = _MetadataContent(payload)
+        self.released = False
+
+    def release(self):
+        self.released = True
+
+
+class FakeHuggingFaceMetadataSession:
+    repository_id = "example/public-model"
+    file_path = "cloud-run-native-proof.safetensors"
+    revision = "f" * 40
+    model_content = b"synthetic-source-first-model"
+    model_digest = hashlib.sha256(model_content).hexdigest()
+    mutable_url = (
+        "https://huggingface.co/example/public-model/resolve/main/"
+        + file_path
+    )
+    pinned_url = (
+        "https://huggingface.co/example/public-model/resolve/"
+        + revision
+        + "/"
+        + file_path
+    )
+
+    def __init__(self):
+        self.requests = []
+        self.gated = False
+
+    @property
+    def metadata_calls(self):
+        return len(self.requests)
+
+    async def get(self, url, *, allow_redirects, timeout):
+        if allow_redirects is not False or not 0 < timeout <= 30:
+            raise AssertionError("unsafe synthetic metadata request")
+        mutable = (
+            "https://huggingface.co/api/models/"
+            + self.repository_id
+            + "/revision/main"
+        )
+        pinned = (
+            "https://huggingface.co/api/models/"
+            + self.repository_id
+            + "/revision/"
+            + self.revision
+            + "?blobs=true"
+        )
+        self.requests.append(url)
+        if url == mutable:
+            payload = {
+                "id": self.repository_id,
+                "sha": self.revision,
+            }
+        elif url == pinned:
+            payload = {
+                "id": self.repository_id,
+                "sha": self.revision,
+                "private": False,
+                "gated": self.gated,
+                "siblings": [
+                    {
+                        "rfilename": self.file_path,
+                        "size": len(self.model_content),
+                        "lfs": {
+                            "size": len(self.model_content),
+                            "sha256": self.model_digest,
+                        },
+                    }
+                ],
+            }
+        else:
+            raise AssertionError("unexpected synthetic metadata request")
+        return _MetadataResponse(url, payload)
+
+
+class SourceFirstHost:
+    def assert_compatible(self):
+        return None
+
+    def describe_node(self, class_type):
+        if class_type not in {"UNETLoader", "LoadImage", "KSampler"}:
+            raise AssertionError("unexpected synthetic class type")
+        return types.SimpleNamespace(kind="core")
 
 
 class SyntheticResolver:
@@ -643,6 +746,54 @@ class FakeWorkerClient:
         )
 
 
+class SourceFirstFakeWorker(FakeWorkerClient):
+    def __init__(self, metadata):
+        super().__init__()
+        self.metadata = metadata
+        self.model_byte_calls = 0
+        self._verified_source_models = set()
+
+    async def apply_manifest(self, payload):
+        result = await super().apply_manifest(payload)
+        items = self._transfer_items(payload["manifest"])
+        models = [item for item in items if item["kind"] == "model"]
+        if len(models) != 1:
+            raise AssertionError("expected one source-first model")
+        model = models[0]
+        if (
+            model["source"]
+            != {
+                "kind": "huggingface",
+                "locator": self.metadata.pinned_url,
+                "immutable_revision": self.metadata.revision,
+            }
+            or model["size_bytes"] != len(self.metadata.model_content)
+            or model["sha256"] != self.metadata.model_digest
+            or payload["source_urls"].get(model["artifact_id"])
+            != self.metadata.pinned_url
+            or self.metadata.mutable_url in repr(payload)
+        ):
+            raise AssertionError("source-first manifest was not immutable")
+        if (
+            result["state"] == "ready"
+            and model["artifact_id"] not in self._verified_source_models
+        ):
+            self._verified_source_models.add(model["artifact_id"])
+            self.model_byte_calls += 1
+        if result["state"] == "ready":
+            total_bytes = sum(item["size_bytes"] for item in items)
+            result = {
+                **result,
+                "progress": {
+                    "phase": "ready",
+                    "dependency_id": None,
+                    "transferred_bytes": total_bytes,
+                    "total_bytes": total_bytes,
+                },
+            }
+        return result
+
+
 @dataclass(frozen=True)
 class CertifiedOutput:
     artifact_id: str
@@ -670,6 +821,7 @@ class FakeCloudRunSystem:
         self.vast = FakeVastProvider()
         self.worker = FakeWorkerClient()
         self.local_prompt_posts = []
+        self.cache_mutations = []
         self._ids = 0
 
         self.settings = SettingsStore(self.data_root)
@@ -720,6 +872,10 @@ class FakeCloudRunSystem:
         )
         self.lifecycle.session_service = self.session_service
         self.lifecycle.schedule_session_watchdog = lambda _session_id: None
+        async def populate_cache(artifact_id, *, acknowledged):
+            self.cache_mutations.append((artifact_id, acknowledged))
+            raise AssertionError("unexpected synthetic cache mutation")
+
         self.service = CloudRunService(
             self.settings,
             self.attempts,
@@ -727,6 +883,9 @@ class FakeCloudRunSystem:
             provider=self.vast,
             blacklist=self.blacklist,
             lifecycle=self.lifecycle,
+            cache_manager=types.SimpleNamespace(
+                populate_cache=populate_cache
+            ),
             session_service=self.session_service,
             session_repository=self.sessions,
             release=self.release,
@@ -769,6 +928,94 @@ class FakeCloudRunSystem:
         )
         return artifact, local
 
+    def source_first_capture_payload(self):
+        fixture_path = (
+            Path(__file__).resolve().parents[1]
+            / "fixtures"
+            / "native-model-metadata-workflow.json"
+        )
+        workflow = json.loads(fixture_path.read_text(encoding="utf-8"))
+        workflow["extra"]["frontendVersion"] = "1.47.10"
+        workflow["nodes"].extend(
+            (
+                {"id": 2, "type": "LoadImage", "mode": 0},
+                {"id": 3, "type": "KSampler", "mode": 0},
+            )
+        )
+        input_name = "private-source-first-input.png"
+        input_root = self.root / "private-input"
+        input_root.mkdir(mode=0o700)
+        input_path = input_root / input_name
+        input_content = b"synthetic-private-source-first-input"
+        input_path.write_bytes(input_content)
+        input_digest = hashlib.sha256(input_content).hexdigest()
+        model_root = self.root / "empty-model-root"
+        model_root.mkdir()
+        self.source_first_model_root = model_root
+
+        self.huggingface = FakeHuggingFaceMetadataSession()
+        self.source_first_mutable_url = self.huggingface.mutable_url
+        self.source_first_pinned_url = self.huggingface.pinned_url
+        self.worker = SourceFirstFakeWorker(self.huggingface)
+        self.resolver = DependencyResolver(
+            host=SourceFirstHost(),
+            repository=self.dependencies,
+            registry=None,
+            resolution_context={
+                "metadata": {
+                    "UNETLoader": {
+                        "model_name": FileInputMetadata(
+                            kind="model",
+                            category="diffusion_models",
+                        )
+                    },
+                    "LoadImage": {
+                        "image": FileInputMetadata(kind="input")
+                    },
+                },
+                "model_roots": {
+                    "diffusion_models": (model_root,),
+                },
+                "input_root": input_root,
+                "source_mappings": {
+                    input_digest: SourceSpec(
+                        "local-upload",
+                        "local-upload:input-" + input_digest,
+                    )
+                },
+                "base_bytes": 40 * 1024**3,
+            },
+            model_source_resolver=WorkflowModelSourceResolver(
+                HuggingFaceClient(session=self.huggingface)
+            ),
+        )
+        self.session_service.resolver = self.resolver
+        return {
+            "workflow": workflow,
+            "output": {
+                "1": {
+                    "class_type": "UNETLoader",
+                    "inputs": {
+                        "model_name": self.huggingface.file_path,
+                        "weight_dtype": "default",
+                    },
+                },
+                "2": {
+                    "class_type": "LoadImage",
+                    "inputs": {"image": input_name},
+                },
+                "3": {
+                    "class_type": "KSampler",
+                    "inputs": {
+                        "model": ["1", 0],
+                        "image": ["2", 0],
+                        "seed": 21,
+                    },
+                },
+            },
+            "queue_options": {"preview_method": "auto"},
+        }
+
     def _relay(self, worker, _session):
         return LocalRelay(
             worker=worker,
@@ -780,9 +1027,14 @@ class FakeCloudRunSystem:
     def capture(self, payload):
         return asyncio.run(self.service.capture(payload))
 
-    def preflight(self, capture):
+    def preflight(self, capture, *, explicit_output_allowance_bytes=None):
         return asyncio.run(
-            self.service.preflight(capture.capture_id)
+            self.service.preflight(
+                capture.capture_id,
+                explicit_output_allowance_bytes=(
+                    explicit_output_allowance_bytes
+                ),
+            )
         )
 
     def quote_confirm_and_ready(
@@ -912,6 +1164,126 @@ class FakeCloudRunSystem:
 
 
 class FakeReusableSessionIntegrationTests(unittest.TestCase):
+    def test_source_first_native_metadata_full_fake_lifecycle(self):
+        system = FakeCloudRunSystem()
+        self.addCleanup(system.close)
+        payload = system.source_first_capture_payload()
+
+        capture = system.capture(payload)
+        preflight = system.preflight(
+            capture,
+            explicit_output_allowance_bytes=4_096,
+        )
+
+        self.assertEqual(
+            set(capture.executable_class_types),
+            {"UNETLoader", "LoadImage", "KSampler"},
+        )
+        self.assertTrue(preflight.rentable)
+        self.assertTrue(all(row.status == "resolved" for row in preflight.rows))
+        self.assertEqual(system.vast.search_count, 0)
+        self.assertEqual(system.vast.mutations, [])
+        self.assertEqual(system.worker.model_byte_calls, 0)
+        self.assertEqual(system.worker.upload_offsets, {})
+        self.assertEqual(list(system.source_first_model_root.iterdir()), [])
+        self.assertEqual(system.huggingface.metadata_calls, 2)
+        self.assertEqual(
+            system.huggingface.requests,
+            [
+                (
+                    "https://huggingface.co/api/models/example/"
+                    "public-model/revision/main"
+                ),
+                (
+                    "https://huggingface.co/api/models/example/"
+                    "public-model/revision/"
+                    + system.huggingface.revision
+                    + "?blobs=true"
+                ),
+            ],
+        )
+        self.assertEqual(
+            payload["workflow"]["nodes"][0]["properties"]["models"][0][
+                "url"
+            ],
+            system.source_first_mutable_url,
+        )
+
+        model_row = next(row for row in preflight.rows if row.kind == "model")
+        self.assertEqual(
+            model_row.destination,
+            "models/diffusion_models/cloud-run-native-proof.safetensors",
+        )
+        self.assertEqual(
+            model_row.source_locator,
+            system.source_first_pinned_url,
+        )
+        manifest = json.loads(
+            system.jobs.get_manifest(preflight.manifest_digest)
+        )
+        model = next(
+            artifact
+            for artifact in manifest["artifacts"]
+            if artifact["kind"] == "model"
+        )
+        self.assertEqual(
+            model["source"]["locator"],
+            system.source_first_pinned_url,
+        )
+        private_input = next(
+            artifact
+            for artifact in manifest["artifacts"]
+            if artifact["kind"] == "input"
+        )
+        self.assertEqual(private_input["source"]["kind"], "local-upload")
+
+        session = system.quote_confirm_and_ready(
+            preflight,
+            offer_id="42",
+            idempotency_key="source-first-session-key",
+            duration_seconds=7_200,
+        )
+
+        self.assertEqual(system.vast.search_count, 1)
+        self.assertEqual(system.vast.create_count, 1)
+        self.assertEqual(system.worker.model_byte_calls, 1)
+        self.assertEqual(
+            system.worker.upload_offsets,
+            {private_input["artifact_id"]: private_input["size_bytes"]},
+        )
+        self.assertNotIn(
+            system.source_first_mutable_url,
+            repr(system.worker.manifest_calls),
+        )
+        self.assertIn(
+            system.source_first_pinned_url,
+            repr(system.worker.manifest_calls),
+        )
+        progress = system.jobs.latest_provision_transaction(
+            session.session_id
+        )
+        self.assertEqual(progress.phase, "ready")
+        self.assertIsNone(progress.current_dependency_id)
+        self.assertEqual(progress.transferred_bytes, preflight.transfer_bytes)
+        self.assertEqual(progress.total_bytes, preflight.transfer_bytes)
+        self.assertNotIn("huggingface.co", repr(progress))
+
+        job = system.run_job(session, capture, "source-first-job-key")
+        self.assertEqual(job.state, JobState.SUCCEEDED)
+        self.assertTrue(job.outputs)
+        self.assertTrue(all(output.local_verified for output in job.outputs))
+
+        review = system.review_destroy(session)
+        destroyed = system.destroy(session, confirmed(review))
+        fresh_inventory = asyncio.run(
+            system.vast.list_instances("synthetic-offline-key")
+        )
+
+        self.assertEqual(destroyed.state, SessionState.DESTROYED)
+        self.assertEqual(system.vast.destroy_count, 1)
+        self.assertEqual(fresh_inventory, [])
+        self.assertEqual(list(system.source_first_model_root.iterdir()), [])
+
     def test_pinned_model_provenance_survives_offline_preflight_storage(self):
         system = FakeCloudRunSystem()
         self.addCleanup(system.close)
