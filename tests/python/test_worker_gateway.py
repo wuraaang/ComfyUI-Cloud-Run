@@ -1,5 +1,7 @@
 """Secret-minimal Caddy gateway and worker supervision tests."""
 
+from contextlib import redirect_stderr
+import io
 import os
 from pathlib import Path
 import stat
@@ -149,6 +151,23 @@ class GatewayTokenTests(unittest.TestCase):
         except GatewayError as error:
             caught = error
         self.assertIsNotNone(caught)
+        self.assertEqual(str(caught), STATIC_ERROR)
+        assert_gateway_error_does_not_retain(self, caught, token)
+
+    def test_mapping_failure_is_static_and_does_not_retain_its_token(self):
+        token = "mapping-failure-secret"
+
+        class FailingMapping:
+            def get(self, _name):
+                raise RuntimeError(token)
+
+        caught = None
+        try:
+            validated_gateway_token(FailingMapping())
+        except Exception as error:
+            caught = error
+
+        self.assertIsInstance(caught, GatewayError)
         self.assertEqual(str(caught), STATIC_ERROR)
         assert_gateway_error_does_not_retain(self, caught, token)
 
@@ -415,8 +434,9 @@ class GatewayConfigurationTests(unittest.TestCase):
             ["--state-directory", "/var/lib/comfyui-cloud-run"]
         )
         self.assertEqual(arguments.state_directory, STATE_DIRECTORY)
-        with self.assertRaises(SystemExit):
-            parse_gateway_arguments(["--state-directory", "/tmp/worker"])
+        with redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                parse_gateway_arguments(["--state-directory", "/tmp/worker"])
 
 
 if __name__ == "__main__":

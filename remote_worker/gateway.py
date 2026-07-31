@@ -49,7 +49,7 @@ def _validated_gateway_token_result(environ):
     try:
         token = environ.get("JUPYTER_TOKEN")
         encoded = token.encode("utf-8")
-    except (AttributeError, TypeError, UnicodeError):
+    except Exception:
         return _GATEWAY_REJECTED
     if len(encoded) > MAX_TOKEN_BYTES or _TOKEN.fullmatch(encoded) is None:
         return _GATEWAY_REJECTED
