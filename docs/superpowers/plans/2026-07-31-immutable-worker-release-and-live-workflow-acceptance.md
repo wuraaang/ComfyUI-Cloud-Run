@@ -540,11 +540,23 @@ Prove `write_worker_release_lock(path, template_hash_id, metadata)`:
 - accepts only a nonexistent file beneath an existing owner-private directory;
 - rejects symlink, pre-existing target, group/world-writable parent, wrong template hash, and altered release metadata;
 - writes exactly the existing `WorkerRelease` fields, compact sorted JSON plus newline, mode `0600`;
+- never exposes a partial final file, fails without overwriting when a competing
+  writer creates the target before publication, and removes its temporary file
+  on every failure;
 - round-trips through `load_worker_release()`.
 
 - [ ] **Step 9: Implement the atomic private lock writer and run all tool tests**
 
-Create the target with `os.open(path, flags, 0o600)`, where `flags` is `O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW` when `O_NOFOLLOW` is supported. Write all bytes, `fsync`, close, then call `load_worker_release()` and compare every returned field before reporting success.
+Create one unpredictable same-directory temporary regular file with mode
+`0600`, using `O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW` when `O_NOFOLLOW` is
+supported. Write all bytes, `fsync`, and close it before publication. Publish
+without overwriting by creating the final path as an atomic hard link to that
+temporary file; a pre-existing or concurrently created target must make the
+operation fail closed. Unlink the temporary name, `fsync` the parent directory,
+then call `load_worker_release()` and compare every returned field before
+reporting success. On every failure, remove only the known temporary file and
+leave any pre-existing final target untouched. Do not use `os.replace()` for
+this lock because it would overwrite a target created by a competing writer.
 
 ```bash
 python3 -m unittest tests.python.test_worker_release_tools -v
