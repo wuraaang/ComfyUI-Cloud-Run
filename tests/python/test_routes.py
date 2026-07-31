@@ -753,6 +753,7 @@ def attempt(state=AttemptState.OFFER_SELECTED):
             worker_archive_sha256="b" * 64,
             protocol_version="1",
             manifest_digest="c" * 64,
+            max_instance_creates=1,
         ),
     )
 
@@ -804,6 +805,7 @@ class PaidSessionRouteTests(unittest.TestCase):
                 "mode": "finite",
                 "duration_seconds": 7200,
             },
+            "max_instance_creates": 1,
         }
 
         quote_response = asyncio.run(
@@ -833,6 +835,13 @@ class PaidSessionRouteTests(unittest.TestCase):
                 FakeRequest({**request_payload, "unexpected": True})
             )
         )
+        missing_limit = dict(request_payload)
+        del missing_limit["max_instance_creates"]
+        missing = asyncio.run(
+            handlers[("POST", "/cloud-run/api/sessions")](
+                FakeRequest(missing_limit)
+            )
+        )
 
         service.preview_session.assert_awaited_once_with(
             preflight_id="preflight-1",
@@ -842,6 +851,7 @@ class PaidSessionRouteTests(unittest.TestCase):
                 "mode": "finite",
                 "duration_seconds": 7200,
             },
+            max_instance_creates=1,
         )
         service.confirm_session.assert_awaited_once_with(
             "session-1",
@@ -852,6 +862,7 @@ class PaidSessionRouteTests(unittest.TestCase):
         self.assertEqual(confirm_response.payload["status"], "bootstrapping")
         self.assertEqual(confirm_response.payload["instance_id"], "77")
         self.assertEqual(rejected.status, 400)
+        self.assertEqual(missing.status, 400)
         for response in (quote_response, confirm_response):
             encoded = repr(response.payload)
             self.assertNotIn("private-session-idempotency-key", encoded)

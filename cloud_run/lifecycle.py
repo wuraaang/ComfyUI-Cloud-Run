@@ -489,14 +489,17 @@ class CloudRunLifecycle:
                     "Vast console immediately."
                 ),
             )
-        if attempt.retry_count >= 1:
+        if (
+            1 + attempt.retry_count
+            >= attempt.quote.max_instance_creates
+        ):
             return self.repository.transition(
                 attempt.attempt_id,
                 AttemptState.FAILED,
                 now=float(self.clock()),
                 instance_id=None,
                 sanitized_error=(
-                    "The single automatic replacement was exhausted."
+                    "The authorized total instance-create limit was reached."
                 ),
             )
 
@@ -604,6 +607,7 @@ class CloudRunLifecycle:
             machine_id=selected.get("machine_id"),
             host_id=selected.get("host_id"),
             public_ipaddr=selected.get("public_ipaddr"),
+            max_instance_creates=attempt.quote.max_instance_creates,
         )
         attempt = self.repository.transition(
             attempt.attempt_id,
@@ -1297,7 +1301,11 @@ class CloudRunLifecycle:
                     "the Vast console immediately."
                 ),
             )
-        if session.retry_count >= 1:
+        if (
+            session.quote is not None
+            and 1 + session.retry_count
+            >= session.quote.max_instance_creates
+        ):
             return self.session_repository.transition(
                 session.session_id,
                 SessionState.FAILED,
@@ -1305,7 +1313,7 @@ class CloudRunLifecycle:
                 instance_id=None,
                 residual_inventory=(),
                 sanitized_error=(
-                    "The single automatic replacement was exhausted."
+                    "The authorized total instance-create limit was reached."
                 ),
             )
         if (
@@ -1404,6 +1412,7 @@ class CloudRunLifecycle:
             machine_id=selected.get("machine_id"),
             host_id=selected.get("host_id"),
             public_ipaddr=selected.get("public_ipaddr"),
+            max_instance_creates=session.quote.max_instance_creates,
         )
         session = self.session_repository.transition(
             session.session_id,

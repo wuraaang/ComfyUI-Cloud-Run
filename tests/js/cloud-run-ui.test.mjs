@@ -60,6 +60,7 @@ function quoteSession(status = "offer_selected", overrides = {}) {
       worker_archive_sha256: "b".repeat(64),
       protocol_version: "1",
       manifest_digest: "c".repeat(64),
+      max_instance_creates: 1,
     },
     instance_id: status === "offer_selected" ? null : "77",
     deadline_at: 8_200,
@@ -299,7 +300,7 @@ test("registers through the pinned ComfyUI extension API", async () => {
 });
 
 
-test("capture preflight offer and paid review use only session routes", async () => {
+test("capture preflight offer and paid review enforce instance creates", async () => {
   const document = new FakeDocument();
   mountLocalRunButton(document);
   const { api, app, localSubmissions } = captureHost();
@@ -357,6 +358,14 @@ test("capture preflight offer and paid review use only session routes", async ()
   assert.equal(document.getElementById("cloud-run-search").disabled, false);
   await document.getElementById("cloud-run-search").click();
   await document.getElementById("cloud-run-offer-0").click();
+  const createLimit = document.getElementById(
+    "cloud-run-max-instance-creates",
+  );
+  assert.deepEqual(
+    createLimit.children.map((option) => option.value),
+    ["1", "2"],
+  );
+  assert.equal(createLimit.value, "1");
   await document.getElementById("cloud-run-review-session").click();
 
   const sessionRequest = calls.find(
@@ -367,16 +376,31 @@ test("capture preflight offer and paid review use only session routes", async ()
     offer_id: "42",
     idempotency_key: "session-key",
     deadline: { mode: "finite", duration_seconds: 7_200 },
+    max_instance_creates: 1,
   });
   assert.match(
     document.getElementById("cloud-run-dependency-console").textContent,
     /approximately \$1\.00 active\/storage/,
   );
   assert.match(
+    document.getElementById("cloud-run-dependency-console").textContent,
+    /Maximum total instance creates: 1/,
+  );
+  assert.match(
     document.getElementById("cloud-run-offers").textContent,
     /<RTX 4090>/,
   );
   assert.equal(document.querySelector("script"), null);
+
+  createLimit.value = "2";
+  await document.getElementById("cloud-run-review-session").click();
+  const selectedLimitRequest = calls.filter(
+    ([endpoint]) => endpoint === "/cloud-run/api/sessions",
+  )[1];
+  assert.equal(
+    JSON.parse(selectedLimitRequest[1].body).max_instance_creates,
+    2,
+  );
 
   await document.getElementById("cloud-run-confirm-session").click();
 

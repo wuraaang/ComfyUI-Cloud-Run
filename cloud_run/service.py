@@ -123,6 +123,14 @@ def _offer_id(value):
     return normalized
 
 
+def _max_instance_creates(value):
+    if type(value) is not int or value not in {1, 2}:
+        raise CloudRunValidationError(
+            "Maximum total instance creates must be 1 or 2."
+        )
+    return value
+
+
 class CloudRunService:
     def __init__(
         self,
@@ -360,6 +368,7 @@ class CloudRunService:
         offer_id,
         idempotency_key,
         deadline,
+        max_instance_creates,
     ):
         release = self._reviewed_release()
         repository = self._session_repository()
@@ -382,6 +391,7 @@ class CloudRunService:
             return existing
         identifier = _offer_id(offer_id)
         mode, duration = self._deadline_contract(deadline)
+        create_limit = _max_instance_creates(max_instance_creates)
         preflight = self.session_service.require_rentable_preflight(
             preflight_id
         )
@@ -430,6 +440,7 @@ class CloudRunService:
             machine_id=selected.get("machine_id"),
             host_id=selected.get("host_id"),
             public_ipaddr=selected.get("public_ipaddr"),
+            max_instance_creates=create_limit,
         )
         candidate = CloudSession.new(
             key,
@@ -542,8 +553,17 @@ class CloudRunService:
         }:
             return session
         repository = self._session_repository()
-        release = self._reviewed_release()
         now = float(self.clock())
+        if 1 + session.retry_count > session.quote.max_instance_creates:
+            return repository.transition(
+                session.session_id,
+                SessionState.FAILED,
+                now=now,
+                sanitized_error=(
+                    "The authorized total instance-create limit was reached."
+                ),
+            )
+        release = self._reviewed_release()
         if now >= session.quote.expires_at:
             repository.transition(
                 session.session_id,

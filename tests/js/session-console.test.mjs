@@ -34,6 +34,7 @@ function fullQuote(overrides = {}) {
       worker_archive_sha256: "b".repeat(64),
       protocol_version: "1",
       manifest_digest: "c".repeat(64),
+      max_instance_creates: 1,
     },
     ...overrides,
   };
@@ -130,6 +131,7 @@ test("session API uses only the exact same-origin lifecycle routes", async () =>
     offer_id: "42",
     idempotency_key: "session-key",
     deadline: { mode: "finite", duration_seconds: 7_200 },
+    max_instance_creates: 1,
   });
   await api.approveMapping("FancyNode", "d".repeat(64));
   await api.confirmSession("session-1", "session-key");
@@ -450,6 +452,7 @@ test("paid review shows every bounded cost and immutable identity", () => {
     "96 GB ephemeral disk",
     "12 KB dependencies and inputs",
     "2 hour automatic limit",
+    "Maximum total instance creates: 1",
     "approximately $1.00 active/storage",
     `template ${"1".repeat(32)}`,
     `worker ${"a".repeat(40)}`,

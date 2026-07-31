@@ -97,7 +97,8 @@ function ensureStyles(document) {
   font-weight: 700;
 }
 .cloud-run-field { display: grid; gap: 5px; margin: 10px 0; }
-.cloud-run-field input {
+.cloud-run-field input,
+.cloud-run-field select {
   box-sizing: border-box;
   width: 100%;
   border: 1px solid var(--border-color, #4b5563);
@@ -349,6 +350,18 @@ export function mountCloudRun(
   vramInput.setAttribute("min", "1");
   vramInput.setAttribute("max", "1024");
   vramInput.setAttribute("step", "1");
+  const createLimitSelect = createElement(document, "select", {
+    id: "cloud-run-max-instance-creates",
+    testId: "cloud-run-max-instance-creates",
+  });
+  for (const value of [1, 2]) {
+    const option = createElement(document, "option", {
+      text: String(value),
+    });
+    option.value = String(value);
+    createLimitSelect.appendChild(option);
+  }
+  createLimitSelect.value = "1";
 
   const primaryActions = createElement(document, "div", {
     className: "cloud-run-actions",
@@ -454,6 +467,12 @@ export function mountCloudRun(
   appendField(document, card, "Vast API key", apiKeyInput);
   appendField(document, card, "Maximum hourly price ($/h)", priceInput);
   appendField(document, card, "Minimum VRAM (GB)", vramInput);
+  appendField(
+    document,
+    card,
+    "Maximum total instance creates",
+    createLimitSelect,
+  );
   card.append(
     primaryActions,
     status,
@@ -626,6 +645,7 @@ export function mountCloudRun(
           mode: "finite",
           duration_seconds: DEFAULT_SESSION_SECONDS,
         },
+        max_instance_creates: Number(createLimitSelect.value),
       });
       sessionConsole.renderQuote(session, {
         idempotencyKey: sessionIdempotencyKey,

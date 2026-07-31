@@ -899,12 +899,14 @@ def register_routes(service_factory=None):
                     "offer_id",
                     "idempotency_key",
                     "deadline",
+                    "max_instance_creates",
                 },
                 required={
                     "preflight_id",
                     "offer_id",
                     "idempotency_key",
                     "deadline",
+                    "max_instance_creates",
                 },
             )
             session = await service.preview_session(
@@ -912,6 +914,7 @@ def register_routes(service_factory=None):
                 offer_id=payload["offer_id"],
                 idempotency_key=payload["idempotency_key"],
                 deadline=payload["deadline"],
+                max_instance_creates=payload["max_instance_creates"],
             )
         except Exception as error:
             return service_error(error)

@@ -46,6 +46,7 @@ def quote(
     machine_id="machine-7",
     host_id="host-3",
     public_ipaddr="8.8.8.8",
+    max_instance_creates=1,
 ):
     return OfferQuote(
         offer_id=offer_id,
@@ -71,6 +72,7 @@ def quote(
         machine_id=machine_id,
         host_id=host_id,
         public_ipaddr=public_ipaddr,
+        max_instance_creates=max_instance_creates,
     )
 
 
@@ -598,6 +600,7 @@ class RecoveryAndReplacementTests(LifecycleTestCase):
         attempt = self.save_attempt(
             AttemptState.STARTING,
             instance_id="instance-1",
+            selected_quote=quote(max_instance_creates=2),
         )
         self.provider.instances = [
             provider_instance("instance-1", attempt.label)
@@ -636,6 +639,7 @@ class RecoveryAndReplacementTests(LifecycleTestCase):
         self.assertEqual(replacement.retry_count, 1)
         self.assertEqual(replacement.instance_id, "instance-2")
         self.assertEqual(replacement.quote.offer_id, "43")
+        self.assertEqual(replacement.quote.max_instance_creates, 2)
         actions = [call[0] for call in self.provider.calls]
         self.assertLess(actions.index("destroy"), actions.index("search"))
         self.assertLess(actions.index("list"), actions.index("create"))
@@ -661,14 +665,62 @@ class RecoveryAndReplacementTests(LifecycleTestCase):
         )
         self.assertEqual(second_failure.state, AttemptState.FAILED)
         self.assertEqual(
+            second_failure.sanitized_error,
+            "The authorized total instance-create limit was reached.",
+        )
+        self.assertEqual(
             len([call for call in self.provider.calls if call[0] == "create"]),
             1,
+        )
+
+    def test_legacy_limit_one_stops_before_blacklist_and_replacement_search(self):
+        attempt = self.save_attempt(
+            AttemptState.STARTING,
+            instance_id="instance-1",
+            selected_quote=quote(max_instance_creates=1),
+        )
+        self.provider.instances = [
+            provider_instance("instance-1", attempt.label)
+        ]
+
+        failed = asyncio.run(
+            self.lifecycle().handle_start_failure(
+                attempt.attempt_id,
+                failure_code="boot_timeout",
+            )
+        )
+
+        self.assertEqual(failed.state, AttemptState.FAILED)
+        self.assertIsNone(failed.instance_id)
+        self.assertEqual(failed.retry_count, 0)
+        self.assertEqual(
+            failed.sanitized_error,
+            "The authorized total instance-create limit was reached.",
+        )
+        self.assertEqual(
+            [call for call in self.provider.calls if call[0] == "search"],
+            [],
+        )
+        self.assertEqual(
+            [call for call in self.provider.calls if call[0] == "create"],
+            [],
+        )
+        self.assertFalse(
+            self.blacklist.contains(
+                {
+                    "machine_id": "machine-7",
+                    "host_id": "host-3",
+                    "public_ipaddr": "8.8.8.8",
+                },
+                now=self.clock(),
+            )
         )
 
     def test_replacement_never_uses_a_release_different_from_the_quote(self):
         attempt = self.save_attempt(
             AttemptState.STARTING,
             instance_id="instance-1",
+            selected_quote=quote(max_instance_creates=2),
         )
         self.provider.instances = [
             provider_instance("instance-1", attempt.label)
@@ -889,8 +941,9 @@ class SessionLifecycleTests(LifecycleTestCase):
         session_id="session-1",
         instance_id="instance-1",
         retry_count=0,
+        max_instance_creates=1,
     ):
-        selected = quote()
+        selected = quote(max_instance_creates=max_instance_creates)
         session = CloudSession.new(
             "key-" + session_id,
             session_id=session_id,
@@ -1094,7 +1147,10 @@ class SessionLifecycleTests(LifecycleTestCase):
         )
 
     def test_recovery_lists_once_and_fails_closed_on_duplicate_label(self):
-        session = self.save_session()
+        session = self.save_session(
+            retry_count=1,
+            max_instance_creates=2,
+        )
         self.provider.instances = [
             self.worker_instance("instance-1", session.label),
             self.worker_instance("instance-2", session.label),
@@ -1110,6 +1166,8 @@ class SessionLifecycleTests(LifecycleTestCase):
             failed.residual_inventory,
             ("instance-1", "instance-2"),
         )
+        self.assertEqual(failed.retry_count, 1)
+        self.assertEqual(failed.quote.max_instance_creates, 2)
         self.assertEqual(
             [call[0] for call in self.provider.calls],
             ["list"],
@@ -1118,7 +1176,11 @@ class SessionLifecycleTests(LifecycleTestCase):
         self.assertEqual(self.session_service.bootstrap_calls, [])
 
     def test_restart_adopts_one_instance_and_reenforces_session_recovery(self):
-        session = self.save_session(state=SessionState.READY)
+        session = self.save_session(
+            state=SessionState.READY,
+            retry_count=1,
+            max_instance_creates=2,
+        )
         self.provider.instances = [
             self.worker_instance("instance-1", session.label)
         ]
@@ -1128,6 +1190,8 @@ class SessionLifecycleTests(LifecycleTestCase):
         )
 
         self.assertEqual(len(recovered), 1)
+        self.assertEqual(recovered[0].retry_count, 1)
+        self.assertEqual(recovered[0].quote.max_instance_creates, 2)
         self.assertEqual(
             self.sessions.get(session.session_id).worker_base_url,
             "http://8.8.8.8:32100",
@@ -1272,7 +1336,7 @@ class SessionLifecycleTests(LifecycleTestCase):
         )
 
     def test_only_boot_failure_replaces_once_after_inventory_absence(self):
-        session = self.save_session()
+        session = self.save_session(max_instance_creates=2)
         self.provider.instances = [
             self.worker_instance("instance-1", session.label)
         ]
@@ -1300,12 +1364,16 @@ class SessionLifecycleTests(LifecycleTestCase):
         self.assertEqual(replacement.retry_count, 1)
         self.assertEqual(replacement.instance_id, "instance-2")
         self.assertEqual(replacement.quote.offer_id, "43")
+        self.assertEqual(replacement.quote.max_instance_creates, 2)
         actions = [call[0] for call in self.provider.calls]
         self.assertEqual(actions, ["destroy", "list", "search", "create"])
 
         self.provider.instances = [
             self.worker_instance("instance-2", replacement.label)
         ]
+        search_count = len(
+            [call for call in self.provider.calls if call[0] == "search"]
+        )
         exhausted = asyncio.run(
             self.session_lifecycle().handle_session_boot_failure(
                 session.session_id,
@@ -1314,12 +1382,72 @@ class SessionLifecycleTests(LifecycleTestCase):
         )
         self.assertEqual(exhausted.state, SessionState.FAILED)
         self.assertEqual(
+            exhausted.sanitized_error,
+            "The authorized total instance-create limit was reached.",
+        )
+        self.assertEqual(
+            len([call for call in self.provider.calls if call[0] == "search"]),
+            search_count,
+        )
+        self.assertEqual(
             len([call for call in self.provider.calls if call[0] == "create"]),
             1,
         )
 
+    def test_limit_one_destroys_failed_boot_without_replacement_search(self):
+        session = self.save_session(max_instance_creates=1)
+        self.provider.instances = [
+            self.worker_instance("instance-1", session.label)
+        ]
+        asyncio.run(
+            self.provider.create_instance(
+                "synthetic-value",
+                offer_id=session.quote.offer_id,
+                disk_gb=session.disk_gb,
+                label=session.label,
+                release=worker_release(),
+            )
+        )
+        initial_create_count = len(
+            [call for call in self.provider.calls if call[0] == "create"]
+        )
+
+        result = asyncio.run(
+            self.session_lifecycle().handle_session_boot_failure(
+                session.session_id,
+                failure_code="boot_timeout",
+            )
+        )
+
+        self.assertEqual(result.state, SessionState.FAILED)
+        self.assertIsNone(result.instance_id)
+        self.assertEqual(result.retry_count, 0)
+        self.assertEqual(
+            [call for call in self.provider.calls if call[0] == "search"],
+            [],
+        )
+        self.assertEqual(
+            len([call for call in self.provider.calls if call[0] == "create"]),
+            initial_create_count,
+        )
+        self.assertEqual(initial_create_count, 1)
+        self.assertFalse(
+            self.blacklist.contains(
+                {
+                    "machine_id": "machine-7",
+                    "host_id": "host-3",
+                    "public_ipaddr": "8.8.8.8",
+                },
+                now=self.clock(),
+            )
+        )
+        self.assertEqual(
+            result.sanitized_error,
+            "The authorized total instance-create limit was reached.",
+        )
+
     def test_ambiguous_replacement_create_adopts_inventory_without_second_create(self):
-        session = self.save_session()
+        session = self.save_session(max_instance_creates=2)
         self.provider.instances = [
             self.worker_instance("instance-1", session.label)
         ]
@@ -1362,6 +1490,7 @@ class SessionLifecycleTests(LifecycleTestCase):
         self.assertEqual(replacement.state, SessionState.BOOTSTRAPPING)
         self.assertEqual(replacement.instance_id, "instance-2")
         self.assertEqual(replacement.retry_count, 1)
+        self.assertEqual(replacement.quote.max_instance_creates, 2)
         self.assertEqual(
             [call[0] for call in self.provider.calls],
             ["destroy", "list", "search", "create", "list"],

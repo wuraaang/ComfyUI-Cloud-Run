@@ -742,6 +742,9 @@ export function createSessionConsole(document, api = {}, options = {}) {
       `${bytesText(quote.transfer_bytes)} dependencies and inputs`,
       `${bytesText(quote.output_allowance_bytes)} output allowance`,
       durationText(quote.duration_seconds),
+      `Maximum total instance creates: ${
+        positiveInteger(quote.max_instance_creates) ?? "unknown"
+      }`,
       `approximately ${money(quote.approximate_max_active_charge)} ` +
         "active/storage",
       `template ${safeText(quote.template_hash_id, "unavailable")}`,

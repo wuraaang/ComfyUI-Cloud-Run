@@ -42,6 +42,7 @@ def make_attempt(key="idem-1", attempt_id="attempt-1", now=100.0):
             machine_id="machine-7",
             host_id="host-3",
             public_ipaddr="203.0.113.7",
+            max_instance_creates=1,
         ),
         attempt_id=attempt_id,
         now=now,

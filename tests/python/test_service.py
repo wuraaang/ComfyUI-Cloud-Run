@@ -207,6 +207,7 @@ class CloudRunServiceTests(unittest.TestCase):
                     "mode": "finite",
                     "duration_seconds": 7_200,
                 },
+                max_instance_creates=1,
             )
         )
         reopened = SessionRepository(self.database_path).get(
@@ -218,6 +219,7 @@ class CloudRunServiceTests(unittest.TestCase):
         self.assertEqual(reopened.quote.transfer_bytes, 12_000)
         self.assertEqual(reopened.quote.output_allowance_bytes, 4_000)
         self.assertEqual(reopened.quote.duration_seconds, 7_200)
+        self.assertEqual(reopened.quote.max_instance_creates, 1)
         self.assertEqual(
             reopened.quote.approximate_max_active_charge,
             1.0,
@@ -236,6 +238,114 @@ class CloudRunServiceTests(unittest.TestCase):
             repr(quoted.public_payload()),
         )
 
+    def test_paid_session_create_limit_is_validated_before_offer_lookup(self):
+        from cloud_run.service import CloudRunValidationError
+
+        provider = FakeProvider(lookups=[offer(price=0.50)])
+        service = self.service(
+            provider,
+            session_service=FakePreflightService(),
+        )
+
+        for index, max_instance_creates in enumerate(
+            (None, True, 0, 3, 1.0, "1")
+        ):
+            with self.subTest(max_instance_creates=max_instance_creates):
+                with self.assertRaisesRegex(
+                    CloudRunValidationError,
+                    "Maximum total instance creates must be 1 or 2.",
+                ):
+                    asyncio.run(
+                        service.preview_session(
+                            preflight_id="preflight-1",
+                            offer_id="42",
+                            idempotency_key=f"invalid-limit-{index}",
+                            deadline={
+                                "mode": "finite",
+                                "duration_seconds": 7_200,
+                            },
+                            max_instance_creates=max_instance_creates,
+                        )
+                    )
+
+        self.assertEqual(provider.lookup_calls, [])
+        self.assertEqual(provider.create_calls, [])
+
+    def test_duplicate_paid_preview_keeps_its_original_create_limit(self):
+        provider = FakeProvider(lookups=[offer(price=0.50)])
+        service = self.service(
+            provider,
+            session_service=FakePreflightService(),
+        )
+
+        first = asyncio.run(
+            service.preview_session(
+                preflight_id="preflight-1",
+                offer_id="42",
+                idempotency_key="same-paid-preview",
+                deadline={
+                    "mode": "finite",
+                    "duration_seconds": 7_200,
+                },
+                max_instance_creates=1,
+            )
+        )
+        duplicate = asyncio.run(
+            service.preview_session(
+                preflight_id="different-preflight",
+                offer_id="999",
+                idempotency_key="same-paid-preview",
+                deadline={"mode": "none", "duration_seconds": None},
+                max_instance_creates=2,
+            )
+        )
+
+        self.assertEqual(duplicate, first)
+        self.assertEqual(duplicate.quote.max_instance_creates, 1)
+        self.assertEqual(len(provider.lookup_calls), 1)
+        self.assertEqual(provider.create_calls, [])
+
+    def test_confirmation_rejects_consumed_create_budget_before_provider(self):
+        provider = FakeProvider(lookups=[offer(price=0.50)])
+        service = self.service(
+            provider,
+            session_service=FakePreflightService(),
+        )
+        quoted = asyncio.run(
+            service.preview_session(
+                preflight_id="preflight-1",
+                offer_id="42",
+                idempotency_key="forged-consumed-budget",
+                deadline={
+                    "mode": "finite",
+                    "duration_seconds": 7_200,
+                },
+                max_instance_creates=1,
+            )
+        )
+        self.session_repository.save(
+            quoted.transition(
+                SessionState.OFFER_SELECTED,
+                now=101.0,
+                retry_count=1,
+            )
+        )
+
+        failed = asyncio.run(
+            service.confirm_session(
+                quoted.session_id,
+                idempotency_key="forged-consumed-budget",
+            )
+        )
+
+        self.assertEqual(failed.state, SessionState.FAILED)
+        self.assertEqual(
+            failed.sanitized_error,
+            "The authorized total instance-create limit was reached.",
+        )
+        self.assertEqual(len(provider.lookup_calls), 1)
+        self.assertEqual(provider.create_calls, [])
+
     def test_paid_confirmation_persists_secret_and_intent_before_one_put(self):
         provider = FakeProvider(
             lookups=[offer(price=0.50), offer(price=0.50)]
@@ -253,6 +363,7 @@ class CloudRunServiceTests(unittest.TestCase):
                     "mode": "finite",
                     "duration_seconds": 7_200,
                 },
+                max_instance_creates=1,
             )
         )
 
@@ -316,6 +427,7 @@ class CloudRunServiceTests(unittest.TestCase):
                     "mode": "finite",
                     "duration_seconds": 7_200,
                 },
+                max_instance_creates=1,
             )
         )
 
@@ -328,6 +440,58 @@ class CloudRunServiceTests(unittest.TestCase):
 
         self.assertEqual(started.state.value, "bootstrapping")
         self.assertEqual(lifecycle.calls, [started.session_id])
+
+    def test_ambiguous_initial_create_adopts_one_consumed_instance(self):
+        provider = FakeProvider(
+            lookups=[offer(price=0.50), offer(price=0.50)]
+        )
+        provider.create_error = VastError(
+            "sensitive lost create response",
+            retryable=True,
+        )
+        service = self.service(
+            provider,
+            session_service=FakePreflightService(),
+        )
+        quoted = asyncio.run(
+            service.preview_session(
+                preflight_id="preflight-1",
+                offer_id=42,
+                idempotency_key="ambiguous-initial-session",
+                deadline={
+                    "mode": "finite",
+                    "duration_seconds": 7_200,
+                },
+                max_instance_creates=1,
+            )
+        )
+        provider.instances = [
+            {
+                "instance_id": "instance-77",
+                "label": quoted.label,
+                "actual_status": "loading",
+            }
+        ]
+
+        reconciled = asyncio.run(
+            service.confirm_session(
+                quoted.session_id,
+                idempotency_key="ambiguous-initial-session",
+            )
+        )
+        duplicate = asyncio.run(
+            service.confirm_session(
+                quoted.session_id,
+                idempotency_key="ambiguous-initial-session",
+            )
+        )
+
+        self.assertEqual(reconciled.state, SessionState.BOOTSTRAPPING)
+        self.assertEqual(reconciled.instance_id, "instance-77")
+        self.assertEqual(reconciled.retry_count, 0)
+        self.assertEqual(reconciled.quote.max_instance_creates, 1)
+        self.assertEqual(duplicate, reconciled)
+        self.assertEqual(len(provider.create_calls), 1)
 
     def test_concurrent_paid_confirmations_issue_exactly_one_create(self):
         async def scenario():
@@ -350,6 +514,7 @@ class CloudRunServiceTests(unittest.TestCase):
                     "mode": "finite",
                     "duration_seconds": 7_200,
                 },
+                max_instance_creates=1,
             )
             original_lookup = provider.get_offer
             both_revalidating = asyncio.Event()
@@ -435,6 +600,7 @@ class CloudRunServiceTests(unittest.TestCase):
                     "mode": "finite",
                     "duration_seconds": 7_200,
                 },
+                max_instance_creates=1,
             )
             confirmation = asyncio.create_task(
                 service.confirm_session(
@@ -480,6 +646,7 @@ class CloudRunServiceTests(unittest.TestCase):
                         "mode": "finite",
                         "duration_seconds": 7_200,
                     },
+                    max_instance_creates=1,
                 )
             )
 

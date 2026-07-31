@@ -1044,6 +1044,7 @@ class FakeCloudRunSystem:
         offer_id,
         idempotency_key,
         duration_seconds,
+        max_instance_creates=1,
     ):
         async def operation():
             offers = await self.service.search(preflight.preflight_id)
@@ -1060,6 +1061,7 @@ class FakeCloudRunSystem:
                     "mode": "finite",
                     "duration_seconds": duration_seconds,
                 },
+                max_instance_creates=max_instance_creates,
             )
             session = await self.service.confirm_session(
                 session.session_id,
@@ -1423,6 +1425,7 @@ class FakeReusableSessionIntegrationTests(unittest.TestCase):
                         "mode": "finite",
                         "duration_seconds": 7_200,
                     },
+                    max_instance_creates=1,
                 )
             )
         self.assertEqual(system.vast.search_count, 0)
@@ -1768,12 +1771,14 @@ class FakeReusableSessionIntegrationTests(unittest.TestCase):
             offer_id="42",
             idempotency_key="replacement-session-key",
             duration_seconds=7200,
+            max_instance_creates=2,
         )
 
         replacement = system.fail_boot(session)
 
         self.assertEqual(replacement.state, SessionState.BOOTSTRAPPING)
         self.assertEqual(replacement.retry_count, 1)
+        self.assertEqual(replacement.quote.max_instance_creates, 2)
         self.assertEqual(system.vast.create_count, 2)
         self.assertEqual(system.vast.destroy_count, 1)
         self.assertEqual(
@@ -1786,6 +1791,10 @@ class FakeReusableSessionIntegrationTests(unittest.TestCase):
 
         self.assertEqual(exhausted.state, SessionState.FAILED)
         self.assertEqual(exhausted.retry_count, 1)
+        self.assertEqual(
+            exhausted.sanitized_error,
+            "The authorized total instance-create limit was reached.",
+        )
         self.assertEqual(system.vast.create_count, 2)
         self.assertEqual(system.vast.destroy_count, 2)
         self.assertEqual(system.vast.inventory, [])

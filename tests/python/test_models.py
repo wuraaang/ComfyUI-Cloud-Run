@@ -41,6 +41,7 @@ def quote(OfferQuote):
         machine_id="machine-7",
         host_id="host-3",
         public_ipaddr="203.0.113.7",
+        max_instance_creates=1,
     )
 
 
@@ -54,6 +55,9 @@ class LifecycleModelTests(unittest.TestCase):
         paid_quote = OfferQuote.from_record(values)
         public = paid_quote.public_payload()
 
+        self.assertEqual(paid_quote.max_instance_creates, 1)
+        self.assertEqual(paid_quote.to_record()["max_instance_creates"], 1)
+        self.assertEqual(public["max_instance_creates"], 1)
         self.assertEqual(public["disk_gb"], 96)
         self.assertEqual(public["transfer_bytes"], 12_000)
         self.assertEqual(public["output_allowance_bytes"], 4_000)
@@ -65,6 +69,30 @@ class LifecycleModelTests(unittest.TestCase):
         self.assertEqual(public["protocol_version"], "1")
         self.assertEqual(public["manifest_digest"], "c" * 64)
         self.assertNotIn("session_secret_hex", public)
+
+    def test_quote_rejects_invalid_total_instance_create_limits(self):
+        from cloud_run.models import OfferQuote
+
+        values = quote(OfferQuote).to_record()
+        for max_instance_creates in (None, True, 0, 3, 1.0, "1"):
+            with self.subTest(max_instance_creates=max_instance_creates):
+                with self.assertRaises(ValueError):
+                    OfferQuote.from_record(
+                        {
+                            **values,
+                            "max_instance_creates": max_instance_creates,
+                        }
+                    )
+
+    def test_persisted_quote_without_create_limit_defaults_to_one(self):
+        from cloud_run.models import OfferQuote
+
+        values = quote(OfferQuote).to_record()
+        del values["max_instance_creates"]
+
+        restored = OfferQuote.from_record(values)
+
+        self.assertEqual(restored.max_instance_creates, 1)
 
     def test_legacy_quote_records_remain_readable_but_cannot_claim_a_release(self):
         from cloud_run.models import OfferQuote
@@ -87,6 +115,7 @@ class LifecycleModelTests(unittest.TestCase):
 
         self.assertFalse(restored.reviewed_release_bound)
         self.assertEqual(restored.offer_id, "42")
+        self.assertEqual(restored.max_instance_creates, 1)
         self.assertIsNone(public["template_hash_id"])
         self.assertIsNone(public["worker_commit"])
         self.assertIsNone(public["manifest_digest"])

@@ -275,6 +275,7 @@ class OfferQuote:
     machine_id: str | None = None
     host_id: str | None = None
     public_ipaddr: str | None = None
+    max_instance_creates: int = 1
 
     def __post_init__(self):
         finite_numbers = (
@@ -318,6 +319,8 @@ class OfferQuote:
             )
             or self.protocol_version != "1"
             or not re.fullmatch(r"[0-9a-f]{64}", self.manifest_digest)
+            or type(self.max_instance_creates) is not int
+            or self.max_instance_creates not in {1, 2}
         ):
             raise ValueError("Invalid paid offer quote.")
         if self.reliability is not None and (
@@ -398,6 +401,7 @@ class OfferQuote:
                 "worker_archive_sha256": _UNBOUND_SHA256,
                 "protocol_version": "1",
                 "manifest_digest": _UNBOUND_SHA256,
+                "max_instance_creates": 1,
             }
         try:
             return cls(**payload)
@@ -444,6 +448,9 @@ class OfferQuote:
             ),
             "protocol_version": self.protocol_version if reviewed else None,
             "manifest_digest": self.manifest_digest if reviewed else None,
+            "max_instance_creates": (
+                self.max_instance_creates if reviewed else None
+            ),
         }
 
 
