@@ -28,6 +28,7 @@ _STATE_FIELDS = {
     "transactions",
     "jobs",
 }
+_UNCHANGED = object()
 
 
 class WorkerStateError(RuntimeError):
@@ -290,3 +291,35 @@ class WorkerStateStore:
             "sha256": sha256,
         }
         return self.save({**state, "transactions": transactions})
+
+    def record_transaction(
+        self,
+        transaction_id,
+        record,
+        *,
+        installed=_UNCHANGED,
+    ):
+        if (
+            not _identifier(transaction_id)
+            or not isinstance(record, dict)
+            or record.get("transaction_id") != transaction_id
+            or not isinstance(record.get("kind"), str)
+            or not _identifier(record["kind"])
+            or (
+                installed is not _UNCHANGED
+                and not isinstance(installed, dict)
+            )
+        ):
+            raise WorkerStateError("Worker transaction state is invalid.")
+        state = self.load()
+        if not state["claimed"]:
+            raise WorkerStateError("Worker is not claimed.")
+        transactions = dict(state["transactions"])
+        transactions[transaction_id] = dict(record)
+        updated = {
+            **state,
+            "transactions": transactions,
+        }
+        if installed is not _UNCHANGED:
+            updated["installed"] = dict(installed)
+        return self.save(updated)

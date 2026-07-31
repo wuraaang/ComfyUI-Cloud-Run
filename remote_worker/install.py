@@ -404,6 +404,36 @@ class CustomNodeInstaller:
             installed.append(wheel.filename)
         return tuple(installed)
 
+    async def install_wheels(self, wheels):
+        try:
+            wheels = tuple(wheels)
+        except TypeError:
+            raise _install_error() from None
+        verified = []
+        identities = set()
+        for wheel in sorted(
+            wheels,
+            key=lambda item: (
+                getattr(item, "filename", ""),
+                getattr(item, "sha256", ""),
+            ),
+        ):
+            try:
+                validate_dependency(wheel)
+            except (TypeError, ValueError):
+                raise _install_error() from None
+            identity = (wheel.filename, wheel.sha256)
+            if identity in identities:
+                raise _install_error()
+            identities.add(identity)
+            path = _verified_file(
+                self._wheel_path(wheel),
+                size_bytes=wheel.size_bytes,
+                sha256=wheel.sha256,
+            )
+            verified.append((wheel, path))
+        return await self._install_wheels(verified)
+
     def _replace_content(self, content, destination):
         backup = None
         try:

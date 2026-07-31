@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 import json
 import re
@@ -19,6 +20,14 @@ from .state import (
     WorkerSessionMismatch,
     WorkerStateError,
     WorkerStateStore,
+)
+from .provision import (
+    ProvisionError,
+    ProvisionResult,
+    ProvisionStalled,
+    UploadsRequired,
+    manifest_upload_artifacts,
+    parse_manifest_request,
 )
 from .transfers import TransferError
 
@@ -183,6 +192,7 @@ class WorkerApplication:
         nonce_cache=None,
         transfer_manager=None,
         upload_artifacts=(),
+        provisioner=None,
     ):
         self.state = WorkerStateStore(
             state_path,
@@ -193,8 +203,21 @@ class WorkerApplication:
             nonce_cache if nonce_cache is not None else NonceCache()
         )
         self.transfer_manager = transfer_manager
+        self.provisioner = provisioner
         self.upload_artifacts = {}
+        self._manifest_lock = None
+        self._manifest_lock_loop = None
         self.register_upload_artifacts(upload_artifacts)
+
+    def _manifest_request_lock(self):
+        loop = asyncio.get_running_loop()
+        if (
+            self._manifest_lock is None
+            or self._manifest_lock_loop is not loop
+        ):
+            self._manifest_lock = asyncio.Lock()
+            self._manifest_lock_loop = loop
+        return self._manifest_lock
 
     def register_upload_artifacts(self, artifacts):
         catalog = {}
@@ -317,6 +340,64 @@ class WorkerApplication:
             },
         )
 
+    async def _apply_manifest_locked(self, body):
+        if self.provisioner is None:
+            return _error(501, "Worker route is not implemented.")
+        try:
+            desired, required, source_urls = parse_manifest_request(body)
+            upload_artifacts = manifest_upload_artifacts(desired)
+            if upload_artifacts:
+                self.register_upload_artifacts(upload_artifacts)
+        except (ProvisionError, ValueError):
+            return _error(400, "Worker manifest was rejected.")
+        try:
+            result = await self.provisioner.apply_manifest(
+                desired,
+                required_class_types=required,
+                source_urls=source_urls,
+            )
+        except UploadsRequired as required_uploads:
+            result = self.provisioner.transaction(
+                "provision-" + desired.digest
+            )
+            if result is None:
+                return _error(503, "Worker transaction is unavailable.")
+            payload = result.payload()
+            payload["required_uploads"] = list(
+                required_uploads.artifact_ids
+            )
+            return _response(202, payload)
+        except ProvisionStalled:
+            return _error(409, "Worker provisioning stalled.")
+        except ProvisionError:
+            return _error(409, "Worker provisioning was rejected.")
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            raise
+        except Exception:
+            return _error(503, "Worker transaction is unavailable.")
+        if not isinstance(result, ProvisionResult):
+            return _error(503, "Worker transaction is unavailable.")
+        return _response(200, result.payload())
+
+    async def _apply_manifest(self, body):
+        async with self._manifest_request_lock():
+            return await self._apply_manifest_locked(body)
+
+    async def _transaction(self, transaction_id):
+        if self.provisioner is None:
+            return _error(501, "Worker route is not implemented.")
+        try:
+            result = self.provisioner.transaction(transaction_id)
+        except ProvisionError:
+            return _error(503, "Worker transaction is unavailable.")
+        except Exception:
+            return _error(503, "Worker transaction is unavailable.")
+        if result is None:
+            return _error(404, "Worker transaction was not found.")
+        if not isinstance(result, ProvisionResult):
+            return _error(503, "Worker transaction is unavailable.")
+        return _response(200, result.payload())
+
     async def handle(self, request):
         method = getattr(request, "method", None)
         path = getattr(request, "path", None)
@@ -336,6 +417,12 @@ class WorkerApplication:
             return _error(401, "Worker request authentication failed.")
         if not await self._authenticate(request, body):
             return _error(401, "Worker request authentication failed.")
+        if route == "/worker/v1/manifests":
+            return await self._apply_manifest(body)
+        if route == "/worker/v1/transactions/{transaction_id}":
+            return await self._transaction(
+                parameters["transaction_id"]
+            )
         if route == "/worker/v1/artifacts/{artifact_id}" and (
             str(method).upper() == "PUT"
         ):

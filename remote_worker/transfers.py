@@ -31,6 +31,16 @@ class TransferError(RuntimeError):
     """A sanitized transfer-policy, transport, or integrity failure."""
 
 
+class ArtifactIntegrityError(TransferError):
+    pass
+
+
+class TransferProgressError(TransferError):
+    def __init__(self, original):
+        self.original = original
+        super().__init__("Artifact transfer progress failed.")
+
+
 class _RetryableTransferError(TransferError):
     pass
 
@@ -153,6 +163,84 @@ def _fsync_directory(path):
     finally:
         if descriptor is not None:
             os.close(descriptor)
+
+
+async def _close_response(response):
+    closer = getattr(response, "close", None)
+    if not callable(closer):
+        return
+    try:
+        result = closer()
+        if inspect.isawaitable(result):
+            await result
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        raise
+    except Exception:
+        return
+
+
+class _AiohttpRangeResponse:
+    def __init__(self, response, session):
+        self._response = response
+        self._session = session
+        self.status = response.status
+        self.headers = response.headers
+        self.url = response.url
+        self._closed = False
+
+    async def iter_chunks(self, maximum_bytes):
+        try:
+            async for chunk in self._response.content.iter_chunked(
+                maximum_bytes
+            ):
+                yield bytes(chunk)
+        finally:
+            await self.close()
+
+    async def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        self._response.release()
+        await self._session.close()
+
+
+class AiohttpRangeClient:
+    async def get(self, url, *, headers, allow_redirects):
+        try:
+            from aiohttp import ClientSession, ClientTimeout
+        except ImportError:
+            raise TransferError("Artifact transport is unavailable.") from None
+        session = None
+        try:
+            timeout = ClientTimeout(
+                total=None,
+                sock_connect=30,
+                sock_read=120,
+            )
+            session = ClientSession(
+                timeout=timeout,
+                auto_decompress=False,
+                trust_env=False,
+            )
+            request_headers = {
+                "Accept-Encoding": "identity",
+                **dict(headers),
+            }
+            response = await session.get(
+                url,
+                headers=request_headers,
+                allow_redirects=allow_redirects,
+            )
+            return _AiohttpRangeResponse(response, session)
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            if session is not None:
+                await session.close()
+            raise
+        except Exception:
+            if session is not None:
+                await session.close()
+            raise TransferError("Artifact transport is unavailable.") from None
 
 
 def wheel_artifact(wheel):
@@ -355,6 +443,37 @@ class TransferManager:
     def destination_path(self, artifact):
         return self._destination(artifact)
 
+    def verify(self, artifact):
+        artifact = self._artifact(artifact)
+        destination = self._destination(artifact)
+        return self._existing_result(artifact, destination)
+
+    def reset(self, artifact):
+        artifact = self._artifact(artifact)
+        destination = self._destination(artifact)
+        part = _part_path(destination)
+        changed_parents = set()
+        for path in (part, destination):
+            try:
+                metadata = os.lstat(path)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                raise _transfer_error() from None
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or metadata.st_nlink != 1
+            ):
+                raise _transfer_error()
+            try:
+                path.unlink()
+            except OSError:
+                raise _transfer_error() from None
+            changed_parents.add(path.parent)
+        for parent in changed_parents:
+            _fsync_directory(parent)
+
     async def _notify_progress(self, artifact, offset):
         if self.progress is None:
             return
@@ -364,8 +483,8 @@ class TransferManager:
                 await result
         except (asyncio.CancelledError, KeyboardInterrupt):
             raise
-        except Exception:
-            raise _transfer_error() from None
+        except Exception as error:
+            raise TransferProgressError(error) from None
 
     def _result(self, artifact, destination, state, offset):
         return TransferResult(
@@ -387,9 +506,12 @@ class TransferManager:
         if (
             not stat.S_ISREG(metadata.st_mode)
             or metadata.st_uid != os.getuid()
-            or not _verified_file(destination, artifact)
         ):
             raise _transfer_error()
+        if not _verified_file(destination, artifact):
+            raise ArtifactIntegrityError(
+                "Artifact content verification failed."
+            )
         return self._result(
             artifact,
             destination,
@@ -428,20 +550,29 @@ class TransferManager:
                 raise
             except Exception:
                 raise _retryable_error() from None
-            status = getattr(response, "status", None)
-            if isinstance(status, bool) or not isinstance(status, int):
-                raise _transfer_error()
-            response_url = str(getattr(response, "url", current_url))
-            if _origin(response_url) != approved_origin:
-                raise _transfer_error()
-            response_headers = _headers(getattr(response, "headers", {}))
+            try:
+                status = getattr(response, "status", None)
+                if isinstance(status, bool) or not isinstance(status, int):
+                    raise _transfer_error()
+                response_url = str(getattr(response, "url", current_url))
+                if _origin(response_url) != approved_origin:
+                    raise _transfer_error()
+                response_headers = _headers(
+                    getattr(response, "headers", {})
+                )
+            except BaseException:
+                await _close_response(response)
+                raise
             if 300 <= status < 400:
                 location = response_headers.get("location")
                 if location is None or redirect_count >= MAX_REDIRECTS:
+                    await _close_response(response)
                     raise _transfer_error()
                 redirected = urljoin(current_url, location)
                 if _origin(redirected) != approved_origin:
+                    await _close_response(response)
                     raise _transfer_error()
+                await _close_response(response)
                 current_url = redirected
                 continue
             return response, response_headers
@@ -554,6 +685,7 @@ class TransferManager:
                 handle.close()
             elif descriptor is not None:
                 os.close(descriptor)
+            await _close_response(response)
         if written != artifact.size_bytes:
             raise _transfer_error()
 
@@ -581,13 +713,18 @@ class TransferManager:
                 source_url,
                 request_headers,
             )
-            response_action = self._validate_response(
-                response,
-                response_headers,
-                offset=offset,
-                expected_size=artifact.size_bytes,
-            )
+            try:
+                response_action = self._validate_response(
+                    response,
+                    response_headers,
+                    offset=offset,
+                    expected_size=artifact.size_bytes,
+                )
+            except BaseException:
+                await _close_response(response)
+                raise
             if response_action == "reset":
+                await _close_response(response)
                 try:
                     part.unlink()
                     _fsync_directory(part.parent)
@@ -601,12 +738,16 @@ class TransferManager:
                     source_url,
                     {},
                 )
-                self._validate_response(
-                    response,
-                    response_headers,
-                    offset=0,
-                    expected_size=artifact.size_bytes,
-                )
+                try:
+                    self._validate_response(
+                        response,
+                        response_headers,
+                        offset=0,
+                        expected_size=artifact.size_bytes,
+                    )
+                except BaseException:
+                    await _close_response(response)
+                    raise
             await self._append_response(
                 artifact,
                 part,

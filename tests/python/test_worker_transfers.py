@@ -476,6 +476,26 @@ class TransferManagerTests(unittest.TestCase):
         )
         self.assertEqual(result.destination.read_bytes(), payload)
 
+    def test_verify_and_explicit_repair_reset_stay_confined(self):
+        from remote_worker.transfers import TransferManager
+
+        payload = b"verified-reset"
+        artifact = artifact_for(payload)
+        manager = TransferManager(root=self.root, sleeper=no_sleep)
+        self.assertIsNone(manager.verify(artifact))
+        uploaded = asyncio.run(
+            manager.upload(
+                artifact,
+                content_range=f"bytes 0-{len(payload) - 1}/{len(payload)}",
+                body=payload,
+            )
+        )
+
+        self.assertEqual(manager.verify(artifact), uploaded)
+        manager.reset(artifact)
+        self.assertIsNone(manager.verify(artifact))
+        self.assertFalse(uploaded.destination.exists())
+
 
 class FakeWorkerRequest:
     def __init__(

@@ -272,6 +272,22 @@ class WorkerInstallTests(unittest.TestCase):
                 self.installer(RecordingRunner()).install(mismatched)
             )
 
+    def test_manifest_delta_can_install_only_verified_new_wheels(self):
+        runner = RecordingRunner()
+        spec = self.node_spec()
+        installer = self.installer(runner)
+
+        installed = asyncio.run(
+            installer.install_wheels(spec.wheels)
+        )
+
+        self.assertEqual(
+            installed,
+            ("dep-1.0-py3-none-any.whl",),
+        )
+        self.assertEqual(len(runner.calls), 1)
+        self.assertFalse((self.custom_nodes / "fancy").exists())
+
 
 if __name__ == "__main__":
     unittest.main()
