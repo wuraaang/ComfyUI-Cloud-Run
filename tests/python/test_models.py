@@ -245,6 +245,69 @@ class LifecycleModelTests(unittest.TestCase):
         self.assertNotIn("manifest_digest", encoded)
         self.assertIn('"billing_may_continue": true', encoded)
 
+    def test_pending_deadline_is_public_but_earlier_finite_limit_stays_effective(self):
+        from cloud_run.models import CloudSession, SessionState
+
+        session = CloudSession.new(
+            "session-key",
+            session_id="session-1",
+            manifest_digest="a" * 64,
+            deadline_at=7_300.0,
+            deadline_mode="finite",
+            disk_gb=80,
+            now=100.0,
+            state=SessionState.READY,
+        )
+        pending = session.transition(
+            SessionState.READY,
+            now=101.0,
+            pending_deadline_at=9_100.0,
+            pending_deadline_mode="finite",
+            pending_deadline_action="add_30_minutes",
+        )
+
+        public = pending.public_payload()
+
+        self.assertEqual(pending.deadline_at, 7_300.0)
+        self.assertEqual(public["deadline_at"], 7_300.0)
+        self.assertTrue(public["deadline_sync_pending"])
+        self.assertEqual(public["pending_deadline_at"], 9_100.0)
+        with self.assertRaises(ValueError):
+            pending.transition(
+                SessionState.READY,
+                pending_deadline_at=None,
+                pending_deadline_mode="finite",
+                pending_deadline_action="add_30_minutes",
+            )
+        with self.assertRaises(ValueError):
+            session.transition(
+                SessionState.READY,
+                pending_deadline_at=7_200.0,
+                pending_deadline_mode="finite",
+                pending_deadline_action="add_30_minutes",
+            )
+
+    def test_destroy_intent_keeps_billing_warning_until_inventory_proves_absence(self):
+        from cloud_run.models import CloudSession, SessionState
+
+        session = CloudSession.new(
+            "session-key",
+            session_id="session-1",
+            manifest_digest="a" * 64,
+            deadline_at=7_300.0,
+            deadline_mode="finite",
+            disk_gb=80,
+            now=100.0,
+            state=SessionState.READY,
+        ).transition(
+            SessionState.DESTROY_REQUESTED,
+            now=101.0,
+            instance_id="77",
+            destroy_requested=True,
+        )
+
+        self.assertTrue(session.public_payload()["billing_may_continue"])
+
     def test_new_attempt_has_a_durable_identity_and_confirming_state(self):
         AttemptState, CloudAttempt, _, OfferQuote = model_api(self)
 

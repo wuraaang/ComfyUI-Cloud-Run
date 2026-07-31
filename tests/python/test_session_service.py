@@ -20,6 +20,9 @@ from cloud_run.relay import RelaySyncResult
 from cloud_run.repository import SessionRepository
 from cloud_run.resolver import NodeResolution
 from cloud_run.session_service import (
+    DeadlineSynchronizationError,
+    DeadlineValidationError,
+    DestroyConfirmationError,
     IncompatibleSession,
     PreflightBlocked,
     SessionBusy,
@@ -824,6 +827,255 @@ class ReusableSessionTests(unittest.TestCase):
             self.sessions.get("session-1").state,
             SessionState.READY,
         )
+
+    def test_deadline_alerts_extensions_and_no_limit_acknowledgement(self):
+        self.assertEqual(
+            self.service.alerts(
+                self.sessions.get("session-1"),
+                now=6_400.0,
+            ),
+            ["15_minutes"],
+        )
+        self.assertEqual(
+            self.service.alerts(
+                self.sessions.get("session-1"),
+                now=7_000.0,
+            ),
+            ["5_minutes"],
+        )
+
+        extended = asyncio.run(
+            self.service.update_deadline(
+                "session-1",
+                {"action": "add_30_minutes"},
+            )
+        )
+
+        self.assertEqual(extended.deadline_at, 9_100.0)
+        self.assertEqual(
+            self.worker.deadline_calls[-1],
+            {
+                "mode": "finite",
+                "deadline_at": 9_100.0,
+                "retrieval_grace_seconds": 300,
+            },
+        )
+        with self.assertRaises(DeadlineValidationError):
+            asyncio.run(
+                self.service.update_deadline(
+                    "session-1",
+                    {
+                        "action": "disable",
+                        "acknowledged": False,
+                    },
+                )
+            )
+        unlimited = asyncio.run(
+            self.service.update_deadline(
+                "session-1",
+                {
+                    "action": "disable",
+                    "acknowledged": True,
+                },
+            )
+        )
+        self.assertEqual(unlimited.deadline_mode, "none")
+        self.assertIsNone(unlimited.deadline_at)
+
+    def test_failed_worker_deadline_sync_keeps_earlier_finite_boundary(self):
+        async def unavailable(_payload):
+            raise RuntimeError("private transport detail")
+
+        self.worker.update_deadline = unavailable
+
+        with self.assertRaises(DeadlineSynchronizationError):
+            asyncio.run(
+                self.service.update_deadline(
+                    "session-1",
+                    {"action": "add_30_minutes"},
+                )
+            )
+
+        session = self.sessions.get("session-1")
+        self.assertEqual(session.deadline_mode, "finite")
+        self.assertEqual(session.deadline_at, 7_300.0)
+        self.assertEqual(session.pending_deadline_at, 9_100.0)
+        self.assertEqual(
+            session.pending_deadline_action,
+            "add_30_minutes",
+        )
+        self.assertNotIn("private transport detail", session.sanitized_error)
+
+    def test_deadline_update_preserves_a_concurrent_running_state(self):
+        async def scenario():
+            entered_update = asyncio.Event()
+            release_update = asyncio.Event()
+
+            async def blocked_update(payload):
+                entered_update.set()
+                await release_update.wait()
+                return {
+                    "mode": payload["mode"],
+                    "deadline_at": payload.get("deadline_at"),
+                }
+
+            self.worker.update_deadline = blocked_update
+            update = asyncio.create_task(
+                self.service.update_deadline(
+                    "session-1",
+                    {"action": "add_30_minutes"},
+                )
+            )
+            await entered_update.wait()
+            self.sessions.transition_if_state(
+                "session-1",
+                SessionState.READY,
+                SessionState.RUNNING,
+                now=101.0,
+            )
+            release_update.set()
+            return await update
+
+        updated = asyncio.run(scenario())
+
+        self.assertEqual(updated.state, SessionState.RUNNING)
+        self.assertEqual(updated.deadline_at, 9_100.0)
+        self.assertIsNone(updated.pending_deadline_mode)
+
+    def test_deadline_update_is_rejected_before_a_worker_can_synchronize_it(self):
+        creating = CloudSession.new(
+            "creating-key",
+            session_id="creating-session",
+            manifest_digest="a" * 64,
+            deadline_at=7_300.0,
+            deadline_mode="finite",
+            disk_gb=80,
+            now=100.0,
+            state=SessionState.CREATING,
+        )
+        self.sessions.create_or_get(creating)
+
+        with self.assertRaises(DeadlineValidationError):
+            asyncio.run(
+                self.service.update_deadline(
+                    creating.session_id,
+                    {"action": "add_30_minutes"},
+                )
+            )
+
+        unchanged = self.sessions.get(creating.session_id)
+        self.assertIsNone(unchanged.pending_deadline_mode)
+        self.assertEqual(self.worker.deadline_calls, [])
+
+    def test_destroy_requires_fresh_review_and_abandons_unverified_outputs(self):
+        job = CloudJob(
+            job_id="destroy-job",
+            session_id="session-1",
+            idempotency_key="destroy-job-key",
+            state=JobState.SUCCEEDED,
+            prompt_digest=self.first_capture.prompt_digest,
+            capture_json=self.first_capture.canonical_payload(),
+            manifest_digest=self.sessions.get(
+                "session-1"
+            ).manifest_digest,
+            remote_prompt_id=None,
+            sanitized_error=None,
+            created_at=100.0,
+            updated_at=100.0,
+            version=1,
+        )
+        self.jobs.create_job(job)
+        self.jobs.save_transfer(
+            job_id=job.job_id,
+            artifact_id="output-2",
+            direction="download",
+            expected_size=20,
+            sha256="f" * 64,
+            offset=10,
+            state="transferring",
+            private_path=str(self.path.parent / "output-2.part"),
+        )
+
+        class DestroyLifecycle:
+            def __init__(inner_self):
+                inner_self.calls = []
+
+            async def destroy_session(inner_self, session_id):
+                inner_self.calls.append(session_id)
+                current = self.sessions.get(session_id)
+                current = self.sessions.transition(
+                    session_id,
+                    SessionState.DESTROY_REQUESTED,
+                    now=102.0,
+                    destroy_requested=True,
+                )
+                current = self.sessions.transition(
+                    session_id,
+                    SessionState.DESTROYING,
+                    now=103.0,
+                )
+                return self.sessions.transition(
+                    session_id,
+                    SessionState.DESTROYED,
+                    now=104.0,
+                    instance_id=None,
+                    worker_base_url=None,
+                    provider_token=None,
+                    session_secret_hex=None,
+                    residual_inventory=(),
+                    sanitized_error=None,
+                )
+
+        lifecycle = DestroyLifecycle()
+        self.service.lifecycle = lifecycle
+        review = asyncio.run(
+            self.service.review_destroy("session-1")
+        )
+
+        self.assertEqual(review.instance_id, "77")
+        self.assertEqual(
+            review.unverified_artifact_ids,
+            ("output-2",),
+        )
+        with self.assertRaises(DestroyConfirmationError):
+            asyncio.run(
+                self.service.destroy(
+                    "session-1",
+                    {
+                        "review_token": review.token,
+                        "acknowledge_data_loss": False,
+                    },
+                )
+            )
+        destroyed = asyncio.run(
+            self.service.destroy(
+                "session-1",
+                {
+                    "review_token": review.token,
+                    "acknowledge_data_loss": True,
+                },
+            )
+        )
+
+        self.assertEqual(destroyed.state, SessionState.DESTROYED)
+        self.assertEqual(lifecycle.calls, ["session-1"])
+        self.assertEqual(
+            self.jobs.get_transfer(
+                "destroy-job",
+                "output-2",
+            ).state.value,
+            "abandoned",
+        )
+        with self.assertRaises(DestroyConfirmationError):
+            asyncio.run(
+                self.service.destroy(
+                    "session-1",
+                    {
+                        "review_token": review.token,
+                        "acknowledge_data_loss": True,
+                    },
+                )
+            )
 
     def test_duplicate_key_is_idempotent_and_busy_session_rejects_new_job(self):
         first = asyncio.run(

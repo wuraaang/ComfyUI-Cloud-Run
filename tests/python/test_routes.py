@@ -919,6 +919,128 @@ class PaidSessionRouteTests(unittest.TestCase):
         self.assertNotIn("private-job-key", encoded)
         self.assertNotIn("11111111-1111-1111-1111-111111111111", encoded)
 
+    def test_deadline_and_two_stage_destroy_routes_accept_only_exact_controls(self):
+        ready = CloudSession.new(
+            "private-session-key",
+            session_id="session-1",
+            manifest_digest="c" * 64,
+            deadline_at=7_300.0,
+            deadline_mode="finite",
+            disk_gb=80,
+            now=100.0,
+            state=SessionState.READY,
+        )
+        destroyed = ready.transition(
+            SessionState.DESTROY_REQUESTED,
+            now=101.0,
+            destroy_requested=True,
+        ).transition(
+            SessionState.DESTROYING,
+            now=102.0,
+        ).transition(
+            SessionState.DESTROYED,
+            now=103.0,
+            instance_id=None,
+        )
+        review_payload = {
+            "session_id": "session-1",
+            "instance_id": "77",
+            "status": "ready",
+            "unverified_artifact_ids": ["output-2"],
+            "warning": "Unverified results will be irreversibly lost.",
+            "review_token": "browser-one-time-token",
+            "expires_at": 400.0,
+        }
+        review = types.SimpleNamespace(
+            public_payload=lambda: review_payload
+        )
+        service = mock.Mock()
+        service.update_session_deadline = mock.AsyncMock(
+            return_value=ready.transition(
+                SessionState.READY,
+                now=101.0,
+                deadline_at=9_100.0,
+            )
+        )
+        service.review_session_destroy = mock.AsyncMock(
+            return_value=review
+        )
+        service.destroy_session = mock.AsyncMock(return_value=destroyed)
+        handlers = captured_handlers(service_factory=lambda: service)
+
+        deadline_response = asyncio.run(
+            handlers[
+                ("PUT", "/cloud-run/api/sessions/{session_id}/deadline")
+            ](
+                FakeRequest(
+                    {"action": "add_30_minutes"},
+                    match_info={"session_id": "session-1"},
+                )
+            )
+        )
+        review_response = asyncio.run(
+            handlers[
+                (
+                    "POST",
+                    "/cloud-run/api/sessions/{session_id}/destroy-review",
+                )
+            ](
+                FakeRequest(
+                    {},
+                    match_info={"session_id": "session-1"},
+                )
+            )
+        )
+        destroy_response = asyncio.run(
+            handlers[
+                ("DELETE", "/cloud-run/api/sessions/{session_id}")
+            ](
+                FakeRequest(
+                    {
+                        "review_token": "browser-one-time-token",
+                        "acknowledge_data_loss": True,
+                    },
+                    match_info={"session_id": "session-1"},
+                )
+            )
+        )
+        invalid = asyncio.run(
+            handlers[
+                ("DELETE", "/cloud-run/api/sessions/{session_id}")
+            ](
+                FakeRequest(
+                    {
+                        "review_token": "browser-one-time-token",
+                        "acknowledge_data_loss": True,
+                        "stop": True,
+                    },
+                    match_info={"session_id": "session-1"},
+                )
+            )
+        )
+
+        self.assertEqual(deadline_response.payload["deadline_at"], 9_100.0)
+        self.assertEqual(
+            review_response.payload["unverified_artifact_ids"],
+            ["output-2"],
+        )
+        self.assertEqual(destroy_response.payload["status"], "destroyed")
+        self.assertEqual(invalid.status, 400)
+        service.update_session_deadline.assert_awaited_once_with(
+            "session-1",
+            {"action": "add_30_minutes"},
+        )
+        service.review_session_destroy.assert_awaited_once_with(
+            "session-1"
+        )
+        service.destroy_session.assert_awaited_once_with(
+            "session-1",
+            {
+                "review_token": "browser-one-time-token",
+                "acknowledge_data_loss": True,
+            },
+        )
+
 
 class RelayMediaRouteTests(unittest.TestCase):
     def setUp(self):

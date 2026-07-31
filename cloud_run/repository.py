@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 from contextlib import closing
+from dataclasses import dataclass
+import hmac
 import json
+import math
 import os
 from pathlib import Path
+import re
 import sqlite3
 
 from .models import (
@@ -37,8 +41,18 @@ _SESSION_COLUMNS = """
     installed_manifest_digest, instance_id, worker_base_url, provider_token,
     session_secret_hex, deadline_at, deadline_mode, disk_gb, retry_count,
     destroy_requested, residual_inventory_json, sanitized_error, created_at,
-    updated_at, version
+    updated_at, version, pending_deadline_at, pending_deadline_mode,
+    pending_deadline_action
 """
+
+
+@dataclass(frozen=True, repr=False)
+class DestroyReviewRecord:
+    session_id: str
+    expires_at: float
+    session_version: int
+    instance_id: str | None
+    unverified_artifact_ids: tuple[str, ...]
 
 
 def _canonical_json(value):
@@ -96,10 +110,28 @@ def _initialize_database(path):
                     sanitized_error TEXT,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
-                    version INTEGER NOT NULL
+                    version INTEGER NOT NULL,
+                    pending_deadline_at REAL,
+                    pending_deadline_mode TEXT,
+                    pending_deadline_action TEXT
                 )
                 """
             )
+            session_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(sessions)"
+                ).fetchall()
+            }
+            for name, declaration in (
+                ("pending_deadline_at", "REAL"),
+                ("pending_deadline_mode", "TEXT"),
+                ("pending_deadline_action", "TEXT"),
+            ):
+                if name not in session_columns:
+                    connection.execute(
+                        f"ALTER TABLE sessions ADD COLUMN {name} {declaration}"
+                    )
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS jobs (
@@ -216,6 +248,18 @@ def _initialize_database(path):
             )
             connection.execute(
                 """
+                CREATE TABLE IF NOT EXISTS destroy_reviews (
+                    session_id TEXT PRIMARY KEY,
+                    token_digest TEXT NOT NULL,
+                    expires_at REAL NOT NULL,
+                    session_version INTEGER NOT NULL,
+                    instance_id TEXT,
+                    unverified_artifact_ids_json TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS dependency_candidates (
                     class_type TEXT NOT NULL,
                     candidate_digest TEXT NOT NULL,
@@ -241,7 +285,7 @@ def _initialize_database(path):
             _migrate_legacy_attempts(connection)
             connection.execute(
                 """
-                INSERT INTO schema_meta(key, value) VALUES('schema_version', '3')
+                INSERT INTO schema_meta(key, value) VALUES('schema_version', '4')
                 ON CONFLICT(key) DO UPDATE SET value = excluded.value
                 """
             )
@@ -594,6 +638,13 @@ class SessionRepository:
             created_at=float(row["created_at"]),
             updated_at=float(row["updated_at"]),
             version=int(row["version"]),
+            pending_deadline_at=(
+                float(row["pending_deadline_at"])
+                if row["pending_deadline_at"] is not None
+                else None
+            ),
+            pending_deadline_mode=row["pending_deadline_mode"],
+            pending_deadline_action=row["pending_deadline_action"],
         )
 
     @staticmethod
@@ -621,6 +672,9 @@ class SessionRepository:
             session.created_at,
             session.updated_at,
             session.version,
+            session.pending_deadline_at,
+            session.pending_deadline_mode,
+            session.pending_deadline_action,
         )
 
     def get(self, session_id):
@@ -661,7 +715,7 @@ class SessionRepository:
                 connection.execute(
                     f"""
                     INSERT INTO sessions ({_SESSION_COLUMNS})
-                    VALUES ({",".join("?" for _ in range(21))})
+                    VALUES ({",".join("?" for _ in range(24))})
                     """,
                     self._values(session),
                 )
@@ -711,6 +765,9 @@ class SessionRepository:
                 residual_inventory_json = ?,
                 sanitized_error = ?,
                 updated_at = ?,
+                pending_deadline_at = ?,
+                pending_deadline_mode = ?,
+                pending_deadline_action = ?,
                 version = version + 1
             WHERE session_id = ? AND version = ?
             """,
@@ -731,6 +788,9 @@ class SessionRepository:
                 _canonical_json(list(session.residual_inventory)),
                 session.sanitized_error,
                 session.updated_at,
+                session.pending_deadline_at,
+                session.pending_deadline_mode,
+                session.pending_deadline_action,
                 session.session_id,
                 session.version,
             ),
@@ -768,6 +828,30 @@ class SessionRepository:
                 raise KeyError(str(session_id))
             changed = self._row_to_session(row).transition(
                 state,
+                now=now,
+                **changes,
+            )
+            try:
+                saved = self._save_in_transaction(connection, changed)
+            except Exception:
+                connection.rollback()
+                raise
+            connection.commit()
+        return saved
+
+    def update(self, session_id, *, now=None, **changes):
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                f"SELECT {_SESSION_COLUMNS} FROM sessions WHERE session_id = ?",
+                (str(session_id),),
+            ).fetchone()
+            if row is None:
+                connection.rollback()
+                raise KeyError(str(session_id))
+            current = self._row_to_session(row)
+            changed = current.transition(
+                current.state,
                 now=now,
                 **changes,
             )
@@ -829,6 +913,9 @@ class SessionRepository:
                     residual_inventory_json = ?,
                     sanitized_error = ?,
                     updated_at = ?,
+                    pending_deadline_at = ?,
+                    pending_deadline_mode = ?,
+                    pending_deadline_action = ?,
                     version = version + 1
                 WHERE session_id = ? AND version = ? AND state = ?
                 """,
@@ -849,6 +936,9 @@ class SessionRepository:
                     _canonical_json(list(changed.residual_inventory)),
                     changed.sanitized_error,
                     changed.updated_at,
+                    changed.pending_deadline_at,
+                    changed.pending_deadline_mode,
+                    changed.pending_deadline_action,
                     changed.session_id,
                     current.version,
                     expected.value,
@@ -869,6 +959,164 @@ class SessionRepository:
             ).fetchone()
             connection.commit()
         return self._row_to_session(saved_row)
+
+    def save_destroy_review(
+        self,
+        session_id,
+        *,
+        token_digest,
+        expires_at,
+        session_version,
+        instance_id,
+        unverified_artifact_ids,
+    ):
+        identifier = str(session_id or "")
+        digest = str(token_digest or "")
+        expiry = float(expires_at)
+        version = int(session_version)
+        instance = None if instance_id is None else str(instance_id)
+        artifact_ids = tuple(
+            sorted(str(item) for item in unverified_artifact_ids)
+        )
+        if (
+            not identifier
+            or len(identifier) > 200
+            or not re.fullmatch(r"[0-9a-f]{64}", digest)
+            or not math.isfinite(expiry)
+            or expiry <= 0
+            or version < 1
+            or (instance is not None and (not instance or len(instance) > 200))
+            or len(artifact_ids) > 100_000
+            or len(set(artifact_ids)) != len(artifact_ids)
+            or any(not item or len(item) > 200 for item in artifact_ids)
+        ):
+            raise ValueError("Destroy review metadata is invalid.")
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            session = connection.execute(
+                """
+                SELECT version, instance_id
+                FROM sessions
+                WHERE session_id = ?
+                """,
+                (identifier,),
+            ).fetchone()
+            if (
+                session is None
+                or int(session["version"]) != version
+                or session["instance_id"] != instance
+            ):
+                connection.rollback()
+                raise ConcurrentSessionUpdate(
+                    "The session changed before destruction review."
+                )
+            connection.execute(
+                """
+                INSERT INTO destroy_reviews(
+                    session_id, token_digest, expires_at, session_version,
+                    instance_id, unverified_artifact_ids_json
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    token_digest = excluded.token_digest,
+                    expires_at = excluded.expires_at,
+                    session_version = excluded.session_version,
+                    instance_id = excluded.instance_id,
+                    unverified_artifact_ids_json =
+                        excluded.unverified_artifact_ids_json
+                """,
+                (
+                    identifier,
+                    digest,
+                    expiry,
+                    version,
+                    instance,
+                    _canonical_json(list(artifact_ids)),
+                ),
+            )
+            connection.commit()
+
+    def consume_destroy_review(
+        self,
+        session_id,
+        *,
+        token_digest,
+        now,
+    ):
+        identifier = str(session_id or "")
+        digest = str(token_digest or "")
+        timestamp = float(now)
+        if (
+            not identifier
+            or not re.fullmatch(r"[0-9a-f]{64}", digest)
+            or not math.isfinite(timestamp)
+            or timestamp < 0
+        ):
+            return None
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT
+                    review.token_digest,
+                    review.expires_at,
+                    review.session_version,
+                    review.instance_id AS reviewed_instance_id,
+                    review.unverified_artifact_ids_json,
+                    session.version AS current_version,
+                    session.instance_id AS live_instance_id
+                FROM destroy_reviews AS review
+                JOIN sessions AS session
+                    ON session.session_id = review.session_id
+                WHERE review.session_id = ?
+                """,
+                (identifier,),
+            ).fetchone()
+            if row is None:
+                connection.commit()
+                return None
+            stale = (
+                timestamp >= float(row["expires_at"])
+                or int(row["session_version"])
+                != int(row["current_version"])
+                or row["reviewed_instance_id"]
+                != row["live_instance_id"]
+            )
+            if stale:
+                connection.execute(
+                    "DELETE FROM destroy_reviews WHERE session_id = ?",
+                    (identifier,),
+                )
+                connection.commit()
+                return None
+            if not hmac.compare_digest(row["token_digest"], digest):
+                connection.commit()
+                return None
+            try:
+                artifact_ids = tuple(
+                    str(item)
+                    for item in json.loads(
+                        row["unverified_artifact_ids_json"]
+                    )
+                )
+            except (json.JSONDecodeError, TypeError, ValueError):
+                connection.execute(
+                    "DELETE FROM destroy_reviews WHERE session_id = ?",
+                    (identifier,),
+                )
+                connection.commit()
+                return None
+            connection.execute(
+                "DELETE FROM destroy_reviews WHERE session_id = ?",
+                (identifier,),
+            )
+            connection.commit()
+        return DestroyReviewRecord(
+            session_id=identifier,
+            expires_at=float(row["expires_at"]),
+            session_version=int(row["session_version"]),
+            instance_id=row["reviewed_instance_id"],
+            unverified_artifact_ids=artifact_ids,
+        )
 
     def list_all(self):
         with closing(self._connect()) as connection:

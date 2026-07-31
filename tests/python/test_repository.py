@@ -1,4 +1,5 @@
 import concurrent.futures
+import hashlib
 import os
 import tempfile
 import unittest
@@ -250,6 +251,120 @@ class SessionRepositoryTests(unittest.TestCase):
         self.assertEqual(
             sessions.get("ready-session").state,
             SessionState.RUNNING,
+        )
+
+    def test_destroy_review_is_hashed_version_bound_and_consumed_once(self):
+        sessions = repository.SessionRepository(self.database_path)
+        saved, _created = sessions.create_or_get(make_session())
+        raw_token = "review-token-never-store-raw"
+        digest = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+
+        sessions.save_destroy_review(
+            saved.session_id,
+            token_digest=digest,
+            expires_at=400.0,
+            session_version=saved.version,
+            instance_id=saved.instance_id,
+            unverified_artifact_ids=("output-2",),
+        )
+        consumed = sessions.consume_destroy_review(
+            saved.session_id,
+            token_digest=digest,
+            now=200.0,
+        )
+        repeated = sessions.consume_destroy_review(
+            saved.session_id,
+            token_digest=digest,
+            now=200.0,
+        )
+
+        self.assertEqual(
+            consumed.unverified_artifact_ids,
+            ("output-2",),
+        )
+        self.assertIsNone(repeated)
+        with sessions._connect() as connection:
+            rows = connection.execute(
+                "SELECT token_digest FROM destroy_reviews"
+            ).fetchall()
+        self.assertNotIn(raw_token, repr(rows))
+
+    def test_destroy_review_is_invalidated_by_session_version_change(self):
+        sessions = repository.SessionRepository(self.database_path)
+        saved, _created = sessions.create_or_get(make_session())
+        digest = "f" * 64
+        sessions.save_destroy_review(
+            saved.session_id,
+            token_digest=digest,
+            expires_at=400.0,
+            session_version=saved.version,
+            instance_id=saved.instance_id,
+            unverified_artifact_ids=(),
+        )
+        sessions.save(
+            saved.transition(SessionState.OFFER_SELECTED, now=101.0)
+        )
+
+        self.assertIsNone(
+            sessions.consume_destroy_review(
+                saved.session_id,
+                token_digest=digest,
+                now=200.0,
+            )
+        )
+
+    def test_destroy_review_expires_at_the_five_minute_boundary(self):
+        sessions = repository.SessionRepository(self.database_path)
+        saved, _created = sessions.create_or_get(make_session())
+        digest = "e" * 64
+        sessions.save_destroy_review(
+            saved.session_id,
+            token_digest=digest,
+            expires_at=400.0,
+            session_version=saved.version,
+            instance_id=saved.instance_id,
+            unverified_artifact_ids=(),
+        )
+
+        self.assertIsNone(
+            sessions.consume_destroy_review(
+                saved.session_id,
+                token_digest=digest,
+                now=400.0,
+            )
+        )
+
+    def test_pending_deadline_intent_survives_repository_reopen(self):
+        sessions = repository.SessionRepository(self.database_path)
+        ready = CloudSession.new(
+            "deadline-key",
+            session_id="deadline-session",
+            manifest_digest="a" * 64,
+            deadline_at=7_300.0,
+            deadline_mode="finite",
+            disk_gb=80,
+            now=100.0,
+            state=SessionState.READY,
+        )
+        saved, _created = sessions.create_or_get(ready)
+        sessions.save(
+            saved.transition(
+                SessionState.READY,
+                now=101.0,
+                pending_deadline_at=9_100.0,
+                pending_deadline_mode="finite",
+                pending_deadline_action="add_30_minutes",
+            )
+        )
+
+        reopened = repository.SessionRepository(self.database_path)
+        pending = reopened.get(ready.session_id)
+
+        self.assertEqual(pending.deadline_at, 7_300.0)
+        self.assertEqual(pending.pending_deadline_at, 9_100.0)
+        self.assertEqual(
+            pending.pending_deadline_action,
+            "add_30_minutes",
         )
 
 

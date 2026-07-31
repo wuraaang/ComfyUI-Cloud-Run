@@ -470,6 +470,9 @@ class CloudSession:
     created_at: float
     updated_at: float
     version: int
+    pending_deadline_at: float | None = None
+    pending_deadline_mode: str | None = None
+    pending_deadline_action: str | None = None
 
     @classmethod
     def new(
@@ -553,6 +556,47 @@ class CloudSession:
     def _validate(self):
         if self.deadline_mode not in {"finite", "none"}:
             raise ValueError("Unsupported deadline mode.")
+        if self.deadline_mode == "none" and self.deadline_at is not None:
+            raise ValueError("No-limit sessions cannot have a deadline.")
+        if self.deadline_at is not None and (
+            isinstance(self.deadline_at, bool)
+            or not isinstance(self.deadline_at, (int, float))
+            or not math.isfinite(self.deadline_at)
+            or self.deadline_at <= 0
+        ):
+            raise ValueError("Invalid finite session deadline.")
+        pending_values = (
+            self.pending_deadline_at,
+            self.pending_deadline_mode,
+            self.pending_deadline_action,
+        )
+        if all(value is None for value in pending_values):
+            pass
+        elif (
+            self.pending_deadline_mode == "finite"
+            and self.pending_deadline_action
+            in {"add_30_minutes", "add_1_hour"}
+            and isinstance(self.pending_deadline_at, (int, float))
+            and not isinstance(self.pending_deadline_at, bool)
+            and math.isfinite(self.pending_deadline_at)
+            and self.pending_deadline_at > 0
+            and self.deadline_mode == "finite"
+            and isinstance(self.deadline_at, (int, float))
+            and not isinstance(self.deadline_at, bool)
+            and self.pending_deadline_at > self.deadline_at
+        ):
+            pass
+        elif (
+            self.pending_deadline_mode == "none"
+            and self.pending_deadline_action == "disable"
+            and self.pending_deadline_at is None
+            and self.deadline_mode == "finite"
+            and isinstance(self.deadline_at, (int, float))
+            and not isinstance(self.deadline_at, bool)
+        ):
+            pass
+        else:
+            raise ValueError("Invalid pending deadline synchronization.")
         if (
             isinstance(self.disk_gb, bool)
             or not isinstance(self.disk_gb, int)
@@ -594,6 +638,9 @@ class CloudSession:
             "installed_manifest_digest",
             "instance_id",
             "manifest_digest",
+            "pending_deadline_action",
+            "pending_deadline_at",
+            "pending_deadline_mode",
             "provider_token",
             "quote",
             "residual_inventory",
@@ -627,6 +674,11 @@ class CloudSession:
             "instance_id": self.instance_id,
             "deadline_at": self.deadline_at,
             "deadline_mode": self.deadline_mode,
+            "deadline_sync_pending": (
+                self.pending_deadline_mode is not None
+            ),
+            "pending_deadline_at": self.pending_deadline_at,
+            "pending_deadline_mode": self.pending_deadline_mode,
             "disk_gb": self.disk_gb,
             "retry_count": self.retry_count,
             "destroy_requested": self.destroy_requested,
@@ -635,8 +687,20 @@ class CloudSession:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
-        residual = self.state == SessionState.FAILED and bool(
-            self.instance_id or self.residual_inventory
+        residual = (
+            self.state
+            in {
+                SessionState.DESTROY_REQUESTED,
+                SessionState.DESTROYING,
+            }
+            or (
+                self.state == SessionState.FAILED
+                and bool(
+                    self.destroy_requested
+                    or self.instance_id
+                    or self.residual_inventory
+                )
+            )
         )
         payload["billing_may_continue"] = residual
         payload["emergency_action"] = (

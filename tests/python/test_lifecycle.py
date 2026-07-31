@@ -786,6 +786,8 @@ class RecoveringSessionService:
         self.repository = repository
         self.bootstrap_calls = []
         self.recovery_calls = []
+        self.deadline_destroy_calls = []
+        self.deadline_prepare_calls = []
 
     async def bootstrap_session(self, session_id):
         session = self.repository.get(session_id)
@@ -796,6 +798,12 @@ class RecoveringSessionService:
         session = self.repository.get(session_id)
         self.recovery_calls.append(session)
         return session
+
+    def confirmed_deadline_destroy(self, session_id):
+        self.deadline_destroy_calls.append(session_id)
+
+    async def prepare_deadline_destroy(self, session_id):
+        self.deadline_prepare_calls.append(session_id)
 
 
 class ReadySessionService(RecoveringSessionService):
@@ -982,6 +990,89 @@ class SessionLifecycleTests(LifecycleTestCase):
             ["list"],
         )
 
+    def test_expired_session_absence_is_recorded_as_deadline_destruction(self):
+        session = self.save_session(state=SessionState.READY)
+        self.sessions.transition(
+            session.session_id,
+            SessionState.READY,
+            now=100.0,
+            deadline_at=99.0,
+        )
+        self.provider.instances = []
+
+        recovered = asyncio.run(
+            self.session_lifecycle().recover_sessions()
+        )
+
+        self.assertEqual(recovered[0].state, SessionState.DESTROYED)
+        self.assertIsNone(recovered[0].instance_id)
+        self.assertEqual(
+            self.session_service.deadline_destroy_calls,
+            [session.session_id],
+        )
+        self.assertEqual(
+            [call[0] for call in self.provider.calls],
+            ["list"],
+        )
+
+    def test_deadline_recovery_requires_both_known_id_and_label_absent(self):
+        session = self.save_session(state=SessionState.READY)
+        self.sessions.transition(
+            session.session_id,
+            SessionState.READY,
+            now=100.0,
+            deadline_at=99.0,
+        )
+        self.provider.instances = [
+            self.worker_instance("instance-1", "unexpected-label")
+        ]
+
+        recovered = asyncio.run(
+            self.session_lifecycle().recover_sessions()
+        )
+
+        self.assertEqual(recovered[0].state, SessionState.FAILED)
+        self.assertEqual(recovered[0].instance_id, "instance-1")
+        self.assertEqual(
+            recovered[0].residual_inventory,
+            ("instance-1",),
+        )
+        self.assertTrue(
+            recovered[0].public_payload()["billing_may_continue"]
+        )
+
+    def test_local_expiry_attempts_bounded_retrieval_then_verifies_destroy(self):
+        session = self.save_session(state=SessionState.READY)
+        self.sessions.transition(
+            session.session_id,
+            SessionState.READY,
+            now=100.0,
+            deadline_at=99.0,
+        )
+        self.provider.instances = [
+            self.worker_instance("instance-1", session.label)
+        ]
+
+        destroyed = asyncio.run(
+            self.session_lifecycle().enforce_session_deadline(
+                session.session_id
+            )
+        )
+
+        self.assertEqual(destroyed.state, SessionState.DESTROYED)
+        self.assertEqual(
+            self.session_service.deadline_prepare_calls,
+            [session.session_id],
+        )
+        self.assertEqual(
+            self.session_service.deadline_destroy_calls,
+            [session.session_id],
+        )
+        self.assertEqual(
+            [call[0] for call in self.provider.calls],
+            ["destroy", "list"],
+        )
+
     def test_only_boot_failure_replaces_once_after_inventory_absence(self):
         session = self.save_session()
         self.provider.instances = [
@@ -1080,6 +1171,72 @@ class SessionLifecycleTests(LifecycleTestCase):
         self.assertEqual(
             len([call for call in self.provider.calls if call[0] == "create"]),
             1,
+        )
+
+    def test_session_destroy_requires_inventory_absence_after_delete(self):
+        session = self.save_session(state=SessionState.READY)
+        self.provider.instances = [
+            self.worker_instance("instance-1", session.label)
+        ]
+
+        destroyed = asyncio.run(
+            self.session_lifecycle().destroy_session(
+                session.session_id
+            )
+        )
+
+        self.assertEqual(destroyed.state, SessionState.DESTROYED)
+        self.assertIsNone(destroyed.instance_id)
+        self.assertEqual(
+            [call[0] for call in self.provider.calls],
+            ["destroy", "list"],
+        )
+
+    def test_delete_response_with_residual_inventory_keeps_billing_warning(self):
+        session = self.save_session(state=SessionState.READY)
+        self.provider.instances = [
+            self.worker_instance("instance-1", session.label)
+        ]
+        self.provider.destroy_removes = False
+
+        failed = asyncio.run(
+            self.session_lifecycle().destroy_session(
+                session.session_id
+            )
+        )
+
+        self.assertEqual(failed.state, SessionState.FAILED)
+        self.assertEqual(failed.instance_id, "instance-1")
+        self.assertTrue(failed.public_payload()["billing_may_continue"])
+        self.assertEqual(
+            [call[0] for call in self.provider.calls],
+            ["destroy", "list"],
+        )
+
+    def test_destroy_never_treats_a_matching_label_without_id_as_absent(self):
+        session = self.save_session(
+            state=SessionState.READY,
+            instance_id=None,
+        )
+        self.provider.instances = [
+            {
+                "instance_id": None,
+                "label": session.label,
+                "actual_status": "running",
+            }
+        ]
+
+        failed = asyncio.run(
+            self.session_lifecycle().destroy_session(
+                session.session_id
+            )
+        )
+
+        self.assertEqual(failed.state, SessionState.FAILED)
+        self.assertTrue(failed.public_payload()["billing_may_continue"])
+        self.assertEqual(
+            [call[0] for call in self.provider.calls],
+            ["list"],
         )
 
 

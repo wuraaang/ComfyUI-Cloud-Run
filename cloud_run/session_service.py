@@ -11,6 +11,7 @@ import math
 from pathlib import Path
 from pathlib import PurePosixPath
 import re
+import secrets
 import time
 import uuid
 
@@ -47,6 +48,11 @@ _SOURCE_KINDS = {
     "registry",
 }
 _JOB_TASKS = {}
+DEADLINE_ACTION_SECONDS = {
+    "add_30_minutes": 30 * 60,
+    "add_1_hour": 60 * 60,
+}
+DESTROY_REVIEW_TTL_SECONDS = 5 * 60
 
 
 class SessionServiceError(RuntimeError):
@@ -75,6 +81,42 @@ class IncompatibleSession(SessionServiceError):
 
 class SessionExecutionError(SessionServiceError):
     pass
+
+
+class DeadlineValidationError(SessionServiceError):
+    pass
+
+
+class DeadlineSynchronizationError(SessionServiceError):
+    pass
+
+
+class DestroyConfirmationError(SessionServiceError):
+    pass
+
+
+@dataclass(frozen=True, repr=False)
+class DestroyReview:
+    session_id: str
+    instance_id: str | None
+    status: str
+    unverified_artifact_ids: tuple[str, ...]
+    warning: str
+    token: str
+    expires_at: float
+
+    def public_payload(self):
+        return {
+            "session_id": self.session_id,
+            "instance_id": self.instance_id,
+            "status": self.status,
+            "unverified_artifact_ids": list(
+                self.unverified_artifact_ids
+            ),
+            "warning": self.warning,
+            "review_token": self.token,
+            "expires_at": self.expires_at,
+        }
 
 
 def _identifier(value, name):
@@ -617,8 +659,10 @@ class SessionService:
         worker_factory=None,
         relay_factory=None,
         source_url_resolver=None,
+        lifecycle=None,
         clock=None,
         id_factory=None,
+        review_token_factory=None,
         sleep=None,
         job_poll_interval_seconds=1,
         max_job_polls=86_400,
@@ -632,8 +676,13 @@ class SessionService:
         self.worker_factory = worker_factory
         self.relay_factory = relay_factory
         self.source_url_resolver = source_url_resolver
+        self.lifecycle = lifecycle
         self.clock = clock or time.time
         self.id_factory = id_factory or (lambda: str(uuid.uuid4()))
+        self.review_token_factory = (
+            review_token_factory
+            or (lambda: secrets.token_urlsafe(32))
+        )
         self.sleep = sleep or asyncio.sleep
         if (
             isinstance(job_poll_interval_seconds, bool)
@@ -868,6 +917,397 @@ class SessionService:
         if job is None or job.session_id != session.session_id:
             raise SessionExecutionError("Cloud Run job was not found.")
         return job
+
+    @staticmethod
+    def alerts(session, *, now):
+        if not hasattr(session, "deadline_mode"):
+            raise DeadlineValidationError(
+                "Cloud Run session deadline is unavailable."
+            )
+        try:
+            timestamp = float(now)
+        except (TypeError, ValueError):
+            raise DeadlineValidationError(
+                "Cloud Run session deadline is unavailable."
+            ) from None
+        if not math.isfinite(timestamp) or timestamp < 0:
+            raise DeadlineValidationError(
+                "Cloud Run session deadline is unavailable."
+            )
+        if session.deadline_mode != "finite":
+            return []
+        if (
+            isinstance(session.deadline_at, bool)
+            or not isinstance(session.deadline_at, (int, float))
+            or not math.isfinite(session.deadline_at)
+        ):
+            raise DeadlineValidationError(
+                "Cloud Run session deadline is unavailable."
+            )
+        remaining = float(session.deadline_at) - timestamp
+        if remaining <= 0:
+            return ["deadline_reached"]
+        if remaining <= 5 * 60:
+            return ["5_minutes"]
+        if remaining <= 15 * 60:
+            return ["15_minutes"]
+        return []
+
+    def _deadline_intent(self, session, payload):
+        if not isinstance(payload, dict):
+            raise DeadlineValidationError(
+                "Invalid session deadline action."
+            )
+        action = payload.get("action")
+        if action in DEADLINE_ACTION_SECONDS:
+            if set(payload) != {"action"}:
+                raise DeadlineValidationError(
+                    "Invalid session deadline action."
+                )
+        elif action == "disable":
+            if (
+                set(payload) != {"action", "acknowledged"}
+                or payload.get("acknowledged") is not True
+            ):
+                raise DeadlineValidationError(
+                    "Disabling the deadline requires explicit acknowledgement."
+                )
+        else:
+            raise DeadlineValidationError(
+                "Invalid session deadline action."
+            )
+        if session.pending_deadline_mode is not None:
+            if session.pending_deadline_action != action:
+                raise DeadlineSynchronizationError(
+                    "A deadline update is still awaiting synchronization."
+                )
+            return (
+                session.pending_deadline_mode,
+                session.pending_deadline_at,
+                session.pending_deadline_action,
+            )
+        if action == "disable":
+            if session.deadline_mode == "none":
+                return "none", None, action
+            return "none", None, action
+        if (
+            session.deadline_mode != "finite"
+            or isinstance(session.deadline_at, bool)
+            or not isinstance(session.deadline_at, (int, float))
+            or not math.isfinite(session.deadline_at)
+            or session.deadline_at <= self._now()
+        ):
+            raise DeadlineValidationError(
+                "The finite session deadline can no longer be extended."
+            )
+        return (
+            "finite",
+            float(session.deadline_at)
+            + DEADLINE_ACTION_SECONDS[action],
+            action,
+        )
+
+    async def update_deadline(self, session_id, payload):
+        synchronized_states = {
+            SessionState.BOOTSTRAPPING,
+            SessionState.PROVISIONING,
+            SessionState.VALIDATING,
+            SessionState.REPAIRING,
+            SessionState.READY,
+            SessionState.RUNNING,
+            SessionState.HARVESTING,
+        }
+        for _attempt in range(8):
+            session = self.session(session_id)
+            if session.state not in synchronized_states:
+                raise DeadlineValidationError(
+                    "The remote worker cannot synchronize a deadline update."
+                )
+            mode, deadline_at, action = self._deadline_intent(
+                session,
+                payload,
+            )
+            if (
+                session.pending_deadline_mode is None
+                and session.deadline_mode == mode
+                and session.deadline_at == deadline_at
+            ):
+                return session
+            if session.pending_deadline_mode is not None:
+                break
+            pending = session.transition(
+                session.state,
+                now=self._now(),
+                pending_deadline_at=deadline_at,
+                pending_deadline_mode=mode,
+                pending_deadline_action=action,
+                sanitized_error=None,
+            )
+            try:
+                session = self._sessions().save(pending)
+            except ConcurrentSessionUpdate:
+                continue
+            break
+        else:
+            raise DeadlineSynchronizationError(
+                "The session changed before the deadline update could be recorded."
+            )
+        try:
+            worker = self._worker(session)
+            update = getattr(worker, "update_deadline", None)
+        except SessionExecutionError:
+            update = None
+        request = (
+            {
+                "mode": "finite",
+                "deadline_at": deadline_at,
+                "retrieval_grace_seconds": 300,
+            }
+            if mode == "finite"
+            else {"mode": "none", "acknowledged": True}
+        )
+        if callable(update):
+            try:
+                response = await update(request)
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                raise
+            except Exception:
+                response = None
+        else:
+            response = None
+        valid = (
+            isinstance(response, dict)
+            and response.get("mode") == mode
+            and response.get("deadline_at") == deadline_at
+        )
+        if not valid:
+            self._sessions().update(
+                session.session_id,
+                now=self._now(),
+                sanitized_error=(
+                    "The deadline update is not synchronized; the earlier "
+                    "finite boundary remains effective."
+                ),
+            )
+            raise DeadlineSynchronizationError(
+                "The remote deadline could not be synchronized."
+            )
+        return self._sessions().update(
+            session.session_id,
+            now=self._now(),
+            deadline_at=deadline_at,
+            deadline_mode=mode,
+            pending_deadline_at=None,
+            pending_deadline_mode=None,
+            pending_deadline_action=None,
+            sanitized_error=None,
+        )
+
+    def _unverified_outputs(self, session_id):
+        artifact_ids = set()
+        for job in self.job_repository.list_jobs(session_id):
+            for transfer in self.job_repository.list_transfers(job.job_id):
+                if (
+                    transfer.direction == "download"
+                    and transfer.state != TransferState.VERIFIED
+                ):
+                    artifact_ids.add(transfer.artifact_id)
+        return tuple(sorted(artifact_ids))
+
+    async def review_destroy(self, session_id):
+        session = self.session(session_id)
+        if session.state == SessionState.DESTROYED:
+            raise DestroyConfirmationError(
+                "The Cloud Run session is already destroyed."
+            )
+        try:
+            token = self.review_token_factory()
+        except Exception:
+            raise DestroyConfirmationError(
+                "A destruction review could not be created."
+            ) from None
+        if (
+            not isinstance(token, str)
+            or not _IDENTIFIER.fullmatch(token)
+            or len(token.encode("utf-8")) < 32
+        ):
+            raise DestroyConfirmationError(
+                "A destruction review could not be created."
+            )
+        expires_at = self._now() + DESTROY_REVIEW_TTL_SECONDS
+        unverified = self._unverified_outputs(session.session_id)
+        digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        try:
+            self._sessions().save_destroy_review(
+                session.session_id,
+                token_digest=digest,
+                expires_at=expires_at,
+                session_version=session.version,
+                instance_id=session.instance_id,
+                unverified_artifact_ids=unverified,
+            )
+        except Exception:
+            raise DestroyConfirmationError(
+                "A destruction review could not be created."
+            ) from None
+        return DestroyReview(
+            session_id=session.session_id,
+            instance_id=session.instance_id,
+            status=session.state.value,
+            unverified_artifact_ids=unverified,
+            warning=(
+                "Destroying the GPU is irreversible. Unverified or "
+                "incomplete results will be irreversibly lost."
+            ),
+            token=token,
+            expires_at=expires_at,
+        )
+
+    def _abandon_session_work(self, session_id):
+        for job in self.job_repository.list_jobs(session_id):
+            for transfer in self.job_repository.list_transfers(job.job_id):
+                if (
+                    transfer.direction == "download"
+                    and transfer.state != TransferState.VERIFIED
+                ):
+                    self.job_repository.save_transfer(
+                        job_id=transfer.job_id,
+                        artifact_id=transfer.artifact_id,
+                        direction=transfer.direction,
+                        expected_size=transfer.expected_size,
+                        sha256=transfer.sha256,
+                        offset=transfer.offset,
+                        state=TransferState.ABANDONED,
+                        private_path=transfer.private_path,
+                    )
+            if job.state in {
+                JobState.CAPTURED,
+                JobState.RESOLVING,
+                JobState.QUEUED,
+                JobState.RUNNING,
+                JobState.HARVESTING,
+            }:
+                self._transition_job(
+                    job,
+                    JobState.FAILED,
+                    sanitized_error=(
+                        "Remote execution was interrupted by GPU destruction."
+                    ),
+                )
+
+    def confirmed_deadline_destroy(self, session_id):
+        session = self.session(session_id)
+        if session.state != SessionState.DESTROYED:
+            raise SessionExecutionError(
+                "Deadline destruction is not inventory verified."
+            )
+        self._abandon_session_work(session.session_id)
+
+    async def prepare_deadline_destroy(self, session_id):
+        session = self.session(session_id)
+        active = [
+            job
+            for job in self.job_repository.list_jobs(session.session_id)
+            if job.state
+            in {
+                JobState.CAPTURED,
+                JobState.RESOLVING,
+                JobState.QUEUED,
+                JobState.RUNNING,
+                JobState.HARVESTING,
+            }
+        ]
+        if len(active) != 1 or session.state not in {
+            SessionState.RUNNING,
+            SessionState.HARVESTING,
+        }:
+            return
+        job = active[0]
+        try:
+            worker = self._worker(session)
+            relay = self._relay(worker, session)
+        except SessionExecutionError:
+            return
+        for attempt in range(3):
+            try:
+                result = await relay.sync_job(job.job_id)
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                raise
+            except Exception:
+                result = None
+            if (
+                isinstance(result, RelaySyncResult)
+                and result.job_id == job.job_id
+                and result.state
+                in {"succeeded", "failed", "interrupted"}
+            ):
+                try:
+                    await self._finish_remote_job(
+                        self.session(session.session_id),
+                        self.job_repository.get_job(job.job_id),
+                        worker,
+                    )
+                except SessionExecutionError:
+                    pass
+                return
+            if attempt < 2:
+                await self.sleep(self.job_poll_interval_seconds)
+
+    async def destroy(self, session_id, confirmation):
+        session = self.session(session_id)
+        if (
+            not isinstance(confirmation, dict)
+            or set(confirmation)
+            != {"review_token", "acknowledge_data_loss"}
+            or confirmation.get("acknowledge_data_loss") is not True
+            or not isinstance(confirmation.get("review_token"), str)
+        ):
+            raise DestroyConfirmationError(
+                "GPU destruction requires the fresh review and data-loss acknowledgement."
+            )
+        token = confirmation["review_token"]
+        if not _IDENTIFIER.fullmatch(token):
+            raise DestroyConfirmationError(
+                "The destruction review is invalid or expired."
+            )
+        digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        reviewed = self._sessions().consume_destroy_review(
+            session.session_id,
+            token_digest=digest,
+            now=self._now(),
+        )
+        if reviewed is None:
+            raise DestroyConfirmationError(
+                "The destruction review is invalid or expired."
+            )
+        current_unverified = self._unverified_outputs(session.session_id)
+        if current_unverified != reviewed.unverified_artifact_ids:
+            raise DestroyConfirmationError(
+                "Session outputs changed; review destruction again."
+            )
+        destroy = getattr(self.lifecycle, "destroy_session", None)
+        if not callable(destroy):
+            raise SessionExecutionError(
+                "Verified GPU destruction is unavailable."
+            )
+        try:
+            result = await destroy(session.session_id)
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            raise
+        except Exception:
+            raise SessionExecutionError(
+                "Verified GPU destruction is unavailable."
+            ) from None
+        if (
+            not hasattr(result, "state")
+            or result.session_id != session.session_id
+        ):
+            raise SessionExecutionError(
+                "Verified GPU destruction is unavailable."
+            )
+        if result.state == SessionState.DESTROYED:
+            self._abandon_session_work(session.session_id)
+        return result
 
     def _worker(self, session):
         if not callable(self.worker_factory):

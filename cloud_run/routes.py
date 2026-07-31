@@ -266,6 +266,7 @@ def build_service():
         release=release,
         worker_factory=worker_factory,
         relay_factory=relay_factory,
+        lifecycle=lifecycle,
     )
     lifecycle.session_service = service.session_service
     service.relay = LocalRelay(
@@ -626,6 +627,61 @@ def register_routes(service_factory=None):
         except Exception as error:
             return service_error(error)
         return web.json_response(job.public_payload())
+
+    @routes.put("/cloud-run/api/sessions/{session_id}/deadline")
+    async def put_session_deadline(request):
+        try:
+            payload = await _request_payload(
+                request,
+                allowed={"action", "acknowledged"},
+                required={"action"},
+            )
+            session = await make_service().update_session_deadline(
+                request.match_info.get("session_id", ""),
+                payload,
+            )
+        except Exception as error:
+            return service_error(error)
+        return web.json_response(_session_payload(session))
+
+    @routes.post(
+        "/cloud-run/api/sessions/{session_id}/destroy-review"
+    )
+    async def post_session_destroy_review(request):
+        try:
+            await _request_payload(
+                request,
+                allowed=set(),
+                required=set(),
+            )
+            review = await make_service().review_session_destroy(
+                request.match_info.get("session_id", "")
+            )
+        except Exception as error:
+            return service_error(error)
+        return web.json_response(review.public_payload())
+
+    @routes.delete("/cloud-run/api/sessions/{session_id}")
+    async def delete_session(request):
+        try:
+            payload = await _request_payload(
+                request,
+                allowed={
+                    "review_token",
+                    "acknowledge_data_loss",
+                },
+                required={
+                    "review_token",
+                    "acknowledge_data_loss",
+                },
+            )
+            session = await make_service().destroy_session(
+                request.match_info.get("session_id", ""),
+                payload,
+            )
+        except Exception as error:
+            return service_error(error)
+        return web.json_response(_session_payload(session))
 
     @routes.get(
         "/cloud-run/api/sessions/{session_id}/jobs/{job_id}/events"

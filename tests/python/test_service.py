@@ -4,7 +4,7 @@ import types
 import unittest
 from pathlib import Path
 
-from cloud_run.models import AttemptState
+from cloud_run.models import AttemptState, SessionState
 from cloud_run.repository import AttemptRepository, SessionRepository
 from cloud_run.vast import VastError
 from cloud_run.worker_release import WorkerRelease
@@ -381,6 +381,85 @@ class CloudRunServiceTests(unittest.TestCase):
         self.assertEqual(first.state.value, "bootstrapping")
         self.assertEqual(second.state.value, "bootstrapping")
         self.assertEqual(len(provider.create_calls), 1)
+
+    def test_destroy_requested_during_create_is_finished_by_the_creator(self):
+        async def scenario():
+            provider = FakeProvider(
+                lookups=[offer(price=0.50), offer(price=0.50)]
+            )
+            entered_create = asyncio.Event()
+            release_create = asyncio.Event()
+            original_create = provider.create_instance
+
+            async def delayed_create(*args, **kwargs):
+                entered_create.set()
+                await release_create.wait()
+                return await original_create(*args, **kwargs)
+
+            provider.create_instance = delayed_create
+
+            class DestroyLifecycle:
+                def __init__(inner_self):
+                    inner_self.calls = []
+
+                async def destroy_session(inner_self, session_id):
+                    current = self.session_repository.get(session_id)
+                    inner_self.calls.append(
+                        (session_id, current.instance_id)
+                    )
+                    current = self.session_repository.transition(
+                        session_id,
+                        SessionState.DESTROYING,
+                        now=104.0,
+                    )
+                    return self.session_repository.transition(
+                        session_id,
+                        SessionState.DESTROYED,
+                        now=105.0,
+                        instance_id=None,
+                        provider_token=None,
+                        session_secret_hex=None,
+                    )
+
+            lifecycle = DestroyLifecycle()
+            service = self.service(
+                provider,
+                session_service=FakePreflightService(),
+                lifecycle=lifecycle,
+            )
+            quoted = await service.preview_session(
+                preflight_id="preflight-1",
+                offer_id=42,
+                idempotency_key="destroy-during-create",
+                deadline={
+                    "mode": "finite",
+                    "duration_seconds": 7_200,
+                },
+            )
+            confirmation = asyncio.create_task(
+                service.confirm_session(
+                    quoted.session_id,
+                    idempotency_key="destroy-during-create",
+                )
+            )
+            await entered_create.wait()
+            self.session_repository.transition(
+                quoted.session_id,
+                SessionState.DESTROY_REQUESTED,
+                now=103.0,
+                destroy_requested=True,
+            )
+            release_create.set()
+            result = await confirmation
+            return result, lifecycle
+
+        result, lifecycle = asyncio.run(scenario())
+
+        self.assertEqual(result.state, SessionState.DESTROYED)
+        self.assertEqual(
+            lifecycle.calls,
+            [(result.session_id, "instance-9")],
+        )
 
     def test_missing_release_blocks_paid_quote_before_provider_request(self):
         provider = FakeProvider(lookups=[offer(price=0.50)])

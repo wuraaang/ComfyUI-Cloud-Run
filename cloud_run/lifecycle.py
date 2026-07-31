@@ -722,6 +722,44 @@ class CloudRunLifecycle:
             return None
         return base_url, token
 
+    def _finalize_session_destroyed(self, session):
+        if session.state == SessionState.DESTROYED:
+            return session
+        if session.state not in {
+            SessionState.PREFLIGHT,
+            SessionState.OFFER_SELECTED,
+            SessionState.DESTROY_REQUESTED,
+            SessionState.DESTROYING,
+        }:
+            session = self.session_repository.transition(
+                session.session_id,
+                SessionState.DESTROY_REQUESTED,
+                now=float(self.clock()),
+                destroy_requested=True,
+            )
+        if session.state == SessionState.DESTROY_REQUESTED:
+            session = self.session_repository.transition(
+                session.session_id,
+                SessionState.DESTROYING,
+                now=float(self.clock()),
+                destroy_requested=True,
+            )
+        return self.session_repository.transition(
+            session.session_id,
+            SessionState.DESTROYED,
+            now=float(self.clock()),
+            destroy_requested=True,
+            instance_id=None,
+            worker_base_url=None,
+            provider_token=None,
+            session_secret_hex=None,
+            residual_inventory=(),
+            sanitized_error=None,
+            pending_deadline_at=None,
+            pending_deadline_mode=None,
+            pending_deadline_action=None,
+        )
+
     async def _activate_session_instance(self, session, instance):
         connection = self._session_connection(instance)
         if connection is None:
@@ -762,12 +800,13 @@ class CloudRunLifecycle:
 
     async def reconcile_session_once(self, session_id):
         session = self._session(session_id)
+        if session.state == SessionState.DESTROYED:
+            return session
         if session.state in {
-            SessionState.DESTROYED,
             SessionState.DESTROY_REQUESTED,
             SessionState.DESTROYING,
         }:
-            return session
+            return await self.destroy_session(session.session_id)
         settings, api_key = self._api_key()
         del settings
         if session.state == SessionState.CREATING:
@@ -817,6 +856,190 @@ class CloudRunLifecycle:
             return session
         return await self._activate_session_instance(session, instance)
 
+    async def destroy_session(self, session_id):
+        session = self._session(session_id)
+        if session.state == SessionState.DESTROYED:
+            return session
+        if (
+            session.state
+            in {
+                SessionState.PREFLIGHT,
+                SessionState.OFFER_SELECTED,
+            }
+            and session.instance_id is None
+            and not session.destroy_requested
+        ):
+            return self._finalize_session_destroyed(session)
+        original_state = session.state
+        if session.state not in {
+            SessionState.DESTROY_REQUESTED,
+            SessionState.DESTROYING,
+        }:
+            session = self.session_repository.transition(
+                session.session_id,
+                SessionState.DESTROY_REQUESTED,
+                now=float(self.clock()),
+                destroy_requested=True,
+                sanitized_error=None,
+            )
+        _settings, api_key = self._api_key()
+        instance_id = session.instance_id
+        if not instance_id:
+            inventory = await self._inventory(api_key)
+            if inventory is None:
+                return self.session_repository.transition(
+                    session.session_id,
+                    SessionState.FAILED,
+                    now=float(self.clock()),
+                    destroy_requested=True,
+                    sanitized_error=(
+                        "Destruction could not be verified because Vast "
+                        "inventory is unavailable."
+                    ),
+                )
+            matches = self._session_matches(inventory, session.label)
+            if len(matches) > 1:
+                return self.session_repository.transition(
+                    session.session_id,
+                    SessionState.FAILED,
+                    now=float(self.clock()),
+                    instance_id=(
+                        str(matches[0].get("instance_id") or "")
+                        or None
+                    ),
+                    residual_inventory=tuple(
+                        str(item.get("instance_id"))
+                        for item in matches
+                        if item.get("instance_id") is not None
+                    ),
+                    destroy_requested=True,
+                    sanitized_error=(
+                        "Multiple managed Vast instances match this session."
+                    ),
+                )
+            if matches and matches[0].get("instance_id") is not None:
+                instance_id = str(matches[0]["instance_id"])
+                session = self.session_repository.transition(
+                    session.session_id,
+                    session.state,
+                    now=float(self.clock()),
+                    instance_id=instance_id,
+                    residual_inventory=(),
+                )
+            elif matches:
+                return self.session_repository.transition(
+                    session.session_id,
+                    SessionState.FAILED,
+                    now=float(self.clock()),
+                    destroy_requested=True,
+                    residual_inventory=(),
+                    sanitized_error=(
+                        "A managed Vast instance remains but its identity "
+                        "cannot be verified; use the Vast console immediately."
+                    ),
+                )
+            elif original_state in {
+                SessionState.CONFIRMING,
+                SessionState.CREATING,
+                SessionState.DESTROY_REQUESTED,
+            } and (
+                float(self.clock()) - session.updated_at
+                < self.boot_deadline_seconds
+            ):
+                return session
+            else:
+                return self._finalize_session_destroyed(session)
+        if session.state != SessionState.DESTROYING:
+            session = self.session_repository.transition(
+                session.session_id,
+                SessionState.DESTROYING,
+                now=float(self.clock()),
+                instance_id=str(instance_id),
+                destroy_requested=True,
+                worker_base_url=None,
+                provider_token=None,
+            )
+        try:
+            await self.provider.destroy_instance(api_key, instance_id)
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            raise
+        except Exception:
+            pass
+        inventory = await self._inventory(api_key)
+        if inventory is None:
+            return self.session_repository.transition(
+                session.session_id,
+                SessionState.FAILED,
+                now=float(self.clock()),
+                instance_id=str(instance_id),
+                residual_inventory=(str(instance_id),),
+                destroy_requested=True,
+                sanitized_error=(
+                    "Destruction could not be verified because Vast "
+                    "inventory is unavailable."
+                ),
+            )
+        residual = self._session_matches(inventory, session.label)
+        residual_ids = tuple(
+            str(item.get("instance_id"))
+            for item in residual
+            if item.get("instance_id") is not None
+        )
+        still_present = any(
+            str(item.get("instance_id")) == str(instance_id)
+            or item.get("label") == session.label
+            for item in inventory
+        )
+        if still_present:
+            return self.session_repository.transition(
+                session.session_id,
+                SessionState.FAILED,
+                now=float(self.clock()),
+                instance_id=str(instance_id),
+                residual_inventory=(
+                    residual_ids or (str(instance_id),)
+                ),
+                destroy_requested=True,
+                sanitized_error=(
+                    "The Vast instance is still present; destroy it in "
+                    "the Vast console immediately."
+                ),
+            )
+        return self._finalize_session_destroyed(session)
+
+    async def enforce_session_deadline(self, session_id):
+        session = self._session(session_id)
+        if (
+            session.deadline_mode != "finite"
+            or not isinstance(session.deadline_at, (int, float))
+            or isinstance(session.deadline_at, bool)
+            or float(self.clock()) < session.deadline_at
+            or session.state == SessionState.DESTROYED
+        ):
+            return session
+        prepare = getattr(
+            self.session_service,
+            "prepare_deadline_destroy",
+            None,
+        )
+        if callable(prepare):
+            try:
+                await prepare(session.session_id)
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                raise
+            except Exception:
+                pass
+        destroyed = await self.destroy_session(session.session_id)
+        if destroyed.state == SessionState.DESTROYED:
+            confirmed = getattr(
+                self.session_service,
+                "confirmed_deadline_destroy",
+                None,
+            )
+            if callable(confirmed):
+                confirmed(destroyed.session_id)
+        return destroyed
+
     async def recover_sessions(self):
         repository = self.session_repository
         if repository is None or not callable(
@@ -842,6 +1065,22 @@ class CloudRunLifecycle:
         for original in sessions:
             session = original
             matches = self._session_matches(managed, session.label)
+            known_id_matches = [
+                item
+                for item in inventory
+                if session.instance_id is not None
+                and str(item.get("instance_id"))
+                == str(session.instance_id)
+            ]
+            if session.state in {
+                SessionState.DESTROY_REQUESTED,
+                SessionState.DESTROYING,
+            }:
+                session = await self.destroy_session(
+                    session.session_id
+                )
+                recovered.append(session)
+                continue
             if len(matches) > 1:
                 session = repository.transition(
                     session.session_id,
@@ -863,6 +1102,47 @@ class CloudRunLifecycle:
                 recovered.append(session)
                 continue
             if not matches:
+                if known_id_matches:
+                    session = repository.transition(
+                        session.session_id,
+                        SessionState.FAILED,
+                        now=float(self.clock()),
+                        instance_id=str(session.instance_id),
+                        residual_inventory=tuple(
+                            str(item.get("instance_id"))
+                            for item in known_id_matches
+                            if item.get("instance_id") is not None
+                        ),
+                        sanitized_error=(
+                            "The managed Vast instance identity no longer "
+                            "matches its session label."
+                        ),
+                    )
+                    recovered.append(session)
+                    continue
+                deadline_expired = (
+                    session.deadline_mode == "finite"
+                    and isinstance(session.deadline_at, (int, float))
+                    and not isinstance(session.deadline_at, bool)
+                    and float(self.clock()) >= session.deadline_at
+                    and session.instance_id is not None
+                    and session.state
+                    not in {
+                        SessionState.CONFIRMING,
+                        SessionState.CREATING,
+                    }
+                )
+                if deadline_expired:
+                    session = self._finalize_session_destroyed(session)
+                    confirmed = getattr(
+                        self.session_service,
+                        "confirmed_deadline_destroy",
+                        None,
+                    )
+                    if callable(confirmed):
+                        confirmed(session.session_id)
+                    recovered.append(session)
+                    continue
                 if session.state in {
                     SessionState.CREATING,
                     SessionState.BOOTSTRAPPING,

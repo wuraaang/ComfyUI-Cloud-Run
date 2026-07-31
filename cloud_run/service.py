@@ -266,12 +266,28 @@ class CloudRunService:
 
     async def refresh_session(self, session_id):
         session = self.get_session(session_id)
+        enforce = getattr(
+            self.lifecycle,
+            "enforce_session_deadline",
+            None,
+        )
+        if (
+            callable(enforce)
+            and session.deadline_mode == "finite"
+            and isinstance(session.deadline_at, (int, float))
+            and not isinstance(session.deadline_at, bool)
+            and float(self.clock()) >= session.deadline_at
+            and session.state != SessionState.DESTROYED
+        ):
+            return await enforce(session.session_id)
         refresh = getattr(self.lifecycle, "reconcile_session_once", None)
         if callable(refresh) and session.state in {
             SessionState.CREATING,
             SessionState.BOOTSTRAPPING,
             SessionState.PROVISIONING,
             SessionState.VALIDATING,
+            SessionState.DESTROY_REQUESTED,
+            SessionState.DESTROYING,
         }:
             return await refresh(session.session_id)
         return session
@@ -303,6 +319,30 @@ class CloudRunService:
                 "Cloud Run job storage is unavailable."
             )
         return self.session_service.get_job(session_id, job_id)
+
+    async def update_session_deadline(self, session_id, payload):
+        update = getattr(self.session_service, "update_deadline", None)
+        if not callable(update):
+            raise CloudRunValidationError(
+                "Cloud Run deadline controls are unavailable."
+            )
+        return await update(session_id, payload)
+
+    async def review_session_destroy(self, session_id):
+        review = getattr(self.session_service, "review_destroy", None)
+        if not callable(review):
+            raise CloudRunValidationError(
+                "Cloud Run destruction review is unavailable."
+            )
+        return await review(session_id)
+
+    async def destroy_session(self, session_id, confirmation):
+        destroy = getattr(self.session_service, "destroy", None)
+        if not callable(destroy):
+            raise CloudRunValidationError(
+                "Verified Cloud Run destruction is unavailable."
+            )
+        return await destroy(session_id, confirmation)
 
     def _validated_session(self, session_id, idempotency_key):
         key = _idempotency_key(idempotency_key)
@@ -457,6 +497,25 @@ class CloudRunService:
 
     async def _finish_created_session(self, session_id, instance_id):
         current = self.get_session(session_id)
+        if current.destroy_requested and current.state in {
+            SessionState.DESTROY_REQUESTED,
+            SessionState.DESTROYING,
+            SessionState.FAILED,
+        }:
+            current = self._session_repository().transition(
+                current.session_id,
+                current.state,
+                now=float(self.clock()),
+                instance_id=str(instance_id),
+            )
+            destroy = getattr(
+                self.lifecycle,
+                "destroy_session",
+                None,
+            )
+            if callable(destroy):
+                return await destroy(current.session_id)
+            return current
         if current.state != SessionState.CREATING:
             return current
         session = self._session_repository().transition(
