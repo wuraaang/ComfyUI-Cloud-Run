@@ -232,6 +232,106 @@ test("renders dependency states as inert text and gates offer search", () => {
 });
 
 
+test("renders only validated immutable Hugging Face provenance as a safe link", () => {
+  const document = new FakeDocument();
+  const view = createSessionConsole(document, {});
+  document.body.appendChild(view.root);
+  const revision = "a".repeat(40);
+  const digest = "b".repeat(64);
+  const repository = "black-forest-labs/FLUX.1-Fill-dev";
+  const filename = "flux1-fill-dev.safetensors";
+  const destination = `models/diffusion_models/${filename}`;
+
+  view.renderPreflight({
+    preflight_id: "preflight-provenance",
+    capture_id: "capture-1",
+    rentable: true,
+    manifest_digest: "c".repeat(64),
+    transfer_bytes: 4_096,
+    output_allowance_bytes: 4_096,
+    disk_gb: 80,
+    rows: [{
+      dependency_id: "artifact:model-flux-fill",
+      kind: "model",
+      display_name: filename,
+      status: "resolved",
+      source_kind: "huggingface",
+      source_locator:
+        `https://huggingface.co/${repository}/resolve/${revision}/${filename}`,
+      immutable_revision: revision,
+      size_bytes: 4_096,
+      sha256: digest,
+      destination,
+      reason: null,
+    }],
+  });
+
+  const text = view.root.textContent;
+  assert.ok(text.includes(destination));
+  assert.ok(text.includes(`${repository}/${filename}`));
+  assert.ok(text.includes(digest.slice(0, 12)));
+  assert.ok(text.includes(revision));
+  assert.ok(text.includes("4 KB"));
+  const links = view.root.querySelectorAll("a");
+  assert.equal(links.length, 1);
+  assert.equal(
+    links[0].getAttribute("href"),
+    `https://huggingface.co/${repository}`,
+  );
+  assert.equal(links[0].getAttribute("target"), "_blank");
+  assert.equal(links[0].getAttribute("rel"), "noopener noreferrer");
+});
+
+
+test("keeps hostile model provenance inert and creates no link", () => {
+  const document = new FakeDocument();
+  const view = createSessionConsole(document, {});
+  document.body.appendChild(view.root);
+  const revision = "a".repeat(40);
+  const pinned =
+    `https://huggingface.co/owner/repository/resolve/${revision}/model.safetensors`;
+  const hostileLocators = [
+    pinned.replace("huggingface.co", "example.com"),
+    pinned.replace("huggingface.co", "user@huggingface.co"),
+    pinned.replace("huggingface.co", "huggingface.co:443"),
+    `${pinned}#fragment`,
+    pinned.replace("/resolve/", "/blob/"),
+    pinned.replace("model.safetensors", "%6dodel.safetensors"),
+    "<a href=\"https://huggingface.co/owner/repository\">model</a>",
+    "javascript:alert(1)",
+  ];
+
+  view.renderPreflight({
+    preflight_id: "preflight-hostile",
+    capture_id: "capture-1",
+    rentable: false,
+    manifest_digest: null,
+    transfer_bytes: 0,
+    output_allowance_bytes: null,
+    disk_gb: null,
+    rows: hostileLocators.map((locator, index) => ({
+      dependency_id: `artifact:hostile-${index}`,
+      kind: "model",
+      display_name: locator,
+      status: "resolved",
+      source_kind: "huggingface",
+      source_locator: locator,
+      immutable_revision: revision,
+      size_bytes: 4_096,
+      sha256: "b".repeat(64),
+      destination: "models/diffusion_models/model.safetensors",
+      reason: null,
+    })),
+  });
+
+  for (const locator of hostileLocators) {
+    assert.ok(view.root.textContent.includes(locator));
+  }
+  assert.equal(view.root.querySelectorAll("a").length, 0);
+  assert.equal(view.root.querySelector("script"), null);
+});
+
+
 test("mapping candidates require an explicit pinned approval then rerun preflight", async () => {
   const document = new FakeDocument();
   const calls = [];

@@ -20,10 +20,13 @@ from .capture import CompiledCapture
 from .manifest import (
     DependencyManifest,
     ManifestDelta,
+    ManifestValidationError,
     MANIFEST_SCHEMA_VERSION,
     PINNED_COMFYUI_CORE_VERSION,
     PINNED_COMFYUI_FRONTEND_VERSION,
     PROTOCOL_VERSION,
+    SourceSpec,
+    validate_dependency,
 )
 from .models import CloudJob, JobState, SessionState, TransferState
 from .relay import RelaySyncResult
@@ -170,6 +173,7 @@ class PreflightRow:
     destination: str | None
     reason: str | None
     mapping_candidate: dict | None = None
+    source_locator: str | None = None
 
     def __post_init__(self):
         _identifier(self.dependency_id, "dependency ID")
@@ -210,6 +214,27 @@ class PreflightRow:
             ):
                 raise SessionServiceError("Invalid dependency destination.")
         _safe_text(self.reason, "dependency reason", optional=True)
+        if self.source_locator is not None:
+            if (
+                self.status != "resolved"
+                or self.source_kind != "huggingface"
+                or self.immutable_revision is None
+            ):
+                raise SessionServiceError(
+                    "Invalid dependency source locator."
+                )
+            try:
+                validate_dependency(
+                    SourceSpec(
+                        kind="huggingface",
+                        locator=self.source_locator,
+                        immutable_revision=self.immutable_revision,
+                    )
+                )
+            except ManifestValidationError:
+                raise SessionServiceError(
+                    "Invalid dependency source locator."
+                ) from None
         candidate = self.mapping_candidate
         if candidate is not None:
             if (
@@ -270,6 +295,7 @@ class PreflightRow:
             "sha256": self.sha256,
             "destination": self.destination,
             "reason": self.reason,
+            "source_locator": self.source_locator,
             "mapping_candidate": (
                 dict(self.mapping_candidate)
                 if self.mapping_candidate is not None
@@ -291,16 +317,21 @@ class PreflightRow:
             "destination",
             "reason",
         }
-        if (
-            not isinstance(payload, dict)
-            or frozenset(payload) not in {
-                frozenset(fields),
-                frozenset(fields | {"mapping_candidate"}),
-            }
-        ):
+        optional_fields = {"mapping_candidate", "source_locator"}
+        allowed = {
+            frozenset(fields | subset)
+            for subset in (
+                set(),
+                {"mapping_candidate"},
+                {"source_locator"},
+                optional_fields,
+            )
+        }
+        if not isinstance(payload, dict) or frozenset(payload) not in allowed:
             raise SessionServiceError("Stored preflight row is invalid.")
         values = dict(payload)
         values.setdefault("mapping_candidate", None)
+        values.setdefault("source_locator", None)
         return cls(**values)
 
 
@@ -508,6 +539,14 @@ def _preflight_rows(resolution, mapping_repository):
                 sha256=artifact_row.sha256,
                 destination=artifact_row.destination,
                 reason=artifact_row.reason,
+                source_locator=(
+                    artifact.source.locator
+                    if (
+                        artifact is not None
+                        and artifact.source.kind == "huggingface"
+                    )
+                    else None
+                ),
             )
         )
     return tuple(rows)

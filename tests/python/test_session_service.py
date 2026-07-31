@@ -26,6 +26,7 @@ from cloud_run.session_service import (
     DestroyConfirmationError,
     IncompatibleSession,
     PreflightBlocked,
+    PreflightRow,
     SessionBusy,
     SessionService,
     SessionServiceError,
@@ -161,6 +162,157 @@ def resolved_resolution():
     )
 
 
+def huggingface_resolution():
+    revision = "b" * 40
+    artifact = ArtifactSpec(
+        artifact_id="model-" + "c" * 64,
+        kind="model",
+        logical_name="example.safetensors",
+        destination="models/diffusion_models/example.safetensors",
+        size_bytes=4096,
+        sha256="c" * 64,
+        source=SourceSpec(
+            "huggingface",
+            (
+                "https://huggingface.co/example/public-model/resolve/"
+                + revision
+                + "/files/example.safetensors"
+            ),
+            immutable_revision=revision,
+        ),
+    )
+    return types.SimpleNamespace(
+        node_rows=(NodeResolution("KSampler", "resolved", "core"),),
+        artifact_rows=(
+            ArtifactResolution(
+                node_id="1",
+                class_type="UNETLoader",
+                input_name="model_name",
+                kind="model",
+                status="resolved",
+                destination=artifact.destination,
+                size_bytes=artifact.size_bytes,
+                sha256=artifact.sha256,
+                artifact_id=artifact.artifact_id,
+            ),
+        ),
+        custom_nodes=(),
+        artifacts=(artifact,),
+        output_allowance_bytes=8,
+        disk_gb=80,
+        rentable=True,
+    )
+
+
+class PreflightRowTests(unittest.TestCase):
+    revision = "a" * 40
+    locator = (
+        "https://huggingface.co/example/public-model/resolve/"
+        + revision
+        + "/files/example.safetensors"
+    )
+
+    def row(self, **overrides):
+        values = {
+            "dependency_id": "artifact:model-example",
+            "kind": "model",
+            "display_name": "example.safetensors",
+            "status": "resolved",
+            "source_kind": "huggingface",
+            "immutable_revision": self.revision,
+            "size_bytes": 4096,
+            "sha256": "c" * 64,
+            "destination": "models/diffusion_models/example.safetensors",
+            "reason": None,
+            "source_locator": self.locator,
+        }
+        values.update(overrides)
+        return PreflightRow(**values)
+
+    def test_resolved_huggingface_row_exposes_only_its_pinned_locator(self):
+        row = self.row()
+
+        self.assertEqual(row.source_locator, self.locator)
+        self.assertEqual(row.public_payload()["source_locator"], self.locator)
+
+    def test_locator_is_forbidden_for_other_sources_or_unresolved_rows(self):
+        invalid = {
+            "local upload": {
+                "source_kind": "local-upload",
+                "immutable_revision": None,
+            },
+            "r2": {"source_kind": "r2", "immutable_revision": None},
+            "custom node": {
+                "kind": "custom_node",
+                "source_kind": "approved",
+            },
+            "mapping required": {
+                "status": "mapping_required",
+                "source_kind": None,
+                "immutable_revision": None,
+                "size_bytes": None,
+                "sha256": None,
+                "reason": "Native model metadata is missing or ambiguous.",
+            },
+            "unsupported": {
+                "status": "unsupported",
+                "source_kind": None,
+                "immutable_revision": None,
+                "size_bytes": None,
+                "sha256": None,
+                "reason": "Native model metadata is invalid.",
+            },
+        }
+
+        for label, overrides in invalid.items():
+            with self.subTest(label=label):
+                with self.assertRaises(SessionServiceError):
+                    self.row(**overrides)
+
+    def test_locator_and_revision_are_jointly_validated_as_source_spec(self):
+        invalid = {
+            "mutable": self.locator.replace(self.revision, "main"),
+            "wrong revision": self.locator.replace(self.revision, "b" * 40),
+            "other host": self.locator.replace(
+                "huggingface.co",
+                "example.com",
+            ),
+            "userinfo": self.locator.replace(
+                "huggingface.co",
+                "user@huggingface.co",
+            ),
+            "port": self.locator.replace(
+                "huggingface.co",
+                "huggingface.co:443",
+            ),
+            "fragment": self.locator + "#secret",
+            "query": self.locator + "?download=true",
+            "percent": self.locator.replace("files", "%66iles"),
+        }
+
+        for label, locator in invalid.items():
+            with self.subTest(label=label):
+                with self.assertRaises(SessionServiceError):
+                    self.row(source_locator=locator)
+
+    def test_legacy_and_new_payload_shapes_round_trip_exactly(self):
+        new_payload = self.row().public_payload()
+        restored = PreflightRow.from_payload(new_payload)
+        self.assertEqual(restored, self.row())
+
+        legacy_payload = dict(new_payload)
+        legacy_payload.pop("source_locator")
+        legacy = PreflightRow.from_payload(legacy_payload)
+        self.assertIsNone(legacy.source_locator)
+        self.assertEqual(
+            set(legacy.public_payload()),
+            set(new_payload),
+        )
+
+        with self.assertRaises(SessionServiceError):
+            PreflightRow.from_payload({**new_payload, "extra": True})
+
+
 class SessionServiceTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -270,6 +422,38 @@ class SessionServiceTests(unittest.TestCase):
         public = result.public_payload()
         self.assertNotIn("private_path", repr(public))
         self.assertNotIn("'source':", repr(public))
+
+    def test_huggingface_locator_round_trips_through_public_and_storage(self):
+        resolution = huggingface_resolution()
+        service = self.service(resolution)
+
+        result = asyncio.run(service.preflight(self.capture.capture_id))
+        public = result.public_payload()
+        reopened = service.get_preflight(result.preflight_id)
+        artifact = resolution.artifacts[0]
+
+        self.assertEqual(
+            public["rows"][1]["source_locator"],
+            artifact.source.locator,
+        )
+        self.assertEqual(
+            reopened.rows[1].source_locator,
+            artifact.source.locator,
+        )
+        self.assertTrue(result.rentable)
+        self.assertEqual(
+            asyncio.run(service.search_offers(result.preflight_id)),
+            [{"offer_id": 42}],
+        )
+
+    def test_non_huggingface_row_does_not_expose_locator(self):
+        result = asyncio.run(
+            self.service(resolved_resolution()).preflight(
+                self.capture.capture_id
+            )
+        )
+
+        self.assertIsNone(result.rows[1].source_locator)
 
     def test_tampered_or_missing_manifest_blocks_offer_search(self):
         result = asyncio.run(

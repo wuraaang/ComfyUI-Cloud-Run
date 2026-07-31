@@ -56,6 +56,91 @@ function safeMappingCandidate(value) {
 }
 
 
+function safeHuggingFaceProvenance(item) {
+  const locator = item?.source_locator;
+  const revision = item?.immutable_revision;
+  if (
+    item?.status !== "resolved"
+    || item?.source_kind !== "huggingface"
+    || typeof locator !== "string"
+    || !locator
+    || locator.length > 8192
+    || !locator.startsWith("https://huggingface.co/")
+    || locator.includes("%")
+    || locator.includes("\\")
+    || typeof revision !== "string"
+    || !/^[0-9a-f]{40}$/.test(revision)
+  ) {
+    return null;
+  }
+  for (let index = 0; index < locator.length; index += 1) {
+    const code = locator.charCodeAt(index);
+    if (code < 33 || code > 126) return null;
+  }
+
+  let parsed;
+  try {
+    parsed = new URL(locator);
+  } catch {
+    return null;
+  }
+  if (
+    parsed.protocol !== "https:"
+    || parsed.hostname !== "huggingface.co"
+    || parsed.username
+    || parsed.password
+    || parsed.port
+    || parsed.hash
+    || parsed.search
+    || parsed.href !== locator
+  ) {
+    return null;
+  }
+
+  const parts = parsed.pathname.split("/");
+  const repositoryPart = /^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/;
+  const pathPart = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,199}$/;
+  if (
+    parts.length < 6
+    || parts[0] !== ""
+    || !repositoryPart.test(parts[1])
+    || !repositoryPart.test(parts[2])
+    || parts[3] !== "resolve"
+    || parts[4] !== revision
+    || !parts.slice(5).every((part) => pathPart.test(part))
+  ) {
+    return null;
+  }
+
+  const destination = item?.destination;
+  const destinationParts = typeof destination === "string"
+    ? destination.split("/")
+    : [];
+  if (
+    !destination
+    || destination.startsWith("/")
+    || destination.includes("\\")
+    || destinationParts.some((part) => !part || part === "." || part === "..")
+  ) {
+    return null;
+  }
+  const digest = typeof item?.sha256 === "string"
+    && /^[0-9a-f]{64}$/.test(item.sha256)
+    ? item.sha256.slice(0, 12)
+    : null;
+  if (digest === null) return null;
+
+  const repository = `${parts[1]}/${parts[2]}`;
+  return {
+    repository,
+    filePath: parts.slice(5).join("/"),
+    repositoryUrl: `https://huggingface.co/${repository}`,
+    destination,
+    digest,
+  };
+}
+
+
 function money(value) {
   const number = finiteNumber(value);
   return number !== null && number >= 0 ? `$${number.toFixed(2)}` : "unknown";
@@ -521,6 +606,25 @@ export function createSessionConsole(document, api = {}, options = {}) {
         `${revision ? ` @ ${revision}` : ""}` +
         `${size === null ? "" : ` — ${bytesText(size)}`}` +
         reason;
+      const provenance = safeHuggingFaceProvenance(item);
+      if (provenance) {
+        const details = element(document, "div", {
+          className: "cloud-run-model-provenance",
+        });
+        const repositoryLink = element(document, "a", {
+          text: provenance.repository,
+        });
+        repositoryLink.setAttribute("href", provenance.repositoryUrl);
+        repositoryLink.setAttribute("target", "_blank");
+        repositoryLink.setAttribute("rel", "noopener noreferrer");
+        details.append(
+          "Verified model: ",
+          repositoryLink,
+          `/${provenance.filePath} — destination ${provenance.destination}`,
+          ` — SHA-256 ${provenance.digest}`,
+        );
+        row.appendChild(details);
+      }
       const candidate = safeMappingCandidate(item?.mapping_candidate);
       if (
         state === "mapping_required"

@@ -26,6 +26,7 @@ from cloud_run.service import CloudRunService
 from cloud_run.session_service import (
     DeadlineValidationError,
     IncompatibleSession,
+    PreflightBlocked,
     SessionExecutionError,
     SessionService,
 )
@@ -116,6 +117,8 @@ class FakeVastProvider:
     def __init__(self):
         self.create_count = 0
         self.destroy_count = 0
+        self.search_count = 0
+        self.get_offer_count = 0
         self.inventory = []
         self.mutations = []
         self.retain_on_destroy = False
@@ -166,6 +169,7 @@ class FakeVastProvider:
         disk_gb,
     ):
         del disk_gb
+        self.search_count += 1
         return [
             dict(offer)
             for offer in self.offers
@@ -186,6 +190,7 @@ class FakeVastProvider:
         disk_gb,
     ):
         del disk_gb
+        self.get_offer_count += 1
         for offer in self.offers:
             if (
                 str(offer["offer_id"]) == str(offer_id)
@@ -907,6 +912,151 @@ class FakeCloudRunSystem:
 
 
 class FakeReusableSessionIntegrationTests(unittest.TestCase):
+    def test_pinned_model_provenance_survives_offline_preflight_storage(self):
+        system = FakeCloudRunSystem()
+        self.addCleanup(system.close)
+        original_resolve = system.resolver.resolve_preflight
+        revision = "a" * 40
+
+        async def resolve_with_pinned_model(
+            capture,
+            *,
+            explicit_output_allowance_bytes,
+        ):
+            resolution = await original_resolve(
+                capture,
+                explicit_output_allowance_bytes=(
+                    explicit_output_allowance_bytes
+                ),
+            )
+            local_model = resolution.artifacts[0]
+            pinned_model = ArtifactSpec(
+                artifact_id=local_model.artifact_id,
+                kind=local_model.kind,
+                logical_name=local_model.logical_name,
+                destination=local_model.destination,
+                size_bytes=local_model.size_bytes,
+                sha256=local_model.sha256,
+                source=SourceSpec(
+                    "huggingface",
+                    (
+                        "https://huggingface.co/example/public-model/resolve/"
+                        + revision
+                        + "/model-a"
+                    ),
+                    immutable_revision=revision,
+                ),
+            )
+            return types.SimpleNamespace(
+                **{
+                    **vars(resolution),
+                    "artifacts": (
+                        pinned_model,
+                        *resolution.artifacts[1:],
+                    ),
+                    "local_artifacts": tuple(
+                        artifact
+                        for artifact in resolution.local_artifacts
+                        if artifact.artifact_id != pinned_model.artifact_id
+                    ),
+                }
+            )
+
+        system.resolver.resolve_preflight = resolve_with_pinned_model
+        capture = system.capture(
+            native_capture(
+                model="model-a",
+                input_name="input-a.jpg",
+                seed=11,
+            )
+        )
+
+        preflight = system.preflight(capture)
+        reopened = system.session_service.get_preflight(
+            preflight.preflight_id
+        )
+        model_row = next(row for row in preflight.rows if row.kind == "model")
+        reopened_model = next(
+            row for row in reopened.rows if row.kind == "model"
+        )
+
+        self.assertTrue(preflight.rentable)
+        self.assertEqual(model_row.source_locator, reopened_model.source_locator)
+        self.assertEqual(model_row.immutable_revision, revision)
+        self.assertEqual(system.vast.search_count, 0)
+        self.assertEqual(system.vast.get_offer_count, 0)
+        self.assertEqual(system.vast.mutations, [])
+
+    def test_unresolved_model_still_blocks_offer_search_and_paid_preview(self):
+        system = FakeCloudRunSystem()
+        self.addCleanup(system.close)
+        original_resolve = system.resolver.resolve_preflight
+
+        async def resolve_with_missing_mapping(
+            capture,
+            *,
+            explicit_output_allowance_bytes,
+        ):
+            resolution = await original_resolve(
+                capture,
+                explicit_output_allowance_bytes=(
+                    explicit_output_allowance_bytes
+                ),
+            )
+            missing_model = ArtifactResolution(
+                node_id="1",
+                class_type="CheckpointLoaderSimple",
+                input_name="ckpt_name",
+                kind="model",
+                status="mapping_required",
+                destination=None,
+                reason="Native model metadata is missing or ambiguous.",
+            )
+            return types.SimpleNamespace(
+                **{
+                    **vars(resolution),
+                    "artifact_rows": (
+                        missing_model,
+                        *resolution.artifact_rows[1:],
+                    ),
+                    "artifacts": resolution.artifacts[1:],
+                    "local_artifacts": resolution.local_artifacts[1:],
+                    "rentable": False,
+                }
+            )
+
+        system.resolver.resolve_preflight = resolve_with_missing_mapping
+        capture = system.capture(
+            native_capture(
+                model="model-a",
+                input_name="input-a.jpg",
+                seed=11,
+            )
+        )
+        preflight = system.preflight(capture)
+
+        self.assertFalse(preflight.rentable)
+        self.assertTrue(
+            any(row.status == "mapping_required" for row in preflight.rows)
+        )
+        with self.assertRaises(PreflightBlocked):
+            asyncio.run(system.service.search(preflight.preflight_id))
+        with self.assertRaises(PreflightBlocked):
+            asyncio.run(
+                system.service.preview_session(
+                    preflight_id=preflight.preflight_id,
+                    offer_id="42",
+                    idempotency_key="blocked-session",
+                    deadline={
+                        "mode": "finite",
+                        "duration_seconds": 7_200,
+                    },
+                )
+            )
+        self.assertEqual(system.vast.search_count, 0)
+        self.assertEqual(system.vast.get_offer_count, 0)
+        self.assertEqual(system.vast.mutations, [])
+
     def test_capture_preflight_one_rental_two_jobs_verified_outputs_and_destroy(self):
         system = FakeCloudRunSystem()
         self.addCleanup(system.close)
