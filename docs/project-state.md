@@ -61,16 +61,41 @@ Source of truth:
   replacement, idempotency, and Agent Panel isolation.
 - A deterministic source-only worker artifact, strict GitHub commit bootstrap,
   and synthetic-only Gold structural validator are implemented and gated.
+- Offline release tooling now binds a deterministic source-only worker archive
+  to an immutable GitHub Release asset name, a 40-character lowercase commit,
+  exact size and SHA-256, protocol, and pinned runtime versions. Bootstrap
+  accepts only the exact release identity and either a direct `200` or one
+  validated `302` to the fixed GitHub release-assets host without retaining the
+  signed target.
+- The reviewed gateway supervises one fixed Caddy binary and the loopback
+  Python worker. It isolates the Jupyter token to Caddy, passes the worker only
+  an explicit environment allowlist, and boundedly terminates and reaps the
+  sibling process when either child exits.
+- Deterministic commands build the release bundle, render strict private Vast
+  template inputs, and atomically write an owner-private `0600` local release
+  lock without overwrite. These commands have been certified only with
+  synthetic private inputs; they have not published or created live material.
+- **Maximum total instance creates** is an immutable reviewed quote field
+  limited to `1` or `2`, conservatively defaulted to `1` for legacy records,
+  and enforced at confirmation and before any replacement offer search or
+  create. The initial create plus durable retry count consumes the budget;
+  recovery, idempotent retries, and ambiguous-create reconciliation never
+  replenish it.
 
 ## Safety and release status
 
+- No immutable Remote Worker release has been published.
+- No private project-specific Vast template has been created.
+- No local live `worker-release.json` exists.
+- No Vast offer search has been performed.
+- No paid Vast instance has been created.
+- No live workflow run has occurred.
 - No real Vast rental or Gold run has occurred.
 - The native fixture exposed `Download All`, but it was not clicked. The free
   Gold preflight resolved exactly five public model sources and one verified
   local input; no model file was created. Sanitized evidence is recorded in
   `docs/workflow-model-metadata-proof.md`.
 - No project-specific worker template has been published or pinned.
-- No live `worker-release.json` exists.
 - No Vast provider mutation, upload, Registry publication, worker release, or
   GPU rental occurred.
 - Public source repository: https://github.com/wuraaang/ComfyUI-Cloud-Run.

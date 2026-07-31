@@ -90,6 +90,14 @@ Offer confirmation revalidates identity and price. Session confirmation and job
 submission are idempotent. Restart recovery adopts matching managed inventory
 instead of blindly creating another instance.
 
+The paid review includes **Maximum total instance creates**, limited to `1` or
+`2` and persisted in the immutable quote. The conservative default, including
+legacy restored quotes, is `1`. A reviewed value of `2` authorizes at most one
+replacement after verified destruction and fresh inventory absence. The
+backend counts the initial create plus the durable retry count and enforces the
+limit at confirmation and before any replacement offer search or create; a
+duplicate or ambiguous request cannot replenish the budget.
+
 A session accepts one job at a time but can run multiple jobs sequentially.
 When the next job needs nothing new, execution starts immediately. A compatible
 model or input causes only its transfer delta. A compatible new custom node
@@ -197,6 +205,50 @@ mutation, publication, or GPU rental.
 The deterministic worker artifact is review material governed by a worker
 release lock. See `docs/remote-worker-bootstrap-review.md`. There is deliberately
 no live release lock in this repository.
+
+The offline publication tools bind one immutable GitHub Release asset to the
+repository, a 40-character lowercase commit, deterministic asset name, exact
+byte size, SHA-256, protocol, and pinned runtime versions. Bootstrap accepts a
+direct identity-encoded `200`, or exactly one manually validated `302` to the
+fixed GitHub release-assets host. The temporary signed target is neither part
+of the lock nor retained, persisted, logged, or returned.
+
+`remote_worker/gateway.py` starts one fixed Caddy binary and the loopback Python
+worker without a shell. Only Caddy receives the validated Jupyter token; the
+worker receives an explicit environment allowlist. The supervisor terminates,
+then boundedly reaps or kills, the sibling when either process exits. Caddy
+exposes `:8765`, strips inbound authorization and boundary headers, and proxies
+only to `127.0.0.1:8766`.
+
+The deterministic commands are:
+
+```sh
+python3 scripts/build_worker_release_bundle.py \
+  --repository-root <repository-root> \
+  --output-directory <owner-private-output-directory> \
+  --worker-commit <40-lowercase-hex-commit>
+
+python3 scripts/render_worker_template.py \
+  --repository-root <repository-root> \
+  --output-directory <owner-private-output-directory> \
+  --release-metadata <owner-private-release-metadata> \
+  --base-template-audit <owner-private-base-template-audit>
+
+python3 scripts/write_worker_release_lock.py \
+  --output <owner-private-data-directory>/worker-release.json \
+  --template-hash-id <32-lowercase-hex-template-id> \
+  --release-metadata <owner-private-release-metadata>
+```
+
+All generation inputs and outputs stay outside the repository in existing
+owner-private directories. Generated files use mode `0600`. The final local
+lock is created atomically without overwrite and must round-trip through the
+runtime loader before it is accepted.
+
+No immutable Remote Worker release has been published. No private
+project-specific Vast template has been created. No local live
+`worker-release.json` exists. No Vast offer search has been performed. No paid
+Vast instance has been created. No live workflow run has occurred.
 
 Before a paid Gold run, a new human GO must state the maximum instance count,
 maximum hourly price, and absolute duration or cost. The private Gold image and

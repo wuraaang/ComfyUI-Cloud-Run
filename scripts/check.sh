@@ -497,6 +497,7 @@ expected_subprocess_surface = {
     ("cloud_run/comfy_host.py", "subprocess.run"),
     ("remote_worker/bootstrap.py", "os.execv"),
     ("remote_worker/comfy.py", "asyncio.create_subprocess_exec"),
+    ("remote_worker/gateway.py", "subprocess.Popen"),
     ("remote_worker/install.py", "asyncio.create_subprocess_exec"),
 }
 if subprocess_surface != expected_subprocess_surface:
@@ -567,6 +568,7 @@ allowed_external_hosts = {
     "console.vast.ai",
     "github.com",
     "huggingface.co",
+    "release-assets.githubusercontent.com",
     "transfer.xethub-eu.hf.co",
     "transfer.xethub.hf.co",
     "us.aws.cdn.hf.co",
@@ -597,6 +599,7 @@ if not {
     "console.vast.ai",
     "github.com",
     "huggingface.co",
+    "release-assets.githubusercontent.com",
     "transfer.xethub-eu.hf.co",
     "transfer.xethub.hf.co",
     "us.aws.cdn.hf.co",
