@@ -14,7 +14,9 @@ from .dependency_repository import (
     MappingValidationError,
 )
 from .job_repository import JobRepository
+from .huggingface import HuggingFaceClient
 from .lifecycle import CloudRunLifecycle
+from .model_sources import WorkflowModelSourceResolver
 from .models import SessionState
 from .offers import HostBlacklist
 from .repository import AttemptRepository, SessionRepository
@@ -165,9 +167,15 @@ def _runtime_output_root(data_directory):
 
 
 class _RuntimeResolver:
-    def __init__(self, dependency_repository, artifact_catalog=None):
+    def __init__(
+        self,
+        dependency_repository,
+        artifact_catalog=None,
+        model_source_resolver=None,
+    ):
         self.dependency_repository = dependency_repository
         self.artifact_catalog = artifact_catalog
+        self.model_source_resolver = model_source_resolver
 
     async def resolve_preflight(
         self,
@@ -176,12 +184,18 @@ class _RuntimeResolver:
         explicit_output_allowance_bytes=None,
     ):
         host = ComfyHost.from_running_host()
+        model_source_resolver = self.model_source_resolver
+        if model_source_resolver is None:
+            model_source_resolver = WorkflowModelSourceResolver(
+                HuggingFaceClient()
+            )
         resolver = DependencyResolver(
             host=host,
             repository=self.dependency_repository,
             registry=RegistryClient(),
             cache_catalog=self.artifact_catalog,
             resolution_context=_runtime_resolution_context(host),
+            model_source_resolver=model_source_resolver,
         )
         return await resolver.resolve_preflight(
             capture,

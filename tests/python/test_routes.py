@@ -9,8 +9,12 @@ import types
 import unittest
 from unittest import mock
 
+from cloud_run.artifacts import FileInputMetadata
 from cloud_run.capture import CompiledCapture
-from cloud_run.routes import build_service, register_routes
+from cloud_run.dependency_repository import DependencyRepository
+from cloud_run.manifest import SourceSpec
+from cloud_run.model_sources import ModelSourceResolution
+from cloud_run.routes import _RuntimeResolver, build_service, register_routes
 from cloud_run.models import (
     AttemptState,
     CloudAttempt,
@@ -293,6 +297,101 @@ class ServiceConstructionTests(unittest.TestCase):
 
         self.assertIsNone(service.release)
         self.assertIsNone(service.session_service.release)
+
+
+class RuntimeResolverTests(unittest.TestCase):
+    def test_injected_model_source_resolver_keeps_route_tests_offline(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            model_root = root / "models"
+            input_root = root / "input"
+            model_root.mkdir()
+            input_root.mkdir()
+            repository = DependencyRepository(
+                root / "private" / "sessions.sqlite3"
+            )
+            revision = "a" * 40
+            digest = "c" * 64
+            model_source_resolver = types.SimpleNamespace(
+                resolve=mock.AsyncMock(
+                    return_value={
+                        ("1", "model_name"): ModelSourceResolution(
+                            status="resolved",
+                            source=SourceSpec(
+                                kind="huggingface",
+                                locator=(
+                                    "https://huggingface.co/example/model/"
+                                    "resolve/"
+                                    + revision
+                                    + "/files/example.safetensors"
+                                ),
+                                immutable_revision=revision,
+                            ),
+                            size_bytes=4096,
+                            sha256=digest,
+                            reason=None,
+                        )
+                    }
+                )
+            )
+
+            class FakeHost:
+                def assert_compatible(self):
+                    return None
+
+                def describe_node(self, class_type):
+                    return types.SimpleNamespace(kind="core")
+
+                def file_input_metadata(self, capture, *, model_filenames):
+                    self.model_filenames = model_filenames
+                    return {
+                        "UNETLoader": {
+                            "model_name": FileInputMetadata(
+                                kind="model",
+                                category="diffusion_models",
+                            )
+                        }
+                    }
+
+            host = FakeHost()
+            folder_paths = types.ModuleType("folder_paths")
+            folder_paths.folder_names_and_paths = {
+                "diffusion_models": ((str(model_root),), {".safetensors"})
+            }
+            folder_paths.get_filename_list = lambda _category: []
+            folder_paths.get_input_directory = lambda: str(input_root)
+            capture = types.SimpleNamespace(
+                executable_class_types=("UNETLoader",),
+                output={
+                    "1": {
+                        "class_type": "UNETLoader",
+                        "inputs": {"model_name": "example.safetensors"},
+                    }
+                },
+                workflow={"nodes": []},
+            )
+            resolver = _RuntimeResolver(
+                repository,
+                model_source_resolver=model_source_resolver,
+            )
+
+            with mock.patch.dict(
+                sys.modules,
+                {"folder_paths": folder_paths},
+            ), mock.patch(
+                "cloud_run.routes.ComfyHost.from_running_host",
+                return_value=host,
+            ):
+                result = asyncio.run(
+                    resolver.resolve_preflight(
+                        capture,
+                        explicit_output_allowance_bytes=1024,
+                    )
+                )
+
+        self.assertTrue(result.rentable)
+        self.assertEqual(result.artifacts[0].source.kind, "huggingface")
+        model_source_resolver.resolve.assert_awaited_once()
 
 
 class OffersRouteTests(unittest.TestCase):

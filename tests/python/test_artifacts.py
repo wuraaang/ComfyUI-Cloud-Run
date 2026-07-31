@@ -22,6 +22,7 @@ from cloud_run.artifacts import (
     static_file_requirements,
 )
 from cloud_run.manifest import ArtifactSpec, SourceSpec
+from cloud_run.model_sources import ModelSourceResolution
 
 
 class FakeCapture:
@@ -181,6 +182,402 @@ class StaticFileRequirementTests(unittest.TestCase):
                     "File-input metadata is invalid",
                 ):
                     static_file_requirements(capture, metadata)
+
+
+class ArtifactResolutionTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.input_root = self.root / "input"
+        self.input_root.mkdir()
+        self.model_roots = {}
+        for category in (
+            "diffusion_models",
+            "text_encoders",
+            "vae",
+            "upscale_models",
+        ):
+            root = self.root / category
+            root.mkdir()
+            self.model_roots[category] = (root,)
+
+    @staticmethod
+    def verified_source(
+        digest,
+        size_bytes,
+        *,
+        repository="example/public-model",
+        file_path="files/example.safetensors",
+    ):
+        revision = "a" * 40
+        return ModelSourceResolution(
+            status="resolved",
+            source=SourceSpec(
+                kind="huggingface",
+                locator=(
+                    "https://huggingface.co/"
+                    + repository
+                    + "/resolve/"
+                    + revision
+                    + "/"
+                    + file_path
+                ),
+                immutable_revision=revision,
+            ),
+            size_bytes=size_bytes,
+            sha256=digest,
+            reason=None,
+        )
+
+    @staticmethod
+    def one_model_capture(name="example.safetensors"):
+        return FakeCapture(
+            {
+                "1": {
+                    "class_type": "UNETLoader",
+                    "inputs": {"model_name": name},
+                }
+            }
+        )
+
+    @staticmethod
+    def one_model_metadata(category="diffusion_models"):
+        return {
+            "UNETLoader": {
+                "model_name": FileInputMetadata(
+                    kind="model",
+                    category=category,
+                )
+            }
+        }
+
+    def test_optional_source_first_arguments_preserve_legacy_resolution(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            model_root = root / "models"
+            input_root = root / "input"
+            model_root.mkdir()
+            input_root.mkdir()
+            model = model_root / "example.safetensors"
+            model.write_bytes(b"legacy model")
+            digest = hash_file(model).sha256
+            capture = FakeCapture(
+                {
+                    "1": {
+                        "class_type": "UNETLoader",
+                        "inputs": {"model_name": "example.safetensors"},
+                    }
+                }
+            )
+            metadata = {
+                "UNETLoader": {
+                    "model_name": FileInputMetadata(
+                        kind="model",
+                        category="diffusion_models",
+                    )
+                }
+            }
+            requirements = static_file_requirements(capture, metadata)
+
+            result = resolve_artifacts(
+                capture,
+                metadata=metadata,
+                model_roots={"diffusion_models": (model_root,)},
+                input_root=input_root,
+                source_mappings={digest: local_source("approved-model")},
+                model_sources={},
+                requirements=requirements,
+            )
+
+        self.assertEqual(result.rows[0].status, "resolved")
+        self.assertEqual(len(result.artifacts), 1)
+
+    def test_verified_model_absent_locally_resolves_to_exact_destination(self):
+        digest = "c" * 64
+        capture = self.one_model_capture()
+        metadata = self.one_model_metadata()
+
+        result = resolve_artifacts(
+            capture,
+            metadata=metadata,
+            model_roots=self.model_roots,
+            input_root=self.input_root,
+            source_mappings={},
+            model_sources={
+                ("1", "model_name"): self.verified_source(digest, 4096)
+            },
+        )
+
+        self.assertEqual(
+            (
+                result.rows[0].status,
+                result.rows[0].destination,
+                result.rows[0].size_bytes,
+                result.rows[0].sha256,
+            ),
+            (
+                "resolved",
+                "models/diffusion_models/example.safetensors",
+                4096,
+                digest,
+            ),
+        )
+        self.assertEqual(len(result.artifacts), 1)
+        self.assertEqual(result.artifacts[0].source.kind, "huggingface")
+        self.assertEqual(result.local_artifacts, ())
+        self.assertTrue(result.rentable)
+
+    def test_matching_local_copy_and_verified_source_produce_one_artifact(self):
+        model = self.model_roots["diffusion_models"][0] / "example.safetensors"
+        model.write_bytes(b"matching model")
+        file_digest = hash_file(model)
+
+        result = resolve_artifacts(
+            self.one_model_capture(),
+            metadata=self.one_model_metadata(),
+            model_roots=self.model_roots,
+            input_root=self.input_root,
+            source_mappings={
+                file_digest.sha256: local_source("legacy-approved")
+            },
+            model_sources={
+                ("1", "model_name"): self.verified_source(
+                    file_digest.sha256,
+                    file_digest.size_bytes,
+                )
+            },
+        )
+
+        self.assertEqual(len(result.artifacts), 1)
+        self.assertEqual(result.artifacts[0].source.kind, "huggingface")
+        self.assertEqual(len(result.local_artifacts), 1)
+        self.assertEqual(
+            result.local_artifacts[0].sha256,
+            file_digest.sha256,
+        )
+
+    def test_local_size_or_digest_collision_blocks_verified_source(self):
+        model = self.model_roots["diffusion_models"][0] / "example.safetensors"
+        model.write_bytes(b"local collision")
+        file_digest = hash_file(model)
+        conflicts = {
+            "size": self.verified_source(
+                file_digest.sha256,
+                file_digest.size_bytes + 1,
+            ),
+            "digest": self.verified_source(
+                "d" * 64,
+                file_digest.size_bytes,
+            ),
+        }
+
+        for label, source in conflicts.items():
+            with self.subTest(label=label):
+                result = resolve_artifacts(
+                    self.one_model_capture(),
+                    metadata=self.one_model_metadata(),
+                    model_roots=self.model_roots,
+                    input_root=self.input_root,
+                    source_mappings={
+                        file_digest.sha256: local_source("legacy-approved")
+                    },
+                    model_sources={("1", "model_name"): source},
+                )
+                self.assertEqual(result.rows[0].status, "unsupported")
+                self.assertEqual(result.artifacts, ())
+                self.assertFalse(result.rentable)
+
+    def test_equal_destination_and_digest_deduplicate_but_conflicts_raise(self):
+        capture = FakeCapture(
+            {
+                str(node_id): {
+                    "class_type": "UNETLoader",
+                    "inputs": {"model_name": "example.safetensors"},
+                }
+                for node_id in (1, 2)
+            }
+        )
+        metadata = self.one_model_metadata()
+        shared = self.verified_source("c" * 64, 4096)
+
+        deduplicated = resolve_artifacts(
+            capture,
+            metadata=metadata,
+            model_roots=self.model_roots,
+            input_root=self.input_root,
+            source_mappings={},
+            model_sources={
+                ("1", "model_name"): shared,
+                ("2", "model_name"): shared,
+            },
+        )
+
+        self.assertEqual([row.status for row in deduplicated.rows], ["resolved"] * 2)
+        self.assertEqual(len(deduplicated.artifacts), 1)
+
+        with self.assertRaises(ArtifactCollisionError):
+            resolve_artifacts(
+                capture,
+                metadata=metadata,
+                model_roots=self.model_roots,
+                input_root=self.input_root,
+                source_mappings={},
+                model_sources={
+                    ("1", "model_name"): shared,
+                    ("2", "model_name"): self.verified_source(
+                        "d" * 64,
+                        4096,
+                    ),
+                },
+            )
+
+    def test_all_supported_model_categories_keep_exact_destinations(self):
+        categories = (
+            "diffusion_models",
+            "text_encoders",
+            "vae",
+            "upscale_models",
+        )
+        output = {}
+        metadata_rules = {}
+        model_sources = {}
+        for offset, category in enumerate(categories, start=1):
+            input_name = "model_" + str(offset)
+            filename = category + ".bin"
+            digest = format(offset, "x") * 64
+            output[str(offset)] = {
+                "class_type": "MultiLoader",
+                "inputs": {input_name: filename},
+            }
+            metadata_rules[input_name] = FileInputMetadata(
+                kind="model",
+                category=category,
+            )
+            model_sources[(str(offset), input_name)] = self.verified_source(
+                digest,
+                1000 + offset,
+                file_path="files/" + filename,
+            )
+
+        result = resolve_artifacts(
+            FakeCapture(output),
+            metadata={"MultiLoader": metadata_rules},
+            model_roots=self.model_roots,
+            input_root=self.input_root,
+            source_mappings={},
+            model_sources=model_sources,
+        )
+
+        self.assertEqual(
+            [row.destination for row in result.rows],
+            [
+                "models/" + category + "/" + category + ".bin"
+                for category in categories
+            ],
+        )
+
+    def test_present_invalid_or_conflicting_annotation_cannot_use_local_mapping(self):
+        model = self.model_roots["diffusion_models"][0] / "example.safetensors"
+        model.write_bytes(b"approved local model")
+        file_digest = hash_file(model)
+        source_mappings = {
+            file_digest.sha256: local_source("legacy-approved")
+        }
+        blockers = {
+            "invalid": ModelSourceResolution(
+                "unsupported",
+                None,
+                None,
+                None,
+                "Native model metadata is invalid.",
+            ),
+            "conflicting": ModelSourceResolution(
+                "mapping_required",
+                None,
+                None,
+                None,
+                "Native model metadata is missing or ambiguous.",
+            ),
+        }
+
+        legacy = resolve_artifacts(
+            self.one_model_capture(),
+            metadata=self.one_model_metadata(),
+            model_roots=self.model_roots,
+            input_root=self.input_root,
+            source_mappings=source_mappings,
+            model_sources={},
+        )
+        self.assertEqual(legacy.rows[0].status, "resolved")
+
+        for label, blocker in blockers.items():
+            with self.subTest(label=label):
+                blocked = resolve_artifacts(
+                    self.one_model_capture(),
+                    metadata=self.one_model_metadata(),
+                    model_roots=self.model_roots,
+                    input_root=self.input_root,
+                    source_mappings=source_mappings,
+                    model_sources={("1", "model_name"): blocker},
+                )
+                self.assertEqual(blocked.rows[0].status, blocker.status)
+                self.assertEqual(blocked.artifacts, ())
+
+    def test_input_resolution_is_unchanged_and_missing_input_stays_unsupported(self):
+        existing = self.input_root / "source.png"
+        existing.write_bytes(b"private image")
+        digest = hash_file(existing).sha256
+        metadata = {
+            "LoadImage": {"image": FileInputMetadata(kind="input")}
+        }
+        existing_capture = FakeCapture(
+            {
+                "1": {
+                    "class_type": "LoadImage",
+                    "inputs": {"image": "source.png"},
+                }
+            }
+        )
+        source_mappings = {digest: local_source("approved-input")}
+
+        legacy = resolve_artifacts(
+            existing_capture,
+            metadata=metadata,
+            model_roots=self.model_roots,
+            input_root=self.input_root,
+            source_mappings=source_mappings,
+        )
+        extended = resolve_artifacts(
+            existing_capture,
+            metadata=metadata,
+            model_roots=self.model_roots,
+            input_root=self.input_root,
+            source_mappings=source_mappings,
+            model_sources={
+                ("unrelated", "model"): self.verified_source("e" * 64, 1)
+            },
+            requirements=static_file_requirements(existing_capture, metadata),
+        )
+        self.assertEqual(extended, legacy)
+
+        missing = resolve_artifacts(
+            FakeCapture(
+                {
+                    "1": {
+                        "class_type": "LoadImage",
+                        "inputs": {"image": "missing.png"},
+                    }
+                }
+            ),
+            metadata=metadata,
+            model_roots=self.model_roots,
+            input_root=self.input_root,
+            source_mappings={},
+            model_sources={},
+        )
+        self.assertEqual(missing.rows[0].status, "unsupported")
+        self.assertEqual(missing.artifacts, ())
 
 
 class ArtifactTests(unittest.TestCase):

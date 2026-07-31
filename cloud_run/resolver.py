@@ -9,6 +9,7 @@ from .artifacts import (
     calculate_disk_gb,
     estimate_output_bytes,
     resolve_artifacts,
+    static_file_requirements,
 )
 from .comfy_host import HostCompatibilityError, NodeNotFound
 from .dependency_repository import MappingValidationError
@@ -122,12 +123,14 @@ class DependencyResolver:
         registry,
         cache_catalog=None,
         resolution_context=None,
+        model_source_resolver=None,
     ):
         self.host = host
         self.repository = repository
         self.registry = registry
         self.cache_catalog = cache_catalog
         self.resolution_context = resolution_context
+        self.model_source_resolver = model_source_resolver
 
     def register_agent_suggestion(self, payload):
         if not isinstance(payload, dict) or set(payload) != {
@@ -295,12 +298,21 @@ class DependencyResolver:
         explicit_output_allowance_bytes,
     ):
         nodes = await self.resolve_nodes(capture)
+        requirements = static_file_requirements(capture, metadata)
+        model_sources = {}
+        if self.model_source_resolver is not None:
+            model_sources = await self.model_source_resolver.resolve(
+                capture,
+                requirements=requirements,
+            )
         artifact_result = resolve_artifacts(
             capture,
             metadata=metadata,
             model_roots=model_roots,
             input_root=input_root,
             source_mappings=source_mappings,
+            model_sources=model_sources,
+            requirements=requirements,
         )
         artifact_rows = artifact_result.rows
         if self.cache_catalog is not None:
