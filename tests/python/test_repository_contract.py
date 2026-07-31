@@ -168,7 +168,8 @@ class RepositoryContractTests(unittest.TestCase):
             "cloud_run/worker_protocol.py",
             "SHA-256",
             "own-instance DELETE",
-            "No worker archive or project-specific Vast template has been published",
+            "No dedicated Remote Worker release artifact or "
+            "project-specific Vast template has been published",
             "ComfyRelay",
             "Public source repository:",
             "Published source commit:",

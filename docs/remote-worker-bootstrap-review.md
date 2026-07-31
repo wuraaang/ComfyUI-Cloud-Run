@@ -3,7 +3,7 @@
 This document is the offline review handoff and public source-publication
 record. It is not a release lock, Vast template, or permission to spend.
 
-No worker archive or project-specific Vast template has been published.
+No dedicated Remote Worker release artifact or project-specific Vast template has been published.
 Publishing source alone does not create a worker release lock, authorize Vast
 activity, or convert the deterministic review artifact below into a live
 release.
@@ -49,13 +49,18 @@ must not be copied into a live lock for those GitHub bytes.
 
 Current bootstrap result: `FAIL`.
 
-- `observed_final_url=FAIL`: the current bootstrap requires the returned URL
-  to equal the locked `github.com` URL and rejects the observed codeload
-  redirect.
-- `same_url_archive_shape=FAIL`: even with the returned URL simulated as equal,
-  the current bootstrap rejects the GitHub archive metadata and full-repository
-  layout, including PAX headers, non-normalized owner/mode/mtime values, the
-  commit root prefix, and additional files.
+- `observed_final_url=FAIL`: the injected-stream audit observed the exact
+  returned-URL check reject the codeload final URL. The production HTTPS
+  transport is stricter still: its no-redirect handler rejects the initial
+  `302` before accepting a codeload response.
+- `same_url_archive_shape=FAIL`: with the returned URL simulated as equal, the
+  same bytes still failed. The measured size, digest, and single gzip member
+  were valid; archive-member validation rejects the observed PAX headers,
+  `root` owner/group, nonzero mtime, and `0664`/`0775` modes.
+
+Separately, code review proves that normalizing metadata alone would remain
+insufficient: the commit root prefix and 88 additional repository files would
+fail the installed-tree allowlist after extraction.
 
 These failures are release-blocking evidence. They do not authorize weakening
 redirect, archive, extraction, allowlist, digest, or shell restrictions.
