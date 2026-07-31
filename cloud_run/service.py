@@ -119,6 +119,7 @@ class CloudRunService:
         disk_gb=DEFAULT_DISK_GB,
         lifecycle=None,
         cache_manager=None,
+        session_service=None,
     ):
         self.settings_store = settings_store
         self.repository = repository
@@ -130,6 +131,7 @@ class CloudRunService:
         self.disk_gb = int(disk_gb)
         self.lifecycle = lifecycle
         self.cache_manager = cache_manager
+        self.session_service = session_service
 
     async def capture(self, payload):
         if self.job_repository is None:
@@ -151,6 +153,40 @@ class CloudRunService:
             acknowledged=acknowledged,
         )
 
+    async def preflight(
+        self,
+        capture_id,
+        *,
+        explicit_output_allowance_bytes=None,
+    ):
+        if self.session_service is None:
+            raise CloudRunValidationError(
+                "Dependency preflight is unavailable."
+            )
+        return await self.session_service.preflight(
+            capture_id,
+            explicit_output_allowance_bytes=(
+                explicit_output_allowance_bytes
+            ),
+        )
+
+    async def approve_mapping(self, mapping_id, candidate_digest):
+        if self.session_service is None:
+            raise CloudRunValidationError(
+                "Dependency mappings are unavailable."
+            )
+        return self.session_service.approve_mapping(
+            mapping_id,
+            candidate_digest,
+        )
+
+    async def register_agent_suggestion(self, payload):
+        if self.session_service is None:
+            raise CloudRunValidationError(
+                "Agent Panel integration is unavailable."
+            )
+        return self.session_service.register_agent_suggestion(payload)
+
     def _settings(self):
         settings = self.settings_store.load()
         if not isinstance(settings, dict) or not settings.get("api_key"):
@@ -159,7 +195,12 @@ class CloudRunService:
             )
         return settings
 
-    async def search(self):
+    async def search(self, preflight_id=None):
+        if self.session_service is not None:
+            return await self.session_service.search_offers(preflight_id)
+        return await self._search_without_preflight()
+
+    async def _search_without_preflight(self):
         settings = self._settings()
         offers = await self.provider.search_offers(
             settings["api_key"],

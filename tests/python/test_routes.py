@@ -198,7 +198,7 @@ class OffersRouteTests(unittest.TestCase):
     def setUp(self):
         self.handlers = captured_handlers()
 
-    def test_missing_key_is_a_sanitized_client_error(self):
+    def test_missing_preflight_blocks_before_provider_configuration(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             with mock.patch.dict(
                 os.environ,
@@ -206,13 +206,15 @@ class OffersRouteTests(unittest.TestCase):
                 clear=False,
             ):
                 response = asyncio.run(
-                    self.handlers[("POST", "/cloud-run/api/offers")](FakeRequest())
+                    self.handlers[("POST", "/cloud-run/api/offers")](
+                        FakeRequest({"preflight_id": "preflight-1"})
+                    )
                 )
 
         self.assertEqual(response.status, 400)
         self.assertEqual(
             response.payload,
-            {"error": "Vast API key is not configured."},
+            {"error": "Cloud Run preflight was not found."},
         )
 
     def test_success_returns_only_the_service_sanitized_offers(self):
@@ -229,10 +231,12 @@ class OffersRouteTests(unittest.TestCase):
         service.search = mock.AsyncMock(return_value=offers)
         handlers = captured_handlers(service_factory=lambda: service)
         response = asyncio.run(
-            handlers[("POST", "/cloud-run/api/offers")](FakeRequest())
+            handlers[("POST", "/cloud-run/api/offers")](
+                FakeRequest({"preflight_id": "preflight-1"})
+            )
         )
 
-        service.search.assert_awaited_once_with()
+        service.search.assert_awaited_once_with("preflight-1")
         self.assertEqual(response.status, 200)
         self.assertEqual(response.payload, {"offers": offers})
         self.assertNotIn("api_key", repr(response.payload))
@@ -245,7 +249,9 @@ class OffersRouteTests(unittest.TestCase):
         )
         handlers = captured_handlers(service_factory=lambda: service)
         response = asyncio.run(
-            handlers[("POST", "/cloud-run/api/offers")](FakeRequest())
+            handlers[("POST", "/cloud-run/api/offers")](
+                FakeRequest({"preflight_id": "preflight-1"})
+            )
         )
 
         self.assertEqual(response.status, 502)
@@ -295,6 +301,141 @@ class CaptureRouteTests(unittest.TestCase):
         self.assertNotIn("workflow", response.payload)
         self.assertNotIn("output", response.payload)
         self.assertEqual(service.provider_mutations, [])
+
+
+class PreflightRouteTests(unittest.TestCase):
+    def test_preflight_mapping_and_agent_routes_are_typed_and_provider_free(self):
+        preflight = types.SimpleNamespace(
+            public_payload=lambda: {
+                "preflight_id": "preflight-1",
+                "capture_id": "capture-1",
+                "rows": [],
+                "rentable": False,
+                "manifest_digest": None,
+                "transfer_bytes": 0,
+                "output_allowance_bytes": None,
+                "disk_gb": None,
+            }
+        )
+        service = mock.Mock()
+        service.preflight = mock.AsyncMock(return_value=preflight)
+        service.approve_mapping = mock.AsyncMock(
+            return_value={
+                "class_type": "Fancy",
+                "source_kind": "approved",
+                "approved": True,
+            }
+        )
+        service.register_agent_suggestion = mock.AsyncMock(
+            return_value={
+                "class_type": "Fancy",
+                "source_kind": "agent",
+                "approved": False,
+            }
+        )
+        service.provider_mutations = []
+        handlers = captured_handlers(service_factory=lambda: service)
+
+        preflight_response = asyncio.run(
+            handlers[("POST", "/cloud-run/api/preflights")](
+                FakeRequest(
+                    {
+                        "capture_id": "capture-1",
+                        "explicit_output_allowance_bytes": 1024,
+                    }
+                )
+            )
+        )
+        mapping_response = asyncio.run(
+            handlers[
+                ("PUT", "/cloud-run/api/mappings/{mapping_id}")
+            ](
+                FakeRequest(
+                    {"candidate_digest": "a" * 64},
+                    match_info={"mapping_id": "Fancy"},
+                )
+            )
+        )
+        suggestion = {
+            "class_type": "Fancy",
+            "candidate": {
+                "repository_url": "https://github.com/acme/fancy",
+                "revision": "b" * 40,
+            },
+        }
+        agent_response = asyncio.run(
+            handlers[
+                (
+                    "POST",
+                    "/cloud-run/api/integrations/agent-panel/suggestions",
+                )
+            ](FakeRequest(suggestion))
+        )
+
+        service.preflight.assert_awaited_once_with(
+            "capture-1",
+            explicit_output_allowance_bytes=1024,
+        )
+        service.approve_mapping.assert_awaited_once_with(
+            "Fancy",
+            "a" * 64,
+        )
+        service.register_agent_suggestion.assert_awaited_once_with(
+            suggestion
+        )
+        self.assertEqual(preflight_response.status, 200)
+        self.assertEqual(mapping_response.status, 200)
+        self.assertEqual(agent_response.status, 202)
+        self.assertFalse(agent_response.payload["approved"])
+        self.assertEqual(service.provider_mutations, [])
+
+    def test_preflight_routes_reject_extra_or_missing_fields(self):
+        service = mock.Mock()
+        service.preflight = mock.AsyncMock()
+        service.approve_mapping = mock.AsyncMock()
+        service.register_agent_suggestion = mock.AsyncMock()
+        handlers = captured_handlers(service_factory=lambda: service)
+
+        responses = [
+            asyncio.run(
+                handlers[("POST", "/cloud-run/api/preflights")](
+                    FakeRequest(
+                        {"capture_id": "capture-1", "unexpected": True}
+                    )
+                )
+            ),
+            asyncio.run(
+                handlers[
+                    ("PUT", "/cloud-run/api/mappings/{mapping_id}")
+                ](
+                    FakeRequest(
+                        {},
+                        match_info={"mapping_id": "Fancy"},
+                    )
+                )
+            ),
+            asyncio.run(
+                handlers[
+                    (
+                        "POST",
+                        "/cloud-run/api/integrations/agent-panel/suggestions",
+                    )
+                ](
+                    FakeRequest(
+                        {
+                            "class_type": "Fancy",
+                            "candidate": {},
+                            "command": "forbidden",
+                        }
+                    )
+                )
+            ),
+        ]
+
+        self.assertTrue(all(response.status == 400 for response in responses))
+        service.preflight.assert_not_awaited()
+        service.approve_mapping.assert_not_awaited()
+        service.register_agent_suggestion.assert_not_awaited()
 
 
 class CacheRouteTests(unittest.TestCase):

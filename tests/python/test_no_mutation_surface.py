@@ -32,6 +32,12 @@ class ProviderMutationSurfaceTests(unittest.TestCase):
                 ("GET", "/cloud-run/api/settings"),
                 ("PUT", "/cloud-run/api/settings"),
                 ("POST", "/cloud-run/api/captures"),
+                ("POST", "/cloud-run/api/preflights"),
+                ("PUT", "/cloud-run/api/mappings/{mapping_id}"),
+                (
+                    "POST",
+                    "/cloud-run/api/integrations/agent-panel/suggestions",
+                ),
                 (
                     "POST",
                     "/cloud-run/api/cache/artifacts/{artifact_id}",
@@ -44,6 +50,24 @@ class ProviderMutationSurfaceTests(unittest.TestCase):
                 ("DELETE", "/cloud-run/api/attempts/{attempt_id}"),
             },
         )
+
+    def test_agent_suggestion_route_has_no_provider_or_lifecycle_capability(self):
+        handler = captured_handlers()[
+            (
+                "POST",
+                "/cloud-run/api/integrations/agent-panel/suggestions",
+            )
+        ]
+        source = inspect.getsource(handler).casefold()
+        for forbidden in (
+            "confirm",
+            "destroy",
+            "lifecycle",
+            "offer",
+            "provider",
+            "vast",
+        ):
+            self.assertNotIn(forbidden, source)
 
     def test_vast_module_uses_only_the_approved_provider_origins_and_methods(self):
         source_path = REPOSITORY_ROOT / "cloud_run" / "vast.py"

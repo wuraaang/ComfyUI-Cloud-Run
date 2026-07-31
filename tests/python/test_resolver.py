@@ -303,6 +303,25 @@ class DependencyResolverTests(unittest.TestCase):
             },
         )
         cache_catalog = FakeCacheCatalog()
+        resolution_context = {
+            "metadata": {
+                "ApprovedNode": {
+                    "model_name": FileInputMetadata(
+                        kind="model",
+                        category="upscale_models",
+                    )
+                }
+            },
+            "model_roots": {"upscale_models": (model_root,)},
+            "input_root": input_root,
+            "source_mappings": {
+                model_digest: SourceSpec(
+                    "local-upload",
+                    "local-upload:approved-model",
+                )
+            },
+            "base_bytes": 40 * GIB,
+        }
         resolver = DependencyResolver(
             host=FakeHost(
                 {
@@ -314,28 +333,12 @@ class DependencyResolverTests(unittest.TestCase):
             repository=self.repository,
             registry=FakeRegistry({}),
             cache_catalog=cache_catalog,
+            resolution_context=resolution_context,
         )
 
         result = asyncio.run(
-            resolver.resolve_dependencies(
+            resolver.resolve_preflight(
                 capture,
-                metadata={
-                    "ApprovedNode": {
-                        "model_name": FileInputMetadata(
-                            kind="model",
-                            category="upscale_models",
-                        )
-                    }
-                },
-                model_roots={"upscale_models": (model_root,)},
-                input_root=input_root,
-                source_mappings={
-                    model_digest: SourceSpec(
-                        "local-upload",
-                        "local-upload:approved-model",
-                    )
-                },
-                base_bytes=40 * GIB,
                 explicit_output_allowance_bytes=None,
             )
         )

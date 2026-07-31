@@ -42,6 +42,7 @@ PY
 
 echo "[check] JavaScript syntax"
 "$node_command" --check web/js/cloud-run.js
+"$node_command" --check web/js/session-console.js
 "$node_command" --check tests/js/fake-dom.mjs
 "$node_command" --check tests/js/cloud-run-ui.test.mjs
 
@@ -171,6 +172,12 @@ allowed_cloud_run_routes = {
     ("GET", "/cloud-run/api/settings"),
     ("PUT", "/cloud-run/api/settings"),
     ("POST", "/cloud-run/api/captures"),
+    ("POST", "/cloud-run/api/preflights"),
+    ("PUT", "/cloud-run/api/mappings/{mapping_id}"),
+    (
+        "POST",
+        "/cloud-run/api/integrations/agent-panel/suggestions",
+    ),
     ("POST", "/cloud-run/api/cache/artifacts/{artifact_id}"),
     ("POST", "/cloud-run/api/offers"),
     ("POST", "/cloud-run/api/quotes"),

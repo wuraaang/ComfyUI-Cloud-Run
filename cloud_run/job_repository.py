@@ -63,6 +63,14 @@ class InstalledDependency:
     destination: str
 
 
+@dataclass(frozen=True)
+class StoredPreflight:
+    preflight_id: str
+    capture_id: str
+    payload: dict
+    created_at: float
+
+
 _JOB_COLUMNS = """
     job_id, session_id, idempotency_key, state, prompt_digest, capture_json,
     manifest_digest, remote_prompt_id, sanitized_error, created_at, updated_at,
@@ -333,6 +341,78 @@ class JobRepository:
             row["capture_id"],
             row["capture_json"],
             row["prompt_digest"],
+        )
+
+    def save_preflight(
+        self,
+        preflight_id,
+        capture_id,
+        payload,
+        *,
+        created_at=None,
+    ):
+        identifier = _require_identifier(preflight_id, "preflight ID")
+        capture_identifier = _require_identifier(capture_id, "capture ID")
+        if not isinstance(payload, dict):
+            raise ValueError("Preflight result must be an object.")
+        encoded = _canonical_json(payload)
+        timestamp = float(time.time() if created_at is None else created_at)
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                """
+                SELECT capture_id, result_json
+                FROM preflights
+                WHERE preflight_id = ?
+                """,
+                (identifier,),
+            ).fetchone()
+            if existing is not None and (
+                existing["capture_id"] != capture_identifier
+                or existing["result_json"] != encoded
+            ):
+                connection.rollback()
+                raise ValueError(
+                    "A preflight identity cannot change content."
+                )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO preflights(
+                    preflight_id, capture_id, result_json, created_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    identifier,
+                    capture_identifier,
+                    encoded,
+                    timestamp,
+                ),
+            )
+            connection.commit()
+
+    def get_preflight(self, preflight_id):
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                """
+                SELECT preflight_id, capture_id, result_json, created_at
+                FROM preflights
+                WHERE preflight_id = ?
+                """,
+                (str(preflight_id),),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            payload = json.loads(row["result_json"])
+        except (json.JSONDecodeError, TypeError):
+            raise ValueError("Stored preflight is invalid.") from None
+        if not isinstance(payload, dict):
+            raise ValueError("Stored preflight is invalid.")
+        return StoredPreflight(
+            preflight_id=row["preflight_id"],
+            capture_id=row["capture_id"],
+            payload=payload,
+            created_at=float(row["created_at"]),
         )
 
     def append_event(

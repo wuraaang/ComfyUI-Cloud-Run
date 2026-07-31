@@ -140,6 +140,16 @@ def _initialize_database(path):
             )
             connection.execute(
                 """
+                CREATE TABLE IF NOT EXISTS preflights (
+                    preflight_id TEXT PRIMARY KEY,
+                    capture_id TEXT NOT NULL,
+                    result_json TEXT NOT NULL,
+                    created_at REAL NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS job_events (
                     job_id TEXT NOT NULL,
                     sequence INTEGER NOT NULL,
@@ -220,7 +230,7 @@ def _initialize_database(path):
             _migrate_legacy_attempts(connection)
             connection.execute(
                 """
-                INSERT INTO schema_meta(key, value) VALUES('schema_version', '2')
+                INSERT INTO schema_meta(key, value) VALUES('schema_version', '3')
                 ON CONFLICT(key) DO UPDATE SET value = excluded.value
                 """
             )

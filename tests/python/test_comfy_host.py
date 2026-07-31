@@ -2,6 +2,7 @@ import types
 import unittest
 from pathlib import Path
 
+from cloud_run.artifacts import FileInputMetadata
 from cloud_run.comfy_host import (
     ComfyHost,
     HostCompatibilityError,
@@ -155,6 +156,78 @@ class ComfyHostTests(unittest.TestCase):
             forbidden.describe_node("X")
         with self.assertRaises(HostCompatibilityError):
             escaped.describe_node("X")
+
+    def test_file_widget_metadata_comes_from_running_node_contracts(self):
+        host = ComfyHost(
+            comfy_root=Path("/safe/ComfyUI"),
+            custom_nodes_root=Path("/safe/ComfyUI/custom_nodes"),
+            node_records={
+                "Upscale": NodeRecord(
+                    "/safe/ComfyUI/nodes.py",
+                    "nodes",
+                    input_types={
+                        "required": {
+                            "model_name": (
+                                ["upscaler.pth"],
+                                {},
+                            ),
+                            "strength": ("FLOAT", {}),
+                        }
+                    },
+                ),
+                "LoadImage": NodeRecord(
+                    "/safe/ComfyUI/nodes.py",
+                    "nodes",
+                    input_types={
+                        "required": {
+                            "image": (
+                                ["source.jpg"],
+                                {"image_upload": True},
+                            )
+                        }
+                    },
+                ),
+            },
+            version_reader=lambda: ("0.29.0", "1.47.10", "3.13.12"),
+        )
+        capture = types.SimpleNamespace(
+            output={
+                "1": {
+                    "class_type": "Upscale",
+                    "inputs": {
+                        "model_name": "upscaler.pth",
+                        "strength": 0.5,
+                    },
+                },
+                "2": {
+                    "class_type": "LoadImage",
+                    "inputs": {"image": "source.jpg"},
+                },
+            }
+        )
+
+        metadata = host.file_input_metadata(
+            capture,
+            model_filenames={
+                "upscale_models": {"upscaler.pth"},
+                "checkpoints": set(),
+            },
+        )
+
+        self.assertEqual(
+            metadata,
+            {
+                "Upscale": {
+                    "model_name": FileInputMetadata(
+                        kind="model",
+                        category="upscale_models",
+                    )
+                },
+                "LoadImage": {
+                    "image": FileInputMetadata(kind="input"),
+                },
+            },
+        )
 
 
 if __name__ == "__main__":

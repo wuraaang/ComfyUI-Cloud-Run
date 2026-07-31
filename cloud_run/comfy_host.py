@@ -11,6 +11,7 @@ import platform
 import re
 import subprocess
 
+from .artifacts import FileInputMetadata
 from .manifest import ManifestValidationError, normalize_github_repository
 
 
@@ -31,6 +32,7 @@ class NodeNotFound(LookupError):
 class NodeRecord:
     source_path: str
     module_name: str
+    input_types: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -148,9 +150,16 @@ class ComfyHost:
                 )
             except (OSError, TypeError):
                 continue
+            try:
+                input_types = node_class.INPUT_TYPES()
+            except Exception:
+                input_types = None
+            if not isinstance(input_types, dict):
+                input_types = None
             records[str(class_type)] = NodeRecord(
                 source_path=str(source_path),
                 module_name=str(getattr(node_class, "__module__", "")),
+                input_types=input_types,
             )
         root = Path(folder_paths.base_path)
         return cls(
@@ -275,3 +284,88 @@ class ComfyHost:
             repository_url=identity[0] if identity else None,
             revision=identity[1] if identity else None,
         )
+
+    def file_input_metadata(self, capture, *, model_filenames):
+        self.assert_compatible()
+        if not isinstance(model_filenames, dict) or not all(
+            isinstance(category, str)
+            and isinstance(filenames, (set, frozenset))
+            for category, filenames in model_filenames.items()
+        ):
+            raise HostCompatibilityError(
+                "ComfyUI model metadata is unavailable."
+            )
+        output = getattr(capture, "output", None)
+        if not isinstance(output, dict):
+            raise HostCompatibilityError(
+                "Compiled prompt metadata is unavailable."
+            )
+        metadata = {}
+        for node in output.values():
+            if not isinstance(node, dict):
+                continue
+            class_type = str(node.get("class_type") or "")
+            inputs = node.get("inputs")
+            record = (self.node_records or {}).get(class_type)
+            if (
+                not isinstance(record, NodeRecord)
+                or not isinstance(record.input_types, dict)
+                or not isinstance(inputs, dict)
+            ):
+                continue
+            specifications = {}
+            for section in ("required", "optional"):
+                values = record.input_types.get(section, {})
+                if isinstance(values, dict):
+                    specifications.update(values)
+            class_metadata = metadata.setdefault(class_type, {})
+            for input_name, value in inputs.items():
+                if not isinstance(value, str):
+                    continue
+                specification = specifications.get(input_name)
+                if (
+                    not isinstance(specification, (tuple, list))
+                    or not specification
+                ):
+                    continue
+                input_type = specification[0]
+                options = (
+                    specification[1]
+                    if len(specification) > 1
+                    and isinstance(specification[1], dict)
+                    else {}
+                )
+                upload = options.get("image_upload") is True or (
+                    isinstance(input_type, str)
+                    and input_type
+                    in {
+                        "AUDIO_UPLOAD",
+                        "FILE_UPLOAD",
+                        "IMAGE_UPLOAD",
+                        "VIDEO_UPLOAD",
+                    }
+                )
+                if upload:
+                    class_metadata[input_name] = FileInputMetadata(
+                        kind="input"
+                    )
+                    continue
+                if not isinstance(input_type, (tuple, list)):
+                    continue
+                matching_categories = sorted(
+                    category
+                    for category, filenames in model_filenames.items()
+                    if value in filenames
+                )
+                if len(matching_categories) > 1:
+                    raise HostCompatibilityError(
+                        "ComfyUI model filename category is ambiguous."
+                    )
+                if len(matching_categories) == 1:
+                    class_metadata[input_name] = FileInputMetadata(
+                        kind="model",
+                        category=matching_categories[0],
+                    )
+            if not class_metadata:
+                metadata.pop(class_type, None)
+        return metadata

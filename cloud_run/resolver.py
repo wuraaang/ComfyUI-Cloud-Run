@@ -120,11 +120,13 @@ class DependencyResolver:
         repository,
         registry,
         cache_catalog=None,
+        resolution_context=None,
     ):
         self.host = host
         self.repository = repository
         self.registry = registry
         self.cache_catalog = cache_catalog
+        self.resolution_context = resolution_context
 
     def register_agent_suggestion(self, payload):
         if not isinstance(payload, dict) or set(payload) != {
@@ -385,4 +387,36 @@ class DependencyResolver:
             output_allowance_bytes=output_allowance,
             disk_gb=disk_gb,
             rentable=nodes.rentable and artifact_result.rentable,
+        )
+
+    async def resolve_preflight(
+        self,
+        capture,
+        *,
+        explicit_output_allowance_bytes=None,
+    ):
+        context = self.resolution_context
+        if callable(context):
+            context = context(capture)
+        required = {
+            "metadata",
+            "model_roots",
+            "input_root",
+            "source_mappings",
+            "base_bytes",
+        }
+        if not isinstance(context, dict) or set(context) != required:
+            raise MappingValidationError(
+                "Dependency resolution context is unavailable."
+            )
+        return await self.resolve_dependencies(
+            capture,
+            metadata=context["metadata"],
+            model_roots=context["model_roots"],
+            input_root=context["input_root"],
+            source_mappings=context["source_mappings"],
+            base_bytes=context["base_bytes"],
+            explicit_output_allowance_bytes=(
+                explicit_output_allowance_bytes
+            ),
         )

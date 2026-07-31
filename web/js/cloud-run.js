@@ -1,8 +1,10 @@
 import { captureOfficialQueuePayload } from "./canvas-adapter.js";
 import { fetchJson, postCapture } from "./cloud-run-api.js";
+import { createSessionConsole } from "./session-console.js";
 
 
 const SETTINGS_ENDPOINT = "/cloud-run/api/settings";
+const PREFLIGHTS_ENDPOINT = "/cloud-run/api/preflights";
 const OFFERS_ENDPOINT = "/cloud-run/api/offers";
 const QUOTES_ENDPOINT = "/cloud-run/api/quotes";
 const OFFICIAL_TEMPLATE_ID = "027fba7753c024be019030fb42aed900";
@@ -126,6 +128,14 @@ function ensureStyles(document) {
   border-radius: 7px;
   background: rgba(127,127,127,.12);
 }
+.cloud-run-session-console {
+  margin: 12px 0;
+  padding: 10px;
+  border: 1px solid var(--border-color, #4b5563);
+  border-radius: 7px;
+}
+.cloud-run-session-console h3 { margin: 0 0 8px; }
+.cloud-run-preflight-rows { display: grid; gap: 4px; margin: 8px 0; }
 `;
   document.head.appendChild(style);
 }
@@ -524,6 +534,28 @@ export function mountCloudRun(
     openLink,
     destroyButton,
   );
+  const preflightConsole = createSessionConsole(
+    document,
+    {
+      async preflight(captureId, explicitOutputAllowanceBytes) {
+        const payload = { capture_id: captureId };
+        if (explicitOutputAllowanceBytes !== null) {
+          payload.explicit_output_allowance_bytes =
+            explicitOutputAllowanceBytes;
+        }
+        return fetchJson(fetchImpl, PREFLIGHTS_ENDPOINT, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+      },
+    },
+    {
+      id: "cloud-run-dependency-console",
+      searchButton,
+      manageSearch: false,
+    },
+  );
 
   const status = createElement(document, "div", {
     id: "cloud-run-status",
@@ -546,7 +578,13 @@ export function mountCloudRun(
   appendField(document, card, "Vast API key", apiKeyInput);
   appendField(document, card, "Maximum hourly price ($/h)", priceInput);
   appendField(document, card, "Minimum VRAM (GB)", vramInput);
-  card.append(actions, status, offers, selectionPreview);
+  card.append(
+    preflightConsole.root,
+    actions,
+    status,
+    offers,
+    selectionPreview,
+  );
   dialog.appendChild(card);
 
   let selectedOffer = null;
@@ -568,6 +606,19 @@ export function mountCloudRun(
     status,
   };
 
+  function requiresPreflight() {
+    const context = record?.captureContext ?? captureContext;
+    return Boolean(
+      context.app
+      && context.api
+      && typeof context.onCapture === "function"
+    );
+  }
+
+  function offersUnlocked() {
+    return !requiresPreflight() || Boolean(preflightConsole.preflightId);
+  }
+
   function clearPoll() {
     if (
       pollTimer !== null &&
@@ -581,15 +632,16 @@ export function mountCloudRun(
   function renderCurrent() {
     if (currentAttempt) {
       renderAttemptState(document, elements, currentAttempt, busy);
-      return;
+    } else {
+      saveButton.disabled = busy;
+      searchButton.disabled = busy;
+      previewButton.disabled = busy || !selectedOffer;
+      confirmButton.hidden = true;
+      cancelButton.hidden = true;
+      openLink.hidden = true;
+      destroyButton.hidden = true;
     }
-    saveButton.disabled = busy;
-    searchButton.disabled = busy;
-    previewButton.disabled = busy || !selectedOffer;
-    confirmButton.hidden = true;
-    cancelButton.hidden = true;
-    openLink.hidden = true;
-    destroyButton.hidden = true;
+    if (!offersUnlocked()) searchButton.disabled = true;
   }
 
   function setBusy(value) {
@@ -650,10 +702,16 @@ export function mountCloudRun(
         app: context.app,
         api: context.api,
       });
+      let persisted = null;
       if (typeof context.onCapture === "function") {
-        await context.onCapture(capture);
+        persisted = await context.onCapture(capture);
       }
       record.currentCapture = capture;
+      preflightConsole.setCapture(
+        typeof persisted?.capture_id === "string"
+          ? persisted.capture_id
+          : null,
+      );
       status.textContent =
         "Current canvas captured without local execution.";
     } catch (error) {
@@ -722,6 +780,11 @@ export function mountCloudRun(
   });
 
   searchButton.addEventListener("click", async () => {
+    if (!offersUnlocked()) {
+      status.textContent =
+        "Run and resolve the free dependency preflight first.";
+      return;
+    }
     clearPoll();
     selectedOffer = null;
     currentAttempt = null;
@@ -733,6 +796,14 @@ export function mountCloudRun(
     try {
       const result = await fetchJson(fetchImpl, OFFERS_ENDPOINT, {
         method: "POST",
+        headers: requiresPreflight()
+          ? { "Content-Type": "application/json" }
+          : undefined,
+        body: requiresPreflight()
+          ? JSON.stringify({
+              preflight_id: preflightConsole.preflightId,
+            })
+          : undefined,
       });
       if (!Array.isArray(result.offers)) throw new Error("search failed");
       renderOffers(document, offers, result.offers, (offer) => {
@@ -886,8 +957,11 @@ export function mountCloudRun(
     launcher,
     observer: null,
     openDialog,
+    preflightConsole,
+    renderCurrent,
   };
   mountedCloudRuns.set(document, record);
+  renderCurrent();
   ensureLauncherPlacement(browserWindow, document, record);
   return launcher;
 }
@@ -964,6 +1038,7 @@ export {
   OFFICIAL_TEMPLATE_NAME,
   OPEN_COMMAND_ID,
   QUOTES_ENDPOINT,
+  PREFLIGHTS_ENDPOINT,
   SETTINGS_ENDPOINT,
 };
 

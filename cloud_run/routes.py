@@ -1,11 +1,23 @@
 """Allowlisted same-origin routes for the managed Cloud Run lifecycle."""
 
+import os
+from pathlib import Path
+import re
+
+from .artifacts import GIB
 from .capture import CaptureValidationError
+from .comfy_host import ComfyHost, FORBIDDEN_TREE, HostCompatibilityError
 from .constants import OFFICIAL_TEMPLATE_ID, OFFICIAL_TEMPLATE_NAME
+from .dependency_repository import (
+    DependencyRepository,
+    MappingValidationError,
+)
 from .job_repository import JobRepository
 from .lifecycle import CloudRunLifecycle
 from .offers import HostBlacklist
 from .repository import AttemptRepository
+from .registry import RegistryClient
+from .resolver import DependencyResolver
 from .r2 import R2TransferError, R2ValidationError
 from .service import (
     AttemptNotFound,
@@ -14,6 +26,7 @@ from .service import (
     QuoteUnavailable,
     VastProvider,
 )
+from .session_service import SessionService, SessionServiceError
 from .settings import (
     SettingsStore,
     SettingsValidationError,
@@ -27,11 +40,129 @@ from .vast import (
 )
 
 
+_MODEL_CATEGORY = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}")
+_PREFLIGHT_WORKER_VERSION = "preflight-v1"
+_BASE_ENVIRONMENT_BYTES = 40 * GIB
+
+
+def _lexical_path(value):
+    return Path(os.path.abspath(os.fspath(value)))
+
+
+def _forbidden_path(path):
+    try:
+        path.relative_to(FORBIDDEN_TREE)
+    except ValueError:
+        return False
+    return True
+
+
+def _runtime_resolution_context(host):
+    def context(capture):
+        try:
+            import folder_paths
+        except ImportError:
+            raise HostCompatibilityError(
+                "ComfyUI asset metadata is unavailable."
+            ) from None
+        configured = getattr(folder_paths, "folder_names_and_paths", None)
+        if not isinstance(configured, dict):
+            raise HostCompatibilityError(
+                "ComfyUI model roots are unavailable."
+            )
+        model_roots = {}
+        model_filenames = {}
+        for category, record in configured.items():
+            if (
+                not isinstance(category, str)
+                or not _MODEL_CATEGORY.fullmatch(category)
+                or not isinstance(record, (tuple, list))
+                or not record
+            ):
+                continue
+            raw_roots = record[0]
+            if isinstance(raw_roots, (str, os.PathLike)):
+                raw_roots = (raw_roots,)
+            if not isinstance(raw_roots, (tuple, list)):
+                continue
+            roots = tuple(_lexical_path(root) for root in raw_roots)
+            if any(_forbidden_path(root) for root in roots):
+                raise HostCompatibilityError("Forbidden model root.")
+            try:
+                filenames = folder_paths.get_filename_list(category)
+            except Exception:
+                continue
+            if (
+                not isinstance(filenames, (tuple, list))
+                or len(filenames) > 200_000
+                or not all(isinstance(name, str) for name in filenames)
+            ):
+                continue
+            model_roots[category] = roots
+            model_filenames[category] = set(filenames)
+        try:
+            input_root = _lexical_path(folder_paths.get_input_directory())
+        except Exception:
+            raise HostCompatibilityError(
+                "ComfyUI input root is unavailable."
+            ) from None
+        if _forbidden_path(input_root):
+            raise HostCompatibilityError("Forbidden input root.")
+        return {
+            "metadata": host.file_input_metadata(
+                capture,
+                model_filenames=model_filenames,
+            ),
+            "model_roots": model_roots,
+            "input_root": input_root,
+            "source_mappings": {},
+            "base_bytes": _BASE_ENVIRONMENT_BYTES,
+        }
+
+    return context
+
+
+class _RuntimeResolver:
+    def __init__(self, dependency_repository):
+        self.dependency_repository = dependency_repository
+
+    async def resolve_preflight(
+        self,
+        capture,
+        *,
+        explicit_output_allowance_bytes=None,
+    ):
+        host = ComfyHost.from_running_host()
+        resolver = DependencyResolver(
+            host=host,
+            repository=self.dependency_repository,
+            registry=RegistryClient(),
+            resolution_context=_runtime_resolution_context(host),
+        )
+        return await resolver.resolve_preflight(
+            capture,
+            explicit_output_allowance_bytes=(
+                explicit_output_allowance_bytes
+            ),
+        )
+
+    def register_agent_suggestion(self, payload):
+        resolver = DependencyResolver(
+            host=None,
+            repository=self.dependency_repository,
+            registry=None,
+        )
+        return resolver.register_agent_suggestion(payload)
+
+
 def build_service():
     data_directory = resolve_data_directory()
     settings_store = SettingsStore(data_directory)
     repository = AttemptRepository(data_directory / "attempts.sqlite3")
     job_repository = JobRepository(data_directory / "attempts.sqlite3")
+    dependency_repository = DependencyRepository(
+        data_directory / "attempts.sqlite3"
+    )
     blacklist = HostBlacklist(data_directory / "host-blacklist.json")
     provider = VastProvider()
     lifecycle = CloudRunLifecycle(
@@ -40,7 +171,7 @@ def build_service():
         provider=provider,
         blacklist=blacklist,
     )
-    return CloudRunService(
+    service = CloudRunService(
         settings_store,
         repository,
         job_repository=job_repository,
@@ -48,6 +179,15 @@ def build_service():
         blacklist=blacklist,
         lifecycle=lifecycle,
     )
+    resolver = _RuntimeResolver(dependency_repository)
+    service.session_service = SessionService(
+        job_repository=job_repository,
+        resolver=resolver,
+        offer_search=service._search_without_preflight,
+        mapping_repository=dependency_repository,
+        worker_version=_PREFLIGHT_WORKER_VERSION,
+    )
+    return service
 
 
 def _attempt_payload(attempt):
@@ -84,7 +224,15 @@ def register_routes(service_factory=None):
     make_service = service_factory or build_service
 
     def service_error(error):
-        if isinstance(error, (CaptureValidationError, CloudRunValidationError)):
+        if isinstance(
+            error,
+            (
+                CaptureValidationError,
+                CloudRunValidationError,
+                SessionServiceError,
+                MappingValidationError,
+            ),
+        ):
             return web.json_response({"error": str(error)}, status=400)
         if isinstance(error, R2ValidationError):
             return web.json_response({"error": str(error)}, status=400)
@@ -156,6 +304,60 @@ def register_routes(service_factory=None):
             }
         )
 
+    @routes.post("/cloud-run/api/preflights")
+    async def post_preflight(request):
+        try:
+            payload = await _request_payload(
+                request,
+                allowed={
+                    "capture_id",
+                    "explicit_output_allowance_bytes",
+                },
+                required={"capture_id"},
+            )
+            result = await make_service().preflight(
+                payload["capture_id"],
+                explicit_output_allowance_bytes=payload.get(
+                    "explicit_output_allowance_bytes"
+                ),
+            )
+        except Exception as error:
+            return service_error(error)
+        return web.json_response(result.public_payload())
+
+    @routes.put("/cloud-run/api/mappings/{mapping_id}")
+    async def put_mapping(request):
+        try:
+            payload = await _request_payload(
+                request,
+                allowed={"candidate_digest"},
+                required={"candidate_digest"},
+            )
+            result = await make_service().approve_mapping(
+                request.match_info.get("mapping_id", ""),
+                payload["candidate_digest"],
+            )
+        except Exception as error:
+            return service_error(error)
+        return web.json_response(result)
+
+    @routes.post(
+        "/cloud-run/api/integrations/agent-panel/suggestions"
+    )
+    async def post_agent_suggestion(request):
+        try:
+            payload = await _request_payload(
+                request,
+                allowed={"class_type", "candidate"},
+                required={"class_type", "candidate"},
+            )
+            result = await make_service().register_agent_suggestion(
+                payload
+            )
+        except Exception as error:
+            return service_error(error)
+        return web.json_response(result, status=202)
+
     @routes.post("/cloud-run/api/cache/artifacts/{artifact_id}")
     async def post_cache_artifact(request):
         try:
@@ -177,9 +379,14 @@ def register_routes(service_factory=None):
         return web.json_response(result.public_payload())
 
     @routes.post("/cloud-run/api/offers")
-    async def post_offers(_request):
+    async def post_offers(request):
         try:
-            offers = await make_service().search()
+            payload = await _request_payload(
+                request,
+                allowed={"preflight_id"},
+                required={"preflight_id"},
+            )
+            offers = await make_service().search(payload["preflight_id"])
         except Exception as error:
             return service_error(error)
         return web.json_response({"offers": offers})

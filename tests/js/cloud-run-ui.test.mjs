@@ -354,6 +354,93 @@ test("registered Cloud Run persists the native capture through same-origin API",
   assert.deepEqual(localSubmissions, []);
 });
 
+test("registered Cloud Run gates offers behind the persisted preflight", async () => {
+  const document = new FakeDocument();
+  mountLocalRunButton(document);
+  const requests = [];
+  let extension = null;
+  const responses = [
+    settingsResponse(),
+    jsonResponse({
+      capture_id: "capture-server-id",
+      prompt_digest: "a".repeat(64),
+      status: "captured",
+    }),
+    jsonResponse({
+      preflight_id: "preflight-1",
+      capture_id: "capture-server-id",
+      rows: [],
+      rentable: true,
+      manifest_digest: "b".repeat(64),
+      transfer_bytes: 0,
+      output_allowance_bytes: 1024,
+      disk_gb: 80,
+    }),
+    jsonResponse({ offers: [] }),
+  ];
+  const api = {
+    async fetchApi(...args) {
+      requests.push(args);
+      return responses.shift();
+    },
+    async queuePrompt() {
+      assert.fail("Cloud capture must restore before local submission");
+    },
+  };
+  const app = {
+    registerExtension(specification) {
+      extension = specification;
+    },
+    async queuePrompt(number) {
+      await api.queuePrompt(
+        number,
+        {
+          workflow: {
+            version: 1,
+            nodes: [{ id: 1 }],
+            extra: { frontendVersion: "1.47.10" },
+          },
+          output: {
+            "1": {
+              class_type: "KSampler",
+              inputs: { seed: 7 },
+            },
+          },
+        },
+        {},
+      );
+    },
+  };
+  const browserWindow = {
+    comfyAPI: { app: { app }, api: { api } },
+    setTimeout() {
+      assert.fail("ready APIs must not schedule a retry");
+    },
+  };
+
+  registerCloudRunWhenReady(browserWindow, document);
+  await extension.setup();
+  await document.getElementById("cloud-run-button").click();
+
+  const search = document.getElementById("cloud-run-search");
+  assert.equal(search.disabled, true);
+  const allowance = document.getElementById("cloud-run-output-allowance");
+  allowance.value = "1024";
+  await document.getElementById("cloud-run-preflight").click();
+  assert.equal(requests[2][0], "/cloud-run/api/preflights");
+  assert.deepEqual(JSON.parse(requests[2][1].body), {
+    capture_id: "capture-server-id",
+    explicit_output_allowance_bytes: 1024,
+  });
+  assert.equal(search.disabled, false);
+
+  await search.click();
+  assert.equal(requests[3][0], "/cloud-run/api/offers");
+  assert.deepEqual(JSON.parse(requests[3][1].body), {
+    preflight_id: "preflight-1",
+  });
+});
+
 test("waits for a late local Run button and injects the launcher only once", async () => {
   const document = new FakeDocument();
   let extension = null;
@@ -1040,7 +1127,6 @@ test("frontend source has no HTML, browser-storage, URL, console, or mutation cr
     "sessionStorage",
     "URLSearchParams",
     "window.location",
-    "console.",
     "console.vast.ai",
     "/" + "asks",
     "/" + "instances",
@@ -1048,6 +1134,10 @@ test("frontend source has no HTML, browser-storage, URL, console, or mutation cr
   for (const snippet of forbiddenSnippets) {
     assert.equal(source.includes(snippet), false, `forbidden snippet: ${snippet}`);
   }
+  assert.doesNotMatch(
+    source,
+    /\bconsole\.(?:debug|error|info|log|warn)\s*\(/,
+  );
   assert.ok(source.includes('const SETTINGS_ENDPOINT = "/cloud-run/api/settings"'));
   assert.ok(source.includes('const OFFERS_ENDPOINT = "/cloud-run/api/offers"'));
   assert.ok(source.includes('const QUOTES_ENDPOINT = "/cloud-run/api/quotes"'));

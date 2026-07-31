@@ -98,6 +98,12 @@ class LoaderContractTests(unittest.TestCase):
                 ("GET", "/cloud-run/api/settings"),
                 ("PUT", "/cloud-run/api/settings"),
                 ("POST", "/cloud-run/api/captures"),
+                ("POST", "/cloud-run/api/preflights"),
+                ("PUT", "/cloud-run/api/mappings/{mapping_id}"),
+                (
+                    "POST",
+                    "/cloud-run/api/integrations/agent-panel/suggestions",
+                ),
                 (
                     "POST",
                     "/cloud-run/api/cache/artifacts/{artifact_id}",
