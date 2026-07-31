@@ -1,19 +1,70 @@
 # Remote Worker bootstrap review
 
-This document is the offline review handoff. It is not a release lock,
-publication record, Vast template, or permission to spend.
+This document is the offline review handoff and public source-publication
+record. It is not a release lock, Vast template, or permission to spend.
 
-Public source repository: https://github.com/wuraaang/ComfyUI-Cloud-Run. The
-repository exists, but this review does not claim a published branch, source
-commit, or fetched archive until those are separately verified.
-
-No worker archive or project-specific Vast template has been published. The
-repository intentionally contains no live `worker-release.json`. The unrelated
-ComfyRelay remote is retained as `comfy-relay-do-not-push` at
-https://github.com/wuraaang/comfy-relay.git and received no publication push.
+No worker archive or project-specific Vast template has been published.
 Publishing source alone does not create a worker release lock, authorize Vast
 activity, or convert the deterministic review artifact below into a live
 release.
+
+## Public source publication evidence — 2026-07-31
+
+Public source repository: https://github.com/wuraaang/ComfyUI-Cloud-Run
+
+Published source commit:
+`4627ffcd504cd3cbfdaa280921a9d09eba63f488`
+
+The repository was verified `PUBLIC` with default branch `main`. At the source
+publication boundary, both `main` and `feat/vast-cloud-run-lifecycle` resolved
+to that exact commit. The unrelated ComfyRelay remote is retained locally as
+`comfy-relay-do-not-push` at
+https://github.com/wuraaang/comfy-relay.git; its feature-branch query returned
+no ref and it received no publication push.
+
+Fetched archive URL:
+https://github.com/wuraaang/ComfyUI-Cloud-Run/archive/4627ffcd504cd3cbfdaa280921a9d09eba63f488.tar.gz
+
+Fetched archive size: `356149 bytes`
+
+Fetched archive SHA-256:
+`bf7727f35e2ec32103cf7eeaf329e0e094406a2503fdec1241328b3322aa681b`
+
+Observed redirect boundary: HTTP `302` from the requested `github.com` URL to
+`https://codeload.github.com/wuraaang/ComfyUI-Cloud-Run/tar.gz/4627ffcd504cd3cbfdaa280921a9d09eba63f488`.
+
+The fetched archive had one complete gzip member with no trailing or
+unconsumed bytes. Its tar contained 116 members under the single root
+`ComfyUI-Cloud-Run-4627ffcd504cd3cbfdaa280921a9d09eba63f488`, with no
+duplicate, unsafe path, symlink, hard link, device, or other special member.
+All 116 members carried PAX headers; UID/GID were zero, owner/group were
+`root`, modes were `0664` or `0775`, and the sole mtime was `1785488657`.
+All 15 reviewed worker files were present, with zero reviewed files missing
+and 88 additional repository files.
+
+The deterministic review artifact remained `51590 bytes` with SHA-256
+`783a8f180365f6401af69679ba7681401aa123c50d050ead47c4f6faeb8df06f`.
+It is not byte-identical to the fetched full-repository archive and its digest
+must not be copied into a live lock for those GitHub bytes.
+
+Current bootstrap result: `FAIL`.
+
+- `observed_final_url=FAIL`: the current bootstrap requires the returned URL
+  to equal the locked `github.com` URL and rejects the observed codeload
+  redirect.
+- `same_url_archive_shape=FAIL`: even with the returned URL simulated as equal,
+  the current bootstrap rejects the GitHub archive metadata and full-repository
+  layout, including PAX headers, non-normalized owner/mode/mtime values, the
+  commit root prefix, and additional files.
+
+These failures are release-blocking evidence. They do not authorize weakening
+redirect, archive, extraction, allowlist, digest, or shell restrictions.
+
+No project-specific Vast template has been created.
+No live worker-release.json has been created.
+No paid Gold run has occurred.
+No Vast provider mutation, worker release, tag, Registry publication, or GPU
+rental occurred during this source-publication audit.
 
 ## Deterministic review artifact
 

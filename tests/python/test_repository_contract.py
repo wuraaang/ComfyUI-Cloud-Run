@@ -170,6 +170,16 @@ class RepositoryContractTests(unittest.TestCase):
             "own-instance DELETE",
             "No worker archive or project-specific Vast template has been published",
             "ComfyRelay",
+            "Public source repository:",
+            "Published source commit:",
+            "Fetched archive URL:",
+            "Fetched archive size:",
+            "Fetched archive SHA-256:",
+            "Observed redirect boundary:",
+            "Current bootstrap result:",
+            "No project-specific Vast template has been created",
+            "No live worker-release.json has been created",
+            "No paid Gold run has occurred",
         ):
             with self.subTest(text=required_text):
                 self.assertIn(required_text, review)

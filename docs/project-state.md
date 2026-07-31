@@ -1,9 +1,9 @@
 # Project state
 
 Status: workflow-derived reusable sessions implemented and fake/offline
-certified on the pinned local ComfyUI Desktop environment. The correctly named
-public source repository has been created; source publication evidence and all
-real paid activity remain human-gated.
+certified on the pinned local ComfyUI Desktop environment. The exact reviewed
+source commit has been published and its immutable GitHub archive audited. All
+worker-template and real paid activity remains human-gated.
 
 Source of truth:
 
@@ -59,10 +59,11 @@ Source of truth:
 - No real Vast rental or Gold run has occurred.
 - No project-specific worker template has been published or pinned.
 - No live `worker-release.json` exists.
-- No provider mutation, upload, Registry publication, or remote push is part of
-  autonomous verification.
+- No Vast provider mutation, upload, Registry publication, worker release, or
+  GPU rental occurred.
 - Public source repository: https://github.com/wuraaang/ComfyUI-Cloud-Run.
-  Local `origin` points to the matching `.git` URL.
+  The audited source commit and fetched archive evidence are recorded in
+  `docs/remote-worker-bootstrap-review.md`.
 - The unrelated legacy remote `comfy-relay-do-not-push` points to
   https://github.com/wuraaang/comfy-relay.git. ComfyRelay received no push from
   this publication.
@@ -74,12 +75,17 @@ Source of truth:
 
 ## Next gated action
 
-A human must review `docs/remote-worker-bootstrap-review.md`, publish and audit
-the exact reviewed source commit, then inspect the fetched immutable GitHub
-archive. The worker archive, project-specific template, and matching private
-release lock remain pending separate review.
+The current bootstrap rejects both GitHub's observed redirect and the fetched
+archive's metadata/full-repository layout. The next action is not template
+creation: invoke `superpowers:brainstorming` for a narrowly scoped
+bootstrap/publication correction, obtain explicit design approval, then use
+`superpowers:writing-plans` and strict red-green TDD for a new immutable
+commit. Redirect, extraction, allowlist, digest, and shell restrictions remain
+fail-closed until that approved work is complete and reviewed.
 
-Only then can a separate paid Gold GO authorize all of:
+Only after a corrected public artifact is manually reviewed may separate
+authorization create a project-specific Vast template and its owner-private
+`0600` release lock. A later paid Gold GO must still state all of:
 
 1. maximum instance count;
 2. maximum hourly price;
