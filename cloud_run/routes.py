@@ -1,6 +1,8 @@
 """Allowlisted same-origin routes for the managed Cloud Run lifecycle."""
 
+from .capture import CaptureValidationError
 from .constants import OFFICIAL_TEMPLATE_ID, OFFICIAL_TEMPLATE_NAME
+from .job_repository import JobRepository
 from .lifecycle import CloudRunLifecycle
 from .offers import HostBlacklist
 from .repository import AttemptRepository
@@ -28,6 +30,7 @@ def build_service():
     data_directory = resolve_data_directory()
     settings_store = SettingsStore(data_directory)
     repository = AttemptRepository(data_directory / "attempts.sqlite3")
+    job_repository = JobRepository(data_directory / "attempts.sqlite3")
     blacklist = HostBlacklist(data_directory / "host-blacklist.json")
     provider = VastProvider()
     lifecycle = CloudRunLifecycle(
@@ -39,6 +42,7 @@ def build_service():
     return CloudRunService(
         settings_store,
         repository,
+        job_repository=job_repository,
         provider=provider,
         blacklist=blacklist,
         lifecycle=lifecycle,
@@ -79,7 +83,7 @@ def register_routes(service_factory=None):
     make_service = service_factory or build_service
 
     def service_error(error):
-        if isinstance(error, CloudRunValidationError):
+        if isinstance(error, (CaptureValidationError, CloudRunValidationError)):
             return web.json_response({"error": str(error)}, status=400)
         if isinstance(error, AttemptNotFound):
             return web.json_response({"error": str(error)}, status=404)
@@ -124,6 +128,25 @@ def register_routes(service_factory=None):
                 status=500,
             )
         return web.json_response(public_settings(settings))
+
+    @routes.post("/cloud-run/api/captures")
+    async def post_capture(request):
+        try:
+            payload = await _request_payload(
+                request,
+                allowed={"workflow", "output", "queue_options"},
+                required={"workflow", "output", "queue_options"},
+            )
+            capture = await make_service().capture(payload)
+        except Exception as error:
+            return service_error(error)
+        return web.json_response(
+            {
+                "capture_id": capture.capture_id,
+                "prompt_digest": capture.prompt_digest,
+                "status": "captured",
+            }
+        )
 
     @routes.post("/cloud-run/api/offers")
     async def post_offers(_request):

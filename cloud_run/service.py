@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 
+from .capture import CompiledCapture
 from .constants import DEFAULT_DISK_GB
 from .models import AttemptState, CloudAttempt, OfferQuote
 from .offers import apply_offer_policy
@@ -110,6 +111,7 @@ class CloudRunService:
         settings_store,
         repository,
         *,
+        job_repository=None,
         provider=None,
         blacklist=None,
         clock=None,
@@ -119,12 +121,23 @@ class CloudRunService:
     ):
         self.settings_store = settings_store
         self.repository = repository
+        self.job_repository = job_repository
         self.provider = provider or VastProvider()
         self.blacklist = blacklist
         self.clock = clock or time.time
         self.quote_ttl_seconds = float(quote_ttl_seconds)
         self.disk_gb = int(disk_gb)
         self.lifecycle = lifecycle
+
+    async def capture(self, payload):
+        if self.job_repository is None:
+            raise CloudRunError("Cloud Run capture storage is unavailable.")
+        capture = CompiledCapture.from_payload(payload)
+        self.job_repository.save_capture(
+            capture,
+            created_at=float(self.clock()),
+        )
+        return capture
 
     def _settings(self):
         settings = self.settings_store.load()

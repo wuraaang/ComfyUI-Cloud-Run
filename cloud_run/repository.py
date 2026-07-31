@@ -130,6 +130,16 @@ def _initialize_database(path):
             )
             connection.execute(
                 """
+                CREATE TABLE IF NOT EXISTS captures (
+                    capture_id TEXT PRIMARY KEY,
+                    prompt_digest TEXT NOT NULL,
+                    capture_json TEXT NOT NULL,
+                    created_at REAL NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS job_events (
                     job_id TEXT NOT NULL,
                     sequence INTEGER NOT NULL,

@@ -6,6 +6,7 @@ import types
 import unittest
 from unittest import mock
 
+from cloud_run.capture import CompiledCapture
 from cloud_run.routes import register_routes
 from cloud_run.models import AttemptState, CloudAttempt, OfferQuote
 from cloud_run.service import (
@@ -246,6 +247,48 @@ class OffersRouteTests(unittest.TestCase):
             response.payload, {"error": "Vast offer search is unavailable."}
         )
         self.assertNotIn(sensitive_marker, repr(response.payload))
+
+
+class CaptureRouteTests(unittest.TestCase):
+    def test_capture_route_persists_native_payload_without_provider_call(self):
+        class FakeCaptureService:
+            def __init__(self):
+                self.provider_mutations = []
+                self.received = None
+
+            async def capture(self, payload):
+                self.received = payload
+                return CompiledCapture.from_payload(payload)
+
+        service = FakeCaptureService()
+        handlers = captured_handlers(service_factory=lambda: service)
+        payload = {
+            "workflow": {
+                "version": 1,
+                "nodes": [{"id": 1}],
+                "extra": {"frontendVersion": "1.47.10"},
+            },
+            "output": {
+                "1": {
+                    "class_type": "KSampler",
+                    "inputs": {"seed": 7},
+                }
+            },
+            "queue_options": {},
+        }
+
+        response = asyncio.run(
+            handlers[("POST", "/cloud-run/api/captures")](
+                FakeRequest(payload)
+            )
+        )
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.payload["status"], "captured")
+        self.assertEqual(service.received, payload)
+        self.assertNotIn("workflow", response.payload)
+        self.assertNotIn("output", response.payload)
+        self.assertEqual(service.provider_mutations, [])
 
 
 def attempt(state=AttemptState.OFFER_SELECTED):

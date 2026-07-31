@@ -274,6 +274,86 @@ test("Cloud Run captures the official queue payload before the console callback"
   );
 });
 
+
+test("registered Cloud Run persists the native capture through same-origin API", async () => {
+  const document = new FakeDocument();
+  mountLocalRunButton(document);
+  const requests = [];
+  const localSubmissions = [];
+  let extension = null;
+  const api = {
+    async fetchApi(...args) {
+      requests.push(args);
+      if (requests.length === 1) return settingsResponse();
+      return jsonResponse({
+        capture_id: "capture-server-id",
+        prompt_digest: "a".repeat(64),
+        status: "captured",
+      });
+    },
+    async queuePrompt(...args) {
+      localSubmissions.push(args);
+      return { prompt_id: "local", node_errors: {} };
+    },
+  };
+  const app = {
+    registerExtension(specification) {
+      extension = specification;
+    },
+    async queuePrompt(number) {
+      await api.queuePrompt(
+        number,
+        {
+          workflow: {
+            version: 1,
+            nodes: [{ id: 1 }],
+            extra: { frontendVersion: "1.47.10" },
+          },
+          output: {
+            "1": {
+              class_type: "KSampler",
+              inputs: { seed: 7 },
+            },
+          },
+        },
+        {},
+      );
+    },
+  };
+  const browserWindow = {
+    comfyAPI: {
+      app: { app },
+      api: { api },
+    },
+    setTimeout() {
+      assert.fail("ready ComfyUI APIs must not schedule a retry");
+    },
+  };
+
+  registerCloudRunWhenReady(browserWindow, document);
+  await extension.setup();
+  await document.getElementById("cloud-run-button").click();
+
+  assert.equal(requests.length, 2);
+  assert.equal(requests[1][0], "/cloud-run/api/captures");
+  assert.equal(requests[1][1].method, "POST");
+  assert.deepEqual(JSON.parse(requests[1][1].body), {
+    workflow: {
+      version: 1,
+      nodes: [{ id: 1 }],
+      extra: { frontendVersion: "1.47.10" },
+    },
+    output: {
+      "1": {
+        class_type: "KSampler",
+        inputs: { seed: 7 },
+      },
+    },
+    queue_options: {},
+  });
+  assert.deepEqual(localSubmissions, []);
+});
+
 test("waits for a late local Run button and injects the launcher only once", async () => {
   const document = new FakeDocument();
   let extension = null;

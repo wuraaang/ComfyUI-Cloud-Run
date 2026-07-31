@@ -31,6 +31,7 @@ class ProviderMutationSurfaceTests(unittest.TestCase):
             {
                 ("GET", "/cloud-run/api/settings"),
                 ("PUT", "/cloud-run/api/settings"),
+                ("POST", "/cloud-run/api/captures"),
                 ("POST", "/cloud-run/api/offers"),
                 ("POST", "/cloud-run/api/quotes"),
                 ("GET", "/cloud-run/api/attempts/{attempt_id}"),

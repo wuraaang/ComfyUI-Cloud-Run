@@ -10,6 +10,7 @@ import re
 import sqlite3
 import time
 
+from .capture import CompiledCapture
 from .models import CloudJob, JobState, TransferState
 from .repository import _canonical_json, _initialize_database, _private_connection
 
@@ -279,6 +280,60 @@ class JobRepository:
                 (str(manifest_digest),),
             ).fetchone()
         return row["manifest_json"] if row is not None else None
+
+    def save_capture(self, capture, *, created_at=None):
+        if not isinstance(capture, CompiledCapture):
+            raise TypeError("A compiled capture is required.")
+        encoded = capture.canonical_payload()
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                """
+                SELECT prompt_digest, capture_json
+                FROM captures
+                WHERE capture_id = ?
+                """,
+                (capture.capture_id,),
+            ).fetchone()
+            if existing is not None and (
+                existing["prompt_digest"] != capture.prompt_digest
+                or existing["capture_json"] != encoded
+            ):
+                connection.rollback()
+                raise ValueError("A capture identity cannot change content.")
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO captures(
+                    capture_id, prompt_digest, capture_json, created_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    capture.capture_id,
+                    capture.prompt_digest,
+                    encoded,
+                    float(time.time() if created_at is None else created_at),
+                ),
+            )
+            connection.commit()
+        return capture
+
+    def get_capture(self, capture_id):
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                """
+                SELECT capture_id, prompt_digest, capture_json
+                FROM captures
+                WHERE capture_id = ?
+                """,
+                (str(capture_id),),
+            ).fetchone()
+        if row is None:
+            return None
+        return CompiledCapture.from_record(
+            row["capture_id"],
+            row["capture_json"],
+            row["prompt_digest"],
+        )
 
     def append_event(
         self,

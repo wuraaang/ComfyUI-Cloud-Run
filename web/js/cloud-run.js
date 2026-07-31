@@ -1,4 +1,5 @@
 import { captureOfficialQueuePayload } from "./canvas-adapter.js";
+import { fetchJson, postCapture } from "./cloud-run-api.js";
 
 
 const SETTINGS_ENDPOINT = "/cloud-run/api/settings";
@@ -159,33 +160,6 @@ function createIdempotencyKey(browserWindow) {
     ).join("");
   }
   throw new Error("secure random source unavailable");
-}
-
-
-async function fetchJson(fetchImpl, endpoint, options) {
-  let response;
-  try {
-    response = await fetchImpl(endpoint, options);
-  } catch {
-    throw new Error("request failed");
-  }
-
-  let payload;
-  try {
-    payload = await response.json();
-  } catch {
-    throw new Error("request failed");
-  }
-
-  if (!payload || typeof payload !== "object") {
-    throw new Error("request failed");
-  }
-  if (!response.ok) {
-    const message =
-      typeof payload.error === "string" ? payload.error.trim() : "";
-    throw new Error(message || "request failed");
-  }
-  return payload;
 }
 
 
@@ -950,7 +924,11 @@ export function registerCloudRunWhenReady(browserWindow, document, tries = 0) {
   }
 
   const fetchImpl = api.fetchApi.bind(api);
-  const captureContext = { app, api };
+  const captureContext = {
+    app,
+    api,
+    onCapture: (capture) => postCapture(fetchImpl, capture),
+  };
   app.registerExtension({
     name: "comfyui-cloud-run.lifecycle",
     commands: [
