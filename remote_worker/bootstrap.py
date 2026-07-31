@@ -96,6 +96,37 @@ def _close_response(response):
         return
 
 
+class _BufferedChunks:
+    def __init__(self, buffered):
+        self._buffered = buffered
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        buffered = self._buffered
+        if buffered is None:
+            raise StopIteration
+        try:
+            chunk = buffered.read(1024 * 1024)
+        except Exception:
+            chunk = _TRANSPORT_REJECTED
+        if chunk is _TRANSPORT_REJECTED or not isinstance(chunk, bytes):
+            self.close()
+            raise BootstrapError(
+                "Reviewed worker archive is unavailable."
+            )
+        if not chunk:
+            self.close()
+            raise StopIteration
+        return chunk
+
+    def close(self):
+        buffered = self._buffered
+        self._buffered = None
+        _close_response(buffered)
+
+
 class HttpsTransport:
     """HTTPS-only stream that neither follows redirects nor uses a shell."""
 
@@ -205,29 +236,13 @@ class HttpsTransport:
                 _close_response(buffered)
                 buffered = None
 
-        def chunks():
-            nonlocal buffered
-            rejected = False
-            try:
-                while True:
-                    chunk = buffered.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    yield chunk
-            except Exception:
-                rejected = True
-            finally:
-                _close_response(buffered)
-                buffered = None
-            if rejected:
-                raise BootstrapError(
-                    "Reviewed worker archive is unavailable."
-                )
+        chunks = _BufferedChunks(buffered)
+        buffered = None
 
         return DownloadStream(
             source_url=url,
             redirect_count=redirect_count,
-            chunks=chunks(),
+            chunks=chunks,
         )
 
 
@@ -547,11 +562,10 @@ class Bootstrap:
             raise _bootstrap_error()
         digest = hashlib.sha256()
         size = 0
-        chunks = None
+        chunks = stream.chunks
         try:
             with Path(path).open("xb") as destination:
                 os.chmod(path, 0o600)
-                chunks = iter(stream.chunks)
                 for chunk in chunks:
                     if not isinstance(chunk, bytes) or not chunk:
                         raise _bootstrap_error()

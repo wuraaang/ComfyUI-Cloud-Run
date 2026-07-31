@@ -939,6 +939,40 @@ class BootstrapTests(unittest.TestCase):
         self.assertTrue(chunks.closed)
         self.assertFalse(self.destination.exists())
 
+    def test_destination_open_failure_closes_the_https_spool(self):
+        buffered = io.BytesIO()
+        response = FakeResponse(content=self.archive)
+        with (
+            patch(
+                "remote_worker.bootstrap.urlrequest.build_opener",
+                return_value=FakeOpener(response),
+            ),
+            patch(
+                "remote_worker.bootstrap.tempfile.SpooledTemporaryFile",
+                return_value=buffered,
+            ),
+        ):
+            stream = HttpsTransport(timeout_seconds=7).stream(
+                release_asset_url(
+                    WORKER_COMMIT,
+                    hashlib.sha256(self.archive).hexdigest(),
+                )
+            )
+
+        missing_path = self.root / "missing-parent" / "worker.tar.gz.part"
+        with self.assertRaises(BootstrapError):
+            Bootstrap(
+                transport=FixedStreamTransport(stream.chunks),
+                exec_runner=RecordingExec(),
+                allowed_destination=self.destination,
+            )._download(
+                release_lock(self.archive, self.destination),
+                missing_path,
+            )
+
+        self.assertTrue(response.closed)
+        self.assertTrue(buffered.closed)
+
     def test_bootstrap_rejects_archive_path_traversal(self):
         archive = malicious_archive("../escape.py")
 
