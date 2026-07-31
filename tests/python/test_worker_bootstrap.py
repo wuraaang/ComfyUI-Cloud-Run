@@ -8,11 +8,14 @@ from pathlib import Path
 import tarfile
 import tempfile
 import unittest
+from unittest.mock import patch
+from urllib import error as urlerror
 
 from remote_worker.bootstrap import (
     Bootstrap,
     BootstrapError,
     DownloadStream,
+    HttpsTransport,
 )
 from scripts.build_worker_artifact import (
     ArtifactBuildError,
@@ -26,16 +29,18 @@ WORKER_COMMIT = "a" * 40
 
 
 class FakeTransport:
-    def __init__(self, content, *, final_url=None):
+    def __init__(self, content, *, source_url=None, redirect_count=0):
         self.content = content
-        self.final_url = final_url
+        self.source_url = source_url
+        self.redirect_count = redirect_count
         self.urls = []
 
     def stream(self, url):
         self.urls.append(url)
         midpoint = max(1, len(self.content) // 2)
         return DownloadStream(
-            final_url=self.final_url or url,
+            source_url=self.source_url or url,
+            redirect_count=self.redirect_count,
             chunks=(
                 self.content[:midpoint],
                 self.content[midpoint:],
@@ -54,15 +59,28 @@ class RecordingExec:
         self.cwd = Path(cwd)
 
 
+def release_asset_url(commit, digest):
+    tag = "worker-v1-" + commit
+    asset = (
+        "comfyui-cloud-run-worker-"
+        + commit
+        + "-"
+        + digest
+        + ".tar.gz"
+    )
+    return (
+        "https://github.com/wuraaang/ComfyUI-Cloud-Run/releases/download/"
+        + tag
+        + "/"
+        + asset
+    )
+
+
 def release_lock(archive, destination, **overrides):
     digest = hashlib.sha256(archive).hexdigest()
     payload = {
         "schema_version": 1,
-        "archive_url": (
-            "https://github.com/example/ComfyUI-Cloud-Run/archive/"
-            + WORKER_COMMIT
-            + ".tar.gz"
-        ),
+        "archive_url": release_asset_url(WORKER_COMMIT, digest),
         "worker_commit": WORKER_COMMIT,
         "worker_archive_sha256": digest,
         "worker_archive_size_bytes": len(archive),
@@ -91,6 +109,197 @@ def malicious_archive(name):
     import gzip
 
     return gzip.compress(raw.getvalue(), mtime=0)
+
+
+class FakeResponse:
+    def __init__(
+        self,
+        *,
+        status=200,
+        content=b"worker archive",
+        content_encoding="identity",
+        final_url="https://example.invalid/not-reviewed",
+    ):
+        self.status = status
+        self.headers = {"Content-Encoding": content_encoding}
+        self.content = content
+        self.final_url = final_url
+        self.closed = False
+
+    def read(self, _size=-1):
+        if not self.content:
+            return b""
+        content = self.content
+        self.content = b""
+        return content
+
+    def close(self):
+        self.closed = True
+
+    def geturl(self):
+        return self.final_url
+
+
+class FakeOpener:
+    def __init__(self, *outcomes):
+        self.outcomes = list(outcomes)
+        self.requested_urls = []
+
+    def open(self, request, *, timeout):
+        self.requested_urls.append((request.full_url, timeout))
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+
+def redirect_error(source_url, code, location):
+    response = FakeResponse(status=code)
+    return urlerror.HTTPError(
+        source_url,
+        code,
+        "redirect",
+        {"Location": location},
+        response,
+    )
+
+
+class HttpsTransportTests(unittest.TestCase):
+    def setUp(self):
+        self.source_url = release_asset_url(WORKER_COMMIT, "d" * 64)
+        self.signed_location = (
+            "https://release-assets.githubusercontent.com/github-production-"
+            "release-asset/123/worker.tar.gz?sp=r&sig=secret-signed-value"
+        )
+
+    def _stream(self, opener):
+        with patch(
+            "remote_worker.bootstrap.urlrequest.build_opener",
+            return_value=opener,
+        ) as build_opener:
+            stream = HttpsTransport(timeout_seconds=7).stream(self.source_url)
+        self.assertEqual(build_opener.call_count, 1)
+        return stream
+
+    def _assert_rejected(self, opener, *, location=None):
+        with patch(
+            "remote_worker.bootstrap.urlrequest.build_opener",
+            return_value=opener,
+        ):
+            with self.assertRaises(BootstrapError) as caught:
+                HttpsTransport(timeout_seconds=7).stream(self.source_url)
+        self.assertEqual(
+            str(caught.exception),
+            "Reviewed worker archive is unavailable.",
+        )
+        if location is not None:
+            self.assertNotIn(location, repr(caught.exception))
+
+    def test_direct_identity_response_returns_reviewed_source_without_redirect(self):
+        response = FakeResponse(
+            content=b"direct",
+            final_url="https://github.com/untrusted-response-url",
+        )
+        opener = FakeOpener(response)
+
+        stream = self._stream(opener)
+
+        self.assertEqual(stream.source_url, self.source_url)
+        self.assertEqual(stream.redirect_count, 0)
+        self.assertEqual(tuple(stream.chunks), (b"direct",))
+        self.assertEqual(opener.requested_urls, [(self.source_url, 7)])
+        self.assertTrue(response.closed)
+
+    def test_one_302_to_release_assets_host_is_accepted(self):
+        redirect = redirect_error(
+            self.source_url,
+            302,
+            self.signed_location,
+        )
+        response = FakeResponse(
+            content=b"redirected",
+            final_url=self.signed_location,
+        )
+        opener = FakeOpener(redirect, response)
+
+        stream = self._stream(opener)
+
+        self.assertEqual(stream.source_url, self.source_url)
+        self.assertEqual(stream.redirect_count, 1)
+        self.assertEqual(tuple(stream.chunks), (b"redirected",))
+        self.assertEqual(
+            opener.requested_urls,
+            [(self.source_url, 7), (self.signed_location, 7)],
+        )
+        self.assertTrue(redirect.fp.closed)
+        self.assertTrue(response.closed)
+
+    def test_redirect_status_other_than_302_is_rejected(self):
+        for code in (301, 303, 307, 308):
+            with self.subTest(code=code):
+                self._assert_rejected(
+                    FakeOpener(
+                        redirect_error(
+                            self.source_url,
+                            code,
+                            self.signed_location,
+                        )
+                    ),
+                    location=self.signed_location,
+                )
+
+    def test_unreviewed_redirect_locations_are_rejected(self):
+        invalid_locations = {
+            "relative": "/github-production-release-asset/worker.tar.gz",
+            "http": self.signed_location.replace("https://", "http://"),
+            "wrong host": self.signed_location.replace(
+                "release-assets.githubusercontent.com",
+                "example.com",
+            ),
+            "subdomain": self.signed_location.replace(
+                "release-assets.githubusercontent.com",
+                "evil.release-assets.githubusercontent.com",
+            ),
+            "userinfo": self.signed_location.replace(
+                "release-assets.githubusercontent.com",
+                "user@release-assets.githubusercontent.com",
+            ),
+            "explicit port": self.signed_location.replace(
+                "release-assets.githubusercontent.com",
+                "release-assets.githubusercontent.com:443",
+            ),
+            "fragment": self.signed_location + "#fragment",
+        }
+        for label, location in invalid_locations.items():
+            with self.subTest(label=label):
+                self._assert_rejected(
+                    FakeOpener(
+                        redirect_error(self.source_url, 302, location)
+                    ),
+                    location=location,
+                )
+
+    def test_second_redirect_is_rejected(self):
+        opener = FakeOpener(
+            redirect_error(self.source_url, 302, self.signed_location),
+            redirect_error(
+                self.signed_location,
+                302,
+                self.signed_location + "&second=1",
+            ),
+        )
+
+        self._assert_rejected(opener, location=self.signed_location)
+
+    def test_invalid_terminal_response_is_rejected(self):
+        cases = {
+            "non-200 status": FakeResponse(status=206),
+            "non-identity encoding": FakeResponse(content_encoding="gzip"),
+        }
+        for label, response in cases.items():
+            with self.subTest(label=label):
+                self._assert_rejected(FakeOpener(response))
+                self.assertTrue(response.closed)
 
 
 class WorkerArtifactTests(unittest.TestCase):
@@ -225,6 +434,93 @@ class BootstrapTests(unittest.TestCase):
         self.archive = self.archive_path.read_bytes()
         self.destination = self.root / "installed-worker"
 
+    def test_bootstrap_accepts_only_the_exact_release_asset_identity(self):
+        digest = hashlib.sha256(self.archive).hexdigest()
+        valid_url = release_asset_url(WORKER_COMMIT, digest)
+        accepted_destination = self.root / "accepted-worker"
+
+        Bootstrap(
+            transport=FakeTransport(self.archive),
+            exec_runner=RecordingExec(),
+            allowed_destination=accepted_destination,
+        ).run(release_lock(self.archive, accepted_destination))
+        self.assertTrue(accepted_destination.is_dir())
+
+        other_commit = "b" * 40
+        other_digest = "c" * 64
+        tag = "worker-v1-" + WORKER_COMMIT
+        asset = (
+            "comfyui-cloud-run-worker-"
+            + WORKER_COMMIT
+            + "-"
+            + digest
+            + ".tar.gz"
+        )
+        invalid_cases = {
+            "branch archive": (
+                "https://github.com/wuraaang/ComfyUI-Cloud-Run/"
+                "archive/refs/heads/main.tar.gz"
+            ),
+            "codeload": (
+                "https://codeload.github.com/wuraaang/ComfyUI-Cloud-Run/"
+                "tar.gz/refs/tags/" + tag
+            ),
+            "wrong owner": valid_url.replace("/wuraaang/", "/other/"),
+            "wrong repository": valid_url.replace(
+                "/ComfyUI-Cloud-Run/",
+                "/other/",
+            ),
+            "short commit": release_asset_url(WORKER_COMMIT[:-1], digest),
+            "mismatched tag commit": valid_url.replace(
+                tag,
+                "worker-v1-" + other_commit,
+            ),
+            "mismatched asset commit": valid_url.replace(
+                asset,
+                "comfyui-cloud-run-worker-"
+                + other_commit
+                + "-"
+                + digest
+                + ".tar.gz",
+            ),
+            "mismatched asset digest": valid_url.replace(
+                digest + ".tar.gz",
+                other_digest + ".tar.gz",
+            ),
+            "extra path component": valid_url.replace(
+                "/" + asset,
+                "/extra/" + asset,
+            ),
+            "percent encoding": valid_url.replace(
+                "ComfyUI-Cloud-Run",
+                "ComfyUI%2DCloud%2DRun",
+            ),
+            "query": valid_url + "?download=1",
+            "fragment": valid_url + "#archive",
+            "explicit port": valid_url.replace(
+                "github.com",
+                "github.com:443",
+            ),
+            "user information": valid_url.replace(
+                "github.com",
+                "user@github.com",
+            ),
+            "mutable asset name": valid_url.replace(asset, "worker.tar.gz"),
+        }
+        for index, (label, archive_url) in enumerate(invalid_cases.items()):
+            destination = self.root / f"rejected-worker-{index}"
+            overrides = {"archive_url": archive_url}
+            if label == "short commit":
+                overrides["worker_commit"] = WORKER_COMMIT[:-1]
+            with self.subTest(label=label):
+                with self.assertRaises(BootstrapError):
+                    Bootstrap(
+                        transport=FakeTransport(self.archive),
+                        exec_runner=RecordingExec(),
+                        allowed_destination=destination,
+                    ).run(release_lock(self.archive, destination, **overrides))
+                self.assertFalse(destination.exists())
+
     def test_bootstrap_downloads_one_commit_verifies_then_execs_fixed_worker(self):
         transport = FakeTransport(self.archive)
         runner = RecordingExec()
@@ -239,9 +535,10 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(
             transport.urls,
             [
-                "https://github.com/example/ComfyUI-Cloud-Run/archive/"
-                + WORKER_COMMIT
-                + ".tar.gz"
+                release_asset_url(
+                    WORKER_COMMIT,
+                    hashlib.sha256(self.archive).hexdigest(),
+                ),
             ],
         )
         self.assertEqual(
@@ -296,7 +593,7 @@ class BootstrapTests(unittest.TestCase):
                 release_lock(self.archive, self.destination),
                 FakeTransport(
                     self.archive,
-                    final_url="https://github.com/example/redirected",
+                    source_url="https://github.com/example/redirected",
                 ),
             ),
         ):

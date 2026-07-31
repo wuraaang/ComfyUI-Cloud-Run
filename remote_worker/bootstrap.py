@@ -27,7 +27,6 @@ DEFAULT_DESTINATION = Path("/opt/comfyui-cloud-run")
 STATE_DIRECTORY = "/var/lib/comfyui-cloud-run"
 _HEX_40 = re.compile(r"[0-9a-f]{40}")
 _HEX_64 = re.compile(r"[0-9a-f]{64}")
-_GITHUB_PART = r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}"
 _LOCK_FIELDS = {
     "schema_version",
     "archive_url",
@@ -48,7 +47,8 @@ class BootstrapError(RuntimeError):
 
 @dataclass(frozen=True)
 class DownloadStream:
-    final_url: str
+    source_url: str
+    redirect_count: int
     chunks: object
 
 
@@ -74,31 +74,77 @@ class HttpsTransport:
             urlrequest.ProxyHandler({}),
             _NoRedirect(),
         )
-        request = urlrequest.Request(
-            url,
-            headers={
-                "Accept": "application/octet-stream",
-                "Accept-Encoding": "identity",
-                "User-Agent": "ComfyUI-Cloud-Run-Bootstrap/1",
-            },
-            method="GET",
-        )
+        headers = {
+            "Accept": "application/octet-stream",
+            "Accept-Encoding": "identity",
+            "User-Agent": "ComfyUI-Cloud-Run-Bootstrap/1",
+        }
+        request = urlrequest.Request(url, headers=headers, method="GET")
+        redirect_count = 0
         try:
             response = opener.open(
                 request,
                 timeout=self.timeout_seconds,
             )
-        except (OSError, urlerror.URLError, urlerror.HTTPError):
+        except urlerror.HTTPError as redirect:
+            if redirect.code != 302:
+                redirect.close()
+                raise BootstrapError(
+                    "Reviewed worker archive is unavailable."
+                ) from None
+            try:
+                location = redirect.headers.get("Location")
+                if not isinstance(location, str):
+                    raise BootstrapError(
+                        "Reviewed worker archive is unavailable."
+                    )
+                parsed = urlsplit(location)
+                if (
+                    parsed.scheme != "https"
+                    or parsed.hostname
+                    != "release-assets.githubusercontent.com"
+                    or parsed.username is not None
+                    or parsed.password is not None
+                    or parsed.port is not None
+                    or parsed.fragment
+                ):
+                    raise BootstrapError(
+                        "Reviewed worker archive is unavailable."
+                    )
+            except (TypeError, ValueError):
+                raise BootstrapError(
+                    "Reviewed worker archive is unavailable."
+                ) from None
+            finally:
+                redirect.close()
+            redirect_count = 1
+            request = urlrequest.Request(
+                location,
+                headers=headers,
+                method="GET",
+            )
+            try:
+                response = opener.open(
+                    request,
+                    timeout=self.timeout_seconds,
+                )
+            except urlerror.HTTPError as terminal_error:
+                terminal_error.close()
+                raise BootstrapError(
+                    "Reviewed worker archive is unavailable."
+                ) from None
+            except (OSError, urlerror.URLError):
+                raise BootstrapError(
+                    "Reviewed worker archive is unavailable."
+                ) from None
+        except (OSError, urlerror.URLError):
             raise BootstrapError(
                 "Reviewed worker archive is unavailable."
             ) from None
-        if (
-            getattr(response, "status", None) != 200
-            or response.headers.get(
-                "Content-Encoding",
-                "identity",
-            ).casefold()
-            != "identity"
+        encoding = response.headers.get("Content-Encoding", "identity")
+        if getattr(response, "status", None) != 200 or (
+            not isinstance(encoding, str)
+            or encoding.casefold() != "identity"
         ):
             response.close()
             raise BootstrapError(
@@ -116,7 +162,8 @@ class HttpsTransport:
                 response.close()
 
         return DownloadStream(
-            final_url=response.geturl(),
+            source_url=url,
+            redirect_count=redirect_count,
             chunks=chunks(),
         )
 
@@ -165,10 +212,15 @@ def _validated_lock(payload, allowed_destination):
         raise _bootstrap_error()
     try:
         parsed = urlsplit(url)
-        expected_path = re.fullmatch(
-            rf"/{_GITHUB_PART}/{_GITHUB_PART}/archive/"
-            rf"({commit})\.tar\.gz",
-            parsed.path,
+        expected_path = (
+            "/wuraaang/ComfyUI-Cloud-Run/releases/download/"
+            + "worker-v1-"
+            + commit
+            + "/comfyui-cloud-run-worker-"
+            + commit
+            + "-"
+            + digest
+            + ".tar.gz"
         )
     except (TypeError, ValueError):
         raise _bootstrap_error() from None
@@ -179,7 +231,7 @@ def _validated_lock(payload, allowed_destination):
         or parsed.password is not None
         or parsed.query
         or parsed.fragment
-        or expected_path is None
+        or parsed.path != expected_path
     ):
         raise _bootstrap_error()
     return dict(payload)
@@ -430,7 +482,8 @@ class Bootstrap:
             raise _bootstrap_error() from None
         if (
             not isinstance(stream, DownloadStream)
-            or stream.final_url != lock["archive_url"]
+            or stream.source_url != lock["archive_url"]
+            or stream.redirect_count not in {0, 1}
         ):
             raise _bootstrap_error()
         digest = hashlib.sha256()
