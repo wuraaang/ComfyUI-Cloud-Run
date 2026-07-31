@@ -1,10 +1,13 @@
 import asyncio
+import hashlib
 import tempfile
 import unittest
 from pathlib import Path
 
+from cloud_run.artifacts import FileInputMetadata, GIB
 from cloud_run.comfy_host import NodeDescription, NodeNotFound
 from cloud_run.dependency_repository import DependencyRepository
+from cloud_run.manifest import SourceSpec
 from cloud_run.registry import RegistryCandidate
 from cloud_run.resolver import DependencyResolver
 
@@ -35,8 +38,9 @@ def pending_candidate(revision="a" * 40):
 
 
 class FakeCapture:
-    def __init__(self, *class_types):
+    def __init__(self, *class_types, output=None):
         self.executable_class_types = tuple(class_types)
+        self.output = output or {}
 
 
 class FakeHost:
@@ -244,6 +248,90 @@ class DependencyResolverTests(unittest.TestCase):
         self.assertEqual(candidate.source_kind, "agent")
         self.assertFalse(candidate.approved)
         self.assertIsNone(self.repository.approved("AgentNode"))
+
+    def test_dependency_preflight_assembles_verified_artifacts_and_disk(self):
+        approved = self.repository.save_candidate(
+            "ApprovedNode",
+            "manual",
+            complete_candidate(),
+            approved=False,
+        )
+        self.repository.approve(
+            "ApprovedNode",
+            approved.candidate_digest,
+        )
+        model_root = Path(self.temporary_directory.name) / "models"
+        input_root = Path(self.temporary_directory.name) / "input"
+        model_root.mkdir()
+        input_root.mkdir()
+        model = model_root / "upscaler.pth"
+        model.write_bytes(b"model")
+        model_digest = hashlib.sha256(b"model").hexdigest()
+        capture = FakeCapture(
+            "ApprovedNode",
+            "EmptyLatentImage",
+            "SaveImage",
+            output={
+                "1": {
+                    "class_type": "ApprovedNode",
+                    "inputs": {"model_name": "upscaler.pth"},
+                },
+                "2": {
+                    "class_type": "EmptyLatentImage",
+                    "inputs": {
+                        "width": 512,
+                        "height": 512,
+                        "batch_size": 1,
+                    },
+                },
+                "3": {
+                    "class_type": "SaveImage",
+                    "inputs": {"images": ["2", 0]},
+                },
+            },
+        )
+        resolver = DependencyResolver(
+            host=FakeHost(
+                {
+                    "ApprovedNode": custom("ApprovedNode"),
+                    "EmptyLatentImage": core("EmptyLatentImage"),
+                    "SaveImage": core("SaveImage"),
+                }
+            ),
+            repository=self.repository,
+            registry=FakeRegistry({}),
+        )
+
+        result = asyncio.run(
+            resolver.resolve_dependencies(
+                capture,
+                metadata={
+                    "ApprovedNode": {
+                        "model_name": FileInputMetadata(
+                            kind="model",
+                            category="upscale_models",
+                        )
+                    }
+                },
+                model_roots={"upscale_models": (model_root,)},
+                input_root=input_root,
+                source_mappings={
+                    model_digest: SourceSpec(
+                        "local-upload",
+                        "local-upload:approved-model",
+                    )
+                },
+                base_bytes=40 * GIB,
+                explicit_output_allowance_bytes=None,
+            )
+        )
+
+        self.assertTrue(result.rentable)
+        self.assertEqual(result.disk_gb, 80)
+        self.assertEqual(len(result.custom_nodes), 1)
+        self.assertEqual(result.custom_nodes[0].package_id, "acme.nodes")
+        self.assertEqual(len(result.artifacts), 1)
+        self.assertEqual(result.artifacts[0].sha256, model_digest)
 
 
 if __name__ == "__main__":

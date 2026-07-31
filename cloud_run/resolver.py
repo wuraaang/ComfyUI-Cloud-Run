@@ -4,8 +4,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .artifacts import (
+    ArtifactCollisionError,
+    calculate_disk_gb,
+    estimate_output_bytes,
+    resolve_artifacts,
+)
 from .comfy_host import HostCompatibilityError, NodeNotFound
 from .dependency_repository import MappingValidationError
+from .manifest import (
+    ArtifactSpec,
+    CustomNodeSpec,
+    PythonWheelSpec,
+    SourceSpec,
+    validate_dependency,
+)
 from .registry import RegistryError
 
 
@@ -24,10 +37,22 @@ class NodeResolutionResult:
     rentable: bool
 
 
+@dataclass(frozen=True)
+class DependencyPreflightResult:
+    node_rows: tuple[NodeResolution, ...]
+    artifact_rows: tuple
+    custom_nodes: tuple[CustomNodeSpec, ...]
+    artifacts: tuple[ArtifactSpec, ...]
+    output_allowance_bytes: int
+    disk_gb: int
+    rentable: bool
+
+
 def _candidate_is_complete(candidate, class_type):
     payload = candidate.payload
     return (
-        isinstance(payload.get("archive"), dict)
+        isinstance(payload.get("package_id"), str)
+        and isinstance(payload.get("archive"), dict)
         and isinstance(payload.get("wheels"), list)
         and isinstance(payload.get("provided_class_types"), list)
         and class_type in payload["provided_class_types"]
@@ -43,6 +68,45 @@ def _first_candidate(repository, class_type, source_kind):
         ),
         None,
     )
+
+
+def _custom_node_from_mapping(candidate):
+    payload = candidate.payload
+    archive_payload = payload["archive"]
+    archive = ArtifactSpec(
+        artifact_id=archive_payload["artifact_id"],
+        kind="custom_node_archive",
+        logical_name=payload["package_id"],
+        destination=archive_payload["destination"],
+        size_bytes=archive_payload["size_bytes"],
+        sha256=archive_payload["sha256"],
+        source=SourceSpec(
+            kind="local-upload",
+            locator=archive_payload["locator"],
+        ),
+    )
+    wheels = tuple(
+        PythonWheelSpec(
+            filename=wheel["filename"],
+            size_bytes=wheel["size_bytes"],
+            sha256=wheel["sha256"],
+            source=SourceSpec(
+                kind="local-upload",
+                locator=wheel["locator"],
+            ),
+        )
+        for wheel in payload["wheels"]
+    )
+    node = CustomNodeSpec(
+        package_id=payload["package_id"],
+        repository_url=candidate.repository_url,
+        revision=candidate.revision,
+        archive=archive,
+        wheels=wheels,
+        provided_class_types=tuple(payload["provided_class_types"]),
+    )
+    validate_dependency(node)
+    return node
 
 
 class DependencyResolver:
@@ -205,4 +269,81 @@ class DependencyResolver:
         return NodeResolutionResult(
             rows=resolved,
             rentable=all(row.status == "resolved" for row in resolved),
+        )
+
+    async def resolve_dependencies(
+        self,
+        capture,
+        *,
+        metadata,
+        model_roots,
+        input_root,
+        source_mappings,
+        base_bytes,
+        explicit_output_allowance_bytes,
+    ):
+        nodes = await self.resolve_nodes(capture)
+        artifact_result = resolve_artifacts(
+            capture,
+            metadata=metadata,
+            model_roots=model_roots,
+            input_root=input_root,
+            source_mappings=source_mappings,
+        )
+        output_allowance = estimate_output_bytes(
+            capture,
+            explicit_bytes=explicit_output_allowance_bytes,
+        )
+
+        custom_nodes_by_package = {}
+        for row in nodes.rows:
+            if row.status != "resolved" or row.source_kind != "approved":
+                continue
+            candidate = self.repository.approved(row.class_type)
+            if candidate is None or not _candidate_is_complete(
+                candidate,
+                row.class_type,
+            ):
+                continue
+            custom_node = _custom_node_from_mapping(candidate)
+            existing = custom_nodes_by_package.get(custom_node.package_id)
+            if existing is not None and existing != custom_node:
+                raise ArtifactCollisionError(
+                    "Custom-node package has conflicting approved mappings."
+                )
+            custom_nodes_by_package[custom_node.package_id] = custom_node
+        custom_nodes = tuple(
+            custom_nodes_by_package[key]
+            for key in sorted(custom_nodes_by_package)
+        )
+
+        custom_dependency_bytes = sum(
+            node.archive.size_bytes
+            + sum(wheel.size_bytes for wheel in node.wheels)
+            for node in custom_nodes
+        )
+        model_bytes = sum(
+            artifact.size_bytes
+            for artifact in artifact_result.artifacts
+            if artifact.kind == "model"
+        )
+        input_bytes = sum(
+            artifact.size_bytes
+            for artifact in artifact_result.artifacts
+            if artifact.kind == "input"
+        )
+        disk_gb = calculate_disk_gb(
+            base_bytes=base_bytes,
+            dependency_bytes=custom_dependency_bytes + model_bytes,
+            input_bytes=input_bytes,
+            output_bytes=output_allowance,
+        )
+        return DependencyPreflightResult(
+            node_rows=nodes.rows,
+            artifact_rows=artifact_result.rows,
+            custom_nodes=custom_nodes,
+            artifacts=artifact_result.artifacts,
+            output_allowance_bytes=output_allowance,
+            disk_gb=disk_gb,
+            rentable=nodes.rentable and artifact_result.rentable,
         )
