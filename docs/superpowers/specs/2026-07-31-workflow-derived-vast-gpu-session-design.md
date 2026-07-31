@@ -577,8 +577,9 @@ allowlists, route/state contracts, and a public-artifact scan.
 
 The manual Gold asset is the user's existing medium-complexity image-upscale
 workflow that creates a desktop wallpaper, plus a user-supplied source image.
-Neither personal workflow nor image is committed or uploaded publicly without
-separate permission.
+The currently designated source is the private 736 x 1308 JPEG supplied by the
+user outside the repository. Neither personal workflow nor image is committed
+or uploaded publicly without separate permission.
 
 Gold certification is remote-only:
 
@@ -587,24 +588,30 @@ Gold certification is remote-only:
 3. review and explicitly confirm one reliable offer;
 4. provision and validate the remote environment;
 5. execute the wallpaper upscale on Vast;
-6. retrieve and verify the expected wallpaper dimensions and output file;
-7. modify an execution parameter or approved input and submit a second job on
-   the same session;
-8. prove that the second job creates no second Vast instance and does not
-   redownload unchanged models;
-9. retrieve and verify the second result;
-10. destroy the session;
-11. confirm fresh Vast inventory contains no managed or residual instance;
-12. record the provider credit delta without exposing account data.
+6. retrieve the result and verify that it decodes, matches the
+   workflow-declared dimensions and format, is larger than the source where the
+   workflow promises enlargement, preserves the recognizable source
+   composition, and contains no obvious blank, corrupt, tiled, or truncated
+   region;
+7. if the output fails those checks, diagnose and retry only within the same
+   authorized instance and its finite cost/deadline boundary;
+8. after the first coherent locally verified output, immediately request
+   destruction rather than spending money on a redundant second Gold job;
+9. confirm fresh Vast inventory contains no managed or residual instance;
+10. record the provider credit delta without exposing account data.
 
 Pixel identity with a local MPS run is not an acceptance criterion because no
 local reference generation is performed. Acceptance proves exact canvas
 compilation semantics, immutable dependency identity, successful native remote
 execution, expected output structure and dimensions, local artifact integrity,
-session reuse, and verified teardown.
+visual coherence, and verified teardown. Reusable-session behavior remains
+mandatory but is certified by the complete fake end-to-end suite; an additional
+paid reuse run requires separate authorization.
 
-Each paid Gold mutation requires an explicit human authorization that states
-the allowed number of rentals and cost boundary.
+Each paid Gold rental requires an explicit human authorization that states the
+allowed number of instances, maximum hourly price, and absolute cost or duration
+boundary. Permission to spend extra development time never implies permission
+to leave a paid instance running without that boundary.
 
 ## Release sequence
 
@@ -633,8 +640,9 @@ The unrelated ComfyRelay remote is never used.
   without a workflow-specific shell script.
 - V1 creates no Vast volume and leaves no Vast storage charge after verified
   destruction.
-- One session executes at least two sequential compatible jobs without a
-  second rental or redundant model download.
+- Offline fake certification proves that one session executes at least two
+  sequential compatible jobs without a second rental or redundant model
+  download.
 - Progress, errors, previews, and final outputs return to the local session
   console.
 - Normal teardown waits for verified local outputs; manual destruction and the
@@ -646,8 +654,8 @@ The unrelated ComfyRelay remote is never used.
 - Agent Panel annotations are useful but optional and cannot authorize paid or
   arbitrary remote actions.
 - Offline gates pass before GitHub publication or paid certification.
-- The remote-only wallpaper Gold executes twice on one session, retrieves both
-  results, destroys the instance, and leaves Vast inventory empty.
+- The remote-only wallpaper Gold obtains one coherent locally verified result,
+  immediately destroys the instance, and leaves Vast inventory empty.
 
 ## Non-goals
 
