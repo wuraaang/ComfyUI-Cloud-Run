@@ -1,15 +1,18 @@
 # Project state
 
-Status: workflow-derived reusable sessions implemented and fake/offline
-certified on the pinned local ComfyUI Desktop environment. The exact reviewed
-source commit has been published and its immutable GitHub archive audited. All
-worker-template and real paid activity remains human-gated.
+Status: workflow-derived reusable sessions and the workflow-embedded model
+metadata consumer bridge are implemented and offline-certified on the pinned
+local ComfyUI environment. Native missing-model visibility and the free,
+read-only Gold preflight are complete. All worker-template and real paid
+activity remains human-gated.
 
 Source of truth:
 
 - `AGENTS.md`;
 - `docs/superpowers/specs/2026-07-31-workflow-derived-vast-gpu-session-design.md`;
-- `docs/superpowers/plans/2026-07-31-workflow-derived-vast-gpu-session.md`.
+- `docs/superpowers/plans/2026-07-31-workflow-derived-vast-gpu-session.md`;
+- `docs/superpowers/specs/2026-07-31-workflow-embedded-model-metadata-bridge-design.md`;
+- `docs/superpowers/plans/2026-07-31-workflow-embedded-model-metadata-bridge.md`.
 
 ## Implemented offline
 
@@ -22,6 +25,11 @@ Source of truth:
 - Preflight resolves core/custom nodes, models, inputs, masks, and other
   file-backed dependencies before offer search. All non-core material is bound
   to immutable origin, exact size, SHA-256, and safe ComfyUI destination.
+- Exact native model annotations classify active loader selections even when a
+  model is absent locally or exposed through a schema-based `COMBO`. Public
+  Hugging Face sources are resolved to immutable revisions, exact sizes, and
+  SHA-256 values without downloading model content. Existing private inputs
+  become verified local-upload artifacts without exposing their identity.
 - Custom-node candidate precedence is approved mapping, Registry, installed Git
   identity, Agent suggestion, then manual mapping. Candidates require separate
   explicit approval; Agent suggestions have no spend, secret, shell, or
@@ -57,6 +65,10 @@ Source of truth:
 ## Safety and release status
 
 - No real Vast rental or Gold run has occurred.
+- The native fixture exposed `Download All`, but it was not clicked. The free
+  Gold preflight resolved exactly five public model sources and one verified
+  local input; no model file was created. Sanitized evidence is recorded in
+  `docs/workflow-model-metadata-proof.md`.
 - No project-specific worker template has been published or pinned.
 - No live `worker-release.json` exists.
 - No Vast provider mutation, upload, Registry publication, worker release, or
@@ -75,17 +87,9 @@ Source of truth:
 
 ## Next gated action
 
-The current bootstrap rejects both GitHub's observed redirect and the fetched
-archive's metadata/full-repository layout. The next action is not template
-creation: invoke `superpowers:brainstorming` for a narrowly scoped
-bootstrap/publication correction, obtain explicit design approval, then use
-`superpowers:writing-plans` and strict red-green TDD for a new immutable
-commit. Redirect, extraction, allowlist, digest, and shell restrictions remain
-fail-closed until that approved work is complete and reviewed.
-
-Only after a corrected public artifact is manually reviewed may separate
-authorization create a project-specific Vast template and its owner-private
-`0600` release lock. A later paid Gold GO must still state all of:
+The free boundary is complete. No offer search, provider mutation, release
+publication, or paid Gold execution is authorized in the current run. A paid
+Gold GO must separately state all of:
 
 1. maximum instance count;
 2. maximum hourly price;
