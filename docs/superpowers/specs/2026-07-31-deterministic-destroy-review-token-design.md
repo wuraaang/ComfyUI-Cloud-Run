@@ -72,11 +72,12 @@ Add one regression test to
 4. assert that the review succeeds and exposes the deterministic hexadecimal
    token.
 
-Before the production change, the test fails with
-`DestroyConfirmationError` because the service calls the patched URL-safe
-generator. After the one-line factory change, it passes. The existing invalid
-factory and destruction-confirmation tests continue to cover fail-closed
-validation and one-time consumption.
+Before the production change, the service raises `DestroyConfirmationError`
+because it calls the patched URL-safe generator; the regression test catches
+that exception and deliberately fails with a precise assertion. After the
+one-line factory change, it passes. The existing invalid factory and
+destruction-confirmation tests continue to cover fail-closed validation and
+one-time consumption.
 
 Verification requires:
 
