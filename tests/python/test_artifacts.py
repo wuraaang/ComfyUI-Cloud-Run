@@ -10,6 +10,7 @@ from cloud_run.artifacts import (
     ArtifactPathError,
     FileInputMetadata,
     OutputAllowanceRequired,
+    StaticFileRequirement,
     UnpinnedRequirementsError,
     build_custom_node_dependency,
     build_package_archive,
@@ -18,6 +19,7 @@ from cloud_run.artifacts import (
     hash_file,
     reject_destination_collisions,
     resolve_artifacts,
+    static_file_requirements,
 )
 from cloud_run.manifest import ArtifactSpec, SourceSpec
 
@@ -44,6 +46,141 @@ def artifact(destination, digest):
         sha256=digest,
         source=local_source("artifact-" + digest[:12]),
     )
+
+
+class StaticFileRequirementTests(unittest.TestCase):
+    def test_mapping_preserves_prompt_and_metadata_order_for_every_value(self):
+        model_rule = FileInputMetadata(
+            kind="model",
+            category="diffusion_models",
+        )
+        input_rule = FileInputMetadata(kind="input")
+        capture = FakeCapture(
+            {
+                "20": {
+                    "class_type": "First",
+                    "inputs": {
+                        "model": "example.safetensors",
+                        "linked": ["10", 0],
+                    },
+                },
+                "10": {
+                    "class_type": "Second",
+                    "inputs": {"number": 7},
+                },
+            }
+        )
+        metadata = {
+            "First": {
+                "missing": input_rule,
+                "model": model_rule,
+                "linked": input_rule,
+            },
+            "Second": {
+                "number": input_rule,
+                "absent_model": model_rule,
+            },
+        }
+
+        requirements = static_file_requirements(capture, metadata)
+
+        self.assertEqual(
+            requirements,
+            (
+                StaticFileRequirement(
+                    node_id="20",
+                    class_type="First",
+                    input_name="missing",
+                    metadata=input_rule,
+                    value=None,
+                ),
+                StaticFileRequirement(
+                    node_id="20",
+                    class_type="First",
+                    input_name="model",
+                    metadata=model_rule,
+                    value="example.safetensors",
+                ),
+                StaticFileRequirement(
+                    node_id="20",
+                    class_type="First",
+                    input_name="linked",
+                    metadata=input_rule,
+                    value=["10", 0],
+                ),
+                StaticFileRequirement(
+                    node_id="10",
+                    class_type="Second",
+                    input_name="number",
+                    metadata=input_rule,
+                    value=7,
+                ),
+                StaticFileRequirement(
+                    node_id="10",
+                    class_type="Second",
+                    input_name="absent_model",
+                    metadata=model_rule,
+                    value=None,
+                ),
+            ),
+        )
+
+    def test_callable_and_host_object_metadata_use_the_same_contract(self):
+        rule = FileInputMetadata(kind="input")
+        capture = FakeCapture(
+            {
+                "1": {
+                    "class_type": "LoadImage",
+                    "inputs": {"image": "source.png"},
+                }
+            }
+        )
+        calls = []
+
+        def callable_metadata(class_type):
+            calls.append(("callable", class_type))
+            return {"image": rule}
+
+        class HostMetadata:
+            def file_input_metadata(self, class_type):
+                calls.append(("host", class_type))
+                return {"image": rule}
+
+        callable_result = static_file_requirements(
+            capture,
+            callable_metadata,
+        )
+        host_result = static_file_requirements(capture, HostMetadata())
+
+        self.assertEqual(callable_result, host_result)
+        self.assertEqual(
+            calls,
+            [("callable", "LoadImage"), ("host", "LoadImage")],
+        )
+
+    def test_missing_class_metadata_is_empty_and_invalid_metadata_fails(self):
+        capture = FakeCapture(
+            {
+                "1": {
+                    "class_type": "LoadImage",
+                    "inputs": {"image": "source.png"},
+                }
+            }
+        )
+        self.assertEqual(static_file_requirements(capture, {}), ())
+
+        invalid_metadata = (
+            {"LoadImage": []},
+            {"LoadImage": {1: FileInputMetadata(kind="input")}},
+            {"LoadImage": {"image": object()}},
+        )
+        for metadata in invalid_metadata:
+            with self.subTest(metadata=metadata):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "File-input metadata is invalid",
+                ):
+                    static_file_requirements(capture, metadata)
 
 
 class ArtifactTests(unittest.TestCase):

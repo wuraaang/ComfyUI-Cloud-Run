@@ -114,6 +114,15 @@ class FileInputMetadata:
 
 
 @dataclass(frozen=True)
+class StaticFileRequirement:
+    node_id: str
+    class_type: str
+    input_name: str
+    metadata: FileInputMetadata
+    value: object
+
+
+@dataclass(frozen=True)
 class ArtifactResolution:
     node_id: str
     class_type: str
@@ -455,6 +464,33 @@ def _metadata_for(metadata, class_type):
     return result
 
 
+def static_file_requirements(capture, metadata):
+    output = getattr(capture, "output", None)
+    if not isinstance(output, dict):
+        raise ArtifactResolutionError("Compiled prompt is invalid.")
+    requirements = []
+    for raw_node_id, node in output.items():
+        node_id = str(raw_node_id)
+        if not isinstance(node, dict):
+            raise ArtifactResolutionError("Compiled prompt node is invalid.")
+        class_type = str(node.get("class_type") or "")
+        inputs = node.get("inputs")
+        if not class_type or not isinstance(inputs, dict):
+            raise ArtifactResolutionError("Compiled prompt node is invalid.")
+        rules = _metadata_for(metadata, class_type)
+        for input_name, rule in rules.items():
+            requirements.append(
+                StaticFileRequirement(
+                    node_id=node_id,
+                    class_type=class_type,
+                    input_name=input_name,
+                    metadata=rule,
+                    value=inputs.get(input_name),
+                )
+            )
+    return tuple(requirements)
+
+
 def _roots_for_model(model_roots, category):
     configured = model_roots.get(category, ())
     if isinstance(configured, (str, os.PathLike)):
@@ -511,20 +547,14 @@ def resolve_artifacts(
     rows = []
     artifacts = []
     local_artifacts = {}
-    output = getattr(capture, "output", None)
-    if not isinstance(output, dict):
-        raise ArtifactResolutionError("Compiled prompt is invalid.")
-    for raw_node_id, node in output.items():
-        node_id = str(raw_node_id)
-        if not isinstance(node, dict):
-            raise ArtifactResolutionError("Compiled prompt node is invalid.")
-        class_type = str(node.get("class_type") or "")
-        inputs = node.get("inputs")
-        if not class_type or not isinstance(inputs, dict):
-            raise ArtifactResolutionError("Compiled prompt node is invalid.")
-        rules = _metadata_for(metadata, class_type)
-        for input_name, rule in rules.items():
-            value = inputs.get(input_name)
+    requirements = static_file_requirements(capture, metadata)
+    for requirement in requirements:
+        node_id = requirement.node_id
+        class_type = requirement.class_type
+        rule = requirement.metadata
+        for input_name, value in (
+            (requirement.input_name, requirement.value),
+        ):
             if not isinstance(value, str):
                 if value is None:
                     continue
