@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
+from pathlib import Path
 import re
 import time
 
@@ -30,6 +31,18 @@ from .provision import (
     parse_manifest_request,
 )
 from .transfers import TransferError
+from .deadline import (
+    DeadlineEnforcementError,
+    DeadlineValidationError,
+    parse_deadline_update,
+)
+from .jobs import (
+    JobBusyError,
+    JobError,
+    JobResult,
+    JobValidationError,
+    parse_job_request,
+)
 
 
 WORKER_BIND_HOST = "127.0.0.1"
@@ -83,11 +96,26 @@ def worker_route_set():
 @dataclass(frozen=True)
 class WorkerResponse:
     status: int
-    payload: dict
+    payload: object
+    headers: dict = field(default_factory=dict)
 
 
-def _response(status, payload):
-    return WorkerResponse(status=int(status), payload=payload)
+@dataclass(frozen=True)
+class WorkerFile:
+    path: Path
+    start: int
+    end: int
+    size_bytes: int
+    sha256: str
+    mime_type: str
+
+
+def _response(status, payload, *, headers=None):
+    return WorkerResponse(
+        status=int(status),
+        payload=payload,
+        headers=dict(headers or {}),
+    )
 
 
 def _error(status, message):
@@ -146,6 +174,13 @@ def _auth_envelope(request):
     }
 
 
+def _authentication_path(request):
+    path_qs = getattr(request, "path_qs", None)
+    if isinstance(path_qs, str) and path_qs.startswith("/"):
+        return path_qs
+    return getattr(request, "path", None)
+
+
 def _route_for(method, path):
     if not isinstance(method, str) or not isinstance(path, str):
         return None
@@ -193,6 +228,8 @@ class WorkerApplication:
         transfer_manager=None,
         upload_artifacts=(),
         provisioner=None,
+        job_manager=None,
+        deadline_watchdog=None,
     ):
         self.state = WorkerStateStore(
             state_path,
@@ -204,6 +241,8 @@ class WorkerApplication:
         )
         self.transfer_manager = transfer_manager
         self.provisioner = provisioner
+        self.job_manager = job_manager
+        self.deadline_watchdog = deadline_watchdog
         self.upload_artifacts = {}
         self._manifest_lock = None
         self._manifest_lock_loop = None
@@ -297,7 +336,7 @@ class WorkerApplication:
             verify_request(
                 secret,
                 request.method,
-                request.path,
+                _authentication_path(request),
                 body,
                 _auth_envelope(request),
                 now=self.clock(),
@@ -306,6 +345,60 @@ class WorkerApplication:
         except (WorkerStateError, ProtocolAuthenticationError):
             return False
         return True
+
+    @staticmethod
+    def _event_cursor(request):
+        query = getattr(request, "query", {})
+        try:
+            keys = set(query)
+        except (TypeError, ValueError):
+            raise JobValidationError(
+                "Remote job event cursor is invalid."
+            ) from None
+        if not keys:
+            return 0
+        if keys != {"after_sequence"}:
+            raise JobValidationError(
+                "Remote job event cursor is invalid."
+            )
+        try:
+            values = query.getall("after_sequence")
+        except AttributeError:
+            values = [query.get("after_sequence")]
+        if len(values) != 1 or not isinstance(values[0], str):
+            raise JobValidationError(
+                "Remote job event cursor is invalid."
+            )
+        if not re.fullmatch(r"0|[1-9][0-9]{0,19}", values[0]):
+            raise JobValidationError(
+                "Remote job event cursor is invalid."
+            )
+        return int(values[0])
+
+    @staticmethod
+    def _file_range(request, size_bytes):
+        value = _headers(request).get("range")
+        if value is None:
+            return 200, 0, size_bytes - 1
+        match = re.fullmatch(
+            r"bytes=(0|[1-9][0-9]*)-(0|[1-9][0-9]*)?",
+            value,
+        )
+        if match is None:
+            raise JobValidationError(
+                "Remote output range is invalid."
+            )
+        start = int(match.group(1))
+        end = (
+            int(match.group(2))
+            if match.group(2) is not None
+            else size_bytes - 1
+        )
+        if start >= size_bytes or end < start or end >= size_bytes:
+            raise JobValidationError(
+                "Remote output range is invalid."
+            )
+        return 206, start, end
 
     async def _upload_artifact(self, request, artifact_id, body):
         artifact = self.upload_artifacts.get(artifact_id)
@@ -398,6 +491,144 @@ class WorkerApplication:
             return _error(503, "Worker transaction is unavailable.")
         return _response(200, result.payload())
 
+    async def _start_job(self, body):
+        if self.job_manager is None:
+            return _error(501, "Worker route is not implemented.")
+        try:
+            request = parse_job_request(body)
+            result = await self.job_manager.start(request)
+        except JobBusyError:
+            return _error(409, "Worker is already executing a job.")
+        except JobValidationError:
+            return _error(400, "Worker job was rejected.")
+        except JobError:
+            return _error(503, "Worker job is unavailable.")
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            raise
+        except Exception:
+            return _error(503, "Worker job is unavailable.")
+        if not isinstance(result, JobResult):
+            return _error(503, "Worker job is unavailable.")
+        return _response(
+            (
+                202
+                if result.state in {"queued", "running"}
+                else 200
+            ),
+            result.public_payload(),
+        )
+
+    async def _job(self, job_id):
+        if self.job_manager is None:
+            return _error(501, "Worker route is not implemented.")
+        try:
+            result = self.job_manager.job(job_id)
+        except JobError:
+            return _error(503, "Worker job is unavailable.")
+        if result is None:
+            return _error(404, "Worker job was not found.")
+        if not isinstance(result, JobResult):
+            return _error(503, "Worker job is unavailable.")
+        return _response(200, result.public_payload())
+
+    async def _job_events(self, request, job_id):
+        if self.job_manager is None:
+            return _error(501, "Worker route is not implemented.")
+        try:
+            cursor = self._event_cursor(request)
+            events = self.job_manager.events(job_id, cursor)
+        except JobValidationError:
+            return _error(400, "Worker event cursor was rejected.")
+        except JobError:
+            return _error(503, "Worker job events are unavailable.")
+        if events is None:
+            return _error(404, "Worker job was not found.")
+        return _response(
+            200,
+            {
+                "job_id": job_id,
+                "events": [dict(event) for event in events],
+                "last_sequence": (
+                    events[-1]["sequence"] if events else cursor
+                ),
+            },
+        )
+
+    async def _job_preview(self, job_id, preview_id):
+        if self.job_manager is None:
+            return _error(501, "Worker route is not implemented.")
+        try:
+            preview = self.job_manager.preview(job_id, preview_id)
+        except JobError:
+            return _error(503, "Worker preview is unavailable.")
+        if preview is None:
+            return _error(404, "Worker preview was not found.")
+        return _response(
+            200,
+            preview.content,
+            headers={
+                "Content-Type": preview.mime_type,
+                "Content-Length": str(len(preview.content)),
+                "X-Content-Type-Options": "nosniff",
+                "Cache-Control": "no-store",
+            },
+        )
+
+    async def _job_output(self, request, artifact_id):
+        if self.job_manager is None:
+            return _error(501, "Worker route is not implemented.")
+        try:
+            output = self.job_manager.output(artifact_id)
+            if output is None:
+                return _error(404, "Worker output was not found.")
+            status, start, end = self._file_range(
+                request,
+                output.size_bytes,
+            )
+        except JobValidationError:
+            return _error(416, "Worker output range was rejected.")
+        except JobError:
+            return _error(503, "Worker output is unavailable.")
+        headers = {
+            "Content-Type": output.mime_type,
+            "Content-Length": str(end - start + 1),
+            "Accept-Ranges": "bytes",
+            "ETag": '"' + output.sha256 + '"',
+            "X-Content-Type-Options": "nosniff",
+            "Cache-Control": "no-store",
+        }
+        if status == 206:
+            headers["Content-Range"] = (
+                f"bytes {start}-{end}/{output.size_bytes}"
+            )
+        return _response(
+            status,
+            WorkerFile(
+                path=output.path,
+                start=start,
+                end=end,
+                size_bytes=output.size_bytes,
+                sha256=output.sha256,
+                mime_type=output.mime_type,
+            ),
+            headers=headers,
+        )
+
+    async def _deadline(self, body):
+        if self.deadline_watchdog is None:
+            return _error(501, "Worker route is not implemented.")
+        try:
+            payload = parse_deadline_update(body)
+            result = self.deadline_watchdog.update(payload)
+            self.deadline_watchdog.start()
+        except DeadlineValidationError:
+            return _error(400, "Worker deadline update was rejected.")
+        except DeadlineEnforcementError:
+            return _error(503, "Worker deadline state is unavailable.")
+        except Exception:
+            return _error(503, "Worker deadline state is unavailable.")
+        return _response(200, result.payload())
+
     async def handle(self, request):
         method = getattr(request, "method", None)
         path = getattr(request, "path", None)
@@ -431,4 +662,37 @@ class WorkerApplication:
                 parameters["artifact_id"],
                 body,
             )
+        if route == "/worker/v1/artifacts/{artifact_id}":
+            return await self._job_output(
+                request,
+                parameters["artifact_id"],
+            )
+        if route == "/worker/v1/jobs":
+            return await self._start_job(body)
+        if route == "/worker/v1/jobs/{job_id}":
+            return await self._job(parameters["job_id"])
+        if route == "/worker/v1/jobs/{job_id}/events":
+            return await self._job_events(
+                request,
+                parameters["job_id"],
+            )
+        if route == (
+            "/worker/v1/jobs/{job_id}/previews/{preview_id}"
+        ):
+            return await self._job_preview(
+                parameters["job_id"],
+                parameters["preview_id"],
+            )
+        if route == "/worker/v1/deadline":
+            return await self._deadline(body)
         return _error(501, "Worker route is not implemented.")
+
+    async def close(self):
+        if self.job_manager is not None:
+            close = getattr(self.job_manager, "close", None)
+            if callable(close):
+                await close()
+        if self.deadline_watchdog is not None:
+            close = getattr(self.deadline_watchdog, "close", None)
+            if callable(close):
+                await close()

@@ -863,6 +863,7 @@ class ComfyProcessTests(unittest.TestCase):
             self.assertTrue(factory.process.terminated)
 
     def test_runtime_builder_wires_real_provisioning_components_offline(self):
+        from remote_worker.jobs import JobManager
         from remote_worker.main import build_worker_runtime
 
         with tempfile.TemporaryDirectory() as directory:
@@ -911,6 +912,15 @@ class ComfyProcessTests(unittest.TestCase):
             self.assertEqual(
                 worker.state.path,
                 state_path.resolve(),
+            )
+            self.assertIsInstance(worker.job_manager, JobManager)
+            self.assertEqual(
+                worker.job_manager.preview_root,
+                (data_root / "previews").resolve(),
+            )
+            self.assertIs(
+                worker.job_manager.comfy,
+                worker.provisioner.comfy,
             )
 
 

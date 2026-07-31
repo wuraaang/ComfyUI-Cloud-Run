@@ -3,13 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 import inspect
 import json
 import math
+import mimetypes
 import os
 from pathlib import Path
+from pathlib import PurePosixPath
+import re
 import stat
+import struct
 import time
+import uuid
 
 from cloud_run.constants import PINNED_PYTHON_VERSION
 from cloud_run.manifest import (
@@ -36,6 +42,14 @@ _RUNTIME_ENVIRONMENT = {
     "TMPDIR",
     "XDG_CACHE_HOME",
 }
+MAX_NATIVE_JSON_BYTES = 64 * 1024 * 1024
+MAX_NATIVE_WEBSOCKET_BYTES = 16 * 1024 * 1024
+_SAFE_EVENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}")
+_TERMINAL_EVENTS = {
+    "execution_success",
+    "execution_error",
+    "execution_interrupted",
+}
 
 
 class ComfyProcessError(RuntimeError):
@@ -44,6 +58,43 @@ class ComfyProcessError(RuntimeError):
 
 class ComfyIdentityError(ComfyProcessError):
     pass
+
+
+class ComfyPromptValidationError(ComfyProcessError):
+    def __init__(self, *, error_type=None, node_ids=()):
+        super().__init__("Remote ComfyUI rejected the compiled prompt.")
+        self.error_type = (
+            error_type
+            if isinstance(error_type, str)
+            and _SAFE_EVENT.fullmatch(error_type)
+            else None
+        )
+        self.node_ids = tuple(
+            item
+            for item in node_ids
+            if isinstance(item, str) and _SAFE_EVENT.fullmatch(item)
+        )[:1000]
+
+
+@dataclass(frozen=True)
+class NativeExecution:
+    prompt_id: str
+    terminal_event: str
+
+    def __post_init__(self):
+        try:
+            prompt_id = str(uuid.UUID(self.prompt_id))
+        except (AttributeError, TypeError, ValueError):
+            raise ComfyProcessError(
+                "Remote ComfyUI returned an invalid prompt identity."
+            ) from None
+        if (
+            prompt_id != self.prompt_id
+            or self.terminal_event not in _TERMINAL_EVENTS
+        ):
+            raise ComfyProcessError(
+                "Remote ComfyUI returned an invalid execution result."
+            )
 
 
 def _comfy_error():
@@ -147,8 +198,35 @@ def _validated_system_stats(stats):
 
 
 class AiohttpComfyHttp:
+    @staticmethod
+    async def _response_json(response):
+        if response.headers.get(
+            "Content-Encoding",
+            "identity",
+        ).casefold() != "identity":
+            raise _comfy_error()
+        if response.content_length is not None and (
+            response.content_length > MAX_NATIVE_JSON_BYTES
+        ):
+            raise _comfy_error()
+        content = bytearray()
+        async for chunk in response.content.iter_chunked(1024 * 1024):
+            content.extend(chunk)
+            if len(content) > MAX_NATIVE_JSON_BYTES:
+                raise _comfy_error()
+        try:
+            payload = json.loads(bytes(content).decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError):
+            raise _comfy_error() from None
+        if not isinstance(payload, dict):
+            raise _comfy_error()
+        return payload
+
     async def get_json(self, path):
-        if path not in {"/system_stats", "/object_info"}:
+        if path not in {"/system_stats", "/object_info"} and not re.fullmatch(
+            r"/history/[0-9a-f-]{36}",
+            str(path),
+        ):
             raise _comfy_error()
         try:
             from aiohttp import ClientSession, ClientTimeout
@@ -166,34 +244,230 @@ class AiohttpComfyHttp:
                 ) as response:
                     if response.status != 200:
                         raise _comfy_error()
-                    if response.headers.get(
-                        "Content-Encoding",
-                        "identity",
-                    ).casefold() != "identity":
-                        raise _comfy_error()
-                    if response.content_length is not None and (
-                        response.content_length > 64 * 1024 * 1024
-                    ):
-                        raise _comfy_error()
-                    content = bytearray()
-                    async for chunk in response.content.iter_chunked(
-                        1024 * 1024
-                    ):
-                        content.extend(chunk)
-                        if len(content) > 64 * 1024 * 1024:
-                            raise _comfy_error()
-                    payload = json.loads(bytes(content).decode("utf-8"))
+                    payload = await self._response_json(response)
         except (asyncio.CancelledError, KeyboardInterrupt):
             raise
         except ComfyProcessError:
             raise
-        except (UnicodeError, json.JSONDecodeError):
-            raise _comfy_error() from None
         except Exception:
             raise _comfy_error() from None
-        if not isinstance(payload, dict):
-            raise _comfy_error()
         return payload
+
+    @staticmethod
+    def _text_event(data):
+        if not isinstance(data, str) or len(data.encode("utf-8")) > (
+            2 * 1024 * 1024
+        ):
+            raise _comfy_error()
+        try:
+            payload = json.loads(data)
+        except json.JSONDecodeError:
+            raise _comfy_error() from None
+        if (
+            not isinstance(payload, dict)
+            or not isinstance(payload.get("type"), str)
+            or not isinstance(payload.get("data"), dict)
+        ):
+            return None
+        return {
+            "type": payload["type"],
+            "data": payload["data"],
+        }
+
+    @staticmethod
+    def _binary_event(data):
+        if (
+            not isinstance(data, (bytes, bytearray))
+            or not 4 < len(data) <= MAX_NATIVE_WEBSOCKET_BYTES
+        ):
+            raise _comfy_error()
+        event_type = struct.unpack(">I", data[:4])[0]
+        content = bytes(data[4:])
+        if event_type == 1:
+            if len(content) <= 4:
+                raise _comfy_error()
+            image_type = struct.unpack(">I", content[:4])[0]
+            mime_type = {
+                1: "image/jpeg",
+                2: "image/png",
+            }.get(image_type)
+            if mime_type is None:
+                raise _comfy_error()
+            return {
+                "type": "b_preview",
+                "data": {
+                    "content": content[4:],
+                    "mime_type": mime_type,
+                    "metadata": {},
+                },
+            }
+        if event_type == 3:
+            if len(content) < 4:
+                raise _comfy_error()
+            node_length = struct.unpack(">I", content[:4])[0]
+            if (
+                node_length > 200
+                or len(content) < 4 + node_length
+            ):
+                raise _comfy_error()
+            try:
+                node_id = content[4 : 4 + node_length].decode("utf-8")
+                text = content[4 + node_length :].decode("utf-8")
+            except UnicodeError:
+                raise _comfy_error() from None
+            return {
+                "type": "progress_text",
+                "data": {"node": node_id, "text": text},
+            }
+        if event_type == 4:
+            if len(content) < 4:
+                raise _comfy_error()
+            metadata_length = struct.unpack(">I", content[:4])[0]
+            if (
+                metadata_length > 64 * 1024
+                or len(content) <= 4 + metadata_length
+            ):
+                raise _comfy_error()
+            try:
+                metadata = json.loads(
+                    content[4 : 4 + metadata_length].decode("utf-8")
+                )
+            except (UnicodeError, json.JSONDecodeError):
+                raise _comfy_error() from None
+            if not isinstance(metadata, dict):
+                raise _comfy_error()
+            mime_type = metadata.get("image_type")
+            if mime_type not in {"image/jpeg", "image/png"}:
+                raise _comfy_error()
+            return {
+                "type": "b_preview_with_metadata",
+                "data": {
+                    "content": content[4 + metadata_length :],
+                    "mime_type": mime_type,
+                    "metadata": metadata,
+                },
+            }
+        return None
+
+    async def execute_native(self, prompt_body, on_event):
+        try:
+            from aiohttp import (
+                ClientSession,
+                ClientTimeout,
+                WSMsgType,
+            )
+        except ImportError:
+            raise _comfy_error() from None
+        if (
+            not isinstance(prompt_body, dict)
+            or not callable(on_event)
+            or not isinstance(prompt_body.get("client_id"), str)
+        ):
+            raise _comfy_error()
+        try:
+            encoded = json.dumps(
+                prompt_body,
+                ensure_ascii=True,
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        except (TypeError, ValueError):
+            raise _comfy_error() from None
+        if not 0 < len(encoded) <= MAX_NATIVE_JSON_BYTES:
+            raise _comfy_error()
+        timeout = ClientTimeout(
+            total=None,
+            sock_connect=10,
+            sock_read=None,
+        )
+        try:
+            async with ClientSession(
+                timeout=timeout,
+                auto_decompress=False,
+            ) as session:
+                async with session.ws_connect(
+                    _COMFY_ORIGIN + "/ws",
+                    params={"clientId": prompt_body["client_id"]},
+                    max_msg_size=MAX_NATIVE_WEBSOCKET_BYTES,
+                    autoping=True,
+                ) as websocket:
+                    await websocket.send_json(
+                        {
+                            "type": "feature_flags",
+                            "data": {
+                                "supports_preview_metadata": True,
+                            },
+                        }
+                    )
+                    async with session.post(
+                        _COMFY_ORIGIN + "/prompt",
+                        data=encoded,
+                        headers={
+                            "Content-Type": "application/json",
+                            "Accept": "application/json",
+                        },
+                        allow_redirects=False,
+                    ) as response:
+                        payload = await self._response_json(response)
+                        if response.status != 200:
+                            error = payload.get("error")
+                            error_type = (
+                                error.get("type")
+                                if isinstance(error, dict)
+                                else None
+                            )
+                            node_errors = payload.get("node_errors")
+                            node_ids = (
+                                tuple(node_errors)
+                                if isinstance(node_errors, dict)
+                                else ()
+                            )
+                            raise ComfyPromptValidationError(
+                                error_type=error_type,
+                                node_ids=node_ids,
+                            )
+                    prompt_id = payload.get("prompt_id")
+                    try:
+                        normalized_prompt_id = str(uuid.UUID(prompt_id))
+                    except (AttributeError, TypeError, ValueError):
+                        raise _comfy_error() from None
+                    if normalized_prompt_id != prompt_id:
+                        raise _comfy_error()
+                    async for message in websocket:
+                        if message.type == WSMsgType.TEXT:
+                            event = self._text_event(message.data)
+                        elif message.type == WSMsgType.BINARY:
+                            event = self._binary_event(message.data)
+                        elif message.type in {
+                            WSMsgType.CLOSE,
+                            WSMsgType.CLOSED,
+                            WSMsgType.ERROR,
+                        }:
+                            break
+                        else:
+                            continue
+                        if event is None:
+                            continue
+                        result = on_event(event)
+                        if inspect.isawaitable(result):
+                            await result
+                        data = event["data"]
+                        if (
+                            event["type"] in _TERMINAL_EVENTS
+                            and data.get("prompt_id") == prompt_id
+                        ):
+                            return NativeExecution(
+                                prompt_id=prompt_id,
+                                terminal_event=event["type"],
+                            )
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            raise
+        except (ComfyProcessError, ComfyPromptValidationError):
+            raise
+        except Exception:
+            raise _comfy_error() from None
+        raise _comfy_error()
 
 
 class ComfyProcess:
@@ -208,6 +482,7 @@ class ComfyProcess:
         sleeper=None,
         clock=None,
         progress=None,
+        output_root=None,
         startup_timeout=DEFAULT_STARTUP_TIMEOUT_SECONDS,
         stop_timeout=DEFAULT_STOP_TIMEOUT_SECONDS,
     ):
@@ -230,6 +505,11 @@ class ComfyProcess:
             raise ValueError("Pinned ComfyUI runtime is unavailable.")
         self.main_path = main_path.resolve(strict=True)
         self.python_executable = executable
+        self.output_root = Path(
+            output_root
+            if output_root is not None
+            else self.comfy_root / "output"
+        )
 
         working_path = Path(working_root)
         try:
@@ -415,3 +695,112 @@ class ComfyProcess:
             raise _comfy_error()
         await self._progress("validation")
         return payload
+
+    async def execute_native(self, prompt_body, on_event):
+        if not self._running():
+            raise _comfy_error()
+        method = getattr(self.http, "execute_native", None)
+        if not callable(method):
+            raise _comfy_error()
+        try:
+            result = await method(prompt_body, on_event)
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            raise
+        except (ComfyPromptValidationError, ComfyProcessError):
+            raise
+        except Exception:
+            raise _comfy_error() from None
+        if not isinstance(result, NativeExecution):
+            raise _comfy_error()
+        return result
+
+    async def history(self, prompt_id):
+        try:
+            normalized = str(uuid.UUID(prompt_id))
+        except (AttributeError, TypeError, ValueError):
+            raise _comfy_error() from None
+        if normalized != prompt_id or not self._running():
+            raise _comfy_error()
+        try:
+            payload = await self.http.get_json(
+                "/history/" + normalized
+            )
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            raise
+        except Exception:
+            raise _comfy_error() from None
+        return payload
+
+    def output_path(self, descriptor):
+        if (
+            not isinstance(descriptor, dict)
+            or descriptor.get("type") != "output"
+            or not isinstance(descriptor.get("filename"), str)
+            or not isinstance(descriptor.get("subfolder"), str)
+        ):
+            raise _comfy_error()
+        filename = descriptor["filename"]
+        subfolder = descriptor["subfolder"]
+        if (
+            not filename
+            or filename in {".", ".."}
+            or "/" in filename
+            or "\\" in filename
+            or any(ord(character) < 32 for character in filename)
+            or len(filename.encode("utf-8")) > 1024
+            or "\\" in subfolder
+            or any(ord(character) < 32 for character in subfolder)
+            or len(subfolder.encode("utf-8")) > 4096
+        ):
+            raise _comfy_error()
+        relative = PurePosixPath(subfolder)
+        if relative.is_absolute() or any(
+            part in {"", ".", ".."} for part in relative.parts
+        ):
+            if subfolder:
+                raise _comfy_error()
+            parts = ()
+        else:
+            parts = relative.parts
+        try:
+            root_metadata = os.lstat(self.output_root)
+            root = self.output_root.resolve(strict=True)
+            if (
+                not stat.S_ISDIR(root_metadata.st_mode)
+                or stat.S_ISLNK(root_metadata.st_mode)
+            ):
+                raise _comfy_error()
+            current = self.output_root
+            for part in parts:
+                current = current / part
+                metadata = os.lstat(current)
+                if (
+                    not stat.S_ISDIR(metadata.st_mode)
+                    or stat.S_ISLNK(metadata.st_mode)
+                ):
+                    raise _comfy_error()
+            candidate = current / filename
+            metadata = os.lstat(candidate)
+            resolved = candidate.resolve(strict=True)
+            resolved.relative_to(root)
+        except ComfyProcessError:
+            raise
+        except (OSError, RuntimeError, ValueError):
+            raise _comfy_error() from None
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+        ):
+            raise _comfy_error()
+        return resolved
+
+    @staticmethod
+    def output_mime_type(path):
+        mime_type, _encoding = mimetypes.guess_type(str(path))
+        if (
+            not isinstance(mime_type, str)
+            or len(mime_type) > 100
+            or not re.fullmatch(r"[a-z0-9.+-]+/[a-z0-9.+-]+", mime_type)
+        ):
+            return "application/octet-stream"
+        return mime_type

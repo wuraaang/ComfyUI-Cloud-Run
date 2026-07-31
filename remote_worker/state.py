@@ -16,6 +16,28 @@ STATE_SCHEMA_VERSION = 1
 MAX_STATE_BYTES = 16 * 1024 * 1024
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}")
 _HEX_64 = re.compile(r"[0-9a-f]{64}")
+_JOB_STATES = {
+    "queued",
+    "running",
+    "succeeded",
+    "failed",
+    "interrupted",
+}
+_JOB_RECORD_FIELDS = {
+    "kind",
+    "job_id",
+    "request_digest",
+    "manifest_digest",
+    "state",
+    "client_id",
+    "prompt_id",
+    "sequence",
+    "events",
+    "previews",
+    "outputs",
+    "error",
+    "updated_at",
+}
 _STATE_FIELDS = {
     "schema_version",
     "protocol_version",
@@ -45,6 +67,82 @@ class WorkerSessionMismatch(WorkerStateError):
 
 def _identifier(value):
     return isinstance(value, str) and _IDENTIFIER.fullmatch(value)
+
+
+def _finite_number(value):
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(value)
+    )
+
+
+def _validate_job_record(job_id, record):
+    if (
+        not _identifier(job_id)
+        or not isinstance(record, dict)
+        or set(record) != _JOB_RECORD_FIELDS
+        or record.get("kind") != "job"
+        or record.get("job_id") != job_id
+        or not isinstance(record.get("request_digest"), str)
+        or not _HEX_64.fullmatch(record["request_digest"])
+        or not isinstance(record.get("manifest_digest"), str)
+        or not _HEX_64.fullmatch(record["manifest_digest"])
+        or record.get("state") not in _JOB_STATES
+        or not _identifier(record.get("client_id"))
+        or (
+            record.get("prompt_id") is not None
+            and not _identifier(record["prompt_id"])
+        )
+        or isinstance(record.get("sequence"), bool)
+        or not isinstance(record.get("sequence"), int)
+        or record["sequence"] < 0
+        or not isinstance(record.get("events"), list)
+        or not isinstance(record.get("previews"), dict)
+        or not isinstance(record.get("outputs"), dict)
+        or (
+            record.get("error") is not None
+            and not isinstance(record["error"], dict)
+        )
+        or not _finite_number(record.get("updated_at"))
+        or record["updated_at"] < 0
+    ):
+        raise WorkerStateError("Worker job state is invalid.")
+    if len(record["events"]) != record["sequence"]:
+        raise WorkerStateError("Worker job state is invalid.")
+    for expected_sequence, event in enumerate(record["events"], start=1):
+        if (
+            not isinstance(event, dict)
+            or set(event) != {
+                "sequence",
+                "type",
+                "data",
+                "created_at",
+            }
+            or event.get("sequence") != expected_sequence
+            or not _identifier(event.get("type"))
+            or not isinstance(event.get("data"), dict)
+            or not _finite_number(event.get("created_at"))
+            or event["created_at"] < 0
+        ):
+            raise WorkerStateError("Worker job state is invalid.")
+    for preview_id, preview in record["previews"].items():
+        if (
+            not _identifier(preview_id)
+            or not isinstance(preview, dict)
+            or preview.get("preview_id") != preview_id
+            or not isinstance(preview.get("private_path"), str)
+        ):
+            raise WorkerStateError("Worker job state is invalid.")
+    for artifact_id, output in record["outputs"].items():
+        if (
+            not _identifier(artifact_id)
+            or not isinstance(output, dict)
+            or output.get("artifact_id") != artifact_id
+            or not isinstance(output.get("private_path"), str)
+        ):
+            raise WorkerStateError("Worker job state is invalid.")
+    return record
 
 
 def _default_state(expected_session_id):
@@ -323,3 +421,93 @@ class WorkerStateStore:
         if installed is not _UNCHANGED:
             updated["installed"] = dict(installed)
         return self.save(updated)
+
+    def record_job(self, job_id, record):
+        _validate_job_record(job_id, record)
+        state = self.load()
+        if not state["claimed"]:
+            raise WorkerStateError("Worker is not claimed.")
+        jobs = dict(state["jobs"])
+        jobs[job_id] = dict(record)
+        return self.save({**state, "jobs": jobs})
+
+    def job(self, job_id):
+        if not _identifier(job_id):
+            raise WorkerStateError("Worker job identity is invalid.")
+        record = self.load()["jobs"].get(job_id)
+        if record is None:
+            return None
+        _validate_job_record(job_id, record)
+        return dict(record)
+
+    def record_deadline(
+        self,
+        *,
+        mode,
+        deadline_at,
+        retrieval_grace_seconds,
+        destroy_intent,
+        destroy_intent_at,
+        destroy_requested,
+        updated_at,
+    ):
+        if (
+            mode not in {"finite", "none"}
+            or (
+                mode == "finite"
+                and (
+                    not _finite_number(deadline_at)
+                    or deadline_at < 0
+                )
+            )
+            or (mode == "none" and deadline_at is not None)
+            or isinstance(retrieval_grace_seconds, bool)
+            or not isinstance(retrieval_grace_seconds, int)
+            or not 0 <= retrieval_grace_seconds <= 300
+            or not isinstance(destroy_intent, bool)
+            or (
+                destroy_intent
+                and (
+                    not _finite_number(destroy_intent_at)
+                    or destroy_intent_at < 0
+                )
+            )
+            or (not destroy_intent and destroy_intent_at is not None)
+            or not isinstance(destroy_requested, bool)
+            or (destroy_requested and not destroy_intent)
+            or not _finite_number(updated_at)
+            or updated_at < 0
+        ):
+            raise WorkerStateError("Worker deadline state is invalid.")
+        state = self.load()
+        if not state["claimed"]:
+            raise WorkerStateError("Worker is not claimed.")
+        transactions = dict(state["transactions"])
+        transactions["deadline"] = {
+            "kind": "deadline",
+            "mode": mode,
+            "deadline_at": (
+                float(deadline_at) if deadline_at is not None else None
+            ),
+            "retrieval_grace_seconds": retrieval_grace_seconds,
+            "destroy_intent": destroy_intent,
+            "destroy_intent_at": (
+                float(destroy_intent_at)
+                if destroy_intent_at is not None
+                else None
+            ),
+            "destroy_requested": destroy_requested,
+            "updated_at": float(updated_at),
+        }
+        return self.save(
+            {
+                **state,
+                "deadline_mode": mode,
+                "deadline_at": (
+                    float(deadline_at)
+                    if deadline_at is not None
+                    else None
+                ),
+                "transactions": transactions,
+            }
+        )
