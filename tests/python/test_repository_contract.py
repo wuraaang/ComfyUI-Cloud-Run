@@ -132,6 +132,29 @@ class RepositoryContractTests(unittest.TestCase):
             with self.subTest(text=required_text):
                 self.assertIn(required_text, gate)
 
+    def test_publication_docs_name_only_the_correct_source_origin(self):
+        paths = (
+            REPOSITORY_ROOT / "README.md",
+            REPOSITORY_ROOT / "docs" / "project-state.md",
+            REPOSITORY_ROOT / "docs" / "remote-worker-bootstrap-review.md",
+        )
+        combined = "\n".join(
+            path.read_text(encoding="utf-8") for path in paths
+        )
+        self.assertIn(
+            "https://github.com/wuraaang/ComfyUI-Cloud-Run",
+            combined,
+        )
+        self.assertIn("comfy-relay-do-not-push", combined)
+        self.assertIn(
+            "https://github.com/wuraaang/comfy-relay.git",
+            combined,
+        )
+        self.assertNotIn(
+            "configured Git remote currently points at the wrong",
+            combined,
+        )
+
     def test_bootstrap_review_records_the_unpublished_worker_boundary(self):
         review = (
             REPOSITORY_ROOT

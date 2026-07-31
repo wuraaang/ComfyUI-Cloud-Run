@@ -3,9 +3,17 @@
 This document is the offline review handoff. It is not a release lock,
 publication record, Vast template, or permission to spend.
 
+Public source repository: https://github.com/wuraaang/ComfyUI-Cloud-Run. The
+repository exists, but this review does not claim a published branch, source
+commit, or fetched archive until those are separately verified.
+
 No worker archive or project-specific Vast template has been published. The
-repository intentionally contains no live `worker-release.json`. The currently
-configured ComfyRelay remote is unrelated and must not receive this project.
+repository intentionally contains no live `worker-release.json`. The unrelated
+ComfyRelay remote is retained as `comfy-relay-do-not-push` at
+https://github.com/wuraaang/comfy-relay.git and received no publication push.
+Publishing source alone does not create a worker release lock, authorize Vast
+activity, or convert the deterministic review artifact below into a live
+release.
 
 ## Deterministic review artifact
 

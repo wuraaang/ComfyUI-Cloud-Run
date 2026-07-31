@@ -200,10 +200,13 @@ no live release lock in this repository.
 
 Before a paid Gold run, a new human GO must state the maximum instance count,
 maximum hourly price, and absolute duration or cost. The private Gold image and
-workflow are never repository fixtures. The configured Git remote currently
-points at the wrong ComfyRelay remote; it must not receive a push. Publication
-requires a correct ComfyUI-Cloud-Run repository, secret audit, worker review,
-immutable artifact publication, and a project-template pin first.
+workflow are never repository fixtures. The canonical public source repository
+is https://github.com/wuraaang/ComfyUI-Cloud-Run. The unrelated ComfyRelay
+remote is retained locally only as `comfy-relay-do-not-push` at
+https://github.com/wuraaang/comfy-relay.git and must never receive a push.
+Publishing repository source alone does not publish a worker artifact, create
+a live release lock or project template, or authorize a paid Gold run; those
+steps remain separately reviewed and gated.
 
 ## Uninstall
 

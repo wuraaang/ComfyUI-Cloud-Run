@@ -1,7 +1,8 @@
 # Project state
 
 Status: workflow-derived reusable sessions implemented and fake/offline
-certified on the pinned local ComfyUI Desktop environment. Publication and all
+certified on the pinned local ComfyUI Desktop environment. The correctly named
+public source repository has been created; source publication evidence and all
 real paid activity remain human-gated.
 
 Source of truth:
@@ -60,8 +61,11 @@ Source of truth:
 - No live `worker-release.json` exists.
 - No provider mutation, upload, Registry publication, or remote push is part of
   autonomous verification.
-- The configured Git remote points to ComfyRelay and is explicitly forbidden
-  for this project.
+- Public source repository: https://github.com/wuraaang/ComfyUI-Cloud-Run.
+  Local `origin` points to the matching `.git` URL.
+- The unrelated legacy remote `comfy-relay-do-not-push` points to
+  https://github.com/wuraaang/comfy-relay.git. ComfyRelay received no push from
+  this publication.
 - The private Gold source and workflow are not read by autonomous tests and are
   never repository fixtures.
 - The official base-template allowlist remains
@@ -70,9 +74,10 @@ Source of truth:
 
 ## Next gated action
 
-A human must review `docs/remote-worker-bootstrap-review.md`, create the correct
-public ComfyUI-Cloud-Run repository, publish an immutable reviewed worker
-artifact, and pin a project-specific template/release lock.
+A human must review `docs/remote-worker-bootstrap-review.md`, publish and audit
+the exact reviewed source commit, then inspect the fetched immutable GitHub
+archive. The worker archive, project-specific template, and matching private
+release lock remain pending separate review.
 
 Only then can a separate paid Gold GO authorize all of:
 
