@@ -10,7 +10,16 @@ contracts and safety policies using LoRA Dataset Studio as a behavioral referenc
 
 The referenced behavior includes Vast offer normalization, host blacklisting,
 reliability-aware offer choice, leak-safe provisioning, forced cleanup, restart
-reconciliation, boot monitoring, and destruction-gated single replacement.
+reconciliation, boot monitoring, destruction-gated single replacement,
+resumable transfer watchdogs, and verified result recovery.
 
 No source code was copied from LoRA Dataset Studio. ComfyUI Cloud Run contains
 an independent, dependency-free implementation scoped to this custom node.
+LoRA Dataset Studio remains a read-only behavioral reference and is not a
+runtime, build, or publication dependency.
+
+The Remote Worker, fixed bootstrap, deterministic artifact builder, canvas
+adapter, dependency resolver, session control plane, relay, and offline fake
+provider certification were authored for this repository. No private Gold
+image, personal workflow, credential, live release lock, or generated worker
+archive is distributed with the source tree.

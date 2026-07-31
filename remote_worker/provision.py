@@ -14,7 +14,6 @@ import shutil
 import time
 from urllib.parse import urlsplit
 
-from cloud_run.artifacts import GIB, HEADROOM_BYTES
 from cloud_run.manifest import (
     MANIFEST_SCHEMA_VERSION,
     PINNED_COMFYUI_CORE_VERSION,
@@ -35,6 +34,8 @@ from .transfers import (
     wheel_artifact,
 )
 
+GIB = 1024 * 1024 * 1024
+HEADROOM_BYTES = 20 * GIB
 
 PROVISION_STALL_SECONDS = 600
 MAX_REQUIRED_CLASS_TYPES = 100_000

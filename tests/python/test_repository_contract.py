@@ -34,6 +34,10 @@ class RepositoryContractTests(unittest.TestCase):
             "LICENSE",
             ".gitignore",
             "scripts/check.sh",
+            "scripts/build_worker_artifact.py",
+            "scripts/validate_gold_output.py",
+            "remote_worker/bootstrap.py",
+            "docs/remote-worker-bootstrap-review.md",
         ):
             with self.subTest(path=relative_path):
                 self.assertTrue(
@@ -54,26 +58,48 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertIn("[tool.comfy]", metadata)
         self.assertIn('DisplayName = "Cloud Run"', metadata)
 
-    def test_readme_documents_cost_cleanup_recovery_and_gate(self):
+    def test_readme_documents_final_session_flow_and_safety_boundary(self):
         readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
+        normalized = " ".join(readme.split()).casefold()
         for required_text in (
             "Paid Vast.ai rental",
             "027fba7753c024be019030fb42aed900",
-            "0600",
+            "exact prompt compiled by ComfyUI",
+            "never posts that prompt to local `/prompt`",
+            "one job at a time",
+            "delta",
+            "20 GiB",
+            "80 GiB",
+            "no Vast volume",
+            "15 and 5 minutes",
+            "Destroy GPU — stop all Vast billing",
             "/cloud-run/api/settings",
+            "/cloud-run/api/captures",
+            "/cloud-run/api/preflights",
             "/cloud-run/api/offers",
-            "/cloud-run/api/quotes",
-            "/cloud-run/api/attempts/{attempt_id}",
+            "/cloud-run/api/sessions/{session_id}/confirm",
+            "/cloud-run/api/sessions/{session_id}/jobs",
+            "/cloud-run/api/sessions/{session_id}/deadline",
             "idempotency",
-            "recovery",
-            "emergency",
-            "uninstalling",
+            "restart recovery",
+            "resume",
+            "worker release lock",
+            "fake/offline",
+            "no project-specific worker template has been published or pinned",
+            "no real Vast rental or Gold run has occurred",
+            "ComfyRelay remote",
+            "maximum instance count",
+            "maximum hourly price",
+            "absolute duration or cost",
+            "private Gold image and workflow are never repository fixtures",
             "does not destroy",
             "scripts/check.sh",
         ):
             with self.subTest(text=required_text):
-                self.assertIn(required_text, readme)
-        self.assertNotIn("Preview only — no instance will be rented", readme)
+                self.assertIn(required_text.casefold(), normalized)
+        self.assertNotIn("/cloud-run/api/quotes", readme)
+        self.assertNotIn("/cloud-run/api/attempts/", readme)
+        self.assertNotIn("Workflow transfer", readme)
 
     def test_notice_records_behavioral_reference_without_vendored_source(self):
         notice = (REPOSITORY_ROOT / "NOTICE").read_text(encoding="utf-8")
@@ -86,13 +112,44 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertIn("behavioral reference", notice)
         self.assertIn("No source code was copied", notice)
 
-    def test_gate_contains_route_state_and_secret_allowlists(self):
+    def test_gate_contains_final_route_state_boundary_and_artifact_checks(self):
         gate = (REPOSITORY_ROOT / "scripts" / "check.sh").read_text(
             encoding="utf-8"
         )
-        self.assertIn("allowed_cloud_run_routes", gate)
-        self.assertIn("expected_attempt_states", gate)
-        self.assertIn("secret_patterns", gate)
+        for required_text in (
+            "[check] fake reusable session",
+            "[check] worker protocol and artifact",
+            "[check] secret, origin, route, state, subprocess, and provider boundary scan",
+            "[check] public artifact scan",
+            "allowed_cloud_run_routes",
+            "allowed_worker_routes",
+            "expected_session_states",
+            "expected_job_states",
+            "expected_transfer_states",
+            "allowed_provider_actions",
+            "secret_patterns",
+        ):
+            with self.subTest(text=required_text):
+                self.assertIn(required_text, gate)
+
+    def test_bootstrap_review_records_the_unpublished_worker_boundary(self):
+        review = (
+            REPOSITORY_ROOT
+            / "docs"
+            / "remote-worker-bootstrap-review.md"
+        ).read_text(encoding="utf-8")
+        for required_text in (
+            "scripts/build_worker_artifact.py",
+            "remote_worker/Caddyfile",
+            "cloud_run/manifest.py",
+            "cloud_run/worker_protocol.py",
+            "SHA-256",
+            "own-instance DELETE",
+            "No worker archive or project-specific Vast template has been published",
+            "ComfyRelay",
+        ):
+            with self.subTest(text=required_text):
+                self.assertIn(required_text, review)
 
     def test_gate_is_executable(self):
         gate = REPOSITORY_ROOT / "scripts" / "check.sh"

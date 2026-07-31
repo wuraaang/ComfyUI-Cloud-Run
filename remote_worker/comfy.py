@@ -17,12 +17,12 @@ import struct
 import time
 import uuid
 
-from cloud_run.constants import PINNED_PYTHON_VERSION
 from cloud_run.manifest import (
     PINNED_COMFYUI_CORE_VERSION,
     PINNED_COMFYUI_FRONTEND_VERSION,
 )
 
+PINNED_PYTHON_VERSION = "3.13.12"
 COMFY_BIND_HOST = "127.0.0.1"
 COMFY_BIND_PORT = 8188
 DEFAULT_STARTUP_TIMEOUT_SECONDS = 180

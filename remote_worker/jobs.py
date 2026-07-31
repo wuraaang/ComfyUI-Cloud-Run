@@ -17,7 +17,7 @@ import tempfile
 import time
 import uuid
 
-from cloud_run.capture import (
+from cloud_run.worker_protocol import (
     CaptureValidationError,
     CompiledCapture,
     canonical_json,

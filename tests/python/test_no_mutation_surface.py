@@ -4,6 +4,8 @@ import unittest
 from pathlib import Path
 
 from cloud_run import vast
+from remote_worker import deadline
+from remote_worker.server import worker_route_set
 from tests.python.test_routes import captured_handlers
 
 
@@ -22,7 +24,7 @@ class ProviderMutationSurfaceTests(unittest.TestCase):
             agents,
         )
         self.assertIn("No real Vast.ai rental without a separate human GO", agents)
-        self.assertIn("managed lifecycle implemented", project_state)
+        self.assertIn("workflow-derived reusable sessions implemented", project_state)
         self.assertIn("fake/offline", project_state)
 
     def test_backend_exposes_only_the_allowlisted_lifecycle_routes(self):
@@ -155,26 +157,54 @@ class ProviderMutationSurfaceTests(unittest.TestCase):
             name
             for name, value in inspect.getmembers(vast, inspect.isfunction)
         }
-        self.assertEqual(
-            {
-                name
-                for name in function_names
-                if name in {
-                    "create_instance",
-                    "destroy_instance",
-                    "get_instance",
-                    "list_instances",
-                }
-            },
-            {
-                "create_instance",
-                "destroy_instance",
-                "get_instance",
-                "list_instances",
-            },
-        )
+        approved = {
+            "search_offers",
+            "get_offer",
+            "create_instance",
+            "list_instances",
+            "get_instance",
+            "destroy_instance",
+        }
+        self.assertEqual(function_names & approved, approved)
         self.assertNotIn("rent_instance", production_source)
         self.assertNotIn("run_command", production_source)
+
+    def test_worker_exposes_only_the_reviewed_routes_and_own_delete(self):
+        self.assertEqual(
+            worker_route_set(),
+            {
+                ("GET", "/worker/v1/health"),
+                ("POST", "/worker/v1/claim"),
+                ("POST", "/worker/v1/manifests"),
+                (
+                    "GET",
+                    "/worker/v1/transactions/{transaction_id}",
+                ),
+                ("PUT", "/worker/v1/artifacts/{artifact_id}"),
+                ("GET", "/worker/v1/artifacts/{artifact_id}"),
+                ("POST", "/worker/v1/jobs"),
+                ("GET", "/worker/v1/jobs/{job_id}"),
+                ("GET", "/worker/v1/jobs/{job_id}/events"),
+                (
+                    "GET",
+                    "/worker/v1/jobs/{job_id}/previews/{preview_id}",
+                ),
+                ("PUT", "/worker/v1/deadline"),
+            },
+        )
+        methods = {
+            name
+            for name, value in inspect.getmembers(
+                deadline.AiohttpOwnInstanceProvider,
+                inspect.isfunction,
+            )
+            if not name.startswith("_")
+        }
+        self.assertEqual(methods, {"delete"})
+        source = inspect.getsource(deadline.AiohttpOwnInstanceProvider)
+        self.assertIn("/api/v0/instances/", source)
+        self.assertNotIn("stop", source.casefold())
+        self.assertNotIn("volume", source.casefold())
 
 
 if __name__ == "__main__":

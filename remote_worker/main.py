@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import os
 from pathlib import Path
 import re
@@ -29,6 +30,7 @@ from .transfers import AiohttpRangeClient, TransferManager
 
 
 _WORKER_VERSION = re.compile(r"[0-9a-f]{40}")
+_FIXED_STATE_DIRECTORY = Path("/var/lib/comfyui-cloud-run")
 
 
 def _private_directory(path):
@@ -233,26 +235,32 @@ def build_aiohttp_application(
     return application
 
 
-def main():
+def parse_worker_arguments(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Run the loopback-only ComfyUI Cloud Run worker."
+    )
+    parser.add_argument(
+        "--state-directory",
+        type=Path,
+        required=True,
+    )
+    arguments = parser.parse_args(argv)
+    if arguments.state_directory != _FIXED_STATE_DIRECTORY:
+        parser.error("the reviewed worker state directory is required")
+    return arguments
+
+
+def main(argv=None):
     try:
         from aiohttp import web
     except ImportError:
         raise RuntimeError("aiohttp is required by the Remote Worker.") from None
+    arguments = parse_worker_arguments(argv)
     session_id = (
         os.environ.get("CLOUD_RUN_SESSION_ID", "").strip() or None
     )
-    data_root = Path(
-        os.environ.get(
-            "CLOUD_RUN_DATA_ROOT",
-            "/var/lib/comfyui-cloud-run",
-        )
-    )
-    state_path = Path(
-        os.environ.get(
-            "CLOUD_RUN_WORKER_STATE",
-            str(data_root / "worker-state.json"),
-        )
-    )
+    data_root = arguments.state_directory
+    state_path = data_root / "worker-state.json"
     comfy_root = Path(
         os.environ.get(
             "CLOUD_RUN_COMFY_ROOT",
