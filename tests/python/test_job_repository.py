@@ -137,6 +137,72 @@ class JobRepositoryTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "changed"):
             jobs.save_job(stale.transition(JobState.FAILED, now=21.0))
 
+    def test_event_poll_replay_is_idempotent_but_gap_or_change_is_rejected(self):
+        jobs = JobRepository(self.path)
+        jobs.create_job(cloud_job())
+        first = jobs.append_event(
+            "job-1",
+            1,
+            "progress",
+            {"value": 1, "max": 2},
+            created_at=11.0,
+        )
+        replay = jobs.append_event(
+            "job-1",
+            1,
+            "progress",
+            {"value": 1, "max": 2},
+            created_at=99.0,
+        )
+
+        self.assertEqual(first, replay)
+        self.assertEqual(jobs.last_event_sequence("job-1"), 1)
+        with self.assertRaisesRegex(ValueError, "identity"):
+            jobs.append_event(
+                "job-1",
+                1,
+                "progress",
+                {"value": 2, "max": 2},
+            )
+        with self.assertRaisesRegex(ValueError, "contiguous"):
+            jobs.append_event(
+                "job-1",
+                3,
+                "execution_success",
+                {},
+            )
+
+    def test_lists_only_the_requested_jobs_transfers(self):
+        jobs = JobRepository(self.path)
+        jobs.create_job(cloud_job())
+        jobs.create_job(
+            cloud_job(
+                job_id="job-2",
+                session_id="session-2",
+                idempotency_key="job-key-2",
+            )
+        )
+        for job_id, artifact_id in (
+            ("job-1", "output-1"),
+            ("job-1", "preview:preview-1"),
+            ("job-2", "output-2"),
+        ):
+            jobs.save_transfer(
+                job_id=job_id,
+                artifact_id=artifact_id,
+                direction="download",
+                expected_size=10,
+                sha256="b" * 64,
+                offset=10,
+                state=TransferState.VERIFIED,
+                private_path="/private/" + artifact_id,
+            )
+
+        self.assertEqual(
+            [item.artifact_id for item in jobs.list_transfers("job-1")],
+            ["output-1", "preview:preview-1"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

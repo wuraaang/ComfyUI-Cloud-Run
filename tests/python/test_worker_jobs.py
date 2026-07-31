@@ -707,6 +707,7 @@ class WorkerJobRouteTests(unittest.IsolatedAsyncioTestCase):
             self.request(
                 "GET",
                 "/worker/v1/artifacts/" + artifact_id,
+                query={"start": "5"},
                 headers={"Range": "bytes=5-"},
             )
         )

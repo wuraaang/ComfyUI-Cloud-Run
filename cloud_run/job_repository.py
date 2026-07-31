@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import closing
 from dataclasses import dataclass
 import json
+import math
 from pathlib import Path
 import re
 import sqlite3
@@ -425,13 +426,58 @@ class JobRepository:
         created_at=None,
     ):
         identifier = _require_identifier(job_id, "job ID")
-        number = int(sequence)
-        if number < 1:
+        if (
+            isinstance(sequence, bool)
+            or not isinstance(sequence, int)
+            or sequence < 1
+        ):
             raise ValueError("Event sequence must be positive.")
+        number = sequence
         kind = _require_identifier(event_type, "event type")
         if not isinstance(payload, dict):
             raise ValueError("Event payload must be an object.")
+        encoded = _canonical_json(payload)
+        timestamp = float(
+            time.time() if created_at is None else created_at
+        )
+        if not math.isfinite(timestamp) or timestamp < 0:
+            raise ValueError("Event timestamp is invalid.")
         with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                """
+                SELECT event_type, payload_json, created_at
+                FROM job_events
+                WHERE job_id = ? AND sequence = ?
+                """,
+                (identifier, number),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["event_type"] != kind
+                    or existing["payload_json"] != encoded
+                ):
+                    connection.rollback()
+                    raise ValueError("Event identity cannot change.")
+                connection.commit()
+                return JobEvent(
+                    job_id=identifier,
+                    sequence=number,
+                    event_type=kind,
+                    payload=json.loads(encoded),
+                    created_at=float(existing["created_at"]),
+                )
+            row = connection.execute(
+                """
+                SELECT COALESCE(MAX(sequence), 0) AS last_sequence
+                FROM job_events
+                WHERE job_id = ?
+                """,
+                (identifier,),
+            ).fetchone()
+            if number != int(row["last_sequence"]) + 1:
+                connection.rollback()
+                raise ValueError("Event sequences must be contiguous.")
             connection.execute(
                 """
                 INSERT INTO job_events(
@@ -442,11 +488,18 @@ class JobRepository:
                     identifier,
                     number,
                     kind,
-                    _canonical_json(payload),
-                    float(time.time() if created_at is None else created_at),
+                    encoded,
+                    timestamp,
                 ),
             )
             connection.commit()
+        return JobEvent(
+            job_id=identifier,
+            sequence=number,
+            event_type=kind,
+            payload=json.loads(encoded),
+            created_at=timestamp,
+        )
 
     def list_events(self, job_id, after_sequence=0):
         with closing(self._connect()) as connection:
@@ -469,6 +522,18 @@ class JobRepository:
             )
             for row in rows
         ]
+
+    def last_event_sequence(self, job_id):
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                """
+                SELECT COALESCE(MAX(sequence), 0) AS last_sequence
+                FROM job_events
+                WHERE job_id = ?
+                """,
+                (str(job_id),),
+            ).fetchone()
+        return int(row["last_sequence"])
 
     def save_transfer(
         self,
@@ -566,6 +631,49 @@ class JobRepository:
             state=TransferState(row["state"]),
             private_path=row["private_path"],
         )
+
+    def list_transfers(self, job_id):
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    job_id, artifact_id, direction, expected_size, sha256,
+                    offset, state, private_path
+                FROM transfers
+                WHERE job_id = ?
+                ORDER BY artifact_id
+                """,
+                (str(job_id),),
+            ).fetchall()
+        return [
+            TransferRecord(
+                job_id=row["job_id"],
+                artifact_id=row["artifact_id"],
+                direction=row["direction"],
+                expected_size=int(row["expected_size"]),
+                sha256=row["sha256"],
+                offset=int(row["offset"]),
+                state=TransferState(row["state"]),
+                private_path=row["private_path"],
+            )
+            for row in rows
+        ]
+
+    def reset_transfer(self, job_id, artifact_id):
+        job_identifier = _require_identifier(job_id, "job ID")
+        artifact_identifier = _require_identifier(
+            artifact_id,
+            "artifact ID",
+        )
+        with closing(self._connect()) as connection:
+            connection.execute(
+                """
+                DELETE FROM transfers
+                WHERE job_id = ? AND artifact_id = ?
+                """,
+                (job_identifier, artifact_identifier),
+            )
+            connection.commit()
 
     def create_provision_transaction(
         self,

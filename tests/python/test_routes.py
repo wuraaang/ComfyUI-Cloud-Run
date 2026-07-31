@@ -1,5 +1,8 @@
 import asyncio
+import hashlib
+import json
 import os
+from pathlib import Path
 import sys
 import tempfile
 import types
@@ -24,9 +27,10 @@ from cloud_run.vast import OfferSearchError
 
 
 class FakeResponse:
-    def __init__(self, payload, status=200):
+    def __init__(self, payload, status=200, headers=None):
         self.payload = payload
         self.status = status
+        self.headers = headers or {}
 
 
 class FakeRoutes:
@@ -54,10 +58,17 @@ class FakeRoutes:
 
 
 class FakeRequest:
-    def __init__(self, body=None, error=None, match_info=None):
+    def __init__(
+        self,
+        body=None,
+        error=None,
+        match_info=None,
+        query=None,
+    ):
         self.body = body
         self.error = error
         self.match_info = match_info or {}
+        self.query = query or {}
 
     async def json(self):
         if self.error is not None:
@@ -73,7 +84,20 @@ def captured_handlers(service_factory=None):
     )
     aiohttp_module = types.ModuleType("aiohttp")
     aiohttp_module.web = types.SimpleNamespace(
-        json_response=lambda payload, status=200: FakeResponse(payload, status)
+        json_response=lambda payload, status=200: FakeResponse(
+            payload,
+            status,
+        ),
+        Response=lambda body=b"", status=200, headers=None: FakeResponse(
+            body,
+            status,
+            headers,
+        ),
+        FileResponse=lambda path, status=200, headers=None: FakeResponse(
+            Path(path).read_bytes(),
+            status,
+            headers,
+        ),
     )
 
     prior_server = sys.modules.get("server")
@@ -786,6 +810,196 @@ class PaidSessionRouteTests(unittest.TestCase):
             encoded = repr(response.payload)
             self.assertNotIn("private-session-idempotency-key", encoded)
             self.assertNotIn("d" * 64, encoded)
+
+
+class RelayMediaRouteTests(unittest.TestCase):
+    def setUp(self):
+        from cloud_run.job_repository import JobRepository
+        from cloud_run.models import CloudJob, JobState, TransferState
+        from cloud_run.relay import LocalRelay
+
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.output_root = self.root / "output"
+        self.output_root.mkdir()
+        repository = JobRepository(
+            self.root / "private" / "sessions.sqlite3"
+        )
+        repository.create_job(
+            CloudJob(
+                job_id="job-1",
+                session_id="session-1",
+                idempotency_key="job-key-1",
+                state=JobState.SUCCEEDED,
+                prompt_digest="c" * 64,
+                capture_json=json.dumps(
+                    {
+                        "workflow": {},
+                        "output": {},
+                        "queue_options": {},
+                    }
+                ),
+                manifest_digest="a" * 64,
+                remote_prompt_id=None,
+                sanitized_error=None,
+                created_at=10,
+                updated_at=20,
+                version=1,
+            )
+        )
+        preview = b"\x89PNG\r\n\x1a\npreview"
+        preview_id = "preview-1"
+        repository.append_event(
+            "job-1",
+            1,
+            "b_preview",
+            {
+                "preview_id": preview_id,
+                "mime_type": "image/png",
+                "size_bytes": len(preview),
+                "sha256": hashlib.sha256(preview).hexdigest(),
+            },
+            created_at=15,
+        )
+        relay = LocalRelay(
+            worker=None,
+            repository=repository,
+            private_root=self.root / "private" / "relay",
+            output_root=self.output_root,
+        )
+        preview_path = (
+            relay.previews_root
+            / "job-1"
+            / (preview_id + ".preview")
+        )
+        preview_path.parent.mkdir(mode=0o700)
+        preview_path.write_bytes(preview)
+        os.chmod(preview_path, 0o600)
+        repository.save_transfer(
+            job_id="job-1",
+            artifact_id="preview:" + preview_id,
+            direction="download",
+            expected_size=len(preview),
+            sha256=hashlib.sha256(preview).hexdigest(),
+            offset=len(preview),
+            state=TransferState.VERIFIED,
+            private_path=str(preview_path),
+        )
+
+        output = b"verified-output"
+        output_path = self.output_root / "job-1" / "wallpaper.png"
+        output_path.parent.mkdir(mode=0o700)
+        output_path.write_bytes(output)
+        repository.save_transfer(
+            job_id="job-1",
+            artifact_id="output-1",
+            direction="download",
+            expected_size=len(output),
+            sha256=hashlib.sha256(output).hexdigest(),
+            offset=len(output),
+            state=TransferState.VERIFIED,
+            private_path=str(output_path),
+        )
+        self.service = types.SimpleNamespace(
+            job_repository=repository,
+            relay=relay,
+        )
+        self.handlers = captured_handlers(
+            service_factory=lambda: self.service
+        )
+
+    def test_routes_return_only_owned_local_verified_media(self):
+        events = asyncio.run(
+            self.handlers[
+                (
+                    "GET",
+                    (
+                        "/cloud-run/api/sessions/{session_id}/jobs/"
+                        "{job_id}/events"
+                    ),
+                )
+            ](
+                FakeRequest(
+                    match_info={
+                        "session_id": "session-1",
+                        "job_id": "job-1",
+                    },
+                    query={"after_sequence": "0"},
+                )
+            )
+        )
+        preview = asyncio.run(
+            self.handlers[
+                (
+                    "GET",
+                    (
+                        "/cloud-run/api/sessions/{session_id}/jobs/"
+                        "{job_id}/previews/{preview_id}"
+                    ),
+                )
+            ](
+                FakeRequest(
+                    match_info={
+                        "session_id": "session-1",
+                        "job_id": "job-1",
+                        "preview_id": "preview-1",
+                    }
+                )
+            )
+        )
+        output = asyncio.run(
+            self.handlers[
+                (
+                    "GET",
+                    (
+                        "/cloud-run/api/sessions/{session_id}/jobs/"
+                        "{job_id}/artifacts/{artifact_id}"
+                    ),
+                )
+            ](
+                FakeRequest(
+                    match_info={
+                        "session_id": "session-1",
+                        "job_id": "job-1",
+                        "artifact_id": "output-1",
+                    }
+                )
+            )
+        )
+
+        self.assertEqual(events.status, 200)
+        self.assertEqual(events.payload["events"][0]["sequence"], 1)
+        self.assertEqual(preview.payload, b"\x89PNG\r\n\x1a\npreview")
+        self.assertEqual(preview.headers["Content-Type"], "image/png")
+        self.assertEqual(output.payload, b"verified-output")
+        self.assertNotIn(str(self.root), repr(events.payload))
+        self.assertNotIn(str(self.root), repr(preview.headers))
+        self.assertNotIn(str(self.root), repr(output.headers))
+
+    def test_wrong_session_cannot_read_an_existing_job(self):
+        response = asyncio.run(
+            self.handlers[
+                (
+                    "GET",
+                    (
+                        "/cloud-run/api/sessions/{session_id}/jobs/"
+                        "{job_id}/artifacts/{artifact_id}"
+                    ),
+                )
+            ](
+                FakeRequest(
+                    match_info={
+                        "session_id": "other-session",
+                        "job_id": "job-1",
+                        "artifact_id": "output-1",
+                    }
+                )
+            )
+        )
+
+        self.assertEqual(response.status, 404)
+        self.assertNotIn("job-1", repr(response.payload))
 
 
 if __name__ == "__main__":

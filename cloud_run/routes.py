@@ -3,6 +3,7 @@
 import os
 from pathlib import Path
 import re
+import stat
 
 from .artifacts import GIB
 from .capture import CaptureValidationError
@@ -19,6 +20,11 @@ from .repository import AttemptRepository, SessionRepository
 from .registry import RegistryClient
 from .resolver import DependencyResolver
 from .r2 import R2TransferError, R2ValidationError
+from .relay import (
+    ArtifactVerificationError,
+    LocalRelay,
+    RelayError,
+)
 from .service import (
     AttemptNotFound,
     CloudRunService,
@@ -126,6 +132,31 @@ def _runtime_resolution_context(host):
     return context
 
 
+def _runtime_output_root(data_directory):
+    try:
+        import folder_paths
+    except ImportError:
+        fallback = Path(data_directory) / "local-outputs"
+        fallback.mkdir(mode=0o700, parents=True, exist_ok=True)
+        return fallback
+    try:
+        configured = Path(folder_paths.get_output_directory())
+        metadata = os.lstat(configured)
+    except (AttributeError, OSError, TypeError):
+        raise HostCompatibilityError(
+            "ComfyUI output directory is unavailable."
+        ) from None
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+    ):
+        raise HostCompatibilityError(
+            "ComfyUI output directory is unavailable."
+        )
+    return configured
+
+
 class _RuntimeResolver:
     def __init__(self, dependency_repository):
         self.dependency_repository = dependency_repository
@@ -202,6 +233,12 @@ def build_service():
         offer_search=service._search_without_preflight,
         mapping_repository=dependency_repository,
         release=release,
+    )
+    service.relay = LocalRelay(
+        worker=None,
+        repository=job_repository,
+        private_root=data_directory / "relay",
+        output_root=_runtime_output_root(data_directory),
     )
     return service
 
@@ -283,6 +320,45 @@ def register_routes(service_factory=None):
             {"error": "Cloud Run is temporarily unavailable."},
             status=500,
         )
+
+    def owned_job(service, session_id, job_id):
+        repository = getattr(service, "job_repository", None)
+        if (
+            not isinstance(repository, JobRepository)
+            or not isinstance(session_id, str)
+            or not _MODEL_CATEGORY.fullmatch(session_id)
+            or not isinstance(job_id, str)
+            or not _MODEL_CATEGORY.fullmatch(job_id)
+        ):
+            return None
+        job = repository.get_job(job_id)
+        if job is None or job.session_id != session_id:
+            return None
+        return job
+
+    def event_cursor(request):
+        query = getattr(request, "query", {})
+        try:
+            keys = set(query)
+        except (TypeError, ValueError):
+            raise CloudRunValidationError(
+                "Invalid event cursor."
+            ) from None
+        if not keys:
+            return 0
+        if keys != {"after_sequence"}:
+            raise CloudRunValidationError("Invalid event cursor.")
+        try:
+            values = query.getall("after_sequence")
+        except AttributeError:
+            values = [query.get("after_sequence")]
+        if (
+            len(values) != 1
+            or not isinstance(values[0], str)
+            or not re.fullmatch(r"0|[1-9][0-9]{0,19}", values[0])
+        ):
+            raise CloudRunValidationError("Invalid event cursor.")
+        return int(values[0])
 
     @routes.get("/cloud-run/api/settings")
     async def get_settings(_request):
@@ -474,6 +550,130 @@ def register_routes(service_factory=None):
         except Exception as error:
             return service_error(error)
         return web.json_response(_session_payload(session))
+
+    @routes.get(
+        "/cloud-run/api/sessions/{session_id}/jobs/{job_id}/events"
+    )
+    async def get_job_events(request):
+        service = make_service()
+        session_id = request.match_info.get("session_id", "")
+        job_id = request.match_info.get("job_id", "")
+        job = owned_job(service, session_id, job_id)
+        if job is None:
+            return web.json_response(
+                {"error": "Local job was not found."},
+                status=404,
+            )
+        try:
+            cursor = event_cursor(request)
+            events = service.job_repository.list_events(job_id, cursor)
+        except Exception as error:
+            return service_error(error)
+        return web.json_response(
+            {
+                "job_id": job_id,
+                "events": [
+                    {
+                        "sequence": event.sequence,
+                        "type": event.event_type,
+                        "data": event.payload,
+                        "created_at": event.created_at,
+                    }
+                    for event in events
+                ],
+                "last_sequence": (
+                    events[-1].sequence if events else cursor
+                ),
+            }
+        )
+
+    @routes.get(
+        (
+            "/cloud-run/api/sessions/{session_id}/jobs/{job_id}/"
+            "previews/{preview_id}"
+        )
+    )
+    async def get_job_preview(request):
+        service = make_service()
+        session_id = request.match_info.get("session_id", "")
+        job_id = request.match_info.get("job_id", "")
+        if owned_job(service, session_id, job_id) is None:
+            return web.json_response(
+                {"error": "Local media was not found."},
+                status=404,
+            )
+        relay = getattr(service, "relay", None)
+        if not isinstance(relay, LocalRelay):
+            return web.json_response(
+                {"error": "Local media is unavailable."},
+                status=503,
+            )
+        try:
+            media = relay.preview_content(
+                job_id,
+                request.match_info.get("preview_id", ""),
+            )
+        except RelayError:
+            return web.json_response(
+                {"error": "Local media was not found."},
+                status=404,
+            )
+        return web.Response(
+            body=media.content,
+            headers={
+                "Content-Type": media.mime_type,
+                "Content-Length": str(len(media.content)),
+                "Cache-Control": "no-store",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+
+    @routes.get(
+        (
+            "/cloud-run/api/sessions/{session_id}/jobs/{job_id}/"
+            "artifacts/{artifact_id}"
+        )
+    )
+    async def get_job_artifact(request):
+        service = make_service()
+        session_id = request.match_info.get("session_id", "")
+        job_id = request.match_info.get("job_id", "")
+        if owned_job(service, session_id, job_id) is None:
+            return web.json_response(
+                {"error": "Local media was not found."},
+                status=404,
+            )
+        relay = getattr(service, "relay", None)
+        if not isinstance(relay, LocalRelay):
+            return web.json_response(
+                {"error": "Local media is unavailable."},
+                status=503,
+            )
+        try:
+            artifact = relay.published_artifact(
+                job_id,
+                request.match_info.get("artifact_id", ""),
+            )
+        except ArtifactVerificationError:
+            return web.json_response(
+                {"error": "Local media is unavailable."},
+                status=503,
+            )
+        except RelayError:
+            return web.json_response(
+                {"error": "Local media was not found."},
+                status=404,
+            )
+        return web.FileResponse(
+            artifact.path,
+            headers={
+                "Content-Type": artifact.mime_type,
+                "Content-Length": str(artifact.size_bytes),
+                "ETag": '"' + artifact.sha256 + '"',
+                "Cache-Control": "no-store",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
 
     @routes.get("/cloud-run/api/attempts/{attempt_id}")
     async def get_attempt(request):

@@ -378,6 +378,34 @@ class WorkerApplication:
     @staticmethod
     def _file_range(request, size_bytes):
         value = _headers(request).get("range")
+        query = getattr(request, "query", {})
+        try:
+            query_keys = set(query)
+        except (TypeError, ValueError):
+            raise JobValidationError(
+                "Remote output range is invalid."
+            ) from None
+        if query_keys:
+            if query_keys != {"start"}:
+                raise JobValidationError(
+                    "Remote output range is invalid."
+                )
+            try:
+                values = query.getall("start")
+            except AttributeError:
+                values = [query.get("start")]
+            if (
+                len(values) != 1
+                or not isinstance(values[0], str)
+                or not re.fullmatch(
+                    r"0|[1-9][0-9]{0,19}",
+                    values[0],
+                )
+                or value != "bytes=" + values[0] + "-"
+            ):
+                raise JobValidationError(
+                    "Remote output range is invalid."
+                )
         if value is None:
             return 200, 0, size_bytes - 1
         match = re.fullmatch(
