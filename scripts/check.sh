@@ -564,6 +564,7 @@ allowed_suffixes = {
 allowed_json = {
     Path("package.json"),
     Path("remote_worker/template-policy.json"),
+    Path("tests/fixtures/native-model-metadata-workflow.json"),
 }
 forbidden_suffixes = {
     ".avi",

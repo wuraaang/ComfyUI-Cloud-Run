@@ -128,6 +128,7 @@ class RepositoryContractTests(unittest.TestCase):
             "expected_transfer_states",
             "allowed_provider_actions",
             "secret_patterns",
+            'Path("tests/fixtures/native-model-metadata-workflow.json")',
         ):
             with self.subTest(text=required_text):
                 self.assertIn(required_text, gate)
