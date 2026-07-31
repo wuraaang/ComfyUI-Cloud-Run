@@ -212,7 +212,11 @@ external port `8765`. It accepts only a nonempty bounded `JUPYTER_TOKEN`, passes
 that token only to the Caddy child environment, never logs it, and terminates
 Caddy when the Python worker exits. Caddy receives no caller environment other
 than the token and fixed private `HOME`, `XDG_CONFIG_HOME`, and `XDG_DATA_HOME`
-paths. Its fixed configuration disables the admin endpoint and automatic HTTPS.
+paths. The Python worker receives only the explicit runtime allowlist plus the
+Vast-injected `CONTAINER_ID` and `CONTAINER_API_KEY` required for its
+own-instance deadline watchdog; it never receives `JUPYTER_TOKEN` or a
+provider-account credential. Caddy's fixed configuration disables the admin
+endpoint and automatic HTTPS.
 The supervisor accepts only one proven
 absolute Caddy path from `/usr/bin/caddy` or `/usr/local/bin/caddy`; zero or two
 matches fail closed. The official base-template audit must establish which one

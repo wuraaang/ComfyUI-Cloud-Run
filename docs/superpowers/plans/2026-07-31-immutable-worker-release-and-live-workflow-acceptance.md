@@ -284,7 +284,9 @@ git commit -m "fix: bootstrap immutable worker release asset"
 
 **Interfaces:**
 
-- Consumes: `JUPYTER_TOKEN`, fixed Caddy candidates, installed repository root, and `/var/lib/comfyui-cloud-run`.
+- Consumes: `JUPYTER_TOKEN`, instance-scoped `CONTAINER_ID` and
+  `CONTAINER_API_KEY`, fixed Caddy candidates, installed repository root, and
+  `/var/lib/comfyui-cloud-run`.
 - Produces: `select_caddy_binary(*, lstat_fn, access_fn) -> Path`, `validated_gateway_token(environ: Mapping[str, str]) -> str`, and `run_gateway(*, environ, popen_factory, wait_timeout_seconds) -> int`.
 
 - [ ] **Step 1: Write failing gateway tests**
@@ -296,7 +298,7 @@ Test these exact requirements with fake `lstat`/`access` results for the two har
 - zero or two matching candidates fail closed;
 - Caddy argv is `[caddy, "run", "--config", Caddyfile, "--adapter", "caddyfile"]`;
 - worker argv is `[sys.executable, "-m", "remote_worker.main", "--state-directory", "/var/lib/comfyui-cloud-run"]`;
-- Caddy receives only `JUPYTER_TOKEN` plus fixed `HOME`, `XDG_CONFIG_HOME`, and `XDG_DATA_HOME`; the worker environment contains only the explicit runtime allowlist and never `JUPYTER_TOKEN`;
+- Caddy receives only `JUPYTER_TOKEN` plus fixed `HOME`, `XDG_CONFIG_HOME`, and `XDG_DATA_HOME`; the worker environment contains only the explicit runtime and own-instance deadline allowlist and never `JUPYTER_TOKEN`;
 - the Caddyfile disables the admin endpoint and automatic HTTPS, listens only on `:8765`, strips authorization, and proxies only to `127.0.0.1:8766`;
 - when either child exits, the other receives terminate, then a bounded wait, then kill only after timeout;
 - no error, captured argv, or logged diagnostic contains the token.
@@ -320,7 +322,7 @@ MAX_TOKEN_BYTES = 4096
 SHUTDOWN_TIMEOUT_SECONDS = 10
 ```
 
-Validate the two hard-coded candidate files with `os.lstat`: regular file, not symlink, owned by root or the current user, and executable according to `os.access`. Resolve neither caller paths nor `PATH`. Resolve the Caddyfile only as `Path(__file__).with_name("Caddyfile")`, require it to be a regular non-symlink file, and pass that exact path. Create fixed private Caddy config/data directories beneath `/var/lib/comfyui-cloud-run`, then build a Caddy environment containing only `JUPYTER_TOKEN`, `HOME=/var/lib/comfyui-cloud-run`, and those two fixed XDG paths. Build the worker environment from an explicit allowlist containing `CLOUD_RUN_SESSION_ID`, `CLOUD_RUN_COMFY_ROOT`, `CLOUD_RUN_WORKER_VERSION`, `HOME`, `LANG`, `LC_ALL`, `PATH`, `PYTHONPATH`, `PYTHONUNBUFFERED`, and `TMPDIR`; always remove `JUPYTER_TOKEN` and every other variable.
+Validate the two hard-coded candidate files with `os.lstat`: regular file, not symlink, owned by root or the current user, and executable according to `os.access`. Resolve neither caller paths nor `PATH`. Resolve the Caddyfile only as `Path(__file__).with_name("Caddyfile")`, require it to be a regular non-symlink file, and pass that exact path. Create fixed private Caddy config/data directories beneath `/var/lib/comfyui-cloud-run`, then build a Caddy environment containing only `JUPYTER_TOKEN`, `HOME=/var/lib/comfyui-cloud-run`, and those two fixed XDG paths. Build the worker environment from an explicit allowlist containing `CLOUD_RUN_SESSION_ID`, `CLOUD_RUN_COMFY_ROOT`, `CLOUD_RUN_WORKER_VERSION`, `CONTAINER_ID`, `CONTAINER_API_KEY`, `HOME`, `LANG`, `LC_ALL`, `PATH`, `PYTHONPATH`, `PYTHONUNBUFFERED`, and `TMPDIR`. The two `CONTAINER_*` values are the Vast-injected, own-instance credentials required by the independently enforced billing deadline; always remove `JUPYTER_TOKEN`, provider-account credentials such as `VAST_API_KEY`, and every other variable.
 
 Add the fixed global Caddy options `admin off` and `auto_https off`. Preserve the exact `:8765` bearer matcher, request-header stripping, authenticated boundary header, and `127.0.0.1:8766` reverse proxy.
 

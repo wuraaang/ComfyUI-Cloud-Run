@@ -1,12 +1,14 @@
 """Secret-minimal Caddy gateway and worker supervision tests."""
 
 from contextlib import redirect_stderr
+import hmac
 import io
 import os
 from pathlib import Path
 import stat
 import subprocess
 import sys
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -232,6 +234,8 @@ class GatewayProcessTests(unittest.TestCase):
             "CLOUD_RUN_SESSION_ID": "session-1",
             "CLOUD_RUN_COMFY_ROOT": "/opt/ComfyUI",
             "CLOUD_RUN_WORKER_VERSION": "a" * 40,
+            "CONTAINER_ID": "77",
+            "CONTAINER_API_KEY": "instance-only-key",
             "HOME": "/root",
             "LANG": "C.UTF-8",
             "LC_ALL": "C.UTF-8",
@@ -317,25 +321,81 @@ class GatewayProcessTests(unittest.TestCase):
                 "XDG_DATA_HOME": str(self.data_directory),
             },
         )
-        self.assertEqual(
-            factory.calls[1][1]["env"],
-            {
-                key: self.runtime_environment[key]
-                for key in (
-                    "CLOUD_RUN_SESSION_ID",
-                    "CLOUD_RUN_COMFY_ROOT",
-                    "CLOUD_RUN_WORKER_VERSION",
-                    "HOME",
-                    "LANG",
-                    "LC_ALL",
-                    "PATH",
-                    "PYTHONPATH",
-                    "PYTHONUNBUFFERED",
-                    "TMPDIR",
-                )
-            },
+        worker_environment = factory.calls[1][1]["env"]
+        expected_names = {
+            "CLOUD_RUN_SESSION_ID",
+            "CLOUD_RUN_COMFY_ROOT",
+            "CLOUD_RUN_WORKER_VERSION",
+            "CONTAINER_ID",
+            "CONTAINER_API_KEY",
+            "HOME",
+            "LANG",
+            "LC_ALL",
+            "PATH",
+            "PYTHONPATH",
+            "PYTHONUNBUFFERED",
+            "TMPDIR",
+        }
+        self.assertEqual(set(worker_environment), expected_names)
+        for name in expected_names - {"CONTAINER_API_KEY"}:
+            self.assertEqual(
+                worker_environment[name],
+                self.runtime_environment[name],
+            )
+        self.assertTrue(
+            hmac.compare_digest(
+                worker_environment["CONTAINER_API_KEY"],
+                self.runtime_environment["CONTAINER_API_KEY"],
+            ),
+            msg="worker instance credential was not preserved",
         )
-        self.assertNotIn("JUPYTER_TOKEN", factory.calls[1][1]["env"])
+        self.assertNotIn("JUPYTER_TOKEN", worker_environment)
+
+    def test_filtered_environment_builds_real_deadline_armed_worker_runtime(self):
+        from remote_worker.deadline import (
+            DeadlineValidationError,
+            deadline_watchdog,
+        )
+        from remote_worker.main import build_worker_runtime
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            comfy_root = root / "ComfyUI"
+            (comfy_root / "custom_nodes").mkdir(parents=True)
+            (comfy_root / "main.py").write_text(
+                "raise SystemExit(0)\n",
+                encoding="utf-8",
+            )
+            data_root = root / "worker-data"
+            self.runtime_environment["CLOUD_RUN_COMFY_ROOT"] = str(comfy_root)
+            result, factory = self.run_recorded(
+                FakeProcess([None], wait_result=0),
+                FakeProcess([0], wait_result=0),
+            )
+
+            worker_environment = factory.calls[1][1]["env"]
+            try:
+                with patch.dict(os.environ, worker_environment, clear=True):
+                    worker = build_worker_runtime(
+                        state_path=data_root / "worker-state.json",
+                        expected_session_id="session-1",
+                        comfy_root=comfy_root,
+                        data_root=data_root,
+                        worker_version="a" * 40,
+                        python_executable=sys.executable,
+                        deadline_factory=deadline_watchdog,
+                    )
+            except DeadlineValidationError as error:
+                self.fail(
+                    "filtered environment prevented real worker startup: "
+                    + str(error)
+                )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            worker.deadline_watchdog.own_instance_url,
+            "https://console.vast.ai/api/v0/instances/77/",
+        )
 
     def test_terminates_and_reaps_caddy_when_worker_exits(self):
         caddy = FakeProcess([None], wait_result=0)

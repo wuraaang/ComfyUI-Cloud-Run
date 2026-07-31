@@ -220,9 +220,11 @@ and proxies only to `127.0.0.1:8766`.
 from its two fixed absolute candidates, validates the token without disclosing
 it, and starts Caddy plus the worker with fixed argv and no shell. Only Caddy's
 minimal environment receives the token. The worker receives only an explicit
-runtime allowlist. When either child exits, the supervisor terminates the
-sibling, waits for the fixed bound, kills only after timeout, and reaps both
-processes or fails with one static error.
+runtime allowlist plus Vast's own-instance `CONTAINER_ID` and
+`CONTAINER_API_KEY` required by its deadline watchdog; it receives neither the
+Jupyter token nor a provider-account key. When either child exits, the
+supervisor terminates the sibling, waits for the fixed bound, kills only after
+timeout, and reaps both processes or fails with one static error.
 
 The Python worker itself binds only to `127.0.0.1:8766`. Its route allowlist is:
 

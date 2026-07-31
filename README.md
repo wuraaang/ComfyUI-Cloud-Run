@@ -214,11 +214,13 @@ fixed GitHub release-assets host. The temporary signed target is neither part
 of the lock nor retained, persisted, logged, or returned.
 
 `remote_worker/gateway.py` starts one fixed Caddy binary and the loopback Python
-worker without a shell. Only Caddy receives the validated Jupyter token; the
-worker receives an explicit environment allowlist. The supervisor terminates,
-then boundedly reaps or kills, the sibling when either process exits. Caddy
-exposes `:8765`, strips inbound authorization and boundary headers, and proxies
-only to `127.0.0.1:8766`.
+worker without a shell. Only Caddy receives the validated Jupyter token. The
+worker receives an explicit runtime allowlist plus Vast's own-instance ID and
+API key required by its independent deadline watchdog, never the Jupyter token
+or a provider-account key. The supervisor terminates, then boundedly reaps or
+kills, the sibling when either process exits. Caddy exposes `:8765`, strips
+inbound authorization and boundary headers, and proxies only to
+`127.0.0.1:8766`.
 
 The deterministic commands are:
 
