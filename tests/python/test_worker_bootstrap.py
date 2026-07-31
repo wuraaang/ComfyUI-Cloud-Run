@@ -507,6 +507,7 @@ class WorkerArtifactTests(unittest.TestCase):
             names = [member.name for member in members]
             self.assertEqual(names, sorted(names))
             self.assertIn("remote_worker/main.py", names)
+            self.assertIn("remote_worker/gateway.py", names)
             self.assertIn("remote_worker/bootstrap.py", names)
             self.assertIn("cloud_run/manifest.py", names)
             self.assertIn("cloud_run/worker_protocol.py", names)
@@ -730,7 +731,7 @@ class BootstrapTests(unittest.TestCase):
             [
                 __import__("sys").executable,
                 "-m",
-                "remote_worker.main",
+                "remote_worker.gateway",
                 "--state-directory",
                 "/var/lib/comfyui-cloud-run",
             ],
@@ -739,6 +740,9 @@ class BootstrapTests(unittest.TestCase):
         self.assertFalse(runner.shell_used)
         self.assertTrue(
             (self.destination / "remote_worker" / "main.py").is_file()
+        )
+        self.assertTrue(
+            (self.destination / "remote_worker" / "gateway.py").is_file()
         )
 
     def test_bootstrap_rejects_mutable_url_wrong_hash_redirect_and_shell_fields(self):

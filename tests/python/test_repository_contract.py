@@ -37,6 +37,7 @@ class RepositoryContractTests(unittest.TestCase):
             "scripts/build_worker_artifact.py",
             "scripts/validate_gold_output.py",
             "remote_worker/bootstrap.py",
+            "remote_worker/gateway.py",
             "docs/remote-worker-bootstrap-review.md",
         ):
             with self.subTest(path=relative_path):

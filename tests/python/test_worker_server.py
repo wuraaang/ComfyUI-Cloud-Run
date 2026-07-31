@@ -440,6 +440,11 @@ class WorkerApplicationTests(unittest.TestCase):
         self.assertEqual(
             caddyfile,
             (
+                "{\n"
+                "\tadmin off\n"
+                "\tauto_https off\n"
+                "}\n"
+                "\n"
                 ":8765 {\n"
                 '\t@unauthorized not header Authorization "Bearer '
                 '{$JUPYTER_TOKEN}"\n'

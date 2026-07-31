@@ -387,6 +387,7 @@ def _safe_extract(tar_path, destination):
 def _verify_layout(destination):
     required = {
         "remote_worker/__init__.py",
+        "remote_worker/gateway.py",
         "remote_worker/main.py",
         "cloud_run/manifest.py",
         "cloud_run/worker_protocol.py",
@@ -584,7 +585,7 @@ class Bootstrap:
         argv = [
             sys.executable,
             "-m",
-            "remote_worker.main",
+            "remote_worker.gateway",
             "--state-directory",
             STATE_DIRECTORY,
         ]
