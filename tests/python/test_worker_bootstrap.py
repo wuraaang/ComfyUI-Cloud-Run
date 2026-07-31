@@ -2,6 +2,7 @@
 
 import ast
 import hashlib
+from http.client import InvalidURL
 import io
 import json
 from pathlib import Path
@@ -194,6 +195,90 @@ class HttpsTransportTests(unittest.TestCase):
         )
         if location is not None:
             self.assertNotIn(location, repr(caught.exception))
+
+    def _assert_only_static_transport_error_is_retained(self, error):
+        retained = []
+        pending = [error]
+        seen = set()
+        while pending:
+            current = pending.pop()
+            if id(current) in seen:
+                continue
+            seen.add(id(current))
+            retained.append(current)
+            if current.__cause__ is not None:
+                pending.append(current.__cause__)
+            if current.__context__ is not None:
+                pending.append(current.__context__)
+        self.assertEqual(retained, [error])
+        self.assertEqual(
+            str(error),
+            "Reviewed worker archive is unavailable.",
+        )
+
+    def test_rejected_first_hop_discards_redirect_exception_graph(self):
+        redirect = redirect_error(
+            self.source_url,
+            301,
+            self.signed_location,
+        )
+
+        with patch(
+            "remote_worker.bootstrap.urlrequest.build_opener",
+            return_value=FakeOpener(redirect),
+        ):
+            with self.assertRaises(BootstrapError) as caught:
+                HttpsTransport(timeout_seconds=7).stream(self.source_url)
+
+        self._assert_only_static_transport_error_is_retained(
+            caught.exception
+        )
+        self.assertTrue(redirect.fp.closed)
+
+    def test_failed_second_hop_discards_http_error_exception_graph(self):
+        redirect = redirect_error(
+            self.source_url,
+            302,
+            self.signed_location,
+        )
+        terminal_error = redirect_error(
+            self.signed_location,
+            403,
+            self.signed_location + "&retry=1",
+        )
+
+        with patch(
+            "remote_worker.bootstrap.urlrequest.build_opener",
+            return_value=FakeOpener(redirect, terminal_error),
+        ):
+            with self.assertRaises(BootstrapError) as caught:
+                HttpsTransport(timeout_seconds=7).stream(self.source_url)
+
+        self._assert_only_static_transport_error_is_retained(
+            caught.exception
+        )
+        self.assertTrue(redirect.fp.closed)
+        self.assertTrue(terminal_error.fp.closed)
+
+    def test_failed_second_hop_discards_invalid_url_exception_graph(self):
+        redirect = redirect_error(
+            self.source_url,
+            302,
+            self.signed_location,
+        )
+        invalid_url = InvalidURL(self.signed_location)
+
+        with patch(
+            "remote_worker.bootstrap.urlrequest.build_opener",
+            return_value=FakeOpener(redirect, invalid_url),
+        ):
+            with self.assertRaises(BootstrapError) as caught:
+                HttpsTransport(timeout_seconds=7).stream(self.source_url)
+
+        self._assert_only_static_transport_error_is_retained(
+            caught.exception
+        )
+        self.assertTrue(redirect.fp.closed)
 
     def test_direct_identity_response_returns_reviewed_source_without_redirect(self):
         response = FakeResponse(

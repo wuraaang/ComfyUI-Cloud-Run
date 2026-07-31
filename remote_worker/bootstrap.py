@@ -81,66 +81,74 @@ class HttpsTransport:
         }
         request = urlrequest.Request(url, headers=headers, method="GET")
         redirect_count = 0
+        redirect_target = None
+        candidate = None
+        parsed = None
+        transport_rejected = False
         try:
             response = opener.open(
                 request,
                 timeout=self.timeout_seconds,
             )
         except urlerror.HTTPError as redirect:
-            if redirect.code != 302:
-                redirect.close()
-                raise BootstrapError(
-                    "Reviewed worker archive is unavailable."
-                ) from None
             try:
-                location = redirect.headers.get("Location")
-                if not isinstance(location, str):
-                    raise BootstrapError(
-                        "Reviewed worker archive is unavailable."
-                    )
-                parsed = urlsplit(location)
-                if (
-                    parsed.scheme != "https"
-                    or parsed.hostname
-                    != "release-assets.githubusercontent.com"
-                    or parsed.username is not None
-                    or parsed.password is not None
-                    or parsed.port is not None
-                    or parsed.fragment
-                ):
-                    raise BootstrapError(
-                        "Reviewed worker archive is unavailable."
-                    )
-            except (TypeError, ValueError):
-                raise BootstrapError(
-                    "Reviewed worker archive is unavailable."
-                ) from None
+                if redirect.code == 302:
+                    candidate = redirect.headers.get("Location")
+                    if isinstance(candidate, str):
+                        parsed = urlsplit(candidate)
+                        if (
+                            parsed.scheme == "https"
+                            and parsed.hostname
+                            == "release-assets.githubusercontent.com"
+                            and parsed.username is None
+                            and parsed.password is None
+                            and parsed.port is None
+                            and not parsed.fragment
+                        ):
+                            redirect_target = candidate
+                transport_rejected = redirect_target is None
+            except Exception:
+                transport_rejected = True
             finally:
-                redirect.close()
-            redirect_count = 1
-            request = urlrequest.Request(
-                location,
-                headers=headers,
-                method="GET",
+                try:
+                    redirect.close()
+                except Exception:
+                    transport_rejected = True
+        except Exception:
+            transport_rejected = True
+        candidate = None
+        parsed = None
+        if transport_rejected:
+            redirect_target = None
+            raise BootstrapError(
+                "Reviewed worker archive is unavailable."
             )
+        if redirect_target is not None:
+            redirect_count = 1
             try:
+                request = urlrequest.Request(
+                    redirect_target,
+                    headers=headers,
+                    method="GET",
+                )
                 response = opener.open(
                     request,
                     timeout=self.timeout_seconds,
                 )
             except urlerror.HTTPError as terminal_error:
-                terminal_error.close()
+                try:
+                    terminal_error.close()
+                except Exception:
+                    pass
+                transport_rejected = True
+            except Exception:
+                transport_rejected = True
+            redirect_target = None
+            request = None
+            if transport_rejected:
                 raise BootstrapError(
                     "Reviewed worker archive is unavailable."
-                ) from None
-            except (OSError, urlerror.URLError):
-                raise BootstrapError(
-                    "Reviewed worker archive is unavailable."
-                ) from None
-        except (OSError, urlerror.URLError):
-            raise BootstrapError(
-                "Reviewed worker archive is unavailable."
-            ) from None
+                )
         encoding = response.headers.get("Content-Encoding", "identity")
         if getattr(response, "status", None) != 200 or (
             not isinstance(encoding, str)
