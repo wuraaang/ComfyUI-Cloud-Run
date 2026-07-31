@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 
 from .server import WORKER_BIND_HOST, WORKER_BIND_PORT, WorkerApplication
+from .transfers import TRANSFER_CHUNK_BYTES
 
 
 def build_aiohttp_application(*, state_path, expected_session_id):
@@ -18,7 +19,9 @@ def build_aiohttp_application(*, state_path, expected_session_id):
         state_path=state_path,
         expected_session_id=expected_session_id,
     )
-    application = web.Application(client_max_size=1024**3)
+    application = web.Application(
+        client_max_size=TRANSFER_CHUNK_BYTES + 1
+    )
 
     async def handle(request):
         response = await worker.handle(request)

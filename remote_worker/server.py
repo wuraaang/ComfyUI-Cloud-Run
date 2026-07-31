@@ -7,6 +7,7 @@ import json
 import re
 import time
 
+from cloud_run.manifest import ArtifactSpec, validate_dependency
 from cloud_run.worker_protocol import (
     NonceCache,
     PROTOCOL_VERSION,
@@ -19,6 +20,7 @@ from .state import (
     WorkerStateError,
     WorkerStateStore,
 )
+from .transfers import TransferError
 
 
 WORKER_BIND_HOST = "127.0.0.1"
@@ -53,7 +55,8 @@ def _route_pattern(path):
     parts = []
     for match in re.finditer(r"\{[a-z_]+\}", path):
         parts.append(re.escape(path[position : match.start()]))
-        parts.append(_IDENTIFIER_PART)
+        name = match.group(0)[1:-1]
+        parts.append(f"(?P<{name}>{_IDENTIFIER_PART})")
         position = match.end()
     parts.append(re.escape(path[position:]))
     return re.compile("".join(parts) + r"\Z")
@@ -138,14 +141,13 @@ def _route_for(method, path):
     if not isinstance(method, str) or not isinstance(path, str):
         return None
     normalized = method.upper()
-    return next(
-        (
-            route
-            for route_method, route, pattern in _ROUTE_PATTERNS
-            if route_method == normalized and pattern.fullmatch(path)
-        ),
-        None,
-    )
+    for route_method, route, pattern in _ROUTE_PATTERNS:
+        if route_method != normalized:
+            continue
+        match = pattern.fullmatch(path)
+        if match is not None:
+            return route, match.groupdict()
+    return None
 
 
 def _claim_payload(body):
@@ -179,13 +181,57 @@ class WorkerApplication:
         expected_session_id=None,
         clock=None,
         nonce_cache=None,
+        transfer_manager=None,
+        upload_artifacts=(),
     ):
         self.state = WorkerStateStore(
             state_path,
             expected_session_id=expected_session_id,
         )
         self.clock = clock or time.time
-        self.nonce_cache = nonce_cache or NonceCache()
+        self.nonce_cache = (
+            nonce_cache if nonce_cache is not None else NonceCache()
+        )
+        self.transfer_manager = transfer_manager
+        self.upload_artifacts = {}
+        self.register_upload_artifacts(upload_artifacts)
+
+    def register_upload_artifacts(self, artifacts):
+        catalog = {}
+        for artifact in artifacts:
+            try:
+                validate_dependency(artifact)
+            except (TypeError, ValueError):
+                raise ValueError("Invalid worker upload artifact.") from None
+            if (
+                not isinstance(artifact, ArtifactSpec)
+                or artifact.source.kind != "local-upload"
+                or artifact.artifact_id in catalog
+            ):
+                raise ValueError("Invalid worker upload artifact.")
+            catalog[artifact.artifact_id] = artifact
+        if catalog and self.transfer_manager is None:
+            raise ValueError("Worker upload manager is required.")
+        if catalog:
+            try:
+                destinations = {
+                    self.transfer_manager.destination_path(artifact)
+                    for artifact in catalog.values()
+                }
+                parts = {
+                    self.transfer_manager.part_path(artifact)
+                    for artifact in catalog.values()
+                }
+            except TransferError:
+                raise ValueError("Invalid worker upload artifact.") from None
+            if (
+                len(destinations) != len(catalog)
+                or len(parts) != len(catalog)
+                or destinations.intersection(parts)
+            ):
+                raise ValueError("Invalid worker upload artifact.")
+        self.upload_artifacts = catalog
+        return tuple(sorted(catalog))
 
     async def _health(self):
         try:
@@ -238,12 +284,46 @@ class WorkerApplication:
             return False
         return True
 
+    async def _upload_artifact(self, request, artifact_id, body):
+        artifact = self.upload_artifacts.get(artifact_id)
+        if artifact is None:
+            return _error(404, "Worker artifact was not found.")
+        content_range = _headers(request).get("content-range")
+        try:
+            result = await self.transfer_manager.upload(
+                artifact,
+                content_range=content_range,
+                body=body,
+            )
+            self.state.record_artifact_transfer(
+                artifact_id=result.artifact_id,
+                transfer_state=result.state,
+                offset=result.next_offset,
+                size_bytes=result.size_bytes,
+                sha256=result.sha256,
+            )
+        except TransferError:
+            return _error(409, "Artifact transfer was rejected.")
+        except WorkerStateError:
+            return _error(503, "Worker state is unavailable.")
+        return _response(
+            200,
+            {
+                "artifact_id": result.artifact_id,
+                "state": result.state,
+                "next_offset": result.next_offset,
+                "size_bytes": result.size_bytes,
+                "sha256": result.sha256,
+            },
+        )
+
     async def handle(self, request):
         method = getattr(request, "method", None)
         path = getattr(request, "path", None)
-        route = _route_for(method, path)
-        if route is None:
+        matched_route = _route_for(method, path)
+        if matched_route is None:
             return _error(404, "Worker route was not found.")
+        route, parameters = matched_route
         if not _has_boundary(request):
             return _error(401, "Worker request authentication failed.")
         if route == "/worker/v1/health":
@@ -256,4 +336,12 @@ class WorkerApplication:
             return _error(401, "Worker request authentication failed.")
         if not await self._authenticate(request, body):
             return _error(401, "Worker request authentication failed.")
+        if route == "/worker/v1/artifacts/{artifact_id}" and (
+            str(method).upper() == "PUT"
+        ):
+            return await self._upload_artifact(
+                request,
+                parameters["artifact_id"],
+                body,
+            )
         return _error(501, "Worker route is not implemented.")

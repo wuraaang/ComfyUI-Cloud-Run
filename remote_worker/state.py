@@ -191,19 +191,33 @@ class WorkerStateStore:
             with os.fdopen(descriptor, "wb") as handle:
                 descriptor = None
                 handle.write(encoded)
-                handle.write(b"\n")
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temporary_path, self.path)
             temporary_path = None
             os.chmod(self.path, 0o600)
+            directory_flags = os.O_RDONLY
+            if hasattr(os, "O_DIRECTORY"):
+                directory_flags |= os.O_DIRECTORY
+            directory_descriptor = os.open(
+                self.path.parent,
+                directory_flags,
+            )
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
+        except WorkerStateError:
+            raise
+        except OSError:
+            raise WorkerStateError("Worker state is unavailable.") from None
         finally:
             if descriptor is not None:
                 os.close(descriptor)
             if temporary_path is not None:
                 try:
                     temporary_path.unlink()
-                except FileNotFoundError:
+                except OSError:
                     pass
         return dict(state)
 
@@ -236,3 +250,43 @@ class WorkerStateStore:
         if not state["claimed"]:
             raise WorkerStateError("Worker is not claimed.")
         return bytes.fromhex(state["session_secret_hex"])
+
+    def record_artifact_transfer(
+        self,
+        *,
+        artifact_id,
+        transfer_state,
+        offset,
+        size_bytes,
+        sha256,
+    ):
+        if (
+            not _identifier(artifact_id)
+            or transfer_state not in {"receiving", "verified"}
+            or isinstance(offset, bool)
+            or not isinstance(offset, int)
+            or isinstance(size_bytes, bool)
+            or not isinstance(size_bytes, int)
+            or not 0 <= offset <= size_bytes
+            or size_bytes <= 0
+            or not isinstance(sha256, str)
+            or not _HEX_64.fullmatch(sha256)
+            or (
+                transfer_state == "verified"
+                and offset != size_bytes
+            )
+        ):
+            raise WorkerStateError("Worker transfer state is invalid.")
+        state = self.load()
+        if not state["claimed"]:
+            raise WorkerStateError("Worker is not claimed.")
+        transactions = dict(state["transactions"])
+        transactions[f"transfer:{artifact_id}"] = {
+            "kind": "artifact_transfer",
+            "artifact_id": artifact_id,
+            "state": transfer_state,
+            "offset": offset,
+            "size_bytes": size_bytes,
+            "sha256": sha256,
+        }
+        return self.save({**state, "transactions": transactions})
