@@ -328,6 +328,26 @@ class ArtifactResolutionTests(unittest.TestCase):
         self.assertEqual(result.local_artifacts, ())
         self.assertTrue(result.rentable)
 
+    def test_verified_model_does_not_require_an_existing_local_category_root(self):
+        digest = "d" * 64
+
+        result = resolve_artifacts(
+            self.one_model_capture(),
+            metadata=self.one_model_metadata(),
+            model_roots={
+                "diffusion_models": (self.root / "missing-model-root",),
+            },
+            input_root=self.input_root,
+            source_mappings={},
+            model_sources={
+                ("1", "model_name"): self.verified_source(digest, 8192)
+            },
+        )
+
+        self.assertTrue(result.rentable)
+        self.assertEqual(result.rows[0].status, "resolved")
+        self.assertEqual(result.artifacts[0].source.kind, "huggingface")
+
     def test_matching_local_copy_and_verified_source_produce_one_artifact(self):
         model = self.model_roots["diffusion_models"][0] / "example.safetensors"
         model.write_bytes(b"matching model")
@@ -740,12 +760,52 @@ class ArtifactTests(unittest.TestCase):
                     "resolved",
                     "models/upscale_models/upscaler.pth",
                 ),
-                ("image", "mapping_required", "input/source.jpg"),
+                ("image", "resolved", "input/source.jpg"),
             ],
         )
+        self.assertEqual(len(result.artifacts), 2)
+        resolved_model = next(
+            item for item in result.artifacts if item.kind == "model"
+        )
+        self.assertEqual(resolved_model.sha256, model_digest)
+        self.assertTrue(result.rentable)
+
+    def test_existing_local_input_uses_its_verified_local_upload_source(self):
+        input_root = self.root / "input"
+        input_root.mkdir()
+        media = input_root / "source.png"
+        media.write_bytes(b"synthetic image bytes")
+        capture = FakeCapture(
+            {
+                "1": {
+                    "class_type": "LoadImage",
+                    "inputs": {"image": "source.png"},
+                }
+            }
+        )
+
+        result = resolve_artifacts(
+            capture,
+            metadata={
+                "LoadImage": {
+                    "image": FileInputMetadata(kind="input"),
+                }
+            },
+            model_roots={},
+            input_root=input_root,
+            source_mappings={},
+        )
+
+        self.assertTrue(result.rentable)
         self.assertEqual(len(result.artifacts), 1)
-        self.assertEqual(result.artifacts[0].sha256, model_digest)
-        self.assertFalse(result.rentable)
+        resolved = result.artifacts[0]
+        self.assertEqual(resolved.kind, "input")
+        self.assertEqual(resolved.source.kind, "local-upload")
+        self.assertEqual(
+            resolved.source.locator,
+            "local-upload:" + resolved.artifact_id,
+        )
+        self.assertEqual(result.rows[0].status, "resolved")
 
     def test_ambiguous_or_escaping_file_metadata_is_unsupported(self):
         first = self.root / "first"

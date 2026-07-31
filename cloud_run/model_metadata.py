@@ -359,3 +359,23 @@ class EmbeddedModelIndex:
             candidate=None,
             reason=_MAPPING_REASON,
         )
+
+    def directories_for(self, *, node_id: str, name: str) -> tuple[str, ...]:
+        if (
+            not isinstance(node_id, str)
+            or not node_id
+            or not isinstance(name, str)
+            or not name
+        ):
+            raise ModelMetadataError("Workflow model lookup is invalid.")
+        directories = {
+            directory
+            for candidate_node_id, candidate_name, directory in self._node_entries
+            if candidate_node_id == node_id and candidate_name == name
+        }
+        directories.update(
+            directory
+            for candidate_name, directory in self._workflow_entries
+            if candidate_name == name
+        )
+        return tuple(sorted(directories))

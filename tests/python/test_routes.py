@@ -15,7 +15,12 @@ from cloud_run.capture import CompiledCapture
 from cloud_run.dependency_repository import DependencyRepository
 from cloud_run.manifest import ArtifactSpec, DependencyManifest, SourceSpec
 from cloud_run.model_sources import ModelSourceResolution
-from cloud_run.routes import _RuntimeResolver, build_service, register_routes
+from cloud_run.routes import (
+    _RuntimeResolver,
+    _runtime_resolution_context,
+    build_service,
+    register_routes,
+)
 from cloud_run.models import (
     AttemptState,
     CloudAttempt,
@@ -302,6 +307,45 @@ class ServiceConstructionTests(unittest.TestCase):
 
 
 class RuntimeResolverTests(unittest.TestCase):
+    def test_runtime_context_keeps_category_when_local_listing_fails(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            model_root = root / "models"
+            input_root = root / "input"
+            model_root.mkdir()
+            input_root.mkdir()
+
+            class FakeHost:
+                def file_input_metadata(self, capture, *, model_filenames):
+                    self.model_filenames = model_filenames
+                    return {}
+
+            host = FakeHost()
+            folder_paths = types.ModuleType("folder_paths")
+            folder_paths.folder_names_and_paths = {
+                "upscale_models": ((str(model_root),), {".pth"})
+            }
+
+            def unavailable_listing(_category):
+                raise OSError("model directory is unavailable")
+
+            folder_paths.get_filename_list = unavailable_listing
+            folder_paths.get_input_directory = lambda: str(input_root)
+
+            with mock.patch.dict(
+                sys.modules,
+                {"folder_paths": folder_paths},
+            ):
+                context = _runtime_resolution_context(host)(
+                    types.SimpleNamespace()
+                )
+
+        self.assertEqual(host.model_filenames, {"upscale_models": set()})
+        self.assertEqual(
+            context["model_roots"],
+            {"upscale_models": (model_root,)},
+        )
+
     def test_injected_model_source_resolver_keeps_route_tests_offline(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

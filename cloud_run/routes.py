@@ -125,7 +125,7 @@ def _runtime_resolution_context(host):
             try:
                 filenames = folder_paths.get_filename_list(category)
             except Exception:
-                continue
+                filenames = ()
             if (
                 not isinstance(filenames, (tuple, list))
                 or len(filenames) > 200_000

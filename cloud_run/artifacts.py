@@ -678,18 +678,23 @@ def resolve_artifacts(
             except FileNotFoundError:
                 local_path = None
             except ArtifactPathError:
-                rows.append(
-                    ArtifactResolution(
-                        node_id,
-                        class_type,
-                        input_name,
-                        rule.kind,
-                        "unsupported",
-                        destination,
-                        reason="File-backed input cannot be resolved safely.",
+                if model_resolution is not None:
+                    local_path = None
+                else:
+                    rows.append(
+                        ArtifactResolution(
+                            node_id,
+                            class_type,
+                            input_name,
+                            rule.kind,
+                            "unsupported",
+                            destination,
+                            reason=(
+                                "File-backed input cannot be resolved safely."
+                            ),
+                        )
                     )
-                )
-                continue
+                    continue
             if model_resolution is not None:
                 file_digest = FileDigest(
                     size_bytes=model_resolution.size_bytes,
@@ -797,6 +802,11 @@ def resolve_artifacts(
             source = normalized_sources.get(file_digest.sha256)
 
         artifact_id = _artifact_id(rule.kind, file_digest.sha256)
+        if source is None and rule.kind == "input":
+            source = SourceSpec(
+                kind="local-upload",
+                locator="local-upload:" + artifact_id,
+            )
         if local_path is not None:
             local_artifacts.setdefault(
                 artifact_id,
