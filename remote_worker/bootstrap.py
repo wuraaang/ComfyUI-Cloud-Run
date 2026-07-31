@@ -63,6 +63,18 @@ class _NoRedirect(urlrequest.HTTPRedirectHandler):
         )
 
 
+_TRANSPORT_REJECTED = object()
+
+
+def _close_response(response):
+    if response is None:
+        return
+    try:
+        response.close()
+    except Exception:
+        return
+
+
 class HttpsTransport:
     """HTTPS-only stream that neither follows redirects nor uses a shell."""
 
@@ -70,62 +82,59 @@ class HttpsTransport:
         self.timeout_seconds = timeout_seconds
 
     def stream(self, url):
-        opener = urlrequest.build_opener(
-            urlrequest.ProxyHandler({}),
-            _NoRedirect(),
-        )
-        headers = {
-            "Accept": "application/octet-stream",
-            "Accept-Encoding": "identity",
-            "User-Agent": "ComfyUI-Cloud-Run-Bootstrap/1",
-        }
-        request = urlrequest.Request(url, headers=headers, method="GET")
-        redirect_count = 0
-        redirect_target = None
-        candidate = None
-        parsed = None
-        transport_rejected = False
-        try:
-            response = opener.open(
-                request,
-                timeout=self.timeout_seconds,
-            )
-        except urlerror.HTTPError as redirect:
-            try:
-                if redirect.code == 302:
-                    candidate = redirect.headers.get("Location")
-                    if isinstance(candidate, str):
-                        parsed = urlsplit(candidate)
-                        if (
-                            parsed.scheme == "https"
-                            and parsed.hostname
-                            == "release-assets.githubusercontent.com"
-                            and parsed.username is None
-                            and parsed.password is None
-                            and parsed.port is None
-                            and not parsed.fragment
-                        ):
-                            redirect_target = candidate
-                transport_rejected = redirect_target is None
-            except Exception:
-                transport_rejected = True
-            finally:
-                try:
-                    redirect.close()
-                except Exception:
-                    transport_rejected = True
-        except Exception:
-            transport_rejected = True
-        candidate = None
-        parsed = None
-        if transport_rejected:
-            redirect_target = None
+        result = self._stream_result(url)
+        if result is _TRANSPORT_REJECTED:
             raise BootstrapError(
                 "Reviewed worker archive is unavailable."
             )
-        if redirect_target is not None:
-            redirect_count = 1
+        return result
+
+    def _stream_result(self, url):
+        response = None
+        try:
+            opener = urlrequest.build_opener(
+                urlrequest.ProxyHandler({}),
+                _NoRedirect(),
+            )
+            headers = {
+                "Accept": "application/octet-stream",
+                "Accept-Encoding": "identity",
+                "User-Agent": "ComfyUI-Cloud-Run-Bootstrap/1",
+            }
+            request = urlrequest.Request(
+                url,
+                headers=headers,
+                method="GET",
+            )
+            redirect_count = 0
             try:
+                response = opener.open(
+                    request,
+                    timeout=self.timeout_seconds,
+                )
+            except urlerror.HTTPError as redirect:
+                try:
+                    if redirect.code != 302:
+                        return _TRANSPORT_REJECTED
+                    redirect_target = redirect.headers.get("Location")
+                    if not isinstance(redirect_target, str):
+                        return _TRANSPORT_REJECTED
+                    parsed = urlsplit(redirect_target)
+                    if (
+                        parsed.scheme != "https"
+                        or parsed.hostname
+                        != "release-assets.githubusercontent.com"
+                        or parsed.username is not None
+                        or parsed.password is not None
+                        or parsed.port is not None
+                        or parsed.fragment
+                    ):
+                        return _TRANSPORT_REJECTED
+                except Exception:
+                    return _TRANSPORT_REJECTED
+                finally:
+                    _close_response(redirect)
+                redirect_count = 1
                 request = urlrequest.Request(
                     redirect_target,
                     headers=headers,
@@ -135,29 +144,20 @@ class HttpsTransport:
                     request,
                     timeout=self.timeout_seconds,
                 )
-            except urlerror.HTTPError as terminal_error:
-                try:
-                    terminal_error.close()
-                except Exception:
-                    pass
-                transport_rejected = True
-            except Exception:
-                transport_rejected = True
-            redirect_target = None
-            request = None
-            if transport_rejected:
-                raise BootstrapError(
-                    "Reviewed worker archive is unavailable."
-                )
-        encoding = response.headers.get("Content-Encoding", "identity")
-        if getattr(response, "status", None) != 200 or (
-            not isinstance(encoding, str)
-            or encoding.casefold() != "identity"
-        ):
-            response.close()
-            raise BootstrapError(
-                "Reviewed worker archive is unavailable."
-            )
+            encoding = response.headers.get("Content-Encoding", "identity")
+            if getattr(response, "status", None) != 200 or (
+                not isinstance(encoding, str)
+                or encoding.casefold() != "identity"
+            ):
+                _close_response(response)
+                return _TRANSPORT_REJECTED
+        except urlerror.HTTPError as terminal_error:
+            _close_response(terminal_error)
+            _close_response(response)
+            return _TRANSPORT_REJECTED
+        except Exception:
+            _close_response(response)
+            return _TRANSPORT_REJECTED
 
         def chunks():
             try:
@@ -167,7 +167,7 @@ class HttpsTransport:
                         break
                     yield chunk
             finally:
-                response.close()
+                _close_response(response)
 
         return DownloadStream(
             source_url=url,

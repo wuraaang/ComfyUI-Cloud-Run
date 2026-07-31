@@ -216,6 +216,105 @@ class HttpsTransportTests(unittest.TestCase):
             "Reviewed worker archive is unavailable.",
         )
 
+    def _capture_rejection_with_traceback(self, opener):
+        with patch(
+            "remote_worker.bootstrap.urlrequest.build_opener",
+            return_value=opener,
+        ):
+            try:
+                HttpsTransport(timeout_seconds=7).stream(self.source_url)
+            except BootstrapError as error:
+                return error
+        self.fail("transport unexpectedly accepted the response")
+
+    def _assert_signed_target_is_not_retained(self, error):
+        self._assert_only_static_transport_error_is_retained(error)
+        bootstrap_path = (
+            REPOSITORY_ROOT / "remote_worker" / "bootstrap.py"
+        ).resolve()
+        production_frames = []
+        pending = [error]
+        seen = set()
+        while pending:
+            current = pending.pop()
+            if id(current) in seen:
+                continue
+            seen.add(id(current))
+            traceback = current.__traceback__
+            while traceback is not None:
+                frame = traceback.tb_frame
+                if Path(frame.f_code.co_filename).resolve() == bootstrap_path:
+                    production_frames.append(frame)
+                traceback = traceback.tb_next
+            if current.__cause__ is not None:
+                pending.append(current.__cause__)
+            if current.__context__ is not None:
+                pending.append(current.__context__)
+        self.assertTrue(production_frames)
+        for frame in production_frames:
+            for name, value in frame.f_locals.items():
+                self.assertNotIn(
+                    self.signed_location,
+                    repr(value),
+                    msg="retained local: " + name,
+                )
+                for attribute in (
+                    "full_url",
+                    "final_url",
+                    "requested_urls",
+                ):
+                    attribute_value = getattr(value, attribute, None)
+                    self.assertNotIn(
+                        self.signed_location,
+                        repr(attribute_value),
+                        msg="retained object: " + name + "." + attribute,
+                    )
+                geturl = getattr(value, "geturl", None)
+                if callable(geturl):
+                    self.assertNotIn(
+                        self.signed_location,
+                        repr(geturl()),
+                        msg="retained object: " + name + ".geturl()",
+                    )
+
+    def test_redirected_non_200_discards_terminal_response_state(self):
+        redirect = redirect_error(
+            self.source_url,
+            302,
+            self.signed_location,
+        )
+        response = FakeResponse(
+            status=206,
+            final_url=self.signed_location,
+        )
+
+        error = self._capture_rejection_with_traceback(
+            FakeOpener(redirect, response)
+        )
+
+        self._assert_signed_target_is_not_retained(error)
+        self.assertTrue(redirect.fp.closed)
+        self.assertTrue(response.closed)
+
+    def test_redirected_non_identity_discards_terminal_response_state(self):
+        redirect = redirect_error(
+            self.source_url,
+            302,
+            self.signed_location,
+        )
+        response = FakeResponse(
+            content_encoding="gzip",
+            final_url=self.signed_location,
+        )
+
+        error = self._capture_rejection_with_traceback(
+            FakeOpener(redirect, response)
+        )
+
+        self._assert_signed_target_is_not_retained(error)
+        self.assertTrue(redirect.fp.closed)
+        self.assertTrue(response.closed)
+
     def test_rejected_first_hop_discards_redirect_exception_graph(self):
         redirect = redirect_error(
             self.source_url,
