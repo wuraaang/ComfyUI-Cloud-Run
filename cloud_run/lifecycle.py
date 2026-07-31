@@ -11,6 +11,7 @@ from .offers import (
     apply_offer_policy,
     select_best_offer,
 )
+from .session_service import TerminalProvisioningError
 from .worker_release import WorkerRelease
 from . import vast
 
@@ -369,6 +370,19 @@ class CloudRunLifecycle:
                 session = await self.reconcile_session_once(session_id)
             except (asyncio.CancelledError, KeyboardInterrupt):
                 raise
+            except TerminalProvisioningError as error:
+                diagnostic = str(error)
+                session = self._session(session_id)
+                session = self.session_repository.transition(
+                    session.session_id,
+                    SessionState.FAILED,
+                    now=float(self.clock()),
+                    sanitized_error=diagnostic,
+                )
+                return await self.destroy_session(
+                    session.session_id,
+                    terminal_error=diagnostic,
+                )
             except Exception:
                 session = self._session(session_id)
             if session.state in {
@@ -722,7 +736,7 @@ class CloudRunLifecycle:
             return None
         return base_url, token
 
-    def _finalize_session_destroyed(self, session):
+    def _finalize_session_destroyed(self, session, *, terminal_error=None):
         if session.state == SessionState.DESTROYED:
             return session
         if session.state not in {
@@ -754,7 +768,7 @@ class CloudRunLifecycle:
             provider_token=None,
             session_secret_hex=None,
             residual_inventory=(),
-            sanitized_error=None,
+            sanitized_error=terminal_error,
             pending_deadline_at=None,
             pending_deadline_mode=None,
             pending_deadline_action=None,
@@ -856,7 +870,7 @@ class CloudRunLifecycle:
             return session
         return await self._activate_session_instance(session, instance)
 
-    async def destroy_session(self, session_id):
+    async def destroy_session(self, session_id, *, terminal_error=None):
         session = self._session(session_id)
         if session.state == SessionState.DESTROYED:
             return session
@@ -869,7 +883,10 @@ class CloudRunLifecycle:
             and session.instance_id is None
             and not session.destroy_requested
         ):
-            return self._finalize_session_destroyed(session)
+            return self._finalize_session_destroyed(
+                session,
+                terminal_error=terminal_error,
+            )
         original_state = session.state
         if session.state not in {
             SessionState.DESTROY_REQUESTED,
@@ -880,7 +897,7 @@ class CloudRunLifecycle:
                 SessionState.DESTROY_REQUESTED,
                 now=float(self.clock()),
                 destroy_requested=True,
-                sanitized_error=None,
+                sanitized_error=terminal_error,
             )
         _settings, api_key = self._api_key()
         instance_id = session.instance_id
@@ -948,7 +965,10 @@ class CloudRunLifecycle:
             ):
                 return session
             else:
-                return self._finalize_session_destroyed(session)
+                return self._finalize_session_destroyed(
+                    session,
+                    terminal_error=terminal_error,
+                )
         if session.state != SessionState.DESTROYING:
             session = self.session_repository.transition(
                 session.session_id,
@@ -1005,7 +1025,10 @@ class CloudRunLifecycle:
                     "the Vast console immediately."
                 ),
             )
-        return self._finalize_session_destroyed(session)
+        return self._finalize_session_destroyed(
+            session,
+            terminal_error=terminal_error,
+        )
 
     async def enforce_session_deadline(self, session_id):
         session = self._session(session_id)

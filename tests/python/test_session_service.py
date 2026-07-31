@@ -31,6 +31,7 @@ from cloud_run.session_service import (
     SessionExecutionError,
     SessionService,
     SessionServiceError,
+    TerminalProvisioningError,
 )
 from cloud_run.worker_release import WorkerRelease
 
@@ -680,6 +681,304 @@ class SequentialRelay:
         )
 
 
+class SessionProvisioningTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.path = Path(temporary.name) / "private" / "sessions.sqlite3"
+        self.jobs = JobRepository(self.path)
+        self.sessions = SessionRepository(self.path)
+        self.capture = capture_with_seed(21)
+        self.jobs.save_capture(self.capture, created_at=100.0)
+        self.artifact = local_artifact("terminal-input.jpg", "d")
+        self.manifest = DependencyManifest(
+            schema_version=1,
+            protocol_version="1",
+            comfyui_core_version="0.29.0",
+            comfyui_frontend_version="1.47.10",
+            worker_version="a" * 40,
+            prompt_digest=self.capture.prompt_digest,
+            custom_nodes=(),
+            artifacts=(self.artifact,),
+            output_allowance_bytes=1024,
+            disk_gb=80,
+        )
+        self.jobs.save_manifest(
+            self.manifest.digest,
+            self.manifest.canonical_bytes().decode("utf-8"),
+            created_at=100.0,
+        )
+        session = CloudSession.new(
+            "terminal-session-key",
+            session_id="terminal-session",
+            manifest_digest=self.manifest.digest,
+            deadline_at=7_300.0,
+            deadline_mode="finite",
+            disk_gb=80,
+            now=100.0,
+            state=SessionState.PROVISIONING,
+        ).transition(
+            SessionState.PROVISIONING,
+            now=100.0,
+            instance_id="77",
+            worker_base_url="http://8.8.8.8:30000",
+            provider_token="provider-token",
+            session_secret_hex="e" * 64,
+        )
+        self.sessions.create_or_get(session)
+        self.worker = SequentialWorker()
+        self.service = SessionService(
+            job_repository=self.jobs,
+            session_repository=self.sessions,
+            resolver=FakeResolver(resolved_resolution()),
+            release=worker_release(),
+            worker_factory=lambda _session: self.worker,
+            clock=lambda: 100.0,
+        )
+
+    def response(self, *, state="ready", manifest=None, **changes):
+        selected = manifest or self.manifest
+        payload = {
+            "transaction_id": "provision-" + selected.digest,
+            "manifest_digest": selected.digest,
+            "state": state,
+            "planned_restarts": 0,
+            "repair_restarts": 0,
+            "missing_class_types": [],
+            "missing_artifacts": [],
+        }
+        payload.update(changes)
+        return payload
+
+    def assert_terminal(self, awaitable, message):
+        with self.assertRaises(TerminalProvisioningError) as caught:
+            asyncio.run(awaitable)
+        self.assertIs(type(caught.exception), TerminalProvisioningError)
+        self.assertEqual(str(caught.exception), message)
+
+    async def apply(self, worker, manifest=None):
+        selected = manifest or self.manifest
+        return await self.service._apply_manifest(
+            worker,
+            self.sessions.get("terminal-session"),
+            selected,
+            transfer_job_id="bootstrap:terminal-session",
+            capture=self.capture,
+        )
+
+    def test_invalid_response_shape_or_identity_is_terminal(self):
+        invalid = (
+            None,
+            {
+                **self.response(),
+                "transaction_id": "provision-" + "f" * 64,
+            },
+        )
+        for response in invalid:
+            with self.subTest(response=response):
+                worker = SequentialWorker()
+
+                async def apply_manifest(_payload, value=response):
+                    return value
+
+                worker.apply_manifest = apply_manifest
+                self.assert_terminal(
+                    self.apply(worker),
+                    "Remote provisioning response was invalid.",
+                )
+
+    def test_unknown_or_nonlocal_required_upload_is_terminal(self):
+        public_artifact = ArtifactSpec(
+            artifact_id="public-model",
+            kind="model",
+            logical_name="public.safetensors",
+            destination="models/diffusion_models/public.safetensors",
+            size_bytes=10,
+            sha256="f" * 64,
+            source=SourceSpec(
+                "huggingface",
+                (
+                    "https://huggingface.co/example/public/resolve/"
+                    + "f" * 40
+                    + "/public.safetensors"
+                ),
+                immutable_revision="f" * 40,
+            ),
+        )
+        public_manifest = DependencyManifest(
+            schema_version=1,
+            protocol_version="1",
+            comfyui_core_version="0.29.0",
+            comfyui_frontend_version="1.47.10",
+            worker_version="a" * 40,
+            prompt_digest=self.capture.prompt_digest,
+            custom_nodes=(),
+            artifacts=(public_artifact,),
+            output_allowance_bytes=1024,
+            disk_gb=80,
+        )
+        cases = (
+            (self.manifest, "unknown-artifact"),
+            (public_manifest, public_artifact.artifact_id),
+        )
+        for manifest, artifact_id in cases:
+            with self.subTest(artifact_id=artifact_id):
+                worker = SequentialWorker()
+
+                async def apply_manifest(_payload, selected=manifest):
+                    return self.response(
+                        state="awaiting_upload",
+                        manifest=selected,
+                        required_uploads=[artifact_id],
+                    )
+
+                worker.apply_manifest = apply_manifest
+                self.assert_terminal(
+                    self.apply(worker, manifest),
+                    "Remote provisioning requested an unknown upload.",
+                )
+
+    def test_invalid_progress_and_upload_receipt_identity_are_terminal(self):
+        worker = SequentialWorker()
+
+        async def apply_manifest(_payload):
+            return self.response(
+                progress={
+                    "phase": "model_transfer",
+                    "dependency_id": "https://example.com/model",
+                    "transferred_bytes": 1,
+                    "total_bytes": self.artifact.size_bytes,
+                }
+            )
+
+        worker.apply_manifest = apply_manifest
+        self.assert_terminal(
+            self.apply(worker),
+            "Remote provisioning response was invalid.",
+        )
+
+        content = b"terminal-upload"
+        path = self.path.parent / "terminal-upload.bin"
+        path.write_bytes(content)
+        digest = __import__("hashlib").sha256(content).hexdigest()
+        artifact = ArtifactSpec(
+            artifact_id="terminal-upload",
+            kind="input",
+            logical_name="terminal-upload.bin",
+            destination="input/terminal-upload.bin",
+            size_bytes=len(content),
+            sha256=digest,
+            source=SourceSpec(
+                "local-upload",
+                "local-upload:terminal-upload",
+            ),
+        )
+        self.jobs.register_local_artifact(
+            types.SimpleNamespace(
+                artifact_id=artifact.artifact_id,
+                private_path=str(path),
+                size_bytes=artifact.size_bytes,
+                sha256=artifact.sha256,
+            )
+        )
+        receipts = (
+            {"artifact_id": "other"},
+            {"size_bytes": artifact.size_bytes + 1},
+            {"sha256": "0" * 64},
+        )
+        for index, changed in enumerate(receipts):
+            with self.subTest(receipt=changed):
+                receipt = {
+                    "artifact_id": artifact.artifact_id,
+                    "state": "verified",
+                    "next_offset": artifact.size_bytes,
+                    "size_bytes": artifact.size_bytes,
+                    "sha256": artifact.sha256,
+                    **changed,
+                }
+
+                class ReceiptWorker:
+                    async def upload_artifact(inner_self, *_args, **_kwargs):
+                        return receipt
+
+                self.assert_terminal(
+                    self.service._upload_artifact(
+                        ReceiptWorker(),
+                        "terminal-upload-job-" + str(index),
+                        artifact,
+                    ),
+                    "Remote dependency upload was not verified.",
+                )
+
+    def test_failed_stalled_or_final_nonready_worker_state_is_terminal(self):
+        for state in ("failed", "stalled"):
+            with self.subTest(state=state):
+                worker = SequentialWorker()
+
+                async def apply_manifest(_payload, value=state):
+                    return self.response(
+                        state=value,
+                        repair_restarts=1,
+                    )
+
+                worker.apply_manifest = apply_manifest
+                self.assert_terminal(
+                    self.apply(worker),
+                    "Remote provisioning did not become ready.",
+                )
+
+        worker = SequentialWorker()
+
+        async def apply_manifest(_payload):
+            return self.response(state="applying")
+
+        async def transaction(_transaction_id):
+            return self.response(state="applying")
+
+        worker.apply_manifest = apply_manifest
+        worker.transaction = transaction
+        self.assert_terminal(
+            self.apply(worker),
+            "Remote provisioning is incomplete.",
+        )
+
+    def test_inconsistent_deadline_response_after_provisioning_is_terminal(self):
+        async def update_deadline(_policy):
+            return {"mode": "none", "acknowledged": True}
+
+        self.worker.update_deadline = update_deadline
+        self.assert_terminal(
+            self.service.bootstrap_session("terminal-session"),
+            "Remote deadline enforcement failed.",
+        )
+
+    def test_transport_unavailability_and_cancellation_are_not_terminal(self):
+        worker = SequentialWorker()
+
+        async def unavailable(_payload):
+            raise OSError("synthetic transport failure")
+
+        worker.apply_manifest = unavailable
+        with self.assertRaises(SessionExecutionError) as caught:
+            asyncio.run(self.apply(worker))
+        self.assertIs(type(caught.exception), SessionExecutionError)
+        self.assertEqual(str(caught.exception), "Remote provisioning failed.")
+
+        async def cancelled(_payload):
+            raise asyncio.CancelledError()
+
+        worker.apply_manifest = cancelled
+        with self.assertRaises(asyncio.CancelledError):
+            asyncio.run(self.apply(worker))
+
+        async def interrupted(_payload):
+            raise KeyboardInterrupt()
+
+        worker.apply_manifest = interrupted
+        with self.assertRaises(KeyboardInterrupt):
+            asyncio.run(self.apply(worker))
+
+
 class ReusableSessionTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -1271,6 +1570,13 @@ class ReusableSessionTests(unittest.TestCase):
         self.assertEqual(self.worker.manifest_calls, [])
 
     def test_execution_failure_returns_the_healthy_session_to_ready(self):
+        lifecycle_calls = []
+
+        class RecordingLifecycle:
+            async def destroy_session(inner_self, *args, **kwargs):
+                lifecycle_calls.append((args, kwargs))
+
+        self.service.lifecycle = RecordingLifecycle()
         self.worker.terminal_state = "failed"
         self.worker.error = {
             "code": "out_of_memory",
@@ -1294,6 +1600,40 @@ class ReusableSessionTests(unittest.TestCase):
             self.sessions.get("session-1").state,
             SessionState.READY,
         )
+        self.assertEqual(lifecycle_calls, [])
+
+    def test_terminal_job_delta_requests_verified_destruction(self):
+        calls = []
+        diagnostic = "Remote provisioning response was invalid."
+
+        class RecordingLifecycle:
+            async def destroy_session(
+                inner_self,
+                session_id,
+                *,
+                terminal_error=None,
+            ):
+                calls.append((session_id, terminal_error))
+                return self_outer.sessions.get(session_id)
+
+        self_outer = self
+        self.service.lifecycle = RecordingLifecycle()
+
+        async def terminal_apply(_payload):
+            raise TerminalProvisioningError(diagnostic)
+
+        self.worker.apply_manifest = terminal_apply
+
+        with self.assertRaises(TerminalProvisioningError):
+            asyncio.run(
+                self.service.submit_job(
+                    "session-1",
+                    capture_id=self.second_capture.capture_id,
+                    idempotency_key="terminal-delta-key",
+                )
+            )
+
+        self.assertEqual(calls, [("session-1", diagnostic)])
 
     def test_running_remote_job_returns_immediately_then_finishes_in_background(self):
         async def scenario():

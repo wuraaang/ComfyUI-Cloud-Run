@@ -12,6 +12,7 @@ from cloud_run.models import (
 )
 from cloud_run.offers import HostBlacklist
 from cloud_run.repository import AttemptRepository, SessionRepository
+from cloud_run.session_service import TerminalProvisioningError
 from cloud_run.vast import VastError
 from cloud_run.worker_release import WorkerRelease
 
@@ -831,6 +832,15 @@ class ReadySessionService(RecoveringSessionService):
         return session
 
 
+class TerminalSessionService(RecoveringSessionService):
+    diagnostic = "Remote provisioning response was invalid."
+
+    async def bootstrap_session(self, session_id):
+        session = self.repository.get(session_id)
+        self.bootstrap_calls.append(session)
+        raise TerminalProvisioningError(self.diagnostic)
+
+
 class SessionLifecycleTests(LifecycleTestCase):
     def setUp(self):
         super().setUp()
@@ -944,6 +954,127 @@ class SessionLifecycleTests(LifecycleTestCase):
             SessionState.READY,
         )
         self.assertEqual(len(self.session_service.bootstrap_calls), 1)
+
+    def test_terminal_provisioning_failure_destroys_and_verifies_immediately(self):
+        self.session_service = TerminalSessionService(self.sessions)
+        session = self.save_session()
+        self.provider.instances = [
+            self.worker_instance("instance-1", session.label)
+        ]
+        lifecycle = self.session_lifecycle()
+        lifecycle.boot_deadline_seconds = 3
+        lifecycle.poll_interval_seconds = 1
+
+        destroyed = asyncio.run(
+            lifecycle.wait_until_session_ready(session.session_id)
+        )
+
+        self.assertEqual(destroyed.state, SessionState.DESTROYED)
+        self.assertIsNone(destroyed.instance_id)
+        self.assertFalse(destroyed.public_payload()["billing_may_continue"])
+        self.assertEqual(
+            destroyed.sanitized_error,
+            TerminalSessionService.diagnostic,
+        )
+        self.assertEqual(self.clock.sleeps, [])
+        self.assertEqual(
+            [call[0] for call in self.provider.calls],
+            ["get", "destroy", "list"],
+        )
+
+    def test_terminal_destroy_exception_keeps_residual_billing_warning(self):
+        self.session_service = TerminalSessionService(self.sessions)
+        session = self.save_session()
+        self.provider.instances = [
+            self.worker_instance("instance-1", session.label)
+        ]
+
+        async def failing_destroy(api_key, instance_id):
+            self.provider.calls.append(("destroy", instance_id, api_key))
+            raise RuntimeError("synthetic destroy failure")
+
+        self.provider.destroy_instance = failing_destroy
+        lifecycle = self.session_lifecycle()
+        lifecycle.boot_deadline_seconds = 3
+        lifecycle.poll_interval_seconds = 1
+
+        failed = asyncio.run(
+            lifecycle.wait_until_session_ready(session.session_id)
+        )
+
+        self.assertEqual(failed.state, SessionState.FAILED)
+        self.assertEqual(failed.instance_id, "instance-1")
+        self.assertEqual(failed.residual_inventory, ("instance-1",))
+        self.assertTrue(failed.public_payload()["billing_may_continue"])
+        self.assertEqual(
+            failed.sanitized_error,
+            "The Vast instance is still present; destroy it in "
+            "the Vast console immediately.",
+        )
+        self.assertEqual(self.clock.sleeps, [])
+        self.assertEqual(
+            [call[0] for call in self.provider.calls],
+            ["get", "destroy", "list"],
+        )
+
+    def test_terminal_destroy_unverifiable_inventory_keeps_warning(self):
+        self.session_service = TerminalSessionService(self.sessions)
+        session = self.save_session()
+        self.provider.instances = [
+            self.worker_instance("instance-1", session.label)
+        ]
+        self.provider.list_error = RuntimeError("synthetic inventory failure")
+        lifecycle = self.session_lifecycle()
+        lifecycle.boot_deadline_seconds = 3
+        lifecycle.poll_interval_seconds = 1
+
+        failed = asyncio.run(
+            lifecycle.wait_until_session_ready(session.session_id)
+        )
+
+        self.assertEqual(failed.state, SessionState.FAILED)
+        self.assertEqual(failed.instance_id, "instance-1")
+        self.assertEqual(failed.residual_inventory, ("instance-1",))
+        self.assertTrue(failed.public_payload()["billing_may_continue"])
+        self.assertEqual(
+            failed.sanitized_error,
+            "Destruction could not be verified because Vast inventory is unavailable.",
+        )
+        self.assertEqual(self.clock.sleeps, [])
+        self.assertEqual(
+            [call[0] for call in self.provider.calls],
+            ["get", "destroy", "list"],
+        )
+
+    def test_terminal_destroy_residual_label_keeps_warning(self):
+        self.session_service = TerminalSessionService(self.sessions)
+        session = self.save_session()
+        self.provider.instances = [
+            self.worker_instance("instance-1", session.label)
+        ]
+        self.provider.destroy_removes = False
+        lifecycle = self.session_lifecycle()
+        lifecycle.boot_deadline_seconds = 3
+        lifecycle.poll_interval_seconds = 1
+
+        failed = asyncio.run(
+            lifecycle.wait_until_session_ready(session.session_id)
+        )
+
+        self.assertEqual(failed.state, SessionState.FAILED)
+        self.assertEqual(failed.instance_id, "instance-1")
+        self.assertEqual(failed.residual_inventory, ("instance-1",))
+        self.assertTrue(failed.public_payload()["billing_may_continue"])
+        self.assertEqual(
+            failed.sanitized_error,
+            "The Vast instance is still present; destroy it in "
+            "the Vast console immediately.",
+        )
+        self.assertEqual(self.clock.sleeps, [])
+        self.assertEqual(
+            [call[0] for call in self.provider.calls],
+            ["get", "destroy", "list"],
+        )
 
     def test_recovery_lists_once_and_fails_closed_on_duplicate_label(self):
         session = self.save_session()

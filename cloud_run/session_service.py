@@ -111,6 +111,10 @@ class SessionExecutionError(SessionServiceError):
     pass
 
 
+class TerminalProvisioningError(SessionExecutionError):
+    """A sanitized deterministic failure after bounded recovery is exhausted."""
+
+
 class DeadlineValidationError(SessionServiceError):
     pass
 
@@ -1520,6 +1524,20 @@ class SessionService:
             self._abandon_session_work(session.session_id)
         return result
 
+    async def _request_terminal_destruction(self, session_id, diagnostic):
+        destroy = getattr(self.lifecycle, "destroy_session", None)
+        if not callable(destroy):
+            return None
+        try:
+            return await destroy(
+                session_id,
+                terminal_error=diagnostic,
+            )
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            raise
+        except Exception:
+            return None
+
     def _worker(self, session):
         if not callable(self.worker_factory):
             raise SessionExecutionError("Remote worker is unavailable.")
@@ -1700,7 +1718,7 @@ class SessionService:
             or existing.expected_size != artifact.size_bytes
             or existing.sha256 != artifact.sha256
         ):
-            raise SessionExecutionError(
+            raise TerminalProvisioningError(
                 "Stored dependency upload identity changed."
             )
         offset = existing.offset if existing is not None else 0
@@ -1748,7 +1766,7 @@ class SessionService:
                         >= artifact.size_bytes
                     )
                 ):
-                    raise SessionExecutionError(
+                    raise TerminalProvisioningError(
                         "Remote dependency upload identity changed."
                     )
                 remote_offset = remote_status["next_offset"]
@@ -1790,7 +1808,7 @@ class SessionService:
                 or not isinstance(next_offset, int)
                 or not offset <= next_offset <= artifact.size_bytes
             ):
-                raise SessionExecutionError(
+                raise TerminalProvisioningError(
                     "Remote dependency upload made invalid progress."
                 )
             self.job_repository.save_transfer(
@@ -1854,7 +1872,7 @@ class SessionService:
             or receipt.get("size_bytes") != artifact.size_bytes
             or receipt.get("sha256") != artifact.sha256
         ):
-            raise SessionExecutionError(
+            raise TerminalProvisioningError(
                 "Remote dependency upload was not verified."
             )
         await progress(artifact.size_bytes)
@@ -1889,7 +1907,7 @@ class SessionService:
                 sanitized_error=sanitized_error,
             )
         except (KeyError, TypeError, ValueError):
-            raise SessionExecutionError(
+            raise TerminalProvisioningError(
                 "Remote provisioning response was invalid."
             ) from None
 
@@ -1925,7 +1943,7 @@ class SessionService:
                 if observed is None:
                     continue
                 if not _provision_payload_valid(observed, manifest):
-                    raise SessionExecutionError(
+                    raise TerminalProvisioningError(
                         "Remote provisioning response was invalid."
                     )
                 self._record_provision_progress(
@@ -1935,7 +1953,7 @@ class SessionService:
                     transfer_job_id=transfer_job_id,
                 )
             if not _provision_payload_valid(response, manifest):
-                raise SessionExecutionError(
+                raise TerminalProvisioningError(
                     "Remote provisioning response was invalid."
                 )
             self._record_provision_progress(
@@ -1987,7 +2005,7 @@ class SessionService:
                     "Remote provisioning failed."
                 ) from None
             if not _provision_payload_valid(response, manifest):
-                raise SessionExecutionError(
+                raise TerminalProvisioningError(
                     "Remote provisioning response was invalid."
                 )
             required_uploads = response.get("required_uploads", [])
@@ -1998,7 +2016,7 @@ class SessionService:
                         artifact is None
                         or artifact.source.kind != "local-upload"
                     ):
-                        raise SessionExecutionError(
+                        raise TerminalProvisioningError(
                             "Remote provisioning requested an unknown upload."
                         )
                     await self._upload_artifact(
@@ -2010,7 +2028,7 @@ class SessionService:
             if response["state"] == "ready":
                 return response
             if response["state"] in {"failed", "stalled"}:
-                raise SessionExecutionError(
+                raise TerminalProvisioningError(
                     "Remote provisioning did not become ready."
                 )
             transaction = getattr(worker, "transaction", None)
@@ -2028,7 +2046,7 @@ class SessionService:
                 not _provision_payload_valid(response, manifest)
                 or response["state"] != "ready"
             ):
-                raise SessionExecutionError(
+                raise TerminalProvisioningError(
                     "Remote provisioning is incomplete."
                 )
             self._record_provision_progress(
@@ -2038,7 +2056,7 @@ class SessionService:
                 transfer_job_id=transfer_job_id,
             )
             return response
-        raise SessionExecutionError(
+        raise TerminalProvisioningError(
             "Remote provisioning did not accept required uploads."
         )
 
@@ -2131,7 +2149,7 @@ class SessionService:
                 != session.deadline_at
             )
         ):
-            raise SessionExecutionError(
+            raise TerminalProvisioningError(
                 "Remote deadline enforcement failed."
             )
         self.job_repository.replace_installed_set(
@@ -2417,6 +2435,24 @@ class SessionService:
                     transfer_job_id=job.job_id,
                     capture=capture,
                 )
+            except TerminalProvisioningError as error:
+                diagnostic = str(error)
+                self._transition_job(
+                    job,
+                    JobState.FAILED,
+                    sanitized_error=diagnostic,
+                )
+                self._sessions().transition(
+                    session.session_id,
+                    SessionState.FAILED,
+                    now=self._now(),
+                    sanitized_error=diagnostic,
+                )
+                await self._request_terminal_destruction(
+                    session.session_id,
+                    diagnostic,
+                )
+                raise
             except Exception:
                 self._transition_job(
                     job,
@@ -2462,6 +2498,24 @@ class SessionService:
                     transfer_job_id=job.job_id,
                     capture=capture,
                 )
+            except TerminalProvisioningError as error:
+                diagnostic = str(error)
+                self._transition_job(
+                    job,
+                    JobState.FAILED,
+                    sanitized_error=diagnostic,
+                )
+                self._sessions().transition(
+                    session.session_id,
+                    SessionState.FAILED,
+                    now=self._now(),
+                    sanitized_error=diagnostic,
+                )
+                await self._request_terminal_destruction(
+                    session.session_id,
+                    diagnostic,
+                )
+                raise
             except Exception:
                 self._transition_job(
                     job,
