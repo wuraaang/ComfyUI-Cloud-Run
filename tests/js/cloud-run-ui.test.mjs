@@ -565,6 +565,8 @@ test("frontend source has no legacy, browser-secret, or provider URL surface", a
     "sessionStorage",
     "window.location",
     "console.vast.ai",
+    "http://",
+    "https://",
     "/cloud-run/api/quotes",
     "/cloud-run/api/attempts/",
   ]) {

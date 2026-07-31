@@ -65,7 +65,6 @@ function safeHuggingFaceProvenance(item) {
     || typeof locator !== "string"
     || !locator
     || locator.length > 8192
-    || !locator.startsWith("https://huggingface.co/")
     || locator.includes("%")
     || locator.includes("\\")
     || typeof revision !== "string"
@@ -134,7 +133,7 @@ function safeHuggingFaceProvenance(item) {
   return {
     repository,
     filePath: parts.slice(5).join("/"),
-    repositoryUrl: `https://huggingface.co/${repository}`,
+    repositoryUrl: `${parsed.origin}/${repository}`,
     destination,
     digest,
   };
