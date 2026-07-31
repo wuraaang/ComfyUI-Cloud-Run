@@ -897,6 +897,42 @@ class ReleaseToolCliTests(unittest.TestCase):
         self.assertNotIn(str(output), combined)
         self.assertNotIn("Traceback", combined)
 
+    def test_cli_redacts_an_invalid_present_worker_tree_build_failure(self):
+        marker = "task4-private-environment-marker"
+        with tempfile.TemporaryDirectory() as root:
+            invalid_repository = Path(root) / "invalid-repository"
+            (invalid_repository / "remote_worker").mkdir(parents=True)
+            (invalid_repository / "cloud_run").mkdir()
+            (invalid_repository / "remote_worker" / "unreviewed.py").write_text(
+                "UNREVIEWED = True\n",
+                encoding="utf-8",
+            )
+            output = self._private_directory(root, "bundle")
+            with mock.patch.dict(
+                os.environ,
+                {"TASK4_PRIVATE_MARKER": marker},
+            ):
+                result = self._run(
+                    "scripts/build_worker_release_bundle.py",
+                    "--repository-root",
+                    str(invalid_repository),
+                    "--output-directory",
+                    str(output),
+                    "--worker-commit",
+                    WORKER_COMMIT,
+                )
+
+        combined = result.stdout + result.stderr
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(
+            combined,
+            "Worker release bundle could not be built.\n",
+        )
+        self.assertNotIn("Traceback", combined)
+        self.assertNotIn(str(invalid_repository), combined)
+        self.assertNotIn(str(REPOSITORY_ROOT), combined)
+        self.assertNotIn(marker, combined)
+
 
 if __name__ == "__main__":
     unittest.main()

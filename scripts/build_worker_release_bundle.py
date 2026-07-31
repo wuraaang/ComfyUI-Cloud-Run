@@ -24,7 +24,10 @@ from cloud_run.manifest import (
     PROTOCOL_VERSION,
 )
 from remote_worker.bootstrap import DEFAULT_DESTINATION, MAX_ARCHIVE_BYTES
-from scripts.build_worker_artifact import build_worker_artifact
+from scripts.build_worker_artifact import (
+    ArtifactBuildError,
+    build_worker_artifact,
+)
 
 
 SCHEMA_VERSION = 1
@@ -296,7 +299,7 @@ def build_worker_release_bundle(
             except OSError:
                 pass
         raise
-    except OSError:
+    except (OSError, ArtifactBuildError):
         if archive_published:
             try:
                 final_archive.unlink()
