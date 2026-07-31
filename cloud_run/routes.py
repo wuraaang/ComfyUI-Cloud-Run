@@ -15,7 +15,7 @@ from .dependency_repository import (
 from .job_repository import JobRepository
 from .lifecycle import CloudRunLifecycle
 from .offers import HostBlacklist
-from .repository import AttemptRepository
+from .repository import AttemptRepository, SessionRepository
 from .registry import RegistryClient
 from .resolver import DependencyResolver
 from .r2 import R2TransferError, R2ValidationError
@@ -24,6 +24,7 @@ from .service import (
     CloudRunService,
     CloudRunValidationError,
     QuoteUnavailable,
+    SessionNotFound,
     VastProvider,
 )
 from .session_service import SessionService, SessionServiceError
@@ -38,10 +39,13 @@ from .vast import (
     OfferSearchError,
     VastError,
 )
+from .worker_release import (
+    WorkerReleaseUnavailable,
+    load_worker_release,
+)
 
 
 _MODEL_CATEGORY = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}")
-_PREFLIGHT_WORKER_VERSION = "preflight-v1"
 _BASE_ENVIRONMENT_BYTES = 40 * GIB
 
 
@@ -159,17 +163,27 @@ def build_service():
     data_directory = resolve_data_directory()
     settings_store = SettingsStore(data_directory)
     repository = AttemptRepository(data_directory / "attempts.sqlite3")
+    session_repository = SessionRepository(
+        data_directory / "attempts.sqlite3"
+    )
     job_repository = JobRepository(data_directory / "attempts.sqlite3")
     dependency_repository = DependencyRepository(
         data_directory / "attempts.sqlite3"
     )
     blacklist = HostBlacklist(data_directory / "host-blacklist.json")
     provider = VastProvider()
+    try:
+        release = load_worker_release(
+            data_directory / "worker-release.json"
+        )
+    except WorkerReleaseUnavailable:
+        release = None
     lifecycle = CloudRunLifecycle(
         settings_store,
         repository,
         provider=provider,
         blacklist=blacklist,
+        release=release,
     )
     service = CloudRunService(
         settings_store,
@@ -178,6 +192,8 @@ def build_service():
         provider=provider,
         blacklist=blacklist,
         lifecycle=lifecycle,
+        session_repository=session_repository,
+        release=release,
     )
     resolver = _RuntimeResolver(dependency_repository)
     service.session_service = SessionService(
@@ -185,7 +201,7 @@ def build_service():
         resolver=resolver,
         offer_search=service._search_without_preflight,
         mapping_repository=dependency_repository,
-        worker_version=_PREFLIGHT_WORKER_VERSION,
+        release=release,
     )
     return service
 
@@ -195,6 +211,10 @@ def _attempt_payload(attempt):
     payload["official_template_id"] = OFFICIAL_TEMPLATE_ID
     payload["official_template_name"] = OFFICIAL_TEMPLATE_NAME
     return payload
+
+
+def _session_payload(session):
+    return session.public_payload()
 
 
 async def _request_payload(request, *, allowed, required):
@@ -243,8 +263,12 @@ def register_routes(service_factory=None):
             )
         if isinstance(error, AttemptNotFound):
             return web.json_response({"error": str(error)}, status=404)
+        if isinstance(error, SessionNotFound):
+            return web.json_response({"error": str(error)}, status=404)
         if isinstance(error, QuoteUnavailable):
             return web.json_response({"error": str(error)}, status=409)
+        if isinstance(error, WorkerReleaseUnavailable):
+            return web.json_response({"error": str(error)}, status=503)
         if isinstance(error, OfferSearchConfigurationError):
             return web.json_response(
                 {"error": "Vast API key is not configured."},
@@ -406,6 +430,50 @@ def register_routes(service_factory=None):
         except Exception as error:
             return service_error(error)
         return web.json_response(_attempt_payload(attempt))
+
+    @routes.post("/cloud-run/api/sessions")
+    async def post_session(request):
+        try:
+            payload = await _request_payload(
+                request,
+                allowed={
+                    "preflight_id",
+                    "offer_id",
+                    "idempotency_key",
+                    "deadline",
+                },
+                required={
+                    "preflight_id",
+                    "offer_id",
+                    "idempotency_key",
+                    "deadline",
+                },
+            )
+            session = await make_service().preview_session(
+                preflight_id=payload["preflight_id"],
+                offer_id=payload["offer_id"],
+                idempotency_key=payload["idempotency_key"],
+                deadline=payload["deadline"],
+            )
+        except Exception as error:
+            return service_error(error)
+        return web.json_response(_session_payload(session))
+
+    @routes.post("/cloud-run/api/sessions/{session_id}/confirm")
+    async def post_session_confirm(request):
+        try:
+            payload = await _request_payload(
+                request,
+                allowed={"idempotency_key"},
+                required={"idempotency_key"},
+            )
+            session = await make_service().confirm_session(
+                request.match_info.get("session_id", ""),
+                idempotency_key=payload["idempotency_key"],
+            )
+        except Exception as error:
+            return service_error(error)
+        return web.json_response(_session_payload(session))
 
     @routes.get("/cloud-run/api/attempts/{attempt_id}")
     async def get_attempt(request):

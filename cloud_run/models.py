@@ -4,9 +4,12 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
 from enum import Enum
+import math
 import re
 import time
 import uuid
+
+from .constants import MAX_SESSION_DISK_GB, MIN_SESSION_DISK_GB
 
 
 class SessionState(str, Enum):
@@ -230,6 +233,23 @@ _TRANSITIONS = {
 }
 
 
+_LEGACY_QUOTE_KEYS = {
+    "offer_id",
+    "gpu_name",
+    "gpu_ram_gb",
+    "dph_total",
+    "reliability",
+    "max_price_per_hour",
+    "expires_at",
+    "machine_id",
+    "host_id",
+    "public_ipaddr",
+}
+_UNBOUND_TEMPLATE_HASH = "0" * 32
+_UNBOUND_WORKER_COMMIT = "0" * 40
+_UNBOUND_SHA256 = "0" * 64
+
+
 @dataclass(frozen=True)
 class OfferQuote:
     offer_id: str
@@ -239,18 +259,162 @@ class OfferQuote:
     reliability: float | None
     max_price_per_hour: float
     expires_at: float
+    disk_gb: int
+    transfer_bytes: int
+    output_allowance_bytes: int
+    inet_down_cost: float | None
+    inet_up_cost: float | None
+    duration_seconds: int | None
+    deadline_mode: str
+    approximate_max_active_charge: float | None
+    template_hash_id: str
+    worker_commit: str
+    worker_archive_sha256: str
+    protocol_version: str
+    manifest_digest: str
     machine_id: str | None = None
     host_id: str | None = None
     public_ipaddr: str | None = None
+
+    def __post_init__(self):
+        finite_numbers = (
+            self.gpu_ram_gb,
+            self.dph_total,
+            self.max_price_per_hour,
+            self.expires_at,
+        )
+        if (
+            not isinstance(self.offer_id, str)
+            or not self.offer_id.isdigit()
+            or not isinstance(self.gpu_name, str)
+            or not self.gpu_name.strip()
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                for value in finite_numbers
+            )
+            or self.gpu_ram_gb <= 0
+            or self.dph_total < 0
+            or self.max_price_per_hour < self.dph_total
+            or self.expires_at <= 0
+            or isinstance(self.disk_gb, bool)
+            or not isinstance(self.disk_gb, int)
+            or not MIN_SESSION_DISK_GB
+            <= self.disk_gb
+            <= MAX_SESSION_DISK_GB
+            or isinstance(self.transfer_bytes, bool)
+            or not isinstance(self.transfer_bytes, int)
+            or self.transfer_bytes < 0
+            or isinstance(self.output_allowance_bytes, bool)
+            or not isinstance(self.output_allowance_bytes, int)
+            or self.output_allowance_bytes <= 0
+            or self.deadline_mode not in {"finite", "none"}
+            or not re.fullmatch(r"[0-9a-f]{32}", self.template_hash_id)
+            or not re.fullmatch(r"[0-9a-f]{40}", self.worker_commit)
+            or not re.fullmatch(
+                r"[0-9a-f]{64}",
+                self.worker_archive_sha256,
+            )
+            or self.protocol_version != "1"
+            or not re.fullmatch(r"[0-9a-f]{64}", self.manifest_digest)
+        ):
+            raise ValueError("Invalid paid offer quote.")
+        if self.reliability is not None and (
+            isinstance(self.reliability, bool)
+            or not isinstance(self.reliability, (int, float))
+            or not math.isfinite(self.reliability)
+            or not 0 <= self.reliability <= 1
+        ):
+            raise ValueError("Invalid paid offer quote.")
+        for cost in (self.inet_down_cost, self.inet_up_cost):
+            if cost is not None and (
+                isinstance(cost, bool)
+                or not isinstance(cost, (int, float))
+                or not math.isfinite(cost)
+                or cost < 0
+            ):
+                raise ValueError("Invalid paid offer quote.")
+        if self.deadline_mode == "finite":
+            if (
+                isinstance(self.duration_seconds, bool)
+                or not isinstance(self.duration_seconds, int)
+                or self.duration_seconds <= 0
+                or isinstance(self.approximate_max_active_charge, bool)
+                or not isinstance(
+                    self.approximate_max_active_charge,
+                    (int, float),
+                )
+                or not math.isfinite(
+                    self.approximate_max_active_charge
+                )
+                or self.approximate_max_active_charge < 0
+                or not math.isclose(
+                    self.approximate_max_active_charge,
+                    self.dph_total * self.duration_seconds / 3600,
+                    rel_tol=1e-12,
+                    abs_tol=1e-12,
+                )
+            ):
+                raise ValueError("Invalid paid offer quote.")
+        elif (
+            self.duration_seconds is not None
+            or self.approximate_max_active_charge is not None
+        ):
+            raise ValueError("Invalid paid offer quote.")
 
     def to_record(self):
         return asdict(self)
 
     @classmethod
     def from_record(cls, payload):
-        return cls(**payload)
+        if not isinstance(payload, dict):
+            raise ValueError("Invalid paid offer quote.")
+        fields = set(payload)
+        if (
+            {
+                "offer_id",
+                "gpu_name",
+                "gpu_ram_gb",
+                "dph_total",
+                "reliability",
+                "max_price_per_hour",
+                "expires_at",
+            }.issubset(fields)
+            and fields.issubset(_LEGACY_QUOTE_KEYS)
+        ):
+            payload = {
+                **payload,
+                "disk_gb": 80,
+                "transfer_bytes": 0,
+                "output_allowance_bytes": 1,
+                "inet_down_cost": None,
+                "inet_up_cost": None,
+                "duration_seconds": None,
+                "deadline_mode": "none",
+                "approximate_max_active_charge": None,
+                "template_hash_id": _UNBOUND_TEMPLATE_HASH,
+                "worker_commit": _UNBOUND_WORKER_COMMIT,
+                "worker_archive_sha256": _UNBOUND_SHA256,
+                "protocol_version": "1",
+                "manifest_digest": _UNBOUND_SHA256,
+            }
+        try:
+            return cls(**payload)
+        except (TypeError, ValueError):
+            raise ValueError("Invalid paid offer quote.") from None
+
+    @property
+    def reviewed_release_bound(self):
+        return (
+            self.template_hash_id != _UNBOUND_TEMPLATE_HASH
+            and self.worker_commit != _UNBOUND_WORKER_COMMIT
+            and self.worker_archive_sha256 != _UNBOUND_SHA256
+            and self.manifest_digest != _UNBOUND_SHA256
+        )
 
     def public_payload(self):
+        reviewed = self.reviewed_release_bound
         return {
             "offer_id": self.offer_id,
             "gpu_name": self.gpu_name,
@@ -259,6 +423,27 @@ class OfferQuote:
             "reliability": self.reliability,
             "max_price_per_hour": self.max_price_per_hour,
             "expires_at": self.expires_at,
+            "disk_gb": self.disk_gb if reviewed else None,
+            "transfer_bytes": self.transfer_bytes if reviewed else None,
+            "output_allowance_bytes": (
+                self.output_allowance_bytes if reviewed else None
+            ),
+            "inet_down_cost": self.inet_down_cost if reviewed else None,
+            "inet_up_cost": self.inet_up_cost if reviewed else None,
+            "duration_seconds": self.duration_seconds if reviewed else None,
+            "deadline_mode": self.deadline_mode if reviewed else None,
+            "approximate_max_active_charge": (
+                self.approximate_max_active_charge if reviewed else None
+            ),
+            "template_hash_id": (
+                self.template_hash_id if reviewed else None
+            ),
+            "worker_commit": self.worker_commit if reviewed else None,
+            "worker_archive_sha256": (
+                self.worker_archive_sha256 if reviewed else None
+            ),
+            "protocol_version": self.protocol_version if reviewed else None,
+            "manifest_digest": self.manifest_digest if reviewed else None,
         }
 
 
@@ -306,6 +491,39 @@ class CloudSession:
         identifier = str(session_id or uuid.uuid4())
         safe_identifier = re.sub(r"[^A-Za-z0-9-]", "-", identifier)[:48]
         timestamp = float(time.time() if now is None else now)
+        if quote is not None:
+            expected_deadline = (
+                timestamp + quote.duration_seconds
+                if isinstance(quote, OfferQuote)
+                and quote.duration_seconds is not None
+                else None
+            )
+            if (
+                not isinstance(quote, OfferQuote)
+                or quote.manifest_digest != manifest_digest
+                or quote.disk_gb != disk_gb
+                or quote.deadline_mode != deadline_mode
+                or (
+                    expected_deadline is None
+                    and deadline_at is not None
+                )
+                or (
+                    expected_deadline is not None
+                    and (
+                        not isinstance(deadline_at, (int, float))
+                        or isinstance(deadline_at, bool)
+                        or not math.isclose(
+                            float(deadline_at),
+                            expected_deadline,
+                            rel_tol=0,
+                            abs_tol=1e-9,
+                        )
+                    )
+                )
+            ):
+                raise ValueError(
+                    "Session quote does not match its durable contract."
+                )
         session = cls(
             session_id=identifier,
             idempotency_key=key,
@@ -320,7 +538,7 @@ class CloudSession:
             session_secret_hex=None,
             deadline_at=deadline_at,
             deadline_mode=str(deadline_mode),
-            disk_gb=int(disk_gb),
+            disk_gb=disk_gb,
             retry_count=0,
             destroy_requested=False,
             residual_inventory=(),
@@ -335,8 +553,16 @@ class CloudSession:
     def _validate(self):
         if self.deadline_mode not in {"finite", "none"}:
             raise ValueError("Unsupported deadline mode.")
-        if int(self.disk_gb) < 80:
-            raise ValueError("Cloud Run sessions require at least 80 GiB.")
+        if (
+            isinstance(self.disk_gb, bool)
+            or not isinstance(self.disk_gb, int)
+            or not MIN_SESSION_DISK_GB
+            <= self.disk_gb
+            <= MAX_SESSION_DISK_GB
+        ):
+            raise ValueError(
+                "Cloud Run sessions require 80 to 2048 GiB."
+            )
         if int(self.retry_count) not in (0, 1):
             raise ValueError("At most one automatic retry is allowed.")
         for name, digest in (

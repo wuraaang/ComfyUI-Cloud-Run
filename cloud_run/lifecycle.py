@@ -11,6 +11,7 @@ from .offers import (
     apply_offer_policy,
     select_best_offer,
 )
+from .worker_release import WorkerRelease
 from . import vast
 
 
@@ -52,6 +53,7 @@ class CloudRunLifecycle:
         poll_interval_seconds=DEFAULT_POLL_INTERVAL_SECONDS,
         boot_deadline_seconds=DEFAULT_BOOT_DEADLINE_SECONDS,
         disk_gb=DEFAULT_DISK_GB,
+        release=None,
     ):
         self.settings_store = settings_store
         self.repository = repository
@@ -63,6 +65,7 @@ class CloudRunLifecycle:
         self.poll_interval_seconds = max(0.1, float(poll_interval_seconds))
         self.boot_deadline_seconds = max(1.0, float(boot_deadline_seconds))
         self.disk_gb = int(disk_gb)
+        self.release = release if isinstance(release, WorkerRelease) else None
 
     def _attempt(self, attempt_id):
         attempt = self.repository.get(str(attempt_id))
@@ -435,11 +438,31 @@ class CloudRunLifecycle:
             sanitized_error=None,
         )
         settings, api_key = self._api_key()
+        if (
+            self.release is None
+            or not attempt.quote.reviewed_release_bound
+            or attempt.quote.template_hash_id
+            != self.release.template_hash_id
+            or attempt.quote.worker_commit != self.release.worker_commit
+            or attempt.quote.worker_archive_sha256
+            != self.release.worker_archive_sha256
+            or attempt.quote.protocol_version
+            != self.release.protocol_version
+        ):
+            return self.repository.transition(
+                attempt.attempt_id,
+                AttemptState.FAILED,
+                now=float(self.clock()),
+                sanitized_error=(
+                    "Reviewed worker release lock is unavailable."
+                ),
+            )
         try:
             offers = await self.provider.search_offers(
                 api_key,
                 max_price_per_hour=settings["max_price_per_hour"],
                 min_vram_gb=settings["min_vram_gb"],
+                disk_gb=attempt.quote.disk_gb,
             )
             eligible = apply_offer_policy(
                 [
@@ -477,6 +500,29 @@ class CloudRunLifecycle:
             ),
             max_price_per_hour=attempt.quote.max_price_per_hour,
             expires_at=float(self.clock()) + 120,
+            disk_gb=attempt.quote.disk_gb,
+            transfer_bytes=attempt.quote.transfer_bytes,
+            output_allowance_bytes=(
+                attempt.quote.output_allowance_bytes
+            ),
+            inet_down_cost=selected.get("inet_down_cost"),
+            inet_up_cost=selected.get("inet_up_cost"),
+            duration_seconds=attempt.quote.duration_seconds,
+            deadline_mode=attempt.quote.deadline_mode,
+            approximate_max_active_charge=(
+                float(selected["dph_total"])
+                * attempt.quote.duration_seconds
+                / 3600
+                if attempt.quote.duration_seconds is not None
+                else None
+            ),
+            template_hash_id=attempt.quote.template_hash_id,
+            worker_commit=attempt.quote.worker_commit,
+            worker_archive_sha256=(
+                attempt.quote.worker_archive_sha256
+            ),
+            protocol_version=attempt.quote.protocol_version,
+            manifest_digest=attempt.quote.manifest_digest,
             machine_id=selected.get("machine_id"),
             host_id=selected.get("host_id"),
             public_ipaddr=selected.get("public_ipaddr"),
@@ -492,8 +538,9 @@ class CloudRunLifecycle:
             instance_id = await self.provider.create_instance(
                 api_key,
                 offer_id=replacement_quote.offer_id,
-                disk_gb=self.disk_gb,
+                disk_gb=replacement_quote.disk_gb,
                 label=attempt.label,
+                release=self.release,
             )
         except Exception:
             inventory = await self._inventory(api_key)

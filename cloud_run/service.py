@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
+import secrets
 import time
 
 from .capture import CompiledCapture
 from .constants import DEFAULT_DISK_GB
-from .models import AttemptState, CloudAttempt, OfferQuote
+from .models import (
+    AttemptState,
+    CloudAttempt,
+    CloudSession,
+    OfferQuote,
+    SessionState,
+)
 from .offers import apply_offer_policy
-from .repository import ConcurrentAttemptUpdate
+from .repository import ConcurrentAttemptUpdate, ConcurrentSessionUpdate
+from .worker_release import WorkerRelease, WorkerReleaseUnavailable
 from . import vast
 
 
@@ -27,6 +35,10 @@ class AttemptNotFound(CloudRunError):
     pass
 
 
+class SessionNotFound(CloudRunError):
+    pass
+
+
 class QuoteUnavailable(CloudRunError):
     pass
 
@@ -40,11 +52,13 @@ class VastProvider:
         *,
         max_price_per_hour,
         min_vram_gb,
+        disk_gb,
     ):
         return await vast.search_offers(
             api_key,
             max_price_per_hour=max_price_per_hour,
             min_vram_gb=min_vram_gb,
+            disk_gb=disk_gb,
         )
 
     async def get_offer(
@@ -54,12 +68,14 @@ class VastProvider:
         *,
         max_price_per_hour,
         min_vram_gb,
+        disk_gb,
     ):
         return await vast.get_offer(
             api_key,
             offer_id=offer_id,
             max_price_per_hour=max_price_per_hour,
             min_vram_gb=min_vram_gb,
+            disk_gb=disk_gb,
         )
 
     async def create_instance(
@@ -69,12 +85,14 @@ class VastProvider:
         offer_id,
         disk_gb,
         label,
+        release,
     ):
         return await vast.create_instance(
             api_key,
             offer_id=offer_id,
             disk_gb=disk_gb,
             label=label,
+            release=release,
         )
 
     async def list_instances(self, api_key):
@@ -120,6 +138,8 @@ class CloudRunService:
         lifecycle=None,
         cache_manager=None,
         session_service=None,
+        session_repository=None,
+        release=None,
     ):
         self.settings_store = settings_store
         self.repository = repository
@@ -132,6 +152,8 @@ class CloudRunService:
         self.lifecycle = lifecycle
         self.cache_manager = cache_manager
         self.session_service = session_service
+        self.session_repository = session_repository
+        self.release = release if isinstance(release, WorkerRelease) else None
 
     async def capture(self, payload):
         if self.job_repository is None:
@@ -195,17 +217,334 @@ class CloudRunService:
             )
         return settings
 
+    def _reviewed_release(self):
+        if self.release is None:
+            raise WorkerReleaseUnavailable(
+                "Reviewed worker release lock is unavailable."
+            )
+        return self.release
+
+    @staticmethod
+    def _deadline_contract(deadline):
+        if (
+            not isinstance(deadline, dict)
+            or set(deadline) != {"mode", "duration_seconds"}
+        ):
+            raise CloudRunValidationError(
+                "A valid session deadline is required."
+            )
+        mode = deadline.get("mode")
+        duration = deadline.get("duration_seconds")
+        if mode == "finite":
+            if (
+                isinstance(duration, bool)
+                or not isinstance(duration, int)
+                or duration <= 0
+            ):
+                raise CloudRunValidationError(
+                    "A valid session deadline is required."
+                )
+            return mode, duration
+        if mode == "none" and duration is None:
+            return mode, None
+        raise CloudRunValidationError(
+            "A valid session deadline is required."
+        )
+
+    def _session_repository(self):
+        if self.session_repository is None:
+            raise CloudRunValidationError(
+                "Cloud Run session storage is unavailable."
+            )
+        return self.session_repository
+
+    def get_session(self, session_id):
+        session = self._session_repository().get(str(session_id))
+        if session is None:
+            raise SessionNotFound("Cloud Run session was not found.")
+        return session
+
+    def _validated_session(self, session_id, idempotency_key):
+        key = _idempotency_key(idempotency_key)
+        session = self.get_session(session_id)
+        if session.idempotency_key != key:
+            raise CloudRunValidationError(
+                "The idempotency key does not match this session."
+            )
+        return session
+
+    async def preview_session(
+        self,
+        *,
+        preflight_id,
+        offer_id,
+        idempotency_key,
+        deadline,
+    ):
+        release = self._reviewed_release()
+        repository = self._session_repository()
+        if (
+            self.session_service is None
+            or not callable(
+                getattr(
+                    self.session_service,
+                    "require_rentable_preflight",
+                    None,
+                )
+            )
+        ):
+            raise CloudRunValidationError(
+                "Dependency preflight is unavailable."
+            )
+        key = _idempotency_key(idempotency_key)
+        existing = repository.get_by_idempotency_key(key)
+        if existing is not None:
+            return existing
+        identifier = _offer_id(offer_id)
+        mode, duration = self._deadline_contract(deadline)
+        preflight = self.session_service.require_rentable_preflight(
+            preflight_id
+        )
+        settings = self._settings()
+        selected = await self._eligible_offer(
+            identifier,
+            settings,
+            disk_gb=preflight.disk_gb,
+        )
+        if selected is None:
+            raise QuoteUnavailable(
+                "The selected Vast offer is no longer available."
+            )
+        now = float(self.clock())
+        quote = OfferQuote(
+            offer_id=identifier,
+            gpu_name=str(selected["gpu_name"]),
+            gpu_ram_gb=float(selected["gpu_ram_gb"]),
+            dph_total=float(selected["dph_total"]),
+            reliability=(
+                float(selected["reliability"])
+                if selected.get("reliability") is not None
+                else None
+            ),
+            max_price_per_hour=float(settings["max_price_per_hour"]),
+            expires_at=now + self.quote_ttl_seconds,
+            disk_gb=int(preflight.disk_gb),
+            transfer_bytes=int(preflight.transfer_bytes),
+            output_allowance_bytes=int(
+                preflight.output_allowance_bytes
+            ),
+            inet_down_cost=selected.get("inet_down_cost"),
+            inet_up_cost=selected.get("inet_up_cost"),
+            duration_seconds=duration,
+            deadline_mode=mode,
+            approximate_max_active_charge=(
+                float(selected["dph_total"]) * duration / 3600
+                if duration is not None
+                else None
+            ),
+            template_hash_id=release.template_hash_id,
+            worker_commit=release.worker_commit,
+            worker_archive_sha256=release.worker_archive_sha256,
+            protocol_version=release.protocol_version,
+            manifest_digest=preflight.manifest_digest,
+            machine_id=selected.get("machine_id"),
+            host_id=selected.get("host_id"),
+            public_ipaddr=selected.get("public_ipaddr"),
+        )
+        candidate = CloudSession.new(
+            key,
+            quote=quote,
+            manifest_digest=preflight.manifest_digest,
+            deadline_at=(now + duration if duration is not None else None),
+            deadline_mode=mode,
+            disk_gb=preflight.disk_gb,
+            now=now,
+            state=SessionState.OFFER_SELECTED,
+        )
+        saved, _created = repository.create_or_get(candidate)
+        return saved
+
+    @staticmethod
+    def _release_matches_quote(release, quote):
+        return (
+            quote.template_hash_id == release.template_hash_id
+            and quote.worker_commit == release.worker_commit
+            and quote.worker_archive_sha256
+            == release.worker_archive_sha256
+            and quote.protocol_version == release.protocol_version
+        )
+
+    @staticmethod
+    def _bandwidth_cost_not_increased(current, quoted):
+        if quoted is None:
+            return current is None
+        return current is not None and float(current) <= float(quoted)
+
+    async def _revalidated_session_offer(self, session, settings):
+        selected = await self._eligible_offer(
+            session.quote.offer_id,
+            settings,
+            disk_gb=session.quote.disk_gb,
+        )
+        if selected is None:
+            return None
+        if (
+            str(selected.get("gpu_name")) == session.quote.gpu_name
+            and float(selected.get("gpu_ram_gb", 0))
+            >= session.quote.gpu_ram_gb
+            and float(selected.get("dph_total", float("inf")))
+            <= session.quote.dph_total
+            and self._bandwidth_cost_not_increased(
+                selected.get("inet_down_cost"),
+                session.quote.inet_down_cost,
+            )
+            and self._bandwidth_cost_not_increased(
+                selected.get("inet_up_cost"),
+                session.quote.inet_up_cost,
+            )
+            and (
+                session.quote.machine_id is None
+                or selected.get("machine_id")
+                == session.quote.machine_id
+            )
+            and (
+                session.quote.host_id is None
+                or selected.get("host_id") == session.quote.host_id
+            )
+        ):
+            return selected
+        return None
+
+    async def _finish_created_session(self, session_id, instance_id):
+        current = self.get_session(session_id)
+        if current.state != SessionState.CREATING:
+            return current
+        return self._session_repository().transition(
+            current.session_id,
+            SessionState.BOOTSTRAPPING,
+            now=float(self.clock()),
+            instance_id=str(instance_id),
+            sanitized_error=None,
+        )
+
+    async def confirm_session(self, session_id, *, idempotency_key):
+        session = self._validated_session(session_id, idempotency_key)
+        if session.state not in {
+            SessionState.OFFER_SELECTED,
+            SessionState.CONFIRMING,
+        }:
+            return session
+        repository = self._session_repository()
+        release = self._reviewed_release()
+        now = float(self.clock())
+        if now >= session.quote.expires_at:
+            repository.transition(
+                session.session_id,
+                SessionState.FAILED,
+                now=now,
+                sanitized_error="The quote expired before confirmation.",
+            )
+            raise QuoteUnavailable("The quote expired before confirmation.")
+        if not self._release_matches_quote(release, session.quote):
+            repository.transition(
+                session.session_id,
+                SessionState.FAILED,
+                now=now,
+                sanitized_error=(
+                    "The reviewed worker release changed before confirmation."
+                ),
+            )
+            raise QuoteUnavailable(
+                "The reviewed worker release changed before confirmation."
+            )
+        settings = self._settings()
+        selected = await self._revalidated_session_offer(session, settings)
+        if selected is None:
+            repository.transition(
+                session.session_id,
+                SessionState.FAILED,
+                now=float(self.clock()),
+                sanitized_error=(
+                    "The selected offer changed or is no longer eligible."
+                ),
+            )
+            raise QuoteUnavailable(
+                "The selected offer changed or is no longer eligible."
+            )
+        try:
+            if session.state == SessionState.OFFER_SELECTED:
+                session = repository.save(
+                    session.transition(
+                        SessionState.CONFIRMING,
+                        now=float(self.clock()),
+                    )
+                )
+            session = repository.save(
+                session.transition(
+                    SessionState.CREATING,
+                    now=float(self.clock()),
+                    session_secret_hex=secrets.token_hex(32),
+                    sanitized_error=None,
+                )
+            )
+        except ConcurrentSessionUpdate:
+            return self.get_session(session.session_id)
+        try:
+            instance_id = await self.provider.create_instance(
+                settings["api_key"],
+                offer_id=session.quote.offer_id,
+                disk_gb=session.quote.disk_gb,
+                label=session.label,
+                release=release,
+            )
+        except Exception as error:
+            reconciled = await self._instance_for_label(
+                settings["api_key"],
+                session.label,
+            )
+            if reconciled is not None and reconciled.get("instance_id"):
+                return await self._finish_created_session(
+                    session.session_id,
+                    str(reconciled["instance_id"]),
+                )
+            retryable = isinstance(error, vast.VastError) and error.retryable
+            if retryable:
+                return repository.transition(
+                    session.session_id,
+                    SessionState.CREATING,
+                    now=float(self.clock()),
+                    sanitized_error=(
+                        "Creation outcome is unknown; verify Vast inventory "
+                        "before taking another action."
+                    ),
+                )
+            return repository.transition(
+                session.session_id,
+                SessionState.FAILED,
+                now=float(self.clock()),
+                sanitized_error=(
+                    str(error)
+                    if isinstance(error, vast.VastError)
+                    else "Vast instance creation failed."
+                ),
+            )
+        return await self._finish_created_session(
+            session.session_id,
+            str(instance_id),
+        )
+
     async def search(self, preflight_id=None):
         if self.session_service is not None:
             return await self.session_service.search_offers(preflight_id)
         return await self._search_without_preflight()
 
-    async def _search_without_preflight(self):
+    async def _search_without_preflight(self, *, disk_gb=DEFAULT_DISK_GB):
         settings = self._settings()
         offers = await self.provider.search_offers(
             settings["api_key"],
             max_price_per_hour=settings["max_price_per_hour"],
             min_vram_gb=settings["min_vram_gb"],
+            disk_gb=disk_gb,
         )
         return apply_offer_policy(
             offers,
@@ -213,12 +552,19 @@ class CloudRunService:
             now=float(self.clock()),
         )
 
-    async def _eligible_offer(self, identifier, settings):
+    async def _eligible_offer(
+        self,
+        identifier,
+        settings,
+        *,
+        disk_gb=DEFAULT_DISK_GB,
+    ):
         selected = await self.provider.get_offer(
             settings["api_key"],
             identifier,
             max_price_per_hour=settings["max_price_per_hour"],
             min_vram_gb=settings["min_vram_gb"],
+            disk_gb=disk_gb,
         )
         if selected is None:
             return None
@@ -237,6 +583,7 @@ class CloudRunService:
         )
 
     async def preview_offer(self, *, offer_id, idempotency_key):
+        release = self._reviewed_release()
         key = _idempotency_key(idempotency_key)
         existing = self.repository.get_by_idempotency_key(key)
         if existing is not None:
@@ -263,6 +610,19 @@ class CloudRunService:
             ),
             max_price_per_hour=float(settings["max_price_per_hour"]),
             expires_at=now + self.quote_ttl_seconds,
+            disk_gb=self.disk_gb,
+            transfer_bytes=0,
+            output_allowance_bytes=1,
+            inet_down_cost=selected.get("inet_down_cost"),
+            inet_up_cost=selected.get("inet_up_cost"),
+            duration_seconds=None,
+            deadline_mode="none",
+            approximate_max_active_charge=None,
+            template_hash_id=release.template_hash_id,
+            worker_commit=release.worker_commit,
+            worker_archive_sha256=release.worker_archive_sha256,
+            protocol_version=release.protocol_version,
+            manifest_digest="0" * 64,
             machine_id=selected.get("machine_id"),
             host_id=selected.get("host_id"),
             public_ipaddr=selected.get("public_ipaddr"),
@@ -350,9 +710,13 @@ class CloudRunService:
 
     async def confirm(self, attempt_id, *, idempotency_key):
         attempt = self._validated_attempt(attempt_id, idempotency_key)
-        if attempt.state != AttemptState.OFFER_SELECTED:
+        if attempt.state not in {
+            AttemptState.OFFER_SELECTED,
+            AttemptState.CONFIRMING,
+        }:
             return attempt
 
+        release = self._reviewed_release()
         now = float(self.clock())
         if now >= attempt.quote.expires_at:
             self.repository.transition(
@@ -362,6 +726,18 @@ class CloudRunService:
                 sanitized_error="The quote expired before confirmation.",
             )
             raise QuoteUnavailable("The quote expired before confirmation.")
+        if not self._release_matches_quote(release, attempt.quote):
+            self.repository.transition(
+                attempt.attempt_id,
+                AttemptState.FAILED,
+                now=now,
+                sanitized_error=(
+                    "The reviewed worker release changed before confirmation."
+                ),
+            )
+            raise QuoteUnavailable(
+                "The reviewed worker release changed before confirmation."
+            )
 
         settings = self._settings()
         selected = await self._revalidated_offer(attempt, settings)
@@ -379,15 +755,18 @@ class CloudRunService:
             )
 
         try:
-            attempt = self.repository.transition(
-                attempt.attempt_id,
-                AttemptState.CONFIRMING,
-                now=float(self.clock()),
-            )
-            attempt = self.repository.transition(
-                attempt.attempt_id,
-                AttemptState.CREATING,
-                now=float(self.clock()),
+            if attempt.state == AttemptState.OFFER_SELECTED:
+                attempt = self.repository.save(
+                    attempt.transition(
+                        AttemptState.CONFIRMING,
+                        now=float(self.clock()),
+                    )
+                )
+            attempt = self.repository.save(
+                attempt.transition(
+                    AttemptState.CREATING,
+                    now=float(self.clock()),
+                )
             )
         except ConcurrentAttemptUpdate:
             return self.get_attempt(attempt.attempt_id)
@@ -398,6 +777,7 @@ class CloudRunService:
                 offer_id=attempt.quote.offer_id,
                 disk_gb=self.disk_gb,
                 label=attempt.label,
+                release=release,
             )
         except Exception as error:
             reconciled = await self._instance_for_label(

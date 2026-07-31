@@ -6,6 +6,28 @@ from pathlib import Path
 from cloud_run.models import AttemptState, CloudAttempt, OfferQuote
 from cloud_run.offers import HostBlacklist
 from cloud_run.repository import AttemptRepository
+from cloud_run.worker_release import WorkerRelease
+
+
+def worker_release(
+    *,
+    template_character="1",
+    commit_character="a",
+    archive_character="b",
+):
+    return WorkerRelease.from_payload(
+        {
+            "schema_version": 1,
+            "template_hash_id": template_character * 32,
+            "worker_commit": commit_character * 40,
+            "worker_archive_sha256": archive_character * 64,
+            "protocol_version": "1",
+            "comfyui_core_version": "0.29.0",
+            "comfyui_frontend_version": "1.47.10",
+            "python_version": "3.13.12",
+            "worker_port": 8765,
+        }
+    )
 
 
 def quote(
@@ -25,6 +47,19 @@ def quote(
         reliability=0.99,
         max_price_per_hour=0.55,
         expires_at=1000.0,
+        disk_gb=80,
+        transfer_bytes=0,
+        output_allowance_bytes=1,
+        inet_down_cost=None,
+        inet_up_cost=None,
+        duration_seconds=7200,
+        deadline_mode="finite",
+        approximate_max_active_charge=price * 2,
+        template_hash_id="1" * 32,
+        worker_commit="a" * 40,
+        worker_archive_sha256="b" * 64,
+        protocol_version="1",
+        manifest_digest="c" * 64,
         machine_id=machine_id,
         host_id=host_id,
         public_ipaddr=public_ipaddr,
@@ -88,8 +123,11 @@ class FakeProvider:
         *,
         max_price_per_hour,
         min_vram_gb,
+        disk_gb,
     ):
-        self.calls.append(("search", api_key, max_price_per_hour, min_vram_gb))
+        self.calls.append(
+            ("search", api_key, max_price_per_hour, min_vram_gb, disk_gb)
+        )
         return list(self.search_results)
 
     async def get_offer(
@@ -99,6 +137,7 @@ class FakeProvider:
         *,
         max_price_per_hour,
         min_vram_gb,
+        disk_gb,
     ):
         self.calls.append(
             (
@@ -107,6 +146,7 @@ class FakeProvider:
                 api_key,
                 max_price_per_hour,
                 min_vram_gb,
+                disk_gb,
             )
         )
         return next(
@@ -128,8 +168,11 @@ class FakeProvider:
         offer_id,
         disk_gb,
         label,
+        release,
     ):
-        self.calls.append(("create", offer_id, disk_gb, label, api_key))
+        self.calls.append(
+            ("create", offer_id, disk_gb, label, api_key, release)
+        )
         return self.create_result
 
     async def list_instances(self, api_key):
@@ -195,6 +238,7 @@ class LifecycleTestCase(unittest.TestCase):
             readiness_probe=self.probe,
             poll_interval_seconds=options.get("poll_interval_seconds", 1),
             boot_deadline_seconds=options.get("boot_deadline_seconds", 3),
+            release=options.get("release", worker_release()),
         )
 
     def save_attempt(
@@ -306,6 +350,7 @@ class CancellationAndReadinessTests(LifecycleTestCase):
                 blacklist=self.blacklist,
                 clock=self.clock,
                 lifecycle=lifecycle,
+                release=worker_release(),
             )
             preview = await service.preview_offer(
                 offer_id=42,
@@ -320,9 +365,17 @@ class CancellationAndReadinessTests(LifecycleTestCase):
                 offer_id,
                 disk_gb,
                 label,
+                release,
             ):
                 self.provider.calls.append(
-                    ("create", offer_id, disk_gb, label, api_key)
+                    (
+                        "create",
+                        offer_id,
+                        disk_gb,
+                        label,
+                        api_key,
+                        release,
+                    )
                 )
                 create_started.set()
                 await release_create.wait()
@@ -602,6 +655,46 @@ class RecoveryAndReplacementTests(LifecycleTestCase):
         self.assertEqual(
             len([call for call in self.provider.calls if call[0] == "create"]),
             1,
+        )
+
+    def test_replacement_never_uses_a_release_different_from_the_quote(self):
+        attempt = self.save_attempt(
+            AttemptState.STARTING,
+            instance_id="instance-1",
+        )
+        self.provider.instances = [
+            provider_instance("instance-1", attempt.label)
+        ]
+        self.provider.search_results = [
+            {
+                "offer_id": 43,
+                "gpu_name": "RTX 4090",
+                "gpu_ram_gb": 24.0,
+                "dph_total": 0.44,
+                "reliability": 0.995,
+            }
+        ]
+        changed_release = worker_release(
+            template_character="2",
+            commit_character="c",
+            archive_character="d",
+        )
+
+        failed = asyncio.run(
+            self.lifecycle(release=changed_release).handle_start_failure(
+                attempt.attempt_id,
+                failure_code="boot_timeout",
+            )
+        )
+
+        self.assertEqual(failed.state, AttemptState.FAILED)
+        self.assertEqual(
+            [call for call in self.provider.calls if call[0] == "create"],
+            [],
+        )
+        self.assertEqual(
+            [call for call in self.provider.calls if call[0] == "search"],
+            [],
         )
 
     def test_no_replacement_when_destruction_cannot_be_verified(self):

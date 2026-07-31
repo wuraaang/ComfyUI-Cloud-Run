@@ -10,6 +10,23 @@ from cloud_run.offers import HostBlacklist
 from cloud_run.repository import AttemptRepository
 from cloud_run.service import CloudRunService
 from cloud_run.settings import SettingsStore
+from cloud_run.worker_release import WorkerRelease
+
+
+def worker_release():
+    return WorkerRelease.from_payload(
+        {
+            "schema_version": 1,
+            "template_hash_id": "1" * 32,
+            "worker_commit": "a" * 40,
+            "worker_archive_sha256": "b" * 64,
+            "protocol_version": "1",
+            "comfyui_core_version": "0.29.0",
+            "comfyui_frontend_version": "1.47.10",
+            "python_version": "3.13.12",
+            "worker_port": 8765,
+        }
+    )
 
 
 class OfflineVast:
@@ -28,6 +45,8 @@ class OfflineVast:
             "public_ipaddr": "8.8.8.8",
             "inet_down_mbps": 500.0,
             "disk_bw_mbps": 600.0,
+            "inet_down_cost": None,
+            "inet_up_cost": None,
         }
 
     async def search_offers(
@@ -36,6 +55,7 @@ class OfflineVast:
         *,
         max_price_per_hour,
         min_vram_gb,
+        disk_gb,
     ):
         if (
             self.offer["dph_total"] <= max_price_per_hour
@@ -51,6 +71,7 @@ class OfflineVast:
         *,
         max_price_per_hour,
         min_vram_gb,
+        disk_gb,
     ):
         if (
             str(self.offer["offer_id"]) == str(offer_id)
@@ -67,6 +88,7 @@ class OfflineVast:
         offer_id,
         disk_gb,
         label,
+        release,
     ):
         self.create_count += 1
         self.asserted_create = (str(offer_id), disk_gb, label)
@@ -129,6 +151,7 @@ class FullOfflineLifecycleTests(unittest.TestCase):
                 provider=provider,
                 blacklist=blacklist,
                 clock=lambda: 100.0,
+                release=worker_release(),
             )
             lifecycle = CloudRunLifecycle(
                 settings,
@@ -137,6 +160,7 @@ class FullOfflineLifecycleTests(unittest.TestCase):
                 blacklist=blacklist,
                 clock=lambda: 101.0,
                 readiness_probe=lambda _url: asyncio.sleep(0, result=True),
+                release=worker_release(),
             )
 
             offers = await service.search()
@@ -186,6 +210,7 @@ class FullOfflineLifecycleTests(unittest.TestCase):
                 reopened,
                 provider=provider,
                 blacklist=blacklist,
+                release=worker_release(),
             ).recover()
             self.assertEqual(recovered, [])
             self.assertEqual(provider.create_count, 1)

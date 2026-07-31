@@ -5,7 +5,12 @@ from __future__ import annotations
 import ipaddress
 import math
 
-from .constants import DEFAULT_DISK_GB, OFFICIAL_TEMPLATE_ID
+from .constants import (
+    DEFAULT_DISK_GB,
+    MAX_SESSION_DISK_GB,
+    MIN_SESSION_DISK_GB,
+)
+from .worker_release import WorkerRelease, WorkerReleaseError
 
 
 VAST_API_V0 = "https://console.vast.ai/api/v0"
@@ -52,6 +57,24 @@ def _safe_identifier(value):
     return text[:160] if text else None
 
 
+def _validate_disk_gb(value):
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise VastConfigurationError(
+            "A valid instance disk size is required."
+        )
+    disk = value
+    if not MIN_SESSION_DISK_GB <= disk <= MAX_SESSION_DISK_GB:
+        raise VastConfigurationError(
+            "A valid instance disk size is required."
+        )
+    return disk
+
+
+def _optional_nonnegative_number(value):
+    normalized = _finite_number(value)
+    return normalized if normalized is not None and normalized >= 0 else None
+
+
 def _require_key(api_key):
     if not isinstance(api_key, str) or not api_key.strip():
         raise VastConfigurationError("Vast API key is not configured.")
@@ -69,6 +92,7 @@ def build_search_payload(
     max_price_per_hour,
     min_vram_gb,
     *,
+    disk_gb=DEFAULT_DISK_GB,
     min_inet_down_mbps=0,
     min_disk_bw_mbps=0,
     min_reliability=MIN_RELIABILITY,
@@ -76,13 +100,14 @@ def build_search_payload(
     secure_cloud_only=False,
 ):
     """Build the on-demand, one-GPU search query."""
+    disk = _validate_disk_gb(disk_gb)
     payload = {
         "gpu_ram": {"gte": int(min_vram_gb) * 1024},
         "reliability": {"gte": float(min_reliability)},
         "rentable": {"eq": True},
         "dph_total": {"lte": float(max_price_per_hour)},
-        "disk_space": {"gte": DEFAULT_DISK_GB},
-        "allocated_storage": DEFAULT_DISK_GB,
+        "disk_space": {"gte": disk},
+        "allocated_storage": disk,
         "num_gpus": {"eq": 1},
         "type": "ondemand",
         "limit": OFFER_SEARCH_LIMIT,
@@ -104,12 +129,14 @@ def normalize_offers(
     max_price_per_hour,
     min_vram_gb,
     *,
+    disk_gb=DEFAULT_DISK_GB,
     min_inet_down_mbps=0,
     min_disk_bw_mbps=0,
     min_reliability=MIN_RELIABILITY,
     verified_only=True,
     secure_cloud_only=False,
 ):
+    disk_required = _validate_disk_gb(disk_gb)
     if not isinstance(payload, dict):
         raise OfferSearchError("Vast returned an invalid offer response.")
     raw_offers = payload.get("offers")
@@ -184,7 +211,7 @@ def normalize_offers(
             )
             or (
                 disk_space is not None
-                and disk_space < DEFAULT_DISK_GB
+                and disk_space < disk_required
             )
         ):
             continue
@@ -200,6 +227,12 @@ def normalize_offers(
                 "public_ipaddr": _safe_identifier(raw.get("public_ipaddr")),
                 "inet_down_mbps": inet_down,
                 "disk_bw_mbps": disk_bw,
+                "inet_down_cost": _optional_nonnegative_number(
+                    raw.get("inet_down_cost")
+                ),
+                "inet_up_cost": _optional_nonnegative_number(
+                    raw.get("inet_up_cost")
+                ),
             }
         )
     offers.sort(key=lambda offer: offer["dph_total"])
@@ -258,6 +291,7 @@ async def _search_with_session(
             payload,
             max_price_per_hour,
             min_vram_gb,
+            disk_gb=search_options["disk_gb"],
             min_inet_down_mbps=search_options["min_inet_down_mbps"],
             min_disk_bw_mbps=search_options["min_disk_bw_mbps"],
             min_reliability=search_options["min_reliability"],
@@ -288,6 +322,7 @@ async def search_offers(
     min_vram_gb,
     session=None,
     *,
+    disk_gb=DEFAULT_DISK_GB,
     min_inet_down_mbps=0,
     min_disk_bw_mbps=0,
     min_reliability=MIN_RELIABILITY,
@@ -297,6 +332,7 @@ async def search_offers(
     if not isinstance(api_key, str) or not api_key.strip():
         raise OfferSearchConfigurationError("Vast API key is not configured.")
     options = {
+        "disk_gb": disk_gb,
         "min_inet_down_mbps": min_inet_down_mbps,
         "min_disk_bw_mbps": min_disk_bw_mbps,
         "min_reliability": min_reliability,
@@ -344,6 +380,7 @@ async def get_offer(
     min_vram_gb,
     session=None,
     *,
+    disk_gb=DEFAULT_DISK_GB,
     min_inet_down_mbps=0,
     min_disk_bw_mbps=0,
     min_reliability=MIN_RELIABILITY,
@@ -354,6 +391,7 @@ async def get_offer(
         raise OfferSearchConfigurationError("Vast API key is not configured.")
     identifier = _validate_offer_id(offer_id)
     options = {
+        "disk_gb": disk_gb,
         "min_inet_down_mbps": min_inet_down_mbps,
         "min_disk_bw_mbps": min_disk_bw_mbps,
         "min_reliability": min_reliability,
@@ -407,20 +445,25 @@ async def create_instance(
     offer_id,
     disk_gb,
     label,
-    template_id=OFFICIAL_TEMPLATE_ID,
+    release,
     session=None,
 ):
+    if not isinstance(release, WorkerRelease):
+        raise VastConfigurationError(
+            "A reviewed worker release is required."
+        )
+    try:
+        validated_release = WorkerRelease.from_payload(
+            release.to_record()
+        )
+    except (AttributeError, WorkerReleaseError):
+        raise VastConfigurationError(
+            "A reviewed worker release is required."
+        ) from None
+    disk = _validate_disk_gb(disk_gb)
     key = _require_key(api_key)
     offer = _validate_offer_id(offer_id)
     managed_label = _validate_label(label)
-    if template_id != OFFICIAL_TEMPLATE_ID:
-        raise VastConfigurationError("The requested Vast template is not allowed.")
-    try:
-        disk = int(disk_gb)
-    except (TypeError, ValueError):
-        raise VastConfigurationError("A valid instance disk size is required.") from None
-    if not 20 <= disk <= 2048:
-        raise VastConfigurationError("A valid instance disk size is required.")
 
     async def operation(client):
         try:
@@ -428,7 +471,9 @@ async def create_instance(
                 VAST_API_V0 + "/asks/" + offer + "/",
                 headers=_headers(key),
                 json={
-                    "template_hash_id": OFFICIAL_TEMPLATE_ID,
+                    "template_hash_id": (
+                        validated_release.template_hash_id
+                    ),
                     "label": managed_label,
                     "disk": disk,
                 },

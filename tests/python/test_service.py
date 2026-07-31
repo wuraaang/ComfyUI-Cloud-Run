@@ -1,11 +1,16 @@
 import asyncio
 import tempfile
+import types
 import unittest
 from pathlib import Path
 
 from cloud_run.models import AttemptState
-from cloud_run.repository import AttemptRepository
+from cloud_run.repository import AttemptRepository, SessionRepository
 from cloud_run.vast import VastError
+from cloud_run.worker_release import WorkerRelease
+
+
+_DEFAULT_RELEASE = object()
 
 
 def offer(offer_id=42, *, price=0.42, gpu_name="RTX 4090"):
@@ -20,7 +25,42 @@ def offer(offer_id=42, *, price=0.42, gpu_name="RTX 4090"):
         "public_ipaddr": "203.0.113.7",
         "inet_down_mbps": 500.0,
         "disk_bw_mbps": 600.0,
+        "inet_down_cost": 0.01,
+        "inet_up_cost": 0.02,
     }
+
+
+def worker_release():
+    return WorkerRelease.from_payload(
+        {
+            "schema_version": 1,
+            "template_hash_id": "1" * 32,
+            "worker_commit": "a" * 40,
+            "worker_archive_sha256": "b" * 64,
+            "protocol_version": "1",
+            "comfyui_core_version": "0.29.0",
+            "comfyui_frontend_version": "1.47.10",
+            "python_version": "3.13.12",
+            "worker_port": 8765,
+        }
+    )
+
+
+class FakePreflightService:
+    def __init__(self):
+        self.calls = []
+        self.result = types.SimpleNamespace(
+            preflight_id="preflight-1",
+            rentable=True,
+            manifest_digest="c" * 64,
+            transfer_bytes=12_000,
+            output_allowance_bytes=4_000,
+            disk_gb=96,
+        )
+
+    def require_rentable_preflight(self, preflight_id):
+        self.calls.append(preflight_id)
+        return self.result
 
 
 class FakeSettings:
@@ -51,9 +91,10 @@ class FakeProvider:
         *,
         max_price_per_hour,
         min_vram_gb,
+        disk_gb,
     ):
         self.search_calls.append(
-            (api_key, max_price_per_hour, min_vram_gb)
+            (api_key, max_price_per_hour, min_vram_gb, disk_gb)
         )
         if len(self.searches) > 1:
             return self.searches.pop(0)
@@ -66,9 +107,16 @@ class FakeProvider:
         *,
         max_price_per_hour,
         min_vram_gb,
+        disk_gb,
     ):
         self.lookup_calls.append(
-            (api_key, str(offer_id), max_price_per_hour, min_vram_gb)
+            (
+                api_key,
+                str(offer_id),
+                max_price_per_hour,
+                min_vram_gb,
+                disk_gb,
+            )
         )
         if not self.lookups:
             return None
@@ -83,6 +131,7 @@ class FakeProvider:
         offer_id,
         disk_gb,
         label,
+        release,
     ):
         self.create_calls.append(
             {
@@ -90,6 +139,7 @@ class FakeProvider:
                 "offer_id": offer_id,
                 "disk_gb": disk_gb,
                 "label": label,
+                "release": release,
             }
         )
         if self.on_create is not None:
@@ -111,8 +161,16 @@ class CloudRunServiceTests(unittest.TestCase):
             Path(self.temporary_directory.name) / "attempts.sqlite3"
         )
         self.repository = AttemptRepository(self.database_path)
+        self.session_repository = SessionRepository(self.database_path)
 
-    def service(self, provider, now=100.0):
+    def service(
+        self,
+        provider,
+        now=100.0,
+        *,
+        release=_DEFAULT_RELEASE,
+        session_service=None,
+    ):
         from cloud_run.service import CloudRunService
 
         return CloudRunService(
@@ -121,7 +179,192 @@ class CloudRunServiceTests(unittest.TestCase):
             provider=provider,
             clock=lambda: now,
             quote_ttl_seconds=60,
+            session_repository=self.session_repository,
+            release=(
+                worker_release()
+                if release is _DEFAULT_RELEASE
+                else release
+            ),
+            session_service=session_service,
         )
+
+    def test_paid_session_quote_is_complete_read_only_and_durable(self):
+        provider = FakeProvider(lookups=[offer(price=0.50)])
+        preflights = FakePreflightService()
+        service = self.service(
+            provider,
+            session_service=preflights,
+        )
+
+        quoted = asyncio.run(
+            service.preview_session(
+                preflight_id="preflight-1",
+                offer_id="42",
+                idempotency_key="session-idem-1",
+                deadline={
+                    "mode": "finite",
+                    "duration_seconds": 7_200,
+                },
+            )
+        )
+        reopened = SessionRepository(self.database_path).get(
+            quoted.session_id
+        )
+
+        self.assertEqual(quoted.state.value, "offer_selected")
+        self.assertEqual(reopened.quote.disk_gb, 96)
+        self.assertEqual(reopened.quote.transfer_bytes, 12_000)
+        self.assertEqual(reopened.quote.output_allowance_bytes, 4_000)
+        self.assertEqual(reopened.quote.duration_seconds, 7_200)
+        self.assertEqual(
+            reopened.quote.approximate_max_active_charge,
+            1.0,
+        )
+        self.assertEqual(
+            reopened.quote.template_hash_id,
+            "1" * 32,
+        )
+        self.assertEqual(reopened.quote.worker_commit, "a" * 40)
+        self.assertEqual(reopened.deadline_at, 7_300.0)
+        self.assertEqual(provider.lookup_calls[0][-1], 96)
+        self.assertEqual(provider.create_calls, [])
+        self.assertIsNone(reopened.session_secret_hex)
+        self.assertNotIn(
+            "session_secret_hex",
+            repr(quoted.public_payload()),
+        )
+
+    def test_paid_confirmation_persists_secret_and_intent_before_one_put(self):
+        provider = FakeProvider(
+            lookups=[offer(price=0.50), offer(price=0.50)]
+        )
+        service = self.service(
+            provider,
+            session_service=FakePreflightService(),
+        )
+        quoted = asyncio.run(
+            service.preview_session(
+                preflight_id="preflight-1",
+                offer_id=42,
+                idempotency_key="session-idem-create",
+                deadline={
+                    "mode": "finite",
+                    "duration_seconds": 7_200,
+                },
+            )
+        )
+
+        def assert_persisted_before_create(label):
+            persisted = self.session_repository.get(quoted.session_id)
+            self.assertEqual(persisted.label, label)
+            self.assertEqual(persisted.state.value, "creating")
+            self.assertEqual(
+                persisted.idempotency_key,
+                "session-idem-create",
+            )
+            self.assertEqual(persisted.manifest_digest, "c" * 64)
+            self.assertEqual(len(persisted.session_secret_hex), 64)
+
+        provider.on_create = assert_persisted_before_create
+        started = asyncio.run(
+            service.confirm_session(
+                quoted.session_id,
+                idempotency_key="session-idem-create",
+            )
+        )
+        duplicate = asyncio.run(
+            service.confirm_session(
+                quoted.session_id,
+                idempotency_key="session-idem-create",
+            )
+        )
+
+        self.assertEqual(started.state.value, "bootstrapping")
+        self.assertEqual(started.instance_id, "instance-9")
+        self.assertEqual(duplicate.session_id, started.session_id)
+        self.assertEqual(len(provider.create_calls), 1)
+        self.assertIs(
+            provider.create_calls[0]["release"],
+            service.release,
+        )
+
+    def test_concurrent_paid_confirmations_issue_exactly_one_create(self):
+        async def scenario():
+            provider = FakeProvider(
+                lookups=[
+                    offer(price=0.50),
+                    offer(price=0.50),
+                    offer(price=0.50),
+                ]
+            )
+            service = self.service(
+                provider,
+                session_service=FakePreflightService(),
+            )
+            quoted = await service.preview_session(
+                preflight_id="preflight-1",
+                offer_id=42,
+                idempotency_key="session-idem-concurrent",
+                deadline={
+                    "mode": "finite",
+                    "duration_seconds": 7_200,
+                },
+            )
+            original_lookup = provider.get_offer
+            both_revalidating = asyncio.Event()
+            revalidation_count = 0
+
+            async def synchronized_lookup(*args, **kwargs):
+                nonlocal revalidation_count
+                revalidation_count += 1
+                if revalidation_count == 2:
+                    both_revalidating.set()
+                await both_revalidating.wait()
+                return await original_lookup(*args, **kwargs)
+
+            provider.get_offer = synchronized_lookup
+            first, second = await asyncio.gather(
+                service.confirm_session(
+                    quoted.session_id,
+                    idempotency_key="session-idem-concurrent",
+                ),
+                service.confirm_session(
+                    quoted.session_id,
+                    idempotency_key="session-idem-concurrent",
+                ),
+            )
+            return first, second, provider
+
+        first, second, provider = asyncio.run(scenario())
+
+        self.assertEqual(first.state.value, "bootstrapping")
+        self.assertEqual(second.state.value, "bootstrapping")
+        self.assertEqual(len(provider.create_calls), 1)
+
+    def test_missing_release_blocks_paid_quote_before_provider_request(self):
+        provider = FakeProvider(lookups=[offer(price=0.50)])
+        service = self.service(
+            provider,
+            release=None,
+            session_service=FakePreflightService(),
+        )
+        from cloud_run.worker_release import WorkerReleaseUnavailable
+
+        with self.assertRaises(WorkerReleaseUnavailable):
+            asyncio.run(
+                service.preview_session(
+                    preflight_id="preflight-1",
+                    offer_id="42",
+                    idempotency_key="session-idem-no-release",
+                    deadline={
+                        "mode": "finite",
+                        "duration_seconds": 7_200,
+                    },
+                )
+            )
+
+        self.assertEqual(provider.lookup_calls, [])
+        self.assertEqual(provider.create_calls, [])
 
     def test_search_selection_and_quote_preview_never_create_a_rental(self):
         provider = FakeProvider()

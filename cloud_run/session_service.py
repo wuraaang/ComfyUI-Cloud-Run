@@ -17,6 +17,7 @@ from .manifest import (
     PINNED_COMFYUI_FRONTEND_VERSION,
     PROTOCOL_VERSION,
 )
+from .worker_release import WorkerRelease
 
 
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}")
@@ -405,7 +406,7 @@ class SessionService:
         resolver,
         offer_search=None,
         mapping_repository=None,
-        worker_version,
+        release,
         clock=None,
         id_factory=None,
     ):
@@ -413,7 +414,7 @@ class SessionService:
         self.resolver = resolver
         self.offer_search = offer_search
         self.mapping_repository = mapping_repository
-        self.worker_version = _identifier(worker_version, "worker version")
+        self.release = release if isinstance(release, WorkerRelease) else None
         self.clock = clock or time.time
         self.id_factory = id_factory or (lambda: str(uuid.uuid4()))
 
@@ -441,6 +442,7 @@ class SessionService:
         disk_gb = getattr(resolution, "disk_gb", None)
         rentable = bool(
             resolution.rentable
+            and self.release is not None
             and rows
             and all(row.status == "resolved" for row in rows)
             and isinstance(output_allowance, int)
@@ -457,7 +459,7 @@ class SessionService:
                 protocol_version=PROTOCOL_VERSION,
                 comfyui_core_version=PINNED_COMFYUI_CORE_VERSION,
                 comfyui_frontend_version=PINNED_COMFYUI_FRONTEND_VERSION,
-                worker_version=self.worker_version,
+                worker_version=self.release.worker_commit,
                 prompt_digest=capture.prompt_digest,
                 custom_nodes=tuple(resolution.custom_nodes),
                 artifacts=tuple(resolution.artifacts),
@@ -507,7 +509,7 @@ class SessionService:
             raise PreflightBlocked("Stored preflight identity is invalid.")
         return result
 
-    async def search_offers(self, preflight_id):
+    def require_rentable_preflight(self, preflight_id):
         result = self.get_preflight(preflight_id)
         if (
             not result.rentable
@@ -538,14 +540,27 @@ class SessionService:
             != result.output_allowance_bytes
             or manifest.get("disk_gb") != result.disk_gb
             or _manifest_transfer_bytes(manifest) != result.transfer_bytes
+            or self.release is None
+            or manifest.get("worker_version")
+            != self.release.worker_commit
+            or manifest.get("protocol_version")
+            != self.release.protocol_version
+            or manifest.get("comfyui_core_version")
+            != self.release.comfyui_core_version
+            or manifest.get("comfyui_frontend_version")
+            != self.release.comfyui_frontend_version
         ):
             raise PreflightBlocked("Stored dependency manifest is invalid.")
+        return result
+
+    async def search_offers(self, preflight_id):
+        result = self.require_rentable_preflight(preflight_id)
         if self.offer_search is None:
             raise PreflightBlocked("Vast offer search is unavailable.")
         if callable(self.offer_search):
-            return await self.offer_search()
+            return await self.offer_search(disk_gb=result.disk_gb)
         if callable(getattr(self.offer_search, "search", None)):
-            return await self.offer_search.search()
+            return await self.offer_search.search(disk_gb=result.disk_gb)
         raise PreflightBlocked("Vast offer search is unavailable.")
 
     def approve_mapping(self, mapping_id, candidate_digest):

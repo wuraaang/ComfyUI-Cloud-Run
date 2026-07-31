@@ -181,6 +181,8 @@ allowed_cloud_run_routes = {
     ("POST", "/cloud-run/api/cache/artifacts/{artifact_id}"),
     ("POST", "/cloud-run/api/offers"),
     ("POST", "/cloud-run/api/quotes"),
+    ("POST", "/cloud-run/api/sessions"),
+    ("POST", "/cloud-run/api/sessions/{session_id}/confirm"),
     ("GET", "/cloud-run/api/attempts/{attempt_id}"),
     ("POST", "/cloud-run/api/attempts/{attempt_id}/confirm"),
     ("POST", "/cloud-run/api/attempts/{attempt_id}/cancel"),

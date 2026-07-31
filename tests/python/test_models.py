@@ -25,6 +25,19 @@ def quote(OfferQuote):
         reliability=0.99,
         max_price_per_hour=0.55,
         expires_at=160.0,
+        disk_gb=96,
+        transfer_bytes=12_000,
+        output_allowance_bytes=4_000,
+        inet_down_cost=0.01,
+        inet_up_cost=0.02,
+        duration_seconds=7_200,
+        deadline_mode="finite",
+        approximate_max_active_charge=0.84,
+        template_hash_id="1" * 32,
+        worker_commit="a" * 40,
+        worker_archive_sha256="b" * 64,
+        protocol_version="1",
+        manifest_digest="c" * 64,
         machine_id="machine-7",
         host_id="host-3",
         public_ipaddr="203.0.113.7",
@@ -32,6 +45,52 @@ def quote(OfferQuote):
 
 
 class LifecycleModelTests(unittest.TestCase):
+    def test_quote_contains_complete_paid_session_contract_without_secrets(self):
+        from cloud_run.models import OfferQuote
+
+        values = quote(OfferQuote).to_record()
+        values["dph_total"] = 0.50
+        values["approximate_max_active_charge"] = 1.0
+        paid_quote = OfferQuote.from_record(values)
+        public = paid_quote.public_payload()
+
+        self.assertEqual(public["disk_gb"], 96)
+        self.assertEqual(public["transfer_bytes"], 12_000)
+        self.assertEqual(public["output_allowance_bytes"], 4_000)
+        self.assertEqual(public["duration_seconds"], 7_200)
+        self.assertEqual(public["approximate_max_active_charge"], 1.0)
+        self.assertEqual(public["template_hash_id"], "1" * 32)
+        self.assertEqual(public["worker_commit"], "a" * 40)
+        self.assertEqual(public["worker_archive_sha256"], "b" * 64)
+        self.assertEqual(public["protocol_version"], "1")
+        self.assertEqual(public["manifest_digest"], "c" * 64)
+        self.assertNotIn("session_secret_hex", public)
+
+    def test_legacy_quote_records_remain_readable_but_cannot_claim_a_release(self):
+        from cloud_run.models import OfferQuote
+
+        legacy = {
+            "offer_id": "42",
+            "gpu_name": "RTX 4090",
+            "gpu_ram_gb": 24.0,
+            "dph_total": 0.42,
+            "reliability": 0.99,
+            "max_price_per_hour": 0.55,
+            "expires_at": 160.0,
+            "machine_id": "machine-7",
+            "host_id": "host-3",
+            "public_ipaddr": "203.0.113.7",
+        }
+
+        restored = OfferQuote.from_record(legacy)
+        public = restored.public_payload()
+
+        self.assertFalse(restored.reviewed_release_bound)
+        self.assertEqual(restored.offer_id, "42")
+        self.assertIsNone(public["template_hash_id"])
+        self.assertIsNone(public["worker_commit"])
+        self.assertIsNone(public["manifest_digest"])
+
     def test_session_and_job_state_contracts_are_exact(self):
         from cloud_run.models import JobState, SessionState, TransferState
 
@@ -77,6 +136,45 @@ class LifecycleModelTests(unittest.TestCase):
                 "abandoned",
             },
         )
+
+    def test_session_rejects_disk_outside_the_provider_contract(self):
+        from cloud_run.models import CloudSession
+
+        for disk_gb in (79, 2049):
+            with self.subTest(disk_gb=disk_gb):
+                with self.assertRaises(ValueError):
+                    CloudSession.new(
+                        "session-key",
+                        session_id="session-1",
+                        disk_gb=disk_gb,
+                        now=100.0,
+                    )
+
+    def test_new_session_requires_quote_manifest_disk_and_deadline_to_match(self):
+        from cloud_run.models import CloudSession, OfferQuote
+
+        paid_quote = quote(OfferQuote)
+        valid = {
+            "quote": paid_quote,
+            "manifest_digest": "c" * 64,
+            "deadline_at": 7_300.0,
+            "deadline_mode": "finite",
+            "disk_gb": 96,
+            "now": 100.0,
+        }
+
+        session = CloudSession.new("session-key", **valid)
+        self.assertEqual(session.quote, paid_quote)
+        for field, value in (
+            ("manifest_digest", "d" * 64),
+            ("disk_gb", 80),
+            ("deadline_at", 7_301.0),
+            ("deadline_mode", "none"),
+        ):
+            with self.subTest(field=field):
+                changed = {**valid, field: value}
+                with self.assertRaises(ValueError):
+                    CloudSession.new("session-key-" + field, **changed)
 
     def test_execution_failure_returns_a_healthy_session_to_ready(self):
         from cloud_run.models import CloudSession, SessionState

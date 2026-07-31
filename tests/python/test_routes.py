@@ -7,8 +7,14 @@ import unittest
 from unittest import mock
 
 from cloud_run.capture import CompiledCapture
-from cloud_run.routes import register_routes
-from cloud_run.models import AttemptState, CloudAttempt, OfferQuote
+from cloud_run.routes import build_service, register_routes
+from cloud_run.models import (
+    AttemptState,
+    CloudAttempt,
+    CloudSession,
+    OfferQuote,
+    SessionState,
+)
 from cloud_run.service import (
     AttemptNotFound,
     CloudRunValidationError,
@@ -192,6 +198,20 @@ class SettingsRouteTests(unittest.TestCase):
         self.assertEqual(invalid_settings.status, 400)
         self.assertTrue(invalid_settings.payload["error"])
         self.assertNotIn(sensitive_marker, repr(invalid_settings.payload))
+
+
+class ServiceConstructionTests(unittest.TestCase):
+    def test_missing_private_release_lock_constructs_a_non_rentable_service(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            with mock.patch.dict(
+                os.environ,
+                {"COMFYUI_CLOUD_RUN_DATA_DIR": temporary_directory},
+                clear=False,
+            ):
+                service = build_service()
+
+        self.assertIsNone(service.release)
+        self.assertIsNone(service.session_service.release)
 
 
 class OffersRouteTests(unittest.TestCase):
@@ -494,6 +514,19 @@ def attempt(state=AttemptState.OFFER_SELECTED):
             reliability=0.99,
             max_price_per_hour=0.55,
             expires_at=160.0,
+            disk_gb=80,
+            transfer_bytes=0,
+            output_allowance_bytes=1,
+            inet_down_cost=None,
+            inet_up_cost=None,
+            duration_seconds=7200,
+            deadline_mode="finite",
+            approximate_max_active_charge=0.84,
+            template_hash_id="1" * 32,
+            worker_commit="a" * 40,
+            worker_archive_sha256="b" * 64,
+            protocol_version="1",
+            manifest_digest="c" * 64,
         ),
     )
 
@@ -662,6 +695,97 @@ class LifecycleRouteTests(unittest.TestCase):
                 ]
             ),
         )
+
+
+class PaidSessionRouteTests(unittest.TestCase):
+    def test_quote_and_confirm_routes_use_only_the_exact_session_contract(self):
+        quoted = CloudSession.new(
+            "private-session-idempotency-key",
+            session_id="session-1",
+            quote=attempt().quote,
+            manifest_digest="c" * 64,
+            deadline_at=7300.0,
+            deadline_mode="finite",
+            disk_gb=80,
+            now=100.0,
+            state=SessionState.OFFER_SELECTED,
+        )
+        started = quoted.transition(
+            SessionState.CONFIRMING,
+            now=101.0,
+        ).transition(
+            SessionState.CREATING,
+            now=102.0,
+            session_secret_hex="d" * 64,
+        ).transition(
+            SessionState.BOOTSTRAPPING,
+            now=103.0,
+            instance_id="77",
+        )
+        service = mock.Mock()
+        service.preview_session = mock.AsyncMock(return_value=quoted)
+        service.confirm_session = mock.AsyncMock(return_value=started)
+        handlers = captured_handlers(service_factory=lambda: service)
+        request_payload = {
+            "preflight_id": "preflight-1",
+            "offer_id": "42",
+            "idempotency_key": "private-session-idempotency-key",
+            "deadline": {
+                "mode": "finite",
+                "duration_seconds": 7200,
+            },
+        }
+
+        quote_response = asyncio.run(
+            handlers[("POST", "/cloud-run/api/sessions")](
+                FakeRequest(request_payload)
+            )
+        )
+        confirm_response = asyncio.run(
+            handlers[
+                (
+                    "POST",
+                    "/cloud-run/api/sessions/{session_id}/confirm",
+                )
+            ](
+                FakeRequest(
+                    {
+                        "idempotency_key": (
+                            "private-session-idempotency-key"
+                        )
+                    },
+                    match_info={"session_id": "session-1"},
+                )
+            )
+        )
+        rejected = asyncio.run(
+            handlers[("POST", "/cloud-run/api/sessions")](
+                FakeRequest({**request_payload, "unexpected": True})
+            )
+        )
+
+        service.preview_session.assert_awaited_once_with(
+            preflight_id="preflight-1",
+            offer_id="42",
+            idempotency_key="private-session-idempotency-key",
+            deadline={
+                "mode": "finite",
+                "duration_seconds": 7200,
+            },
+        )
+        service.confirm_session.assert_awaited_once_with(
+            "session-1",
+            idempotency_key="private-session-idempotency-key",
+        )
+        self.assertEqual(quote_response.status, 200)
+        self.assertEqual(quote_response.payload["status"], "offer_selected")
+        self.assertEqual(confirm_response.payload["status"], "bootstrapping")
+        self.assertEqual(confirm_response.payload["instance_id"], "77")
+        self.assertEqual(rejected.status, 400)
+        for response in (quote_response, confirm_response):
+            encoded = repr(response.payload)
+            self.assertNotIn("private-session-idempotency-key", encoded)
+            self.assertNotIn("d" * 64, encoded)
 
 
 if __name__ == "__main__":

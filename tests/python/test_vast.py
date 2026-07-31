@@ -5,6 +5,24 @@ import types
 import unittest
 
 
+def worker_release():
+    from cloud_run.worker_release import WorkerRelease
+
+    return WorkerRelease.from_payload(
+        {
+            "schema_version": 1,
+            "template_hash_id": "1" * 32,
+            "worker_commit": "a" * 40,
+            "worker_archive_sha256": "b" * 64,
+            "protocol_version": "1",
+            "comfyui_core_version": "0.29.0",
+            "comfyui_frontend_version": "1.47.10",
+            "python_version": "3.13.12",
+            "worker_port": 8765,
+        }
+    )
+
+
 class FakeResponse:
     def __init__(self, status, payload):
         self.status = status
@@ -69,6 +87,8 @@ class VastRequestTests(unittest.TestCase):
                             "public_ipaddr": "192.0.2.10",
                             "inet_down": 850.0,
                             "disk_bw": 640.0,
+                            "inet_down_cost": 0.01,
+                            "inet_up_cost": 0.02,
                         }
                     ]
                 },
@@ -80,6 +100,7 @@ class VastRequestTests(unittest.TestCase):
                 "synthetic-value",
                 max_price_per_hour=0.75,
                 min_vram_gb=24,
+                disk_gb=96,
                 session=session,
             )
         )
@@ -105,8 +126,8 @@ class VastRequestTests(unittest.TestCase):
                 "reliability": {"gte": 0.95},
                 "rentable": {"eq": True},
                 "dph_total": {"lte": 0.75},
-                "disk_space": {"gte": 80},
-                "allocated_storage": 80,
+                "disk_space": {"gte": 96},
+                "allocated_storage": 96,
                 "num_gpus": {"eq": 1},
                 "verified": {"eq": True},
                 "type": "ondemand",
@@ -128,6 +149,8 @@ class VastRequestTests(unittest.TestCase):
                     "public_ipaddr": "192.0.2.10",
                     "inet_down_mbps": 850.0,
                     "disk_bw_mbps": 640.0,
+                    "inet_down_cost": 0.01,
+                    "inet_up_cost": 0.02,
                 }
             ],
         )
@@ -156,6 +179,7 @@ class VastRequestTests(unittest.TestCase):
                 offer_id="42",
                 max_price_per_hour=0.75,
                 min_vram_gb=24,
+                disk_gb=96,
                 session=matching_session,
             )
         )
@@ -170,6 +194,8 @@ class VastRequestTests(unittest.TestCase):
         self.assertEqual(request["json"]["limit"], 1)
         self.assertEqual(request["json"]["dph_total"], {"lte": 0.75})
         self.assertEqual(request["json"]["gpu_ram"], {"gte": 24576})
+        self.assertEqual(request["json"]["disk_space"], {"gte": 96})
+        self.assertEqual(request["json"]["allocated_storage"], 96)
 
         mismatched_session = FakeSession(
             FakeResponse(200, {"offers": [{**matching_offer, "id": 99}]})
@@ -226,6 +252,8 @@ class VastNormalizationAndErrorTests(unittest.TestCase):
                     "machine_id": 77,
                     "inet_down": 500,
                     "disk_bw": 400,
+                    "inet_down_cost": -1,
+                    "inet_up_cost": math.inf,
                 },
                 {
                     "id": 30,
@@ -293,6 +321,8 @@ class VastNormalizationAndErrorTests(unittest.TestCase):
                     "public_ipaddr": None,
                     "inet_down_mbps": 500.0,
                     "disk_bw_mbps": 400.0,
+                    "inet_down_cost": None,
+                    "inet_up_cost": None,
                 },
                 {
                     "offer_id": 20,
@@ -305,6 +335,8 @@ class VastNormalizationAndErrorTests(unittest.TestCase):
                     "public_ipaddr": "192.0.2.1",
                     "inet_down_mbps": None,
                     "disk_bw_mbps": None,
+                    "inet_down_cost": None,
+                    "inet_up_cost": None,
                 },
             ],
         )
@@ -321,6 +353,8 @@ class VastNormalizationAndErrorTests(unittest.TestCase):
                 "public_ipaddr",
                 "inet_down_mbps",
                 "disk_bw_mbps",
+                "inet_down_cost",
+                "inet_up_cost",
             },
         )
 
@@ -491,8 +525,7 @@ class VastLifecycleRequestTests(unittest.TestCase):
             "027fba7753c024be019030fb42aed900",
         )
 
-    def test_create_uses_only_the_official_comfyui_template(self):
-        from cloud_run.constants import OFFICIAL_TEMPLATE_ID
+    def test_create_uses_only_the_injected_reviewed_project_template(self):
         from cloud_run.vast import VAST_API_V0, create_instance
 
         session = FakeSession(
@@ -503,8 +536,9 @@ class VastLifecycleRequestTests(unittest.TestCase):
             create_instance(
                 "synthetic-value",
                 offer_id=42,
-                disk_gb=80,
-                label="comfy-cloud-run-attempt-1",
+                disk_gb=96,
+                label="comfy-cloud-run-session-1",
+                release=worker_release(),
                 session=session,
             )
         )
@@ -520,15 +554,15 @@ class VastLifecycleRequestTests(unittest.TestCase):
                         "Accept": "application/json",
                     },
                     "json": {
-                        "template_hash_id": OFFICIAL_TEMPLATE_ID,
-                        "label": "comfy-cloud-run-attempt-1",
-                        "disk": 80,
+                        "template_hash_id": "1" * 32,
+                        "label": "comfy-cloud-run-session-1",
+                        "disk": 96,
                     },
                 },
             )
         ])
 
-    def test_create_rejects_an_unapproved_template_before_request(self):
+    def test_create_rejects_missing_release_before_request(self):
         from cloud_run.vast import VastConfigurationError, create_instance
 
         session = FakeSession(FakeResponse(200, {}))
@@ -539,11 +573,30 @@ class VastLifecycleRequestTests(unittest.TestCase):
                     offer_id=42,
                     disk_gb=80,
                     label="comfy-cloud-run-attempt-1",
-                    template_id="unapproved-template",
+                    release=None,
                     session=session,
                 )
             )
         self.assertEqual(session.calls, [])
+
+    def test_create_rejects_non_integer_or_out_of_range_disk_before_request(self):
+        from cloud_run.vast import VastConfigurationError, create_instance
+
+        for disk_gb in (True, 79, 96.0, 2049):
+            with self.subTest(disk_gb=disk_gb):
+                session = FakeSession(FakeResponse(200, {}))
+                with self.assertRaises(VastConfigurationError):
+                    asyncio.run(
+                        create_instance(
+                            "synthetic-value",
+                            offer_id=42,
+                            disk_gb=disk_gb,
+                            label="comfy-cloud-run-session-1",
+                            release=worker_release(),
+                            session=session,
+                        )
+                    )
+                self.assertEqual(session.calls, [])
 
     def test_list_get_destroy_and_url_derivation_are_normalized(self):
         from cloud_run.vast import (
@@ -628,6 +681,7 @@ class VastLifecycleRequestTests(unittest.TestCase):
                     offer_id=42,
                     disk_gb=80,
                     label="comfy-cloud-run-attempt-1",
+                    release=worker_release(),
                     session=FakeSession(response),
                 )
             )
@@ -659,6 +713,7 @@ class VastLifecycleRequestTests(unittest.TestCase):
                             offer_id=42,
                             disk_gb=80,
                             label="comfy-cloud-run-attempt-1",
+                            release=worker_release(),
                             session=FakeSession(
                                 FakeResponse(status, {"error": marker})
                             ),

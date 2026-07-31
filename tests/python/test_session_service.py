@@ -10,6 +10,7 @@ from cloud_run.job_repository import JobRepository
 from cloud_run.manifest import ArtifactSpec, SourceSpec
 from cloud_run.resolver import NodeResolution
 from cloud_run.session_service import PreflightBlocked, SessionService
+from cloud_run.worker_release import WorkerRelease
 
 
 def capture_payload():
@@ -27,6 +28,22 @@ def capture_payload():
         },
         "queue_options": {},
     }
+
+
+def worker_release():
+    return WorkerRelease.from_payload(
+        {
+            "schema_version": 1,
+            "template_hash_id": "1" * 32,
+            "worker_commit": "a" * 40,
+            "worker_archive_sha256": "b" * 64,
+            "protocol_version": "1",
+            "comfyui_core_version": "0.29.0",
+            "comfyui_frontend_version": "1.47.10",
+            "python_version": "3.13.12",
+            "worker_port": 8765,
+        }
+    )
 
 
 class FakeResolver:
@@ -62,8 +79,9 @@ class FakeOfferSearch:
         self.calls = 0
         self.mutations = []
 
-    async def __call__(self):
+    async def __call__(self, *, disk_gb):
         self.calls += 1
+        self.disk_gb = disk_gb
         return [{"offer_id": 42}]
 
 
@@ -138,7 +156,7 @@ class SessionServiceTests(unittest.TestCase):
             job_repository=self.repository,
             resolver=FakeResolver(resolution),
             offer_search=self.offer_search,
-            worker_version="worker-test-v1",
+            release=worker_release(),
             clock=lambda: 100.0,
             id_factory=lambda: "preflight-1",
         )
@@ -164,7 +182,7 @@ class SessionServiceTests(unittest.TestCase):
             job_repository=JobRepository(self.path),
             resolver=FakeResolver(resolved_resolution()),
             offer_search=self.offer_search,
-            worker_version="worker-test-v1",
+            release=worker_release(),
         )
         offers = asyncio.run(reopened.search_offers(result.preflight_id))
 
@@ -178,6 +196,7 @@ class SessionServiceTests(unittest.TestCase):
         )
         self.assertEqual(offers, [{"offer_id": 42}])
         self.assertEqual(self.offer_search.calls, 1)
+        self.assertEqual(self.offer_search.disk_gb, 80)
         self.assertEqual(self.offer_search.mutations, [])
         public = result.public_payload()
         self.assertNotIn("private_path", repr(public))
@@ -205,6 +224,24 @@ class SessionServiceTests(unittest.TestCase):
                     result.preflight_id
                 )
             )
+        self.assertEqual(self.offer_search.calls, 0)
+
+    def test_missing_reviewed_release_keeps_resolved_preflight_non_rentable(self):
+        service = SessionService(
+            job_repository=self.repository,
+            resolver=FakeResolver(resolved_resolution()),
+            offer_search=self.offer_search,
+            release=None,
+            clock=lambda: 100.0,
+            id_factory=lambda: "preflight-no-release",
+        )
+
+        result = asyncio.run(service.preflight(self.capture.capture_id))
+
+        self.assertFalse(result.rentable)
+        self.assertIsNone(result.manifest_digest)
+        with self.assertRaises(PreflightBlocked):
+            asyncio.run(service.search_offers(result.preflight_id))
         self.assertEqual(self.offer_search.calls, 0)
 
 
