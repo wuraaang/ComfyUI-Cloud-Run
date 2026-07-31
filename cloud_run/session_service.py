@@ -765,7 +765,7 @@ class SessionService:
         self.id_factory = id_factory or (lambda: str(uuid.uuid4()))
         self.review_token_factory = (
             review_token_factory
-            or (lambda: secrets.token_urlsafe(32))
+            or (lambda: secrets.token_hex(32))
         )
         self.sleep = sleep or asyncio.sleep
         if (

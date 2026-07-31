@@ -4,6 +4,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from cloud_run.artifacts import ArtifactResolution
 from cloud_run.capture import CompiledCapture
@@ -1015,6 +1016,27 @@ class ReusableSessionTests(unittest.TestCase):
         unchanged = self.sessions.get(creating.session_id)
         self.assertIsNone(unchanged.pending_deadline_mode)
         self.assertEqual(self.worker.deadline_calls, [])
+
+    def test_default_destroy_review_token_is_always_identifier_safe(self):
+        with mock.patch(
+            "cloud_run.session_service.secrets.token_urlsafe",
+            return_value="_" + "a" * 42,
+        ):
+            with mock.patch(
+                "cloud_run.session_service.secrets.token_hex",
+                return_value="b" * 64,
+            ):
+                try:
+                    review = asyncio.run(
+                        self.service.review_destroy("session-1")
+                    )
+                except DestroyConfirmationError:
+                    self.fail(
+                        "Default review-token generation must always "
+                        "satisfy its identifier contract."
+                    )
+
+        self.assertEqual(review.token, "b" * 64)
 
     def test_destroy_requires_fresh_review_and_abandons_unverified_outputs(self):
         job = CloudJob(
