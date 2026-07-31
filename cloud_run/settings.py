@@ -3,8 +3,10 @@
 import json
 import math
 import os
+import re
 import tempfile
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from .constants import (
     DEFAULT_MAX_PRICE_PER_HOUR,
@@ -21,6 +23,20 @@ from .constants import (
 
 class SettingsValidationError(ValueError):
     """A settings payload is invalid."""
+
+
+_R2_FIELDS = (
+    "r2_endpoint",
+    "r2_bucket",
+    "r2_access_key_id",
+    "r2_secret_access_key",
+)
+_OPTIONAL_FIELDS = {
+    *_R2_FIELDS,
+    "hf_token",
+    "civitai_token",
+}
+_R2_BUCKET = re.compile(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]")
 
 
 def resolve_data_directory():
@@ -45,12 +61,46 @@ def _default_settings():
     }
 
 
+def _optional_value(field, value):
+    if not isinstance(value, str):
+        raise SettingsValidationError("Optional credential value is invalid.")
+    normalized = value.strip()
+    if not normalized or len(normalized) > MAX_API_KEY_LENGTH:
+        raise SettingsValidationError("Optional credential value is invalid.")
+    if field == "r2_endpoint":
+        try:
+            parsed = urlsplit(normalized)
+            port = parsed.port
+        except ValueError:
+            raise SettingsValidationError("R2 endpoint is invalid.") from None
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or port is not None
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise SettingsValidationError("R2 endpoint is invalid.")
+        return f"https://{parsed.hostname}"
+    if field == "r2_bucket" and not _R2_BUCKET.fullmatch(normalized):
+        raise SettingsValidationError("R2 bucket is invalid.")
+    return normalized
+
+
 def validate_update(payload):
     """Validate and normalize a settings update from the browser."""
     if not isinstance(payload, dict):
         raise SettingsValidationError("Settings must be a JSON object.")
 
-    allowed = {"api_key", "max_price_per_hour", "min_vram_gb"}
+    allowed = {
+        "api_key",
+        "max_price_per_hour",
+        "min_vram_gb",
+        *_OPTIONAL_FIELDS,
+    }
     if set(payload) - allowed:
         raise SettingsValidationError("Settings contain unsupported fields.")
     if "max_price_per_hour" not in payload or "min_vram_gb" not in payload:
@@ -93,6 +143,10 @@ def validate_update(payload):
             raise SettingsValidationError("Vast API key has an invalid length.")
         normalized["api_key"] = key
 
+    for field in _OPTIONAL_FIELDS:
+        if field in payload:
+            normalized[field] = _optional_value(field, payload[field])
+
     return normalized
 
 
@@ -100,6 +154,9 @@ def public_settings(settings):
     """Return the exact browser-safe settings representation."""
     return {
         "configured": bool(settings.get("api_key")),
+        "r2_configured": all(bool(settings.get(field)) for field in _R2_FIELDS),
+        "hf_configured": bool(settings.get("hf_token")),
+        "civitai_configured": bool(settings.get("civitai_token")),
         "max_price_per_hour": settings["max_price_per_hour"],
         "min_vram_gb": settings["min_vram_gb"],
         "official_template_id": OFFICIAL_TEMPLATE_ID,
@@ -144,6 +201,21 @@ class SettingsStore:
                 and len(key.strip()) <= MAX_API_KEY_LENGTH
             ):
                 settings["api_key"] = key.strip()
+            optional = {}
+            for field in _OPTIONAL_FIELDS:
+                if field not in stored:
+                    continue
+                try:
+                    optional[field] = _optional_value(field, stored[field])
+                except SettingsValidationError:
+                    continue
+            if all(field in optional for field in _R2_FIELDS):
+                settings.update(
+                    {field: optional[field] for field in _R2_FIELDS}
+                )
+            for field in ("hf_token", "civitai_token"):
+                if field in optional:
+                    settings[field] = optional[field]
         except (OSError, ValueError, json.JSONDecodeError, SettingsValidationError):
             return _default_settings()
         return settings
@@ -151,6 +223,12 @@ class SettingsStore:
     def update(self, payload):
         updated = self.load()
         updated.update(validate_update(payload))
+        if any(field in updated for field in _R2_FIELDS) and not all(
+            field in updated for field in _R2_FIELDS
+        ):
+            raise SettingsValidationError(
+                "Complete R2 settings are required."
+            )
         self._write(updated)
         return updated
 

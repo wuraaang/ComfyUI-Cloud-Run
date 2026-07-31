@@ -124,12 +124,23 @@ class ArtifactResolution:
     size_bytes: int | None = None
     sha256: str | None = None
     reason: str | None = None
+    artifact_id: str | None = None
+    cache_available: bool = False
+
+
+@dataclass(frozen=True, repr=False)
+class ResolvedLocalArtifact:
+    artifact_id: str
+    private_path: str
+    size_bytes: int
+    sha256: str
 
 
 @dataclass(frozen=True)
 class ArtifactResolutionResult:
     rows: tuple[ArtifactResolution, ...]
     artifacts: tuple[ArtifactSpec, ...]
+    local_artifacts: tuple[ResolvedLocalArtifact, ...]
     rentable: bool
 
 
@@ -499,6 +510,7 @@ def resolve_artifacts(
     resolved_input_root = _resolved_root(input_root)
     rows = []
     artifacts = []
+    local_artifacts = {}
     output = getattr(capture, "output", None)
     if not isinstance(output, dict):
         raise ArtifactResolutionError("Compiled prompt is invalid.")
@@ -569,6 +581,16 @@ def resolve_artifacts(
                 continue
 
             source = normalized_sources.get(file_digest.sha256)
+            artifact_id = _artifact_id(rule.kind, file_digest.sha256)
+            local_artifacts.setdefault(
+                artifact_id,
+                ResolvedLocalArtifact(
+                    artifact_id=artifact_id,
+                    private_path=str(local_path),
+                    size_bytes=file_digest.size_bytes,
+                    sha256=file_digest.sha256,
+                ),
+            )
             if source is None:
                 rows.append(
                     ArtifactResolution(
@@ -581,10 +603,10 @@ def resolve_artifacts(
                         file_digest.size_bytes,
                         file_digest.sha256,
                         "Exact artifact source requires approval.",
+                        artifact_id,
                     )
                 )
                 continue
-            artifact_id = _artifact_id(rule.kind, file_digest.sha256)
             artifact = ArtifactSpec(
                 artifact_id=artifact_id,
                 kind=rule.kind,
@@ -606,6 +628,7 @@ def resolve_artifacts(
                     destination,
                     file_digest.size_bytes,
                     file_digest.sha256,
+                    artifact_id=artifact_id,
                 )
             )
 
@@ -614,6 +637,9 @@ def resolve_artifacts(
     return ArtifactResolutionResult(
         rows=immutable_rows,
         artifacts=unique_artifacts,
+        local_artifacts=tuple(
+            local_artifacts[key] for key in sorted(local_artifacts)
+        ),
         rentable=all(row.status == "resolved" for row in immutable_rows),
     )
 

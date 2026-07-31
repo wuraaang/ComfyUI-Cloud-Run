@@ -150,6 +150,9 @@ class SettingsPersistenceTests(unittest.TestCase):
                 public,
                 {
                     "configured": True,
+                    "r2_configured": False,
+                    "hf_configured": False,
+                    "civitai_configured": False,
                     "max_price_per_hour": 0.8,
                     "min_vram_gb": 24,
                     "official_template_id": "027fba7753c024be019030fb42aed900",
@@ -184,11 +187,55 @@ class SettingsPersistenceTests(unittest.TestCase):
             self.assertEqual(updated["min_vram_gb"], 32)
             self.assertEqual(stat.S_IMODE(store.path.stat().st_mode), 0o600)
 
+    def test_optional_source_credentials_are_write_only_and_preserved(self):
+        from cloud_run.settings import SettingsStore, public_settings
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            store = SettingsStore(Path(temporary_directory))
+            stored = store.update(
+                {
+                    "max_price_per_hour": 1.0,
+                    "min_vram_gb": 16,
+                    "r2_endpoint": (
+                        "https://account.r2.cloudflarestorage.com"
+                    ),
+                    "r2_bucket": "cloud-run",
+                    "r2_access_key_id": "access-id",
+                    "r2_secret_access_key": "synthetic-secret",
+                    "hf_token": "hf-synthetic",
+                    "civitai_token": "civitai-synthetic",
+                }
+            )
+            preserved = store.update(
+                {
+                    "max_price_per_hour": 0.9,
+                    "min_vram_gb": 24,
+                }
+            )
+
+        public = public_settings(stored)
+        self.assertTrue(public["r2_configured"])
+        self.assertTrue(public["hf_configured"])
+        self.assertTrue(public["civitai_configured"])
+        for field in (
+            "r2_endpoint",
+            "r2_bucket",
+            "r2_access_key_id",
+            "r2_secret_access_key",
+            "hf_token",
+            "civitai_token",
+        ):
+            self.assertNotIn(field, public)
+            self.assertEqual(preserved[field], stored[field])
+
     def test_missing_or_corrupt_file_loads_safe_defaults(self):
         from cloud_run.settings import SettingsStore, public_settings
 
         expected = {
             "configured": False,
+            "r2_configured": False,
+            "hf_configured": False,
+            "civitai_configured": False,
             "max_price_per_hour": 1.0,
             "min_vram_gb": 16,
             "official_template_id": "027fba7753c024be019030fb42aed900",

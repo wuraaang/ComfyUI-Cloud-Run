@@ -6,6 +6,7 @@ from .job_repository import JobRepository
 from .lifecycle import CloudRunLifecycle
 from .offers import HostBlacklist
 from .repository import AttemptRepository
+from .r2 import R2TransferError, R2ValidationError
 from .service import (
     AttemptNotFound,
     CloudRunService,
@@ -85,6 +86,13 @@ def register_routes(service_factory=None):
     def service_error(error):
         if isinstance(error, (CaptureValidationError, CloudRunValidationError)):
             return web.json_response({"error": str(error)}, status=400)
+        if isinstance(error, R2ValidationError):
+            return web.json_response({"error": str(error)}, status=400)
+        if isinstance(error, R2TransferError):
+            return web.json_response(
+                {"error": "R2 cache transfer is unavailable."},
+                status=502,
+            )
         if isinstance(error, AttemptNotFound):
             return web.json_response({"error": str(error)}, status=404)
         if isinstance(error, QuoteUnavailable):
@@ -147,6 +155,26 @@ def register_routes(service_factory=None):
                 "status": "captured",
             }
         )
+
+    @routes.post("/cloud-run/api/cache/artifacts/{artifact_id}")
+    async def post_cache_artifact(request):
+        try:
+            payload = await _request_payload(
+                request,
+                allowed={"acknowledged"},
+                required={"acknowledged"},
+            )
+            if payload != {"acknowledged": True}:
+                raise CloudRunValidationError(
+                    "Cache population requires explicit acknowledgement."
+                )
+            result = await make_service().populate_cache(
+                request.match_info.get("artifact_id", ""),
+                acknowledged=True,
+            )
+        except Exception as error:
+            return service_error(error)
+        return web.json_response(result.public_payload())
 
     @routes.post("/cloud-run/api/offers")
     async def post_offers(_request):

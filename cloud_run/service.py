@@ -118,6 +118,7 @@ class CloudRunService:
         quote_ttl_seconds=DEFAULT_QUOTE_TTL_SECONDS,
         disk_gb=DEFAULT_DISK_GB,
         lifecycle=None,
+        cache_manager=None,
     ):
         self.settings_store = settings_store
         self.repository = repository
@@ -128,6 +129,7 @@ class CloudRunService:
         self.quote_ttl_seconds = float(quote_ttl_seconds)
         self.disk_gb = int(disk_gb)
         self.lifecycle = lifecycle
+        self.cache_manager = cache_manager
 
     async def capture(self, payload):
         if self.job_repository is None:
@@ -138,6 +140,16 @@ class CloudRunService:
             created_at=float(self.clock()),
         )
         return capture
+
+    async def populate_cache(self, artifact_id, *, acknowledged):
+        if self.cache_manager is None:
+            raise CloudRunValidationError(
+                "R2 cache population is unavailable."
+            )
+        return await self.cache_manager.populate_cache(
+            artifact_id,
+            acknowledged=acknowledged,
+        )
 
     def _settings(self):
         settings = self.settings_store.load()

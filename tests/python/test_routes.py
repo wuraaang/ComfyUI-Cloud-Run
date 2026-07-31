@@ -108,6 +108,9 @@ class SettingsRouteTests(unittest.TestCase):
             response.payload,
             {
                 "configured": False,
+                "r2_configured": False,
+                "hf_configured": False,
+                "civitai_configured": False,
                 "max_price_per_hour": 1.0,
                 "min_vram_gb": 16,
                 "official_template_id": "027fba7753c024be019030fb42aed900",
@@ -141,6 +144,9 @@ class SettingsRouteTests(unittest.TestCase):
 
         expected = {
             "configured": True,
+            "r2_configured": False,
+            "hf_configured": False,
+            "civitai_configured": False,
             "max_price_per_hour": 0.9,
             "min_vram_gb": 24,
             "official_template_id": "027fba7753c024be019030fb42aed900",
@@ -289,6 +295,48 @@ class CaptureRouteTests(unittest.TestCase):
         self.assertNotIn("workflow", response.payload)
         self.assertNotIn("output", response.payload)
         self.assertEqual(service.provider_mutations, [])
+
+
+class CacheRouteTests(unittest.TestCase):
+    def test_cache_route_requires_exact_ack_and_returns_no_signed_url(self):
+        result = types.SimpleNamespace(
+            public_payload=lambda: {
+                "artifact_id": "model-" + "a" * 64,
+                "status": "cached",
+                "size_bytes": 42,
+                "sha256": "a" * 64,
+            }
+        )
+        service = mock.Mock()
+        service.populate_cache = mock.AsyncMock(return_value=result)
+        handlers = captured_handlers(service_factory=lambda: service)
+        path = "/cloud-run/api/cache/artifacts/{artifact_id}"
+
+        response = asyncio.run(
+            handlers[("POST", path)](
+                FakeRequest(
+                    {"acknowledged": True},
+                    match_info={"artifact_id": "model-" + "a" * 64},
+                )
+            )
+        )
+        rejected = asyncio.run(
+            handlers[("POST", path)](
+                FakeRequest(
+                    {"acknowledged": False, "extra": True},
+                    match_info={"artifact_id": "model-" + "a" * 64},
+                )
+            )
+        )
+
+        service.populate_cache.assert_awaited_once_with(
+            "model-" + "a" * 64,
+            acknowledged=True,
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.payload, result.public_payload())
+        self.assertNotIn("url", repr(response.payload).casefold())
+        self.assertEqual(rejected.status, 400)
 
 
 def attempt(state=AttemptState.OFFER_SELECTED):

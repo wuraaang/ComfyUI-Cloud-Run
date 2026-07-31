@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .artifacts import (
     ArtifactCollisionError,
@@ -20,6 +20,7 @@ from .manifest import (
     validate_dependency,
 )
 from .registry import RegistryError
+from .r2 import LocalCacheArtifact
 
 
 @dataclass(frozen=True)
@@ -112,10 +113,18 @@ def _custom_node_from_mapping(candidate):
 class DependencyResolver:
     """Resolve nodes without installing, uploading, renting, or executing."""
 
-    def __init__(self, *, host, repository, registry):
+    def __init__(
+        self,
+        *,
+        host,
+        repository,
+        registry,
+        cache_catalog=None,
+    ):
         self.host = host
         self.repository = repository
         self.registry = registry
+        self.cache_catalog = cache_catalog
 
     def register_agent_suggestion(self, payload):
         if not isinstance(payload, dict) or set(payload) != {
@@ -290,6 +299,36 @@ class DependencyResolver:
             input_root=input_root,
             source_mappings=source_mappings,
         )
+        artifact_rows = artifact_result.rows
+        if self.cache_catalog is not None:
+            registered = set()
+            for local in artifact_result.local_artifacts:
+                try:
+                    self.cache_catalog.register_local_artifact(
+                        LocalCacheArtifact(
+                            artifact_id=local.artifact_id,
+                            private_path=local.private_path,
+                            size_bytes=local.size_bytes,
+                            sha256=local.sha256,
+                        )
+                    )
+                except Exception:
+                    continue
+                registered.add(local.artifact_id)
+            try:
+                cache_configured = (
+                    self.cache_catalog.cache_configured() is True
+                )
+            except Exception:
+                cache_configured = False
+            if cache_configured:
+                artifact_rows = tuple(
+                    replace(
+                        row,
+                        cache_available=row.artifact_id in registered,
+                    )
+                    for row in artifact_rows
+                )
         output_allowance = estimate_output_bytes(
             capture,
             explicit_bytes=explicit_output_allowance_bytes,
@@ -340,7 +379,7 @@ class DependencyResolver:
         )
         return DependencyPreflightResult(
             node_rows=nodes.rows,
-            artifact_rows=artifact_result.rows,
+            artifact_rows=artifact_rows,
             custom_nodes=custom_nodes,
             artifacts=artifact_result.artifacts,
             output_allowance_bytes=output_allowance,

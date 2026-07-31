@@ -68,6 +68,18 @@ class FakeRegistry:
         return self.candidates.get(class_type)
 
 
+class FakeCacheCatalog:
+    def __init__(self):
+        self.registered = []
+        self.external_calls = []
+
+    def cache_configured(self):
+        return True
+
+    def register_local_artifact(self, artifact):
+        self.registered.append(artifact)
+
+
 def core(class_type):
     return NodeDescription(
         class_type=class_type,
@@ -290,6 +302,7 @@ class DependencyResolverTests(unittest.TestCase):
                 },
             },
         )
+        cache_catalog = FakeCacheCatalog()
         resolver = DependencyResolver(
             host=FakeHost(
                 {
@@ -300,6 +313,7 @@ class DependencyResolverTests(unittest.TestCase):
             ),
             repository=self.repository,
             registry=FakeRegistry({}),
+            cache_catalog=cache_catalog,
         )
 
         result = asyncio.run(
@@ -332,6 +346,13 @@ class DependencyResolverTests(unittest.TestCase):
         self.assertEqual(result.custom_nodes[0].package_id, "acme.nodes")
         self.assertEqual(len(result.artifacts), 1)
         self.assertEqual(result.artifacts[0].sha256, model_digest)
+        self.assertEqual(result.artifacts[0].source.kind, "local-upload")
+        self.assertTrue(result.artifact_rows[0].cache_available)
+        self.assertEqual(
+            cache_catalog.registered[0].artifact_id,
+            result.artifacts[0].artifact_id,
+        )
+        self.assertEqual(cache_catalog.external_calls, [])
 
 
 if __name__ == "__main__":
