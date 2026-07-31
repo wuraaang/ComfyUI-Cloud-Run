@@ -193,6 +193,30 @@ def _initialize_database(path):
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dependency_candidates (
+                    class_type TEXT NOT NULL,
+                    candidate_digest TEXT NOT NULL,
+                    source_kind TEXT NOT NULL,
+                    candidate_json TEXT NOT NULL,
+                    approved INTEGER NOT NULL DEFAULT 0,
+                    created_at REAL NOT NULL,
+                    PRIMARY KEY(class_type, candidate_digest)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dependency_mappings (
+                    class_type TEXT PRIMARY KEY,
+                    candidate_digest TEXT NOT NULL,
+                    source_kind TEXT NOT NULL,
+                    candidate_json TEXT NOT NULL,
+                    updated_at REAL NOT NULL
+                )
+                """
+            )
             _migrate_legacy_attempts(connection)
             connection.execute(
                 """
