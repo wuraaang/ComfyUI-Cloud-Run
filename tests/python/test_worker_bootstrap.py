@@ -1,6 +1,7 @@
 """Deterministic worker artifact and fixed bootstrap certification."""
 
 import ast
+import gzip
 import hashlib
 from http.client import InvalidURL
 import io
@@ -17,9 +18,11 @@ from remote_worker.bootstrap import (
     BootstrapError,
     DownloadStream,
     HttpsTransport,
+    _REVIEWED_ARCHIVE_FILES,
 )
 from scripts.build_worker_artifact import (
     ArtifactBuildError,
+    EXPECTED_FILES,
     build_worker_artifact,
 )
 from remote_worker.main import parse_worker_arguments
@@ -46,6 +49,33 @@ class FakeTransport:
                 self.content[:midpoint],
                 self.content[midpoint:],
             ),
+        )
+
+
+class CloseTrackingChunks:
+    def __init__(self, *chunks):
+        self.chunks = iter(chunks)
+        self.closed = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self.chunks)
+
+    def close(self):
+        self.closed = True
+
+
+class FixedStreamTransport:
+    def __init__(self, chunks):
+        self.chunks = chunks
+
+    def stream(self, url):
+        return DownloadStream(
+            source_url=url,
+            redirect_count=0,
+            chunks=self.chunks,
         )
 
 
@@ -107,9 +137,46 @@ def malicious_archive(name):
         info.gname = ""
         info.mtime = 0
         archive.addfile(info, io.BytesIO(b"x"))
-    import gzip
-
     return gzip.compress(raw.getvalue(), mtime=0)
+
+
+def archive_with_extra_file(reviewed_archive, name):
+    raw = io.BytesIO()
+    with tarfile.open(
+        fileobj=io.BytesIO(reviewed_archive),
+        mode="r:gz",
+    ) as source:
+        with tarfile.open(
+            fileobj=raw,
+            mode="w",
+            format=tarfile.GNU_FORMAT,
+        ) as destination:
+            for member in source.getmembers():
+                extracted = source.extractfile(member)
+                if extracted is None:
+                    raise AssertionError("reviewed artifact member is unreadable")
+                with extracted:
+                    destination.addfile(member, extracted)
+            content = b"unreviewed = True\n"
+            extra = tarfile.TarInfo(name)
+            extra.size = len(content)
+            extra.mode = 0o644
+            extra.uid = 0
+            extra.gid = 0
+            extra.uname = ""
+            extra.gname = ""
+            extra.mtime = 0
+            destination.addfile(extra, io.BytesIO(content))
+    compressed = io.BytesIO()
+    with gzip.GzipFile(
+        filename="",
+        mode="wb",
+        fileobj=compressed,
+        compresslevel=9,
+        mtime=0,
+    ) as stream:
+        stream.write(raw.getvalue())
+    return compressed.getvalue()
 
 
 class FakeResponse:
@@ -139,6 +206,11 @@ class FakeResponse:
 
     def geturl(self):
         return self.final_url
+
+
+class ReadErrorResponse(FakeResponse):
+    def read(self, _size=-1):
+        raise OSError("streaming read failed for " + self.final_url)
 
 
 class FakeOpener:
@@ -228,7 +300,6 @@ class HttpsTransportTests(unittest.TestCase):
         self.fail("transport unexpectedly accepted the response")
 
     def _assert_signed_target_is_not_retained(self, error):
-        self._assert_only_static_transport_error_is_retained(error)
         bootstrap_path = (
             REPOSITORY_ROOT / "remote_worker" / "bootstrap.py"
         ).resolve()
@@ -253,9 +324,8 @@ class HttpsTransportTests(unittest.TestCase):
         self.assertTrue(production_frames)
         for frame in production_frames:
             for name, value in frame.f_locals.items():
-                self.assertNotIn(
-                    self.signed_location,
-                    repr(value),
+                self.assertFalse(
+                    self.signed_location in repr(value),
                     msg="retained local: " + name,
                 )
                 for attribute in (
@@ -264,18 +334,49 @@ class HttpsTransportTests(unittest.TestCase):
                     "requested_urls",
                 ):
                     attribute_value = getattr(value, attribute, None)
-                    self.assertNotIn(
-                        self.signed_location,
-                        repr(attribute_value),
+                    self.assertFalse(
+                        self.signed_location in repr(attribute_value),
                         msg="retained object: " + name + "." + attribute,
                     )
                 geturl = getattr(value, "geturl", None)
                 if callable(geturl):
-                    self.assertNotIn(
-                        self.signed_location,
-                        repr(geturl()),
+                    self.assertFalse(
+                        self.signed_location in repr(geturl()),
                         msg="retained object: " + name + ".geturl()",
                     )
+        self._assert_only_static_transport_error_is_retained(error)
+
+    def test_redirected_stream_read_failure_discards_signed_response_state(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            destination = Path(temporary_directory) / "installed-worker"
+            expected_archive = b"expected archive bytes"
+            lock = release_lock(expected_archive, destination)
+            redirect = redirect_error(
+                lock["archive_url"],
+                302,
+                self.signed_location,
+            )
+            response = ReadErrorResponse(final_url=self.signed_location)
+            error = None
+
+            with patch(
+                "remote_worker.bootstrap.urlrequest.build_opener",
+                return_value=FakeOpener(redirect, response),
+            ):
+                try:
+                    Bootstrap(
+                        transport=HttpsTransport(timeout_seconds=7),
+                        exec_runner=RecordingExec(),
+                        allowed_destination=destination,
+                    ).run(lock)
+                except BootstrapError as caught:
+                    error = caught
+
+            self.assertIsNotNone(error)
+            self._assert_signed_target_is_not_retained(error)
+            self.assertTrue(redirect.fp.closed)
+            self.assertTrue(response.closed)
+            self.assertFalse(destination.exists())
 
     def test_redirected_non_200_discards_terminal_response_state(self):
         redirect = redirect_error(
@@ -418,6 +519,34 @@ class HttpsTransportTests(unittest.TestCase):
         self.assertTrue(redirect.fp.closed)
         self.assertTrue(response.closed)
 
+    def test_redirected_stream_detaches_signed_response_before_consumption(self):
+        redirect = redirect_error(
+            self.source_url,
+            302,
+            self.signed_location,
+        )
+        response = FakeResponse(
+            content=b"redirected",
+            final_url=self.signed_location,
+        )
+
+        stream = self._stream(FakeOpener(redirect, response))
+
+        chunks_frame = getattr(stream.chunks, "gi_frame", None)
+        if chunks_frame is not None:
+            retained_values = tuple(chunks_frame.f_locals.values())
+            self.assertFalse(
+                any(value is response for value in retained_values),
+                msg="returned chunks retain the signed terminal response",
+            )
+            for value in retained_values:
+                self.assertFalse(
+                    self.signed_location in repr(value),
+                    msg="returned chunks retain the signed target",
+                )
+        self.assertTrue(response.closed)
+        self.assertEqual(tuple(stream.chunks), (b"redirected",))
+
     def test_redirect_status_other_than_302_is_rejected(self):
         for code in (301, 303, 307, 308):
             with self.subTest(code=code):
@@ -487,6 +616,9 @@ class HttpsTransportTests(unittest.TestCase):
 
 
 class WorkerArtifactTests(unittest.TestCase):
+    def test_bootstrap_allowlist_matches_reviewed_artifact_members(self):
+        self.assertEqual(_REVIEWED_ARCHIVE_FILES, EXPECTED_FILES)
+
     def test_worker_artifact_is_byte_identical_allowlisted_and_normalized(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -794,6 +926,19 @@ class BootstrapTests(unittest.TestCase):
                     ).run(lock)
                 self.assertFalse(self.destination.exists())
 
+    def test_bootstrap_closes_download_iterator_after_early_rejection(self):
+        chunks = CloseTrackingChunks(self.archive + b"oversize")
+
+        with self.assertRaises(BootstrapError):
+            Bootstrap(
+                transport=FixedStreamTransport(chunks),
+                exec_runner=RecordingExec(),
+                allowed_destination=self.destination,
+            ).run(release_lock(self.archive, self.destination))
+
+        self.assertTrue(chunks.closed)
+        self.assertFalse(self.destination.exists())
+
     def test_bootstrap_rejects_archive_path_traversal(self):
         archive = malicious_archive("../escape.py")
 
@@ -806,6 +951,28 @@ class BootstrapTests(unittest.TestCase):
 
         self.assertFalse((self.root / "escape.py").exists())
         self.assertFalse(self.destination.exists())
+
+    def test_bootstrap_rejects_normalized_extra_remote_worker_members(self):
+        for index, name in enumerate(
+            (
+                "remote_worker/unreviewed.py",
+                "remote_worker/unreviewed.json",
+            )
+        ):
+            with self.subTest(name=name):
+                archive = archive_with_extra_file(self.archive, name)
+                destination = self.root / f"extra-member-{index}"
+                runner = RecordingExec()
+
+                with self.assertRaises(BootstrapError):
+                    Bootstrap(
+                        transport=FakeTransport(archive),
+                        exec_runner=runner,
+                        allowed_destination=destination,
+                    ).run(release_lock(archive, destination))
+
+                self.assertFalse(destination.exists())
+                self.assertIsNone(runner.argv)
 
 
 if __name__ == "__main__":

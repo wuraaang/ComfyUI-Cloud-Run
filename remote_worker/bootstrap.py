@@ -39,6 +39,27 @@ _LOCK_FIELDS = {
     "python_version",
     "destination",
 }
+_REVIEWED_ARCHIVE_FILES = frozenset(
+    {
+        "cloud_run/manifest.py",
+        "cloud_run/worker_protocol.py",
+        "remote_worker/Caddyfile",
+        "remote_worker/__init__.py",
+        "remote_worker/bootstrap.py",
+        "remote_worker/comfy.py",
+        "remote_worker/deadline.py",
+        "remote_worker/gateway.py",
+        "remote_worker/install.py",
+        "remote_worker/jobs.py",
+        "remote_worker/main.py",
+        "remote_worker/provision.py",
+        "remote_worker/server.py",
+        "remote_worker/state.py",
+        "remote_worker/template-policy.json",
+        "remote_worker/transfers.py",
+    }
+)
+_REVIEWED_ARCHIVE_DIRECTORIES = frozenset({"cloud_run", "remote_worker"})
 
 
 class BootstrapError(RuntimeError):
@@ -91,6 +112,8 @@ class HttpsTransport:
 
     def _stream_result(self, url):
         response = None
+        buffered = None
+        accepted = False
         try:
             opener = urlrequest.build_opener(
                 urlrequest.ProxyHandler({}),
@@ -149,25 +172,57 @@ class HttpsTransport:
                 not isinstance(encoding, str)
                 or encoding.casefold() != "identity"
             ):
-                _close_response(response)
                 return _TRANSPORT_REJECTED
+            buffered = tempfile.SpooledTemporaryFile(
+                max_size=1024 * 1024,
+                mode="w+b",
+            )
+            size = 0
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not isinstance(chunk, bytes):
+                    return _TRANSPORT_REJECTED
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > MAX_ARCHIVE_BYTES:
+                    return _TRANSPORT_REJECTED
+                buffered.write(chunk)
+            if size == 0:
+                return _TRANSPORT_REJECTED
+            buffered.flush()
+            buffered.seek(0)
+            accepted = True
         except urlerror.HTTPError as terminal_error:
             _close_response(terminal_error)
-            _close_response(response)
             return _TRANSPORT_REJECTED
         except Exception:
-            _close_response(response)
             return _TRANSPORT_REJECTED
+        finally:
+            _close_response(response)
+            response = None
+            if not accepted:
+                _close_response(buffered)
+                buffered = None
 
         def chunks():
+            nonlocal buffered
+            rejected = False
             try:
                 while True:
-                    chunk = response.read(1024 * 1024)
+                    chunk = buffered.read(1024 * 1024)
                     if not chunk:
                         break
                     yield chunk
+            except Exception:
+                rejected = True
             finally:
-                _close_response(response)
+                _close_response(buffered)
+                buffered = None
+            if rejected:
+                raise BootstrapError(
+                    "Reviewed worker archive is unavailable."
+                )
 
         return DownloadStream(
             source_url=url,
@@ -272,6 +327,7 @@ def _validated_members(archive):
         raise _bootstrap_error()
     records = []
     kinds = {}
+    observed_files = set()
     total = 0
     for member in members:
         relative = _archive_name(member.name)
@@ -299,6 +355,13 @@ def _validated_members(archive):
         else:
             raise _bootstrap_error()
         name = relative.as_posix()
+        if kind == "directory":
+            if name not in _REVIEWED_ARCHIVE_DIRECTORIES:
+                raise _bootstrap_error()
+        elif name not in _REVIEWED_ARCHIVE_FILES:
+            raise _bootstrap_error()
+        else:
+            observed_files.add(name)
         if name in kinds:
             raise _bootstrap_error()
         for parent in relative.parents:
@@ -310,6 +373,8 @@ def _validated_members(archive):
             raise _bootstrap_error()
         kinds[name] = kind
         records.append((relative, member, kind))
+    if observed_files != _REVIEWED_ARCHIVE_FILES:
+        raise _bootstrap_error()
     return tuple(records)
 
 
@@ -385,13 +450,6 @@ def _safe_extract(tar_path, destination):
 
 
 def _verify_layout(destination):
-    required = {
-        "remote_worker/__init__.py",
-        "remote_worker/gateway.py",
-        "remote_worker/main.py",
-        "cloud_run/manifest.py",
-        "cloud_run/worker_protocol.py",
-    }
     observed = set()
     try:
         for path in destination.rglob("*"):
@@ -400,20 +458,12 @@ def _verify_layout(destination):
             if stat.S_ISLNK(metadata.st_mode):
                 raise _bootstrap_error()
             if stat.S_ISDIR(metadata.st_mode):
+                if relative not in _REVIEWED_ARCHIVE_DIRECTORIES:
+                    raise _bootstrap_error()
                 continue
             if not stat.S_ISREG(metadata.st_mode):
                 raise _bootstrap_error()
-            if (
-                relative.startswith("remote_worker/")
-                and (
-                    relative.endswith(".py")
-                    or relative.endswith(".json")
-                    or relative == "remote_worker/Caddyfile"
-                )
-            ) or relative in {
-                "cloud_run/manifest.py",
-                "cloud_run/worker_protocol.py",
-            }:
+            if relative in _REVIEWED_ARCHIVE_FILES:
                 observed.add(relative)
             else:
                 raise _bootstrap_error()
@@ -421,7 +471,7 @@ def _verify_layout(destination):
         raise
     except (OSError, RuntimeError, ValueError):
         raise _bootstrap_error() from None
-    if not required.issubset(observed):
+    if observed != _REVIEWED_ARCHIVE_FILES:
         raise _bootstrap_error()
 
 
@@ -497,10 +547,12 @@ class Bootstrap:
             raise _bootstrap_error()
         digest = hashlib.sha256()
         size = 0
+        chunks = None
         try:
             with Path(path).open("xb") as destination:
                 os.chmod(path, 0o600)
-                for chunk in stream.chunks:
+                chunks = iter(stream.chunks)
+                for chunk in chunks:
                     if not isinstance(chunk, bytes) or not chunk:
                         raise _bootstrap_error()
                     size += len(chunk)
@@ -517,6 +569,8 @@ class Bootstrap:
             raise
         except (OSError, TypeError):
             raise _bootstrap_error() from None
+        finally:
+            _close_response(chunks)
         if (
             size != lock["worker_archive_size_bytes"]
             or digest.hexdigest() != lock["worker_archive_sha256"]
