@@ -35,7 +35,10 @@ class RepositoryContractTests(unittest.TestCase):
             ".gitignore",
             "scripts/check.sh",
             "scripts/build_worker_artifact.py",
+            "scripts/build_worker_release_bundle.py",
+            "scripts/render_worker_template.py",
             "scripts/validate_gold_output.py",
+            "scripts/write_worker_release_lock.py",
             "remote_worker/bootstrap.py",
             "remote_worker/gateway.py",
             "docs/remote-worker-bootstrap-review.md",
@@ -120,6 +123,7 @@ class RepositoryContractTests(unittest.TestCase):
         for required_text in (
             "[check] fake reusable session",
             "[check] worker protocol and artifact",
+            "[check] immutable worker release bundle",
             "[check] secret, origin, route, state, subprocess, and provider boundary scan",
             "[check] public artifact scan",
             "allowed_cloud_run_routes",
@@ -128,6 +132,8 @@ class RepositoryContractTests(unittest.TestCase):
             "expected_job_states",
             "expected_transfer_states",
             "allowed_provider_actions",
+            "reviewed_release_tool_paths",
+            "build_worker_release_bundle",
             "secret_patterns",
             'Path("tests/fixtures/native-model-metadata-workflow.json")',
         ):

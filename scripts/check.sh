@@ -70,6 +70,63 @@ with tempfile.TemporaryDirectory() as temporary_directory:
     print("[check] worker artifact sha256 " + first.sha256)
 PY
 
+echo "[check] immutable worker release bundle"
+PYTHONDONTWRITEBYTECODE=1 "$python_command" - <<'PY'
+import os
+from pathlib import Path
+import tempfile
+
+from scripts.build_worker_release_bundle import build_worker_release_bundle
+
+
+expected_metadata_fields = {
+    "schema_version",
+    "repository",
+    "worker_commit",
+    "tag",
+    "asset_name",
+    "archive_url",
+    "worker_archive_size_bytes",
+    "worker_archive_sha256",
+    "protocol_version",
+    "comfyui_core_version",
+    "comfyui_frontend_version",
+    "python_version",
+    "destination",
+}
+with tempfile.TemporaryDirectory() as temporary_directory:
+    root = Path(temporary_directory)
+    first_output = root / "first"
+    second_output = root / "second"
+    first_output.mkdir(mode=0o700)
+    second_output.mkdir(mode=0o700)
+    os.chmod(first_output, 0o700)
+    os.chmod(second_output, 0o700)
+    worker_commit = "a" * 40
+    first = build_worker_release_bundle(
+        Path.cwd(),
+        first_output,
+        worker_commit,
+    )
+    second = build_worker_release_bundle(
+        Path.cwd(),
+        second_output,
+        worker_commit,
+    )
+    if (
+        first.archive.read_bytes() != second.archive.read_bytes()
+        or first.metadata != second.metadata
+        or first.metadata_path.read_bytes()
+        != second.metadata_path.read_bytes()
+        or set(first.metadata.to_record()) != expected_metadata_fields
+    ):
+        raise SystemExit("[check] worker release bundle is not deterministic")
+    print(
+        "[check] worker release bundle sha256 "
+        + first.metadata.worker_archive_sha256
+    )
+PY
+
 echo "[check] synthetic Gold validator"
 PYTHONDONTWRITEBYTECODE=1 "$gold_python_command" -W error -m unittest \
   tests.python.test_gold_output_validation -v
@@ -357,10 +414,25 @@ if (
 ):
     fail("Remote Worker provider surface is not own-instance DELETE only")
 
+reviewed_release_tool_paths = [
+    Path("scripts/build_worker_release_bundle.py"),
+    Path("scripts/render_worker_template.py"),
+    Path("scripts/write_worker_release_lock.py"),
+]
+reviewed_worker_tool_paths = [
+    Path("remote_worker/gateway.py"),
+]
+if not all(
+    path.is_file()
+    for path in [*reviewed_release_tool_paths, *reviewed_worker_tool_paths]
+):
+    fail("reviewed worker tooling is unavailable")
+
 production_paths = [
     Path("__init__.py"),
     *sorted(Path("cloud_run").glob("*.py")),
     *sorted(Path("remote_worker").glob("*.py")),
+    *reviewed_release_tool_paths,
 ]
 frontend_paths = sorted(Path("web/js").glob("*.js"))
 for path in production_paths:
