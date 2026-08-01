@@ -15,6 +15,12 @@ from .constants import (
 )
 from .offers import offer_quality_key
 from .worker_release import WorkerRelease, WorkerReleaseError
+from .worker_protocol import (
+    BOUNDARY_TOKEN_ENVIRONMENT,
+    SESSION_ID_ENVIRONMENT,
+    is_boundary_token,
+    is_worker_session_id,
+)
 
 
 VAST_API_V0 = "https://console.vast.ai/api/v0"
@@ -581,6 +587,20 @@ def _validate_label(label):
     return value
 
 
+def _worker_environment(boundary_token, session_id):
+    if (
+        not is_boundary_token(boundary_token)
+        or not is_worker_session_id(session_id)
+    ):
+        raise VastConfigurationError(
+            "A valid worker boundary context is required."
+        )
+    return (
+        "-e " + BOUNDARY_TOKEN_ENVIRONMENT + "=" + boundary_token
+        + " -e " + SESSION_ID_ENVIRONMENT + "=" + session_id
+    )
+
+
 async def create_instance(
     api_key,
     *,
@@ -588,8 +608,11 @@ async def create_instance(
     disk_gb,
     label,
     release,
+    boundary_token,
+    session_id,
     session=None,
 ):
+    worker_environment = _worker_environment(boundary_token, session_id)
     if not isinstance(release, WorkerRelease):
         raise VastConfigurationError(
             "A reviewed worker release is required."
@@ -618,6 +641,7 @@ async def create_instance(
                     ),
                     "label": managed_label,
                     "disk": disk,
+                    "env": worker_environment,
                 },
             ) as response:
                 if response.status != 200:

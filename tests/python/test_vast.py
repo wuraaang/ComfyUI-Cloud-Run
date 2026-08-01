@@ -758,6 +758,8 @@ class VastLifecycleRequestTests(unittest.TestCase):
                 disk_gb=96,
                 label="comfy-cloud-run-session-1",
                 release=worker_release(),
+                boundary_token="a" * 64,
+                session_id="session-1",
                 session=session,
             )
         )
@@ -776,6 +778,10 @@ class VastLifecycleRequestTests(unittest.TestCase):
                         "template_hash_id": "1" * 32,
                         "label": "comfy-cloud-run-session-1",
                         "disk": 96,
+                        "env": (
+                            "-e CLOUD_RUN_BOUNDARY_TOKEN=" + "a" * 64
+                            + " -e CLOUD_RUN_SESSION_ID=session-1"
+                        ),
                     },
                 },
             )
@@ -793,10 +799,42 @@ class VastLifecycleRequestTests(unittest.TestCase):
                     disk_gb=80,
                     label="comfy-cloud-run-attempt-1",
                     release=None,
+                    boundary_token="a" * 64,
+                    session_id="attempt-1",
                     session=session,
                 )
             )
         self.assertEqual(session.calls, [])
+
+    def test_create_rejects_invalid_worker_boundary_before_request(self):
+        from cloud_run.vast import VastConfigurationError, create_instance
+
+        cases = (
+            ("A" * 64, "session-1"),
+            ("a" * 63, "session-1"),
+            ("a" * 64, "session/1"),
+            ("a" * 64, ""),
+        )
+        for boundary_token, session_id in cases:
+            with self.subTest(
+                boundary_token=boundary_token,
+                session_id=session_id,
+            ):
+                session = FakeSession(FakeResponse(200, {}))
+                with self.assertRaises(VastConfigurationError):
+                    asyncio.run(
+                        create_instance(
+                            "synthetic-value",
+                            offer_id=42,
+                            disk_gb=80,
+                            label="comfy-cloud-run-attempt-1",
+                            release=worker_release(),
+                            boundary_token=boundary_token,
+                            session_id=session_id,
+                            session=session,
+                        )
+                    )
+                self.assertEqual(session.calls, [])
 
     def test_create_rejects_non_integer_or_out_of_range_disk_before_request(self):
         from cloud_run.vast import VastConfigurationError, create_instance
@@ -812,6 +850,8 @@ class VastLifecycleRequestTests(unittest.TestCase):
                             disk_gb=disk_gb,
                             label="comfy-cloud-run-session-1",
                             release=worker_release(),
+                            boundary_token="a" * 64,
+                            session_id="session-1",
                             session=session,
                         )
                     )
@@ -901,6 +941,8 @@ class VastLifecycleRequestTests(unittest.TestCase):
                     disk_gb=80,
                     label="comfy-cloud-run-attempt-1",
                     release=worker_release(),
+                    boundary_token="a" * 64,
+                    session_id="attempt-1",
                     session=FakeSession(response),
                 )
             )
@@ -933,6 +975,8 @@ class VastLifecycleRequestTests(unittest.TestCase):
                             disk_gb=80,
                             label="comfy-cloud-run-attempt-1",
                             release=worker_release(),
+                            boundary_token="a" * 64,
+                            session_id="attempt-1",
                             session=FakeSession(
                                 FakeResponse(status, {"error": marker})
                             ),

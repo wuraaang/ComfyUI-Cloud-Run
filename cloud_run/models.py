@@ -483,7 +483,7 @@ class CloudSession:
     instance_id: str | None
     worker_base_url: str | None
     provider_token: str | None = field(repr=False)
-    session_secret_hex: str | None
+    session_secret_hex: str | None = field(repr=False)
     deadline_at: float | None
     deadline_mode: str
     disk_gb: int

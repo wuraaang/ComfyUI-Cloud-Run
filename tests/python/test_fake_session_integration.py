@@ -116,9 +116,21 @@ class DeterministicClock:
         return self.value
 
 
+class PrivateBoundaryContext:
+    __slots__ = ("boundary_token", "session_id")
+
+    def __init__(self, boundary_token, session_id):
+        self.boundary_token = boundary_token
+        self.session_id = session_id
+
+    def __repr__(self):
+        return "PrivateBoundaryContext(<redacted>)"
+
+
 class FakeVastProvider:
     def __init__(self):
         self.create_count = 0
+        self.create_boundaries = []
         self.destroy_count = 0
         self.search_count = 0
         self.get_offer_count = 0
@@ -214,8 +226,13 @@ class FakeVastProvider:
         disk_gb,
         label,
         release,
+        boundary_token,
+        session_id,
     ):
         del disk_gb, release
+        self.create_boundaries.append(
+            PrivateBoundaryContext(boundary_token, session_id)
+        )
         if any(
             instance.get("label") == label
             for instance in self.inventory

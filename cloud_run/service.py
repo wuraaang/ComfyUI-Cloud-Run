@@ -94,6 +94,8 @@ class VastProvider:
         disk_gb,
         label,
         release,
+        boundary_token,
+        session_id,
     ):
         return await vast.create_instance(
             api_key,
@@ -101,6 +103,8 @@ class VastProvider:
             disk_gb=disk_gb,
             label=label,
             release=release,
+            boundary_token=boundary_token,
+            session_id=session_id,
         )
 
     async def list_instances(self, api_key):
@@ -652,6 +656,7 @@ class CloudRunService:
                 session.transition(
                     SessionState.CREATING,
                     now=float(self.clock()),
+                    provider_token=secrets.token_hex(32),
                     session_secret_hex=secrets.token_hex(32),
                     sanitized_error=None,
                 )
@@ -665,6 +670,8 @@ class CloudRunService:
                 disk_gb=session.quote.disk_gb,
                 label=session.label,
                 release=release,
+                boundary_token=session.provider_token,
+                session_id=session.session_id,
             )
         except Exception as error:
             reconciled = await self._instance_for_label(
@@ -955,6 +962,7 @@ class CloudRunService:
                 attempt.transition(
                     AttemptState.CREATING,
                     now=float(self.clock()),
+                    provider_token=secrets.token_hex(32),
                 )
             )
         except ConcurrentAttemptUpdate:
@@ -967,6 +975,8 @@ class CloudRunService:
                 disk_gb=self.disk_gb,
                 label=attempt.label,
                 release=release,
+                boundary_token=attempt.provider_token,
+                session_id=attempt.attempt_id,
             )
         except Exception as error:
             reconciled = await self._instance_for_label(

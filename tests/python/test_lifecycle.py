@@ -116,6 +116,17 @@ class FakeClock:
         self.now += float(seconds)
 
 
+class PrivateBoundaryContext:
+    __slots__ = ("boundary_token", "session_id")
+
+    def __init__(self, boundary_token, session_id):
+        self.boundary_token = boundary_token
+        self.session_id = session_id
+
+    def __repr__(self):
+        return "PrivateBoundaryContext(<redacted>)"
+
+
 class FakeProvider:
     def __init__(self):
         self.instances = []
@@ -126,6 +137,7 @@ class FakeProvider:
         self.list_error = None
         self.get_error = None
         self.calls = []
+        self.create_boundaries = []
 
     async def search_offers(
         self,
@@ -179,9 +191,14 @@ class FakeProvider:
         disk_gb,
         label,
         release,
+        boundary_token,
+        session_id,
     ):
         self.calls.append(
             ("create", offer_id, disk_gb, label, api_key, release)
+        )
+        self.create_boundaries.append(
+            PrivateBoundaryContext(boundary_token, session_id)
         )
         return self.create_result
 
@@ -378,6 +395,8 @@ class CancellationAndReadinessTests(LifecycleTestCase):
                 disk_gb,
                 label,
                 release,
+                boundary_token,
+                session_id,
             ):
                 self.provider.calls.append(
                     (
@@ -388,6 +407,9 @@ class CancellationAndReadinessTests(LifecycleTestCase):
                         api_key,
                         release,
                     )
+                )
+                self.provider.create_boundaries.append(
+                    PrivateBoundaryContext(boundary_token, session_id)
                 )
                 create_started.set()
                 await release_create.wait()
@@ -1490,6 +1512,8 @@ class SessionLifecycleTests(LifecycleTestCase):
                 disk_gb=session.disk_gb,
                 label=session.label,
                 release=worker_release(),
+                boundary_token="a" * 64,
+                session_id=session.session_id,
             )
         )
         initial_create_count = len(

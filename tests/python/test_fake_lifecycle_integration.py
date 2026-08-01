@@ -30,9 +30,21 @@ def worker_release():
     )
 
 
+class PrivateBoundaryContext:
+    __slots__ = ("boundary_token", "session_id")
+
+    def __init__(self, boundary_token, session_id):
+        self.boundary_token = boundary_token
+        self.session_id = session_id
+
+    def __repr__(self):
+        return "PrivateBoundaryContext(<redacted>)"
+
+
 class OfflineVast:
     def __init__(self):
         self.create_count = 0
+        self.create_boundaries = []
         self.destroy_count = 0
         self.instances = []
         self.offer = {
@@ -90,9 +102,14 @@ class OfflineVast:
         disk_gb,
         label,
         release,
+        boundary_token,
+        session_id,
     ):
         self.create_count += 1
         self.asserted_create = (str(offer_id), disk_gb, label)
+        self.create_boundaries.append(
+            PrivateBoundaryContext(boundary_token, session_id)
+        )
         self.instances = [
             {
                 "instance_id": "900",

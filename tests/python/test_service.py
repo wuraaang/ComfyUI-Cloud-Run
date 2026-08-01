@@ -8,6 +8,7 @@ from cloud_run.models import AttemptState, SessionState
 from cloud_run.repository import AttemptRepository, SessionRepository
 from cloud_run.vast import VastError
 from cloud_run.worker_release import WorkerRelease
+from cloud_run.worker_protocol import is_boundary_token
 
 
 _DEFAULT_RELEASE = object()
@@ -72,6 +73,17 @@ class FakeSettings:
         }
 
 
+class PrivateBoundaryContext:
+    __slots__ = ("boundary_token", "session_id")
+
+    def __init__(self, boundary_token, session_id):
+        self.boundary_token = boundary_token
+        self.session_id = session_id
+
+    def __repr__(self):
+        return "PrivateBoundaryContext(<redacted>)"
+
+
 class FakeProvider:
     def __init__(self, searches=None, lookups=None):
         self.searches = list(searches or [[offer()]])
@@ -132,18 +144,21 @@ class FakeProvider:
         disk_gb,
         label,
         release,
+        boundary_token,
+        session_id,
     ):
-        self.create_calls.append(
-            {
-                "api_key": api_key,
-                "offer_id": offer_id,
-                "disk_gb": disk_gb,
-                "label": label,
-                "release": release,
-            }
-        )
+        boundary = PrivateBoundaryContext(boundary_token, session_id)
+        call = {
+            "api_key": api_key,
+            "offer_id": offer_id,
+            "disk_gb": disk_gb,
+            "label": label,
+            "release": release,
+            "worker_boundary": boundary,
+        }
+        self.create_calls.append(call)
         if self.on_create is not None:
-            self.on_create(label)
+            self.on_create(call)
         if self.create_error is not None:
             raise self.create_error
         return self.create_result
@@ -370,16 +385,32 @@ class CloudRunServiceTests(unittest.TestCase):
             )
         )
 
-        def assert_persisted_before_create(label):
+        def assert_persisted_before_create(call):
             persisted = self.session_repository.get(quoted.session_id)
-            self.assertEqual(persisted.label, label)
+            self.assertEqual(persisted.label, call["label"])
             self.assertEqual(persisted.state.value, "creating")
             self.assertEqual(
                 persisted.idempotency_key,
                 "session-idem-create",
             )
             self.assertEqual(persisted.manifest_digest, "c" * 64)
+            self.assertTrue(is_boundary_token(persisted.provider_token))
             self.assertEqual(len(persisted.session_secret_hex), 64)
+            self.assertTrue(
+                is_boundary_token(persisted.session_secret_hex)
+            )
+            self.assertTrue(
+                persisted.provider_token
+                != persisted.session_secret_hex
+            )
+            self.assertTrue(
+                call["worker_boundary"].boundary_token
+                == persisted.provider_token
+            )
+            self.assertTrue(
+                call["worker_boundary"].session_id
+                == persisted.session_id
+            )
 
         provider.on_create = assert_persisted_before_create
         started = asyncio.run(
@@ -399,6 +430,20 @@ class CloudRunServiceTests(unittest.TestCase):
         self.assertEqual(started.instance_id, "instance-9")
         self.assertEqual(duplicate.session_id, started.session_id)
         self.assertEqual(len(provider.create_calls), 1)
+        boundary_token = provider.create_calls[0][
+            "worker_boundary"
+        ].boundary_token
+        session_secret_hex = started.session_secret_hex
+        self.assertTrue(duplicate.provider_token == boundary_token)
+        for public_value in (
+            started.public_payload(),
+            duplicate.public_payload(),
+            repr(started),
+            repr(provider),
+        ):
+            rendered = repr(public_value)
+            self.assertFalse(boundary_token in rendered)
+            self.assertFalse(session_secret_hex in rendered)
         self.assertIs(
             provider.create_calls[0]["release"],
             service.release,
@@ -495,6 +540,21 @@ class CloudRunServiceTests(unittest.TestCase):
         self.assertEqual(reconciled.quote.max_instance_creates, 1)
         self.assertEqual(duplicate, reconciled)
         self.assertEqual(len(provider.create_calls), 1)
+        boundary_token = provider.create_calls[0][
+            "worker_boundary"
+        ].boundary_token
+        session_secret_hex = reconciled.session_secret_hex
+        self.assertTrue(reconciled.provider_token == boundary_token)
+        self.assertTrue(duplicate.provider_token == boundary_token)
+        for public_value in (
+            reconciled.public_payload(),
+            duplicate.public_payload(),
+            reconciled.sanitized_error,
+            repr(provider),
+        ):
+            rendered = repr(public_value)
+            self.assertFalse(boundary_token in rendered)
+            self.assertFalse(session_secret_hex in rendered)
 
     def test_concurrent_paid_confirmations_issue_exactly_one_create(self):
         async def scenario():
@@ -549,6 +609,19 @@ class CloudRunServiceTests(unittest.TestCase):
         self.assertEqual(first.state.value, "bootstrapping")
         self.assertEqual(second.state.value, "bootstrapping")
         self.assertEqual(len(provider.create_calls), 1)
+        call = provider.create_calls[0]
+        self.assertTrue(
+            call["worker_boundary"].boundary_token
+            == first.provider_token
+        )
+        self.assertTrue(
+            call["worker_boundary"].boundary_token
+            == second.provider_token
+        )
+        self.assertTrue(
+            call["worker_boundary"].session_id == first.session_id
+        )
+        self.assertTrue(first.provider_token != first.session_secret_hex)
 
     def test_destroy_requested_during_create_is_finished_by_the_creator(self):
         async def scenario():
@@ -926,11 +999,20 @@ class CloudRunServiceTests(unittest.TestCase):
             )
         )
 
-        def assert_persisted_before_create(label):
+        def assert_persisted_before_create(call):
             persisted = self.repository.get(preview.attempt_id)
-            self.assertEqual(persisted.label, label)
+            self.assertEqual(persisted.label, call["label"])
             self.assertEqual(persisted.state, AttemptState.CREATING)
             self.assertEqual(persisted.idempotency_key, "idem-create")
+            self.assertTrue(is_boundary_token(persisted.provider_token))
+            self.assertTrue(
+                call["worker_boundary"].boundary_token
+                == persisted.provider_token
+            )
+            self.assertTrue(
+                call["worker_boundary"].session_id
+                == persisted.attempt_id
+            )
 
         provider.on_create = assert_persisted_before_create
         started = asyncio.run(
@@ -950,7 +1032,14 @@ class CloudRunServiceTests(unittest.TestCase):
         self.assertEqual(started.instance_id, "instance-9")
         self.assertEqual(duplicate.attempt_id, started.attempt_id)
         self.assertEqual(len(provider.create_calls), 1)
+        boundary_token = provider.create_calls[0][
+            "worker_boundary"
+        ].boundary_token
+        self.assertTrue(duplicate.provider_token == boundary_token)
         self.assertNotIn("synthetic-value", repr(started.public_payload()))
+        self.assertFalse(boundary_token in repr(started.public_payload()))
+        self.assertFalse(boundary_token in repr(started))
+        self.assertFalse(boundary_token in repr(provider))
 
     def test_ambiguous_create_is_reconciled_by_unique_label_without_retry(self):
         provider = FakeProvider(lookups=[offer(), offer()])
