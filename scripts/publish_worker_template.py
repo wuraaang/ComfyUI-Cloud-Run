@@ -369,7 +369,12 @@ def _normalize_lookup(payload, row_normalizer):
     return [row_normalizer(row) for row in templates]
 
 
-def _private_path(path, *, require_directory=False):
+def _private_path(
+    path,
+    *,
+    require_directory=False,
+    require_writable=False,
+):
     candidate = Path(path)
     try:
         metadata = os.lstat(candidate)
@@ -381,6 +386,7 @@ def _private_path(path, *, require_directory=False):
         or stat.S_ISLNK(metadata.st_mode)
         or metadata.st_uid != os.getuid()
         or metadata.st_mode & 0o077
+        or (require_writable and not metadata.st_mode & stat.S_IWUSR)
     ):
         _fail()
     return candidate
@@ -588,45 +594,103 @@ def _create_identity(payload, expected_name):
     return template["id"], template["hash_id"]
 
 
-def _write_private_record(output_directory, name, payload):
-    directory = _private_path(output_directory, require_directory=True)
-    destination = directory / name
-    if destination.exists() or destination.is_symlink():
-        _fail()
+def _write_all(descriptor, content):
+    offset = 0
+    while offset < len(content):
+        written = os.write(descriptor, content[offset:])
+        if written <= 0:
+            raise OSError("private record write made no progress")
+        offset += written
+
+
+def _fsync_directory(directory):
     descriptor = None
-    temporary_path = None
     try:
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix="." + name + ".",
-            suffix=".part",
-            dir=str(directory),
-        )
-        temporary_path = Path(temporary_name)
-        content = _compact_json(payload) + b"\n"
-        os.fchmod(descriptor, 0o600)
-        os.write(descriptor, content)
+        flags = os.O_RDONLY
+        if hasattr(os, "O_DIRECTORY"):
+            flags |= os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(directory, flags)
         os.fsync(descriptor)
-        os.close(descriptor)
-        descriptor = None
-        os.link(temporary_path, destination)
-        temporary_path.unlink()
-        temporary_path = None
-        return destination
-    except TemplatePublicationError:
-        raise
-    except OSError:
-        _fail()
     finally:
         if descriptor is not None:
+            os.close(descriptor)
+
+
+class _PrivateRecordWriter:
+    def __init__(self, output_directory, name):
+        self.directory = _private_path(
+            output_directory,
+            require_directory=True,
+            require_writable=True,
+        )
+        self.destination = self.directory / name
+        self.descriptor = None
+        self.temporary_path = None
+        try:
             try:
-                os.close(descriptor)
+                os.lstat(self.destination)
+            except FileNotFoundError:
+                pass
+            else:
+                _fail()
+            self.descriptor, temporary_name = tempfile.mkstemp(
+                prefix="." + name + ".",
+                suffix=".part",
+                dir=str(self.directory),
+            )
+            self.temporary_path = Path(temporary_name)
+            os.fchmod(self.descriptor, 0o600)
+        except TemplatePublicationError:
+            self.close()
+            raise
+        except OSError:
+            self.close()
+            _fail()
+
+    def publish(self, payload):
+        try:
+            content = _compact_json(payload) + b"\n"
+            _write_all(self.descriptor, content)
+            os.fsync(self.descriptor)
+            os.close(self.descriptor)
+            self.descriptor = None
+            os.link(
+                self.temporary_path,
+                self.destination,
+                follow_symlinks=False,
+            )
+            self.temporary_path.unlink()
+            self.temporary_path = None
+            _fsync_directory(self.directory)
+            return self.destination
+        except TemplatePublicationError:
+            raise
+        except OSError:
+            _fail()
+
+    def close(self):
+        if self.descriptor is not None:
+            try:
+                os.close(self.descriptor)
             except OSError:
                 pass
-        if temporary_path is not None:
+            self.descriptor = None
+        if self.temporary_path is not None:
             try:
-                temporary_path.unlink()
+                self.temporary_path.unlink()
             except OSError:
                 pass
+            self.temporary_path = None
+
+
+def _write_private_record(output_directory, name, payload):
+    writer = _PrivateRecordWriter(output_directory, name)
+    try:
+        return writer.publish(payload)
+    finally:
+        writer.close()
 
 
 def audit_base_template(
@@ -677,57 +741,60 @@ def publish_worker_template(
     api_key = _credential(settings_path_resolver)
     client = transport if transport is not None else VastTemplateTransport()
     name = template_payload["name"]
+    writer = _PrivateRecordWriter(
+        output_directory,
+        "template-publication.json",
+    )
     try:
-        if client.lookup_name(api_key, name):
-            _fail()
-    except TemplatePublicationError:
-        raise
-    except Exception:
-        _fail()
-
-    template_id = None
-    template_hash_id = None
-    try:
-        template_id, template_hash_id = _create_identity(
-            client.create_worker_template(api_key, template_payload),
-            name,
-        )
-    except Exception:
         try:
-            reconciled = client.lookup_name(api_key, name)
-            if len(reconciled) != 1 or not _matches_request(
-                reconciled[0], template_payload
-            ):
+            if client.lookup_name(api_key, name):
                 _fail()
-            template_id = reconciled[0]["id"]
-            template_hash_id = reconciled[0]["hash_id"]
+        except TemplatePublicationError:
+            raise
         except Exception:
             _fail()
 
-    try:
-        verified = client.lookup_hash(api_key, template_hash_id)
-        if (
-            len(verified) != 1
-            or verified[0]["id"] != template_id
-            or verified[0]["hash_id"] != template_hash_id
-            or not _matches_request(verified[0], template_payload)
-        ):
+        template_id = None
+        template_hash_id = None
+        try:
+            template_id, template_hash_id = _create_identity(
+                client.create_worker_template(api_key, template_payload),
+                name,
+            )
+        except Exception:
+            try:
+                reconciled = client.lookup_name(api_key, name)
+                if len(reconciled) != 1 or not _matches_request(
+                    reconciled[0], template_payload
+                ):
+                    _fail()
+                template_id = reconciled[0]["id"]
+                template_hash_id = reconciled[0]["hash_id"]
+            except Exception:
+                _fail()
+
+        try:
+            verified = client.lookup_hash(api_key, template_hash_id)
+            if (
+                len(verified) != 1
+                or verified[0]["id"] != template_id
+                or verified[0]["hash_id"] != template_hash_id
+                or not _matches_request(verified[0], template_payload)
+            ):
+                _fail()
+            record = {
+                "id": template_id,
+                "hash_id": template_hash_id,
+                "verified": True,
+            }
+            writer.publish(record)
+            return record
+        except TemplatePublicationError:
+            raise
+        except Exception:
             _fail()
-        record = {
-            "id": template_id,
-            "hash_id": template_hash_id,
-            "verified": True,
-        }
-        _write_private_record(
-            output_directory,
-            "template-publication.json",
-            record,
-        )
-        return record
-    except TemplatePublicationError:
-        raise
-    except Exception:
-        _fail()
+    finally:
+        writer.close()
 
 
 def main(argv=None):

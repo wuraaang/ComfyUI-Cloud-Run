@@ -628,6 +628,103 @@ class WorkerTemplateApiTests(unittest.TestCase):
         body = json.loads(opener.calls[1][0].data)
         self.assertEqual(body, request)
 
+    def test_publish_rejects_unusable_record_destination_before_http(self):
+        with tempfile.TemporaryDirectory() as root:
+            settings, output, request_path = self._private_inputs(root)
+            public = Path(root) / "public"
+            public.mkdir(mode=0o755)
+            os.chmod(public, 0o755)
+            read_only = Path(root) / "read-only"
+            read_only.mkdir(mode=0o500)
+            os.chmod(read_only, 0o500)
+            symlink = Path(root) / "output-link"
+            symlink.symlink_to(output, target_is_directory=True)
+            existing_output = Path(root) / "existing-output"
+            existing_output.mkdir(mode=0o700)
+            os.chmod(existing_output, 0o700)
+            existing = existing_output / "template-publication.json"
+            existing.write_bytes(b"existing")
+            os.chmod(existing, 0o600)
+
+            for candidate in (
+                Path(root) / "missing",
+                public,
+                read_only,
+                symlink,
+                existing_output,
+            ):
+                with self.subTest(candidate=candidate.name):
+                    opener = FakeOpener([])
+                    with self.assertRaises(TemplatePublicationError):
+                        publish_worker_template(
+                            request_path,
+                            candidate,
+                            settings_path_resolver=lambda: settings,
+                            transport=VastTemplateTransport(opener=opener),
+                        )
+                    self.assertEqual(opener.calls, [])
+            self.assertEqual(existing.read_bytes(), b"existing")
+
+    def test_publish_record_handles_partial_writes_and_fsyncs_parent(self):
+        request = template_request()
+        opener = FakeOpener(
+            [
+                FakeResponse(
+                    {"success": True, "templates_found": 0, "templates": []}
+                ),
+                FakeResponse(
+                    {
+                        "success": True,
+                        "msg": "created",
+                        "template": {
+                            "id": 17,
+                            "name": NAME,
+                            "hash_id": HASH_ID,
+                        },
+                    }
+                ),
+                FakeResponse(
+                    {
+                        "success": True,
+                        "templates_found": 1,
+                        "templates": [template_row(request)],
+                    }
+                ),
+            ]
+        )
+        real_write = os.write
+        real_fsync = os.fsync
+        fsync_types = []
+
+        def partial_write(descriptor, content):
+            return real_write(descriptor, content[:7])
+
+        def recording_fsync(descriptor):
+            fsync_types.append(stat.S_IFMT(os.fstat(descriptor).st_mode))
+            return real_fsync(descriptor)
+
+        with tempfile.TemporaryDirectory() as root:
+            settings, output, request_path = self._private_inputs(root)
+            with mock.patch(
+                "scripts.publish_worker_template.os.write",
+                side_effect=partial_write,
+            ), mock.patch(
+                "scripts.publish_worker_template.os.fsync",
+                side_effect=recording_fsync,
+            ):
+                result = publish_worker_template(
+                    request_path,
+                    output,
+                    settings_path_resolver=lambda: settings,
+                    transport=VastTemplateTransport(opener=opener),
+                )
+
+            artifact = output / "template-publication.json"
+            self.assertEqual(json.loads(artifact.read_text()), result)
+            self.assertEqual(tuple(output.glob(".template-publication.json.*.part")), ())
+        self.assertIn(stat.S_IFREG, fsync_types)
+        self.assertIn(stat.S_IFDIR, fsync_types)
+
     def test_publish_rejects_legacy_schema_before_http(self):
         invalid_requests = (
             {**template_request(), "runtype": "jupyter_direc ssh_direc"},
