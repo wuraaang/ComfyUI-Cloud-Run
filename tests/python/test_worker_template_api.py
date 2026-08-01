@@ -725,6 +725,168 @@ class WorkerTemplateApiTests(unittest.TestCase):
         self.assertIn(stat.S_IFREG, fsync_types)
         self.assertIn(stat.S_IFDIR, fsync_types)
 
+    def test_publish_intent_allows_only_one_overlapping_post(self):
+        request = template_request()
+        second_results = []
+        second_errors = []
+        with tempfile.TemporaryDirectory() as root:
+            settings, output, request_path = self._private_inputs(root)
+            second_output = Path(root) / "second-output"
+            second_output.mkdir(mode=0o700)
+            os.chmod(second_output, 0o700)
+            second_opener = FakeOpener(
+                [
+                    FakeResponse(
+                        {
+                            "success": True,
+                            "templates_found": 0,
+                            "templates": [],
+                        }
+                    ),
+                    FakeResponse(
+                        {
+                            "success": True,
+                            "msg": "created",
+                            "template": {
+                                "id": 17,
+                                "name": NAME,
+                                "hash_id": HASH_ID,
+                            },
+                        }
+                    ),
+                    FakeResponse(
+                        {
+                            "success": True,
+                            "templates_found": 1,
+                            "templates": [template_row(request)],
+                        }
+                    ),
+                ]
+            )
+
+            class OverlappingTransport:
+                def __init__(self):
+                    self.post_calls = 0
+
+                def lookup_name(self, api_key, name):
+                    return []
+
+                def create_worker_template(self, api_key, template_payload):
+                    self.post_calls += 1
+                    try:
+                        second_results.append(
+                            publish_worker_template(
+                                request_path,
+                                second_output,
+                                settings_path_resolver=lambda: settings,
+                                transport=VastTemplateTransport(
+                                    opener=second_opener
+                                ),
+                            )
+                        )
+                    except TemplatePublicationError as exception:
+                        second_errors.append(exception)
+                    return {
+                        "success": True,
+                        "msg": "created",
+                        "template": {
+                            "id": 17,
+                            "name": NAME,
+                            "hash_id": HASH_ID,
+                        },
+                    }
+
+                def lookup_hash(self, api_key, hash_id):
+                    return [template_row(request)]
+
+            transport = OverlappingTransport()
+            result = publish_worker_template(
+                request_path,
+                output,
+                settings_path_resolver=lambda: settings,
+                transport=transport,
+            )
+
+            self.assertEqual(result["hash_id"], HASH_ID)
+            self.assertEqual(transport.post_calls, 1)
+            self.assertEqual(second_results, [])
+            self.assertEqual(len(second_errors), 1)
+            self.assertEqual(second_opener.calls, [])
+            self.assertFalse(
+                (second_output / "template-publication.json").exists()
+            )
+            self.assertEqual(
+                tuple(settings.parent.glob(".template-publication-*.intent")),
+                (),
+            )
+
+    def test_ambiguous_post_intent_blocks_restart_from_posting_again(self):
+        first_opener = FakeOpener(
+            [
+                FakeResponse(
+                    {"success": True, "templates_found": 0, "templates": []}
+                ),
+                OSError("ambiguous " + KEY),
+                OSError("still ambiguous " + KEY),
+            ]
+        )
+        second_opener = FakeOpener(
+            [
+                FakeResponse(
+                    {"success": True, "templates_found": 0, "templates": []}
+                ),
+                FakeResponse(
+                    {
+                        "success": True,
+                        "msg": "created",
+                        "template": {
+                            "id": 17,
+                            "name": NAME,
+                            "hash_id": HASH_ID,
+                        },
+                    }
+                ),
+                FakeResponse(
+                    {
+                        "success": True,
+                        "templates_found": 1,
+                        "templates": [template_row()],
+                    }
+                ),
+            ]
+        )
+        with tempfile.TemporaryDirectory() as root:
+            settings, output, request_path = self._private_inputs(root)
+            with self.assertRaises(TemplatePublicationError):
+                publish_worker_template(
+                    request_path,
+                    output,
+                    settings_path_resolver=lambda: settings,
+                    transport=VastTemplateTransport(opener=first_opener),
+                )
+            with self.assertRaises(TemplatePublicationError):
+                publish_worker_template(
+                    request_path,
+                    output,
+                    settings_path_resolver=lambda: settings,
+                    transport=VastTemplateTransport(opener=second_opener),
+                )
+
+            intents = tuple(
+                settings.parent.glob(".template-publication-*.intent")
+            )
+            self.assertEqual(len(intents), 1)
+            self.assertEqual(stat.S_IMODE(intents[0].stat().st_mode), 0o600)
+            self.assertEqual(second_opener.calls, [])
+            self.assertEqual(
+                tuple(output.glob(".template-publication.json.*.part")),
+                (),
+            )
+        self.assertEqual(
+            [call[0].method for call in first_opener.calls],
+            ["GET", "POST", "GET"],
+        )
+
     def test_publish_rejects_legacy_schema_before_http(self):
         invalid_requests = (
             {**template_request(), "runtype": "jupyter_direc ssh_direc"},

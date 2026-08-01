@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -470,7 +471,7 @@ def _credential(settings_path_resolver):
         or any(ord(character) < 33 or ord(character) > 126 for character in key)
     ):
         _fail()
-    return key
+    return key, Path(settings_path)
 
 
 def _resolved_settings_path():
@@ -618,6 +619,118 @@ def _fsync_directory(directory):
             os.close(descriptor)
 
 
+class _PublicationIntent:
+    def __init__(self, settings_path, template_name, template_payload):
+        name_match = (
+            _NAME.fullmatch(template_name)
+            if isinstance(template_name, str)
+            else None
+        )
+        if name_match is None:
+            _fail()
+        self.directory = _private_path(
+            Path(settings_path).parent,
+            require_directory=True,
+            require_writable=True,
+        )
+        self.path = self.directory / (
+            ".template-publication-" + name_match.group(1) + ".intent"
+        )
+        self.identity = None
+        self.mutation_started = False
+        self.removed = False
+        descriptor = None
+        created = False
+        try:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            descriptor = os.open(self.path, flags, 0o600)
+            created = True
+            os.fchmod(descriptor, 0o600)
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+                or metadata.st_nlink != 1
+            ):
+                _fail()
+            self.identity = (metadata.st_dev, metadata.st_ino)
+            content = _compact_json(
+                {
+                    "schema_version": 1,
+                    "name": template_name,
+                    "request_sha256": hashlib.sha256(
+                        _compact_json(template_payload)
+                    ).hexdigest(),
+                }
+            ) + b"\n"
+            _write_all(descriptor, content)
+            os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = None
+            _fsync_directory(self.directory)
+        except TemplatePublicationError:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            if created:
+                try:
+                    self.path.unlink()
+                    _fsync_directory(self.directory)
+                except OSError:
+                    pass
+            raise
+        except OSError:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            if created:
+                try:
+                    self.path.unlink()
+                    _fsync_directory(self.directory)
+                except OSError:
+                    pass
+            _fail()
+
+    def mark_mutation_started(self):
+        self.mutation_started = True
+
+    def _remove(self):
+        if self.removed:
+            return
+        try:
+            metadata = os.lstat(self.path)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or stat.S_ISLNK(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+                or metadata.st_nlink != 1
+                or (metadata.st_dev, metadata.st_ino) != self.identity
+            ):
+                _fail()
+            self.path.unlink()
+            self.removed = True
+            _fsync_directory(self.directory)
+        except TemplatePublicationError:
+            raise
+        except OSError:
+            _fail()
+
+    def complete(self):
+        self._remove()
+
+    def close(self):
+        if not self.mutation_started and not self.removed:
+            self._remove()
+
+
 class _PrivateRecordWriter:
     def __init__(self, output_directory, name):
         self.directory = _private_path(
@@ -699,7 +812,7 @@ def audit_base_template(
     settings_path_resolver=_resolved_settings_path,
     transport=None,
 ):
-    api_key = _credential(settings_path_resolver)
+    api_key, _settings_path = _credential(settings_path_resolver)
     client = transport if transport is not None else VastTemplateTransport()
     try:
         matches = client.lookup_base(api_key)
@@ -738,7 +851,7 @@ def publish_worker_template(
     transport=None,
 ):
     template_payload = _validate_request(_read_private_json(request_file))
-    api_key = _credential(settings_path_resolver)
+    api_key, settings_path = _credential(settings_path_resolver)
     client = transport if transport is not None else VastTemplateTransport()
     name = template_payload["name"]
     writer = _PrivateRecordWriter(
@@ -746,53 +859,59 @@ def publish_worker_template(
         "template-publication.json",
     )
     try:
+        intent = _PublicationIntent(settings_path, name, template_payload)
         try:
-            if client.lookup_name(api_key, name):
-                _fail()
-        except TemplatePublicationError:
-            raise
-        except Exception:
-            _fail()
-
-        template_id = None
-        template_hash_id = None
-        try:
-            template_id, template_hash_id = _create_identity(
-                client.create_worker_template(api_key, template_payload),
-                name,
-            )
-        except Exception:
             try:
-                reconciled = client.lookup_name(api_key, name)
-                if len(reconciled) != 1 or not _matches_request(
-                    reconciled[0], template_payload
-                ):
+                if client.lookup_name(api_key, name):
                     _fail()
-                template_id = reconciled[0]["id"]
-                template_hash_id = reconciled[0]["hash_id"]
+            except TemplatePublicationError:
+                raise
             except Exception:
                 _fail()
 
-        try:
-            verified = client.lookup_hash(api_key, template_hash_id)
-            if (
-                len(verified) != 1
-                or verified[0]["id"] != template_id
-                or verified[0]["hash_id"] != template_hash_id
-                or not _matches_request(verified[0], template_payload)
-            ):
+            template_id = None
+            template_hash_id = None
+            intent.mark_mutation_started()
+            try:
+                template_id, template_hash_id = _create_identity(
+                    client.create_worker_template(api_key, template_payload),
+                    name,
+                )
+            except Exception:
+                try:
+                    reconciled = client.lookup_name(api_key, name)
+                    if len(reconciled) != 1 or not _matches_request(
+                        reconciled[0], template_payload
+                    ):
+                        _fail()
+                    template_id = reconciled[0]["id"]
+                    template_hash_id = reconciled[0]["hash_id"]
+                except Exception:
+                    _fail()
+
+            try:
+                verified = client.lookup_hash(api_key, template_hash_id)
+                if (
+                    len(verified) != 1
+                    or verified[0]["id"] != template_id
+                    or verified[0]["hash_id"] != template_hash_id
+                    or not _matches_request(verified[0], template_payload)
+                ):
+                    _fail()
+                record = {
+                    "id": template_id,
+                    "hash_id": template_hash_id,
+                    "verified": True,
+                }
+                writer.publish(record)
+                intent.complete()
+                return record
+            except TemplatePublicationError:
+                raise
+            except Exception:
                 _fail()
-            record = {
-                "id": template_id,
-                "hash_id": template_hash_id,
-                "verified": True,
-            }
-            writer.publish(record)
-            return record
-        except TemplatePublicationError:
-            raise
-        except Exception:
-            _fail()
+        finally:
+            intent.close()
     finally:
         writer.close()
 
