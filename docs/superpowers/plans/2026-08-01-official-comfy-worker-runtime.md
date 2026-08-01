@@ -6,6 +6,8 @@
 
 **Architecture:** Keep the local Desktop pins and worker protocol unchanged. Pin the remote image by OCI index digest, run the baked ComfyUI directly from its venv and immutable workspace tree, represent remote Python as the verified `3.12` series, and enforce the same NVIDIA/amd64/CUDA/compute constraints at search, local revalidation, and template UI boundaries.
 
+For conflicts concerning the selected image, remote Python, wheel platforms, hardware filters, launch/onstart contract, or base-template audit fields, this plan supersedes the corresponding Task 8 steps in the 2026-07-31 immutable-release plan. All older release, bootstrap, Caddy, transport, immutability, secret, and paid-action gates remain mandatory.
+
 **Tech stack:** Python standard library, unittest, existing aiohttp runtime, GitHub CLI, reviewed Vast template transport.
 
 ---
@@ -53,7 +55,7 @@
 
 1. Change remote-release test fixtures from exact Python `3.13.12` to series `3.12`; leave `cloud_run/comfy_host.py` and its tests at local Python `3.13.12`.
 2. Add failing health tests that accept `3.12.x` and reject `3.11.x`, `3.13.x`, and an unqualified `3.12` report.
-3. Add failing wheel tests that accept compatible `cp312`/`py3` Linux wheels and reject `cp313` and incompatible ABIs/platforms.
+3. Add failing wheel tests that accept compatible `cp312`/`py3` `any`, `linux_x86_64`, legacy manylinux x86_64, and PEP 600 wheels through the selected Ubuntu 24.04/glibc 2.39 ceiling, while rejecting `cp313`, future/malformed manylinux, `musllinux*`, and incompatible ABIs/platforms.
 4. Run the focused tests and observe the intended failures.
 5. Implement the minimal remote constant, bootstrap lock, health prefix, policy, and wheel-tag changes.
 6. Re-run all focused release/bootstrap/provision/artifact tests green.

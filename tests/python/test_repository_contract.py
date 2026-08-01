@@ -263,6 +263,8 @@ class RepositoryContractTests(unittest.TestCase):
             "Python `3.13.12`",
             "`cp312`",
             "`py3`",
+            "`manylinux_2_39_x86_64`",
+            "`musllinux*`",
             "`/venv/main/bin/python`",
             "`CLOUD_RUN_COMFY_ROOT=/opt/workspace-internal/ComfyUI`",
             "only `hash_id`, `use_ssh`, and `ssh_direct`",

@@ -31,8 +31,11 @@ Pillow supplied by ComfyUI. It is pinned for development to ComfyUI Core
 `0.29.0`, frontend `1.47.10`, and local Python `3.13.12`. The remote lock uses
 the exact Python `3.12` series string and remote health accepts only reports
 beginning `3.12.`. Remote wheels are limited to compatible `cp312` or universal
-`py3` wheels for `any` or Linux x86_64-family platforms; other interpreters,
-ABIs, operating systems, and CPU architectures fail closed.
+`py3` wheels for `any`, exact `linux_x86_64`, legacy manylinux x86_64 aliases,
+or PEP 600 `manylinux_2_5_x86_64` through `manylinux_2_39_x86_64`. The
+selected Ubuntu 24.04/glibc 2.39 runtime rejects future or malformed manylinux
+tags and `musllinux*`; other interpreters, ABIs, operating systems, and CPU
+architectures also fail closed.
 
 ## From canvas to remote prompt
 

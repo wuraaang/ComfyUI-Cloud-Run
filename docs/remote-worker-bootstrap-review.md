@@ -149,9 +149,12 @@ The remote lock's `python_version` is the exact series string `3.12`, never a
 patch value. Remote Comfy health accepts only reports beginning `3.12.` and
 rejects Python 3.11, Python 3.13, and an unqualified `3.12`. Custom-node wheels
 are limited to compatible `cp312` or universal `py3` wheels with compatible
-ABIs and platform `any` or Linux x86_64-family; other interpreters, operating
-systems, and CPU architectures fail closed. The local ComfyUI Desktop remains
-pinned separately to Python `3.13.12`.
+ABIs and platform `any`, exact `linux_x86_64`, legacy manylinux x86_64 aliases,
+or PEP 600 `manylinux_2_5_x86_64` through `manylinux_2_39_x86_64`. The selected
+Ubuntu 24.04 runtime uses glibc 2.39, so future or malformed manylinux tags,
+`musllinux*`, other interpreters, operating systems, and CPU architectures fail
+closed. The local ComfyUI Desktop remains pinned separately to Python
+`3.13.12`.
 
 The worker commit is exactly 40 lowercase hex characters. The immutable GitHub
 Release asset URL is bound to the fixed repository, that commit, and the exact

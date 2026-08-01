@@ -899,9 +899,14 @@ class ArtifactTests(unittest.TestCase):
         abi3_wheel = (
             self.root / "abi_dependency-1.0-cp312-abi3-manylinux_2_28_x86_64.whl"
         )
+        max_glibc_wheel = (
+            self.root
+            / "max_glibc_dependency-1.0-cp312-cp312-manylinux_2_39_x86_64.whl"
+        )
         py3_wheel = self.root / "universal_dependency-1.0-py3-none-any.whl"
         cp312_wheel.write_bytes(b"cp312 wheel")
         abi3_wheel.write_bytes(b"abi3 wheel")
+        max_glibc_wheel.write_bytes(b"max glibc wheel")
         py3_wheel.write_bytes(b"py3 wheel")
 
         node = build_custom_node_dependency(
@@ -911,7 +916,12 @@ class ArtifactTests(unittest.TestCase):
             provided_class_types=("AcmeNode",),
             package_root=package,
             archive_path=self.root / "acme-nodes.tar",
-            wheel_paths=(cp312_wheel, abi3_wheel, py3_wheel),
+            wheel_paths=(
+                cp312_wheel,
+                abi3_wheel,
+                max_glibc_wheel,
+                py3_wheel,
+            ),
         )
 
         self.assertGreater(node.archive.size_bytes, 0)
@@ -924,6 +934,7 @@ class ArtifactTests(unittest.TestCase):
             [
                 "abi_dependency-1.0-cp312-abi3-manylinux_2_28_x86_64.whl",
                 "dependency-1.0-cp312-cp312-linux_x86_64.whl",
+                "max_glibc_dependency-1.0-cp312-cp312-manylinux_2_39_x86_64.whl",
                 "universal_dependency-1.0-py3-none-any.whl",
             ],
         )
@@ -939,7 +950,12 @@ class ArtifactTests(unittest.TestCase):
                 provided_class_types=("AcmeNode",),
                 package_root=package,
                 archive_path=self.root / "rejected.tar",
-                wheel_paths=(cp312_wheel, abi3_wheel, py3_wheel),
+                wheel_paths=(
+                    cp312_wheel,
+                    abi3_wheel,
+                    max_glibc_wheel,
+                    py3_wheel,
+                ),
             )
 
     def test_custom_node_archive_rejects_incompatible_wheel_tags(self):
@@ -951,6 +967,8 @@ class ArtifactTests(unittest.TestCase):
             "dependency-1.0-cp312-cp313-linux_x86_64.whl",
             "dependency-1.0-cp312-cp312-win_amd64.whl",
             "dependency-1.0-cp312-cp312-manylinux_2_28_aarch64.whl",
+            "dependency-1.0-cp312-cp312-manylinux_2_40_x86_64.whl",
+            "dependency-1.0-cp312-cp312-manylinux_fake_x86_64.whl",
             "dependency-1.0-cp312-cp312-musllinux_1_2_x86_64.whl",
             "dependency-1.0-cp312-cp312-linux_armv7l.whl",
         )

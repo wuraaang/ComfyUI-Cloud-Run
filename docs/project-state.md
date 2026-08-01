@@ -17,6 +17,12 @@ Source of truth:
 - `docs/superpowers/specs/2026-08-01-official-comfy-worker-runtime-design.md`;
 - `docs/superpowers/plans/2026-08-01-official-comfy-worker-runtime.md`.
 
+For the selected image, remote Python, wheel platforms, hardware filters,
+launch/onstart contract, and base-template audit schema, the 2026-08-01
+documents supersede the corresponding Task 8 passages from 2026-07-31. The
+earlier release/bootstrap/security and paid-action boundaries remain
+authoritative.
+
 ## Implemented offline
 
 - The Cloud Run launcher is adjacent to local `Run/Exécuter`; local queue
@@ -73,7 +79,10 @@ Source of truth:
 - Local ComfyUI Desktop remains pinned to Python `3.13.12`. The new remote lock
   uses the exact Python `3.12` series string, and health accepts only `3.12.`
   reports. Compatible custom-node wheels are limited to `cp312` or universal
-  `py3` with compatible ABI and platform `any` or Linux x86_64-family.
+  `py3` with compatible ABI and platform `any`, exact `linux_x86_64`, legacy
+  manylinux x86_64 aliases, or `manylinux_2_5_x86_64` through
+  `manylinux_2_39_x86_64`. The selected Ubuntu 24.04/glibc 2.39 runtime rejects
+  future or malformed manylinux tags and `musllinux*`.
 - The reviewed gateway supervises one fixed Caddy binary and the loopback
   Python worker. The sole candidate is the official Vast launch path
   `/opt/portal-aio/caddy_manager/caddy`; generic paths and symlinks fail

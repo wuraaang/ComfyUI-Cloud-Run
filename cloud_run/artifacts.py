@@ -62,6 +62,16 @@ _REQUIREMENT = re.compile(
     r"([A-Za-z0-9][A-Za-z0-9_.-]*)(?:\[[A-Za-z0-9_,.-]+\])?"
     r"==([^;\s]+)(?:\s*;\s*.+)?"
 )
+_MANYLINUX_PLATFORM = re.compile(
+    r"manylinux_([1-9][0-9]*)_(0|[1-9][0-9]*)_x86_64\Z"
+)
+_LEGACY_MANYLINUX_PLATFORMS = {
+    "manylinux1_x86_64",
+    "manylinux2010_x86_64",
+    "manylinux2014_x86_64",
+}
+_MINIMUM_MANYLINUX_GLIBC = (2, 5)
+_MAXIMUM_MANYLINUX_GLIBC = (2, 39)
 
 
 class ArtifactResolutionError(ValueError):
@@ -983,6 +993,16 @@ def estimate_output_bytes(capture, explicit_bytes=None):
     return max(total, explicit_bytes or 0)
 
 
+def _compatible_linux_platform(tag):
+    if tag == "linux_x86_64" or tag in _LEGACY_MANYLINUX_PLATFORMS:
+        return True
+    match = _MANYLINUX_PLATFORM.fullmatch(tag)
+    if match is None:
+        return False
+    glibc_version = tuple(int(part) for part in match.groups())
+    return _MINIMUM_MANYLINUX_GLIBC <= glibc_version <= _MAXIMUM_MANYLINUX_GLIBC
+
+
 def _wheel_identity(path):
     filename = Path(path).name
     if not filename.endswith(".whl"):
@@ -1010,12 +1030,7 @@ def _wheel_identity(path):
             "Python wheel is incompatible with Python 3.12."
         )
     if "any" not in platform_tags and not any(
-        tag == "linux_x86_64"
-        or (
-            tag.startswith("manylinux")
-            and tag.endswith("_x86_64")
-        )
-        for tag in platform_tags
+        _compatible_linux_platform(tag) for tag in platform_tags
     ):
         raise UnpinnedRequirementsError(
             "Python wheel is incompatible with Linux."

@@ -6,6 +6,8 @@
 
 **Status:** implementation direction approved; provider publication remains gated by the provenance decision below
 
+**Precedence:** for the selected OCI image, remote Python series, wheel-platform compatibility, hardware filters, launch/onstart contract, and official-template audit schema, this design supersedes the corresponding Task 8 portions of the 2026-07-31 immutable-release design. The older release, bootstrap, Caddy, transport, immutability, secret, and paid-action contracts remain in force.
+
 ## Outcome
 
 Use one immutable official Vast ComfyUI image as the generic single-GPU NVIDIA runtime. Do not build or publish a project Docker image for this release. The workflow remains responsible for declaring its custom nodes, wheels, models, and private inputs; the worker installs or transfers only those verified dependencies.
@@ -45,7 +47,7 @@ The worker launches exactly one native ComfyUI process on loopback port `8188`. 
 
 Local ComfyUI Desktop remains pinned to Python `3.13.12`. Only the remote worker release changes.
 
-The remote lock records Python series `3.12`. The digest-pinned image determines the actual patch version, while the remote health check requires the reported version to start with `3.12.`. Remote custom-node wheel resolution accepts compatible `cp312` and universal `py3` wheels only for `any` or Linux x86_64-family platforms; it rejects other interpreters, operating systems, and CPU architectures.
+The remote lock records Python series `3.12`. The digest-pinned image determines the actual patch version, while the remote health check requires the reported version to start with `3.12.`. Remote custom-node wheel resolution accepts compatible `cp312` and universal `py3` wheels only for `any`, exact `linux_x86_64`, legacy manylinux x86_64 aliases, or PEP 600 `manylinux_2_5_x86_64` through `manylinux_2_39_x86_64`. The selected Ubuntu 24.04 runtime uses glibc 2.39, so future or malformed manylinux tags and `musllinux*` are rejected together with other interpreters, operating systems, and CPU architectures.
 
 Because the published `d317e2f5b69725ae92fd0d3b1dc6273623cf2407` worker requires Python `3.13.12`, a new reviewed commit, deterministic worker archive, and immutable GitHub Release are mandatory. The existing release is preserved unchanged as historical rollback material and is not edited or deleted.
 
