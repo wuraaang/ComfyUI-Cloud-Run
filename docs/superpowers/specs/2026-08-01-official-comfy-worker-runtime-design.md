@@ -45,7 +45,7 @@ The worker launches exactly one native ComfyUI process on loopback port `8188`. 
 
 Local ComfyUI Desktop remains pinned to Python `3.13.12`. Only the remote worker release changes.
 
-The remote lock records Python series `3.12`. The digest-pinned image determines the actual patch version, while the remote health check requires the reported version to start with `3.12.`. Remote custom-node wheel resolution accepts `cp312` and universal `py3` Linux wheels and rejects Python-version-specific wheels for other interpreters.
+The remote lock records Python series `3.12`. The digest-pinned image determines the actual patch version, while the remote health check requires the reported version to start with `3.12.`. Remote custom-node wheel resolution accepts compatible `cp312` and universal `py3` wheels only for `any` or Linux x86_64-family platforms; it rejects other interpreters, operating systems, and CPU architectures.
 
 Because the published `d317e2f5b69725ae92fd0d3b1dc6273623cf2407` worker requires Python `3.13.12`, a new reviewed commit, deterministic worker archive, and immutable GitHub Release are mandatory. The existing release is preserved unchanged as historical rollback material and is not edited or deleted.
 
@@ -63,20 +63,28 @@ Every provider query and every local normalization/revalidation requires all exi
 }
 ```
 
-`compute_cap >= 750` follows Vast's official production ComfyUI floor. It excludes older CUDA architectures that are poor candidates for the image's current accelerated packages. `cuda_max_good >= 12.9` avoids relying on driver compatibility guesses. The same deterministic constraints appear as the private template's `extra_filters`, but backend validation remains authoritative because template filters only seed Vast's search UI.
+`compute_cap >= 750` follows Vast's official production ComfyUI floor. It excludes older CUDA architectures that are poor candidates for the image's current accelerated packages. `cuda_max_good >= 12.9` avoids relying on driver compatibility guesses. The four compatibility constraints plus `num_gpus == 1` appear as the private template's deterministic `extra_filters`, but backend validation remains authoritative because template filters only seed Vast's search UI.
 
 This release deliberately supports one NVIDIA GPU on an amd64 host. AMD, arm64, fractional GPUs, multi-GPU scheduling, distributed execution, and video-specific multi-GPU extensions are later-version work.
 
 ## Template audit and request
 
-The read-only audit of official template hash `027fba7753c024be019030fb42aed900` remains the authority for documented SSH launch flags only. The renderer does not copy its mutable image or unrelated fields. It emits the exact selected image and tag above, fixed port mapping `-p 8765:8765`, fixed compatibility `extra_filters`, SSH-only flags, empty registry credentials, recommended disk `80`, and `private=true`.
+The read-only audit of official template hash `027fba7753c024be019030fb42aed900` remains the authority for the documented `use_ssh=true` and `ssh_direct=true` flags only. A live GET on 2026-08-01 returned `runtype="jupyter"`, replacing the previously observed composite value. Vast's current API documentation lists `use_ssh` and `ssh_direct` as searchable template fields and separately defines the create-time launch contract. The audit therefore neither selects nor records the mutable `runtype` or `jupyter_dir`, and the renderer does not copy the official template's image or unrelated fields.
+
+The project request independently emits and validates the exact selected image and tag above, fixed port mapping `-p 8765:8765`, fixed compatibility `extra_filters`, `runtype="ssh"`, `use_ssh=true`, `ssh_direct=true`, `jup_direct=false`, `jupyter_dir="/workspace"`, `use_jupyter_lab=false`, empty registry credentials, recommended disk `80`, and `private=true`.
 
 The publication transport retains its single-POST budget, exact-name duplicate precheck, ambiguity reconciliation, exact-hash readback, full request comparison, proxy/redirect rejection, and secret-safe output. It adds `extra_filters` to the exact compared fields.
+
+## Loaded-release readiness proof
+
+The existing settings response cannot currently distinguish a process that loaded the reviewed lock from one that started without it. The free same-origin `GET` and `PUT /cloud-run/api/settings` responses therefore add one `worker_release` field. It is `null` when service construction did not load a valid lock; otherwise it is the exact `WorkerRelease.to_record()` value containing only schema, public template hash, worker commit/archive digest, protocol, pinned versions, and worker port. It never includes the lock path, release URL, provider credential, token, workflow, model, session, or private payload.
+
+After restart, an exact non-null response proves that the running extension process loaded the expected lock. The existing `/extensions` listing plus byte equality of the served `cloud-run.js` proves that the extension and Cloud Run UI code are available. Visual mounting of the button remains a human/browser observation and is not simulated.
 
 ## Gates and stopping point
 
 Implementation follows red-green TDD for runtime identity, wheel compatibility, offer filters, deterministic rendering, and publication readback. The complete repository gate runs twice on the final commit, followed by a new code review because the image/runtime migration is a new finding.
 
-Only after those gates and an explicit provenance decision may execution create one new immutable GitHub Release and one new private Vast template, rotate the owner-private `worker-release.json`, and restart the pinned local ComfyUI. The session then verifies the loaded lock and Cloud Run UI without opening the workflow and stops before Task 9.
+Only after those gates and an explicit provenance decision may execution create one new immutable GitHub Release and one new private Vast template, create the currently absent owner-private `worker-release.json`, and restart the pinned local ComfyUI. The session then verifies the loaded lock and Cloud Run UI without opening the workflow and stops before Task 9. If a lock unexpectedly appears before creation, the no-overwrite writer stops; this session does not rotate it automatically.
 
 The remaining human checkpoint is to open or create the real workflow, ensure its native model metadata is present, select the real private input, and invoke the free Cloud Run capture/preflight. No offer search or paid GO is prepared in this design.

@@ -2,9 +2,10 @@
 
 Status: workflow-derived reusable sessions implemented and fake/offline
 certified on the pinned local ComfyUI environment. The workflow-embedded model
-metadata consumer bridge, native missing-model visibility, and the free,
-read-only Gold preflight are also complete. All worker-template and real paid
-activity remains human-gated.
+metadata consumer bridge, native missing-model visibility, and the earlier
+free, read-only metadata preflight are also complete. The official-image remote
+runtime migration is implemented offline. Its post-migration real workflow
+preflight, publication, restart, and every paid activity remain human-gated.
 
 Source of truth:
 
@@ -12,7 +13,9 @@ Source of truth:
 - `docs/superpowers/specs/2026-07-31-workflow-derived-vast-gpu-session-design.md`;
 - `docs/superpowers/plans/2026-07-31-workflow-derived-vast-gpu-session.md`;
 - `docs/superpowers/specs/2026-07-31-workflow-embedded-model-metadata-bridge-design.md`;
-- `docs/superpowers/plans/2026-07-31-workflow-embedded-model-metadata-bridge.md`.
+- `docs/superpowers/plans/2026-07-31-workflow-embedded-model-metadata-bridge.md`;
+- `docs/superpowers/specs/2026-08-01-official-comfy-worker-runtime-design.md`;
+- `docs/superpowers/plans/2026-08-01-official-comfy-worker-runtime.md`.
 
 ## Implemented offline
 
@@ -67,12 +70,20 @@ Source of truth:
   accepts only the exact release identity and either a direct `200` or one
   validated `302` to the fixed GitHub release-assets host without retaining the
   signed target.
+- Local ComfyUI Desktop remains pinned to Python `3.13.12`. The new remote lock
+  uses the exact Python `3.12` series string, and health accepts only `3.12.`
+  reports. Compatible custom-node wheels are limited to `cp312` or universal
+  `py3` with compatible ABI and platform `any` or Linux x86_64-family.
 - The reviewed gateway supervises one fixed Caddy binary and the loopback
   Python worker. The sole candidate is the official Vast launch path
   `/opt/portal-aio/caddy_manager/caddy`; generic paths and symlinks fail
   closed. It isolates the Jupyter token to Caddy, passes the worker only an
   explicit environment allowlist, and boundedly terminates and reaps the
   sibling process when either child exits.
+- Deterministic `onstart` exports
+  `CLOUD_RUN_COMFY_ROOT=/opt/workspace-internal/ComfyUI` and executes
+  `/venv/main/bin/python` directly. It starts neither the image entrypoint nor
+  Supervisor, portal/serverless tooling, or an official ComfyUI wrapper.
 - Deterministic commands build the release bundle, render strict private Vast
   template inputs, and atomically write an owner-private `0600` local release
   lock without overwrite. These commands have been certified only with
@@ -83,12 +94,29 @@ Source of truth:
   endpoint, disables redirects and ambient proxies, obtains the API key only
   from the validated owner-private settings file, exposes no generic or delete
   surface, and is tested exclusively with fake transports and synthetic keys.
-  Audit, render, and publish reject every image outside the exact
-  `docker.io/vastai/base-image@sha256:<lowercase-64-hex>` form. Publication
-  also compares the decoded bootstrap to the reviewed repository bytes and
-  validates one canonical release lock before any HTTP. The separate Task 8
-  provenance gate must still verify the digest-scoped OCI manifest/config and
-  exact source/revision labels before the sole POST is allowed.
+  The base audit records only `hash_id`, `use_ssh`, and `ssh_direct`; it is not
+  an image or `runtype`/Jupyter source. The private request fixes `runtype=ssh`,
+  `use_ssh=true`, `ssh_direct=true`, `jup_direct=false`,
+  `jupyter_dir=/workspace`, `use_jupyter_lab=false`, empty registry
+  credentials, `-p 8765:8765`, recommended disk 80, and `private=true`.
+- Renderer and publisher pin exactly
+  `docker.io/vastai/comfy@sha256:9852fae86527d0be097ffcb90dc18368ff808bcbb7c41fbabd538bff3eb6ab9c`
+  with tag `v0.29.0-cuda-12.9-py312`. The linux/amd64 child is
+  `sha256:7a83c93be852db309d4be3e415cf38e186977c202638f1ef1b4a605a3bc49f0a`;
+  config is
+  `sha256:992e89c2d0641a6c894885d4246dc706911c7a02266f368337b41bf968eaaaf2`
+  at `38584 bytes`.
+- The digest makes runtime bytes immutable, but the config has no
+  `org.opencontainers.image.revision` label. The public Vast build at
+  `46e032d852ece6edb2a2a477c5b9557cba6645bf` is correlation rather than a
+  cryptographic source-revision binding. Before the sole POST, the publication
+  gate requires an explicit human choice: accept that narrower official-image
+  evidence or authorize the digest-pinned in-toto attestation review.
+- Same-origin GET and PUT settings responses expose browser-safe
+  `worker_release`: `null` without a validated loaded lock, otherwise exactly
+  `WorkerRelease.to_record()` from the service instance used by the request.
+  They expose no lock path, archive URL, credential, token, session secret,
+  workflow, model, or private template payload.
 - **Maximum total instance creates** is an immutable reviewed quote field
   limited to `1` or `2`, conservatively defaulted to `1` for legacy records,
   and enforced at confirmation and before any replacement offer search or
@@ -104,24 +132,35 @@ Source of truth:
   Confirmation reapplies the hard policy and rejects a material bandwidth
   downgrade before the initial create. Both replacement paths separately
   reapply the reliability/download floors before selecting or creating from a
-  fresh search result.
+  fresh search result. Every search and local offer normalization/revalidation
+  also requires `gpu_arch=nvidia`, `cpu_arch=amd64`, `cuda_max_good>=12.9`,
+  `compute_cap>=750`, and exactly one GPU. The template mirrors these as the
+  five strictly typed `extra_filters` including `num_gpus=1`.
 
 ## Safety and release status
 
-- No immutable Remote Worker release has been published.
-- No private project-specific Vast template has been created.
+State recorded at the 2026-08-01 source-review checkpoint, before live
+publication:
+
+- The immutable worker release for
+  `d317e2f5b69725ae92fd0d3b1dc6273623cf2407` pins Python `3.13.12` and remains
+  unchanged as a historical rollback; it is not compatible with the selected
+  Python `3.12` runtime.
+- No new Python 3.12 Remote Worker release has been published.
+- No new private project-specific Vast template has been created.
 - No local live `worker-release.json` exists.
+- No post-migration ComfyUI restart has occurred.
 - No Vast offer search has been performed.
 - No paid Vast instance has been created.
-- No live workflow run has occurred.
+- No post-migration live workflow run has occurred.
 - No real Vast rental or Gold run has occurred.
 - The native fixture exposed `Download All`, but it was not clicked. The free
-  Gold preflight resolved exactly five public model sources and one verified
-  local input; no model file was created. Sanitized evidence is recorded in
-  `docs/workflow-model-metadata-proof.md`.
-- No project-specific worker template has been published or pinned.
-- No Vast provider mutation, upload, Registry publication, worker release, or
-  GPU rental occurred.
+  metadata preflight resolved exactly five public model sources and one
+  verified local input; no model file was created. That historical evidence is
+  not the still-pending post-migration real workflow preflight. Sanitized
+  evidence is recorded in `docs/workflow-model-metadata-proof.md`.
+- No new Vast provider mutation, upload, Registry publication, worker release,
+  template publication, or GPU rental occurred during this migration.
 - Public source repository: https://github.com/wuraaang/ComfyUI-Cloud-Run.
   The audited source commit and fetched archive evidence are recorded in
   `docs/remote-worker-bootstrap-review.md`.
@@ -131,16 +170,22 @@ Source of truth:
 - The private Gold source and workflow are not read by autonomous tests and are
   never repository fixtures.
 - The official base-template allowlist remains
-  `027fba7753c024be019030fb42aed900`; it is not a published project-worker
+  `027fba7753c024be019030fb42aed900`, but supplies only the reviewed hash and SSH
+  flags. It is neither the selected image nor a published project-worker
   release.
 
 ## Next gated action
 
-The authorized current path, after the final offline gates and reviewed push,
-conditionally permits only the immutable release publication and, after its
-success, one provenance-verified private template plus its local lock/restart.
-It still permits no offer search, instance creation, workflow execution, or
-paid Gold action. A later paid Gold GO must separately state all of:
+At that source-review checkpoint, the authorized path first requires final
+offline gates, review, and an explicit human decision on the image's incomplete
+revision provenance. Only
+then may separate authorization publish one new Python 3.12 immutable release,
+create at most one exactly read-back private template, create the currently
+absent no-overwrite local lock, and restart the pinned local ComfyUI. Readiness
+must expose the exact loaded `worker_release`; execution then stops before the
+real workflow is opened or captured. It still permits no offer search,
+instance creation, workflow execution, or paid Gold action. A later paid Gold
+GO must separately state all of:
 
 1. maximum instance count;
 2. maximum hourly price;

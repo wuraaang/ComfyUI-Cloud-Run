@@ -90,7 +90,7 @@ class RepositoryContractTests(unittest.TestCase):
             "resume",
             "worker release lock",
             "fake/offline",
-            "no project-specific worker template has been published or pinned",
+            "no new private project-specific Vast template has been created",
             "no real Vast rental or Gold run has occurred",
             "ComfyRelay remote",
             "maximum instance count",
@@ -195,8 +195,8 @@ class RepositoryContractTests(unittest.TestCase):
             "cloud_run/worker_protocol.py",
             "SHA-256",
             "own-instance DELETE",
-            "No immutable Remote Worker release has been published",
-            "No private project-specific Vast template has been created",
+            "No new Python 3.12 Remote Worker release has been published",
+            "No new private project-specific Vast template has been created",
             "No local live `worker-release.json` exists",
             "ComfyRelay",
             "Public source repository:",
@@ -208,7 +208,7 @@ class RepositoryContractTests(unittest.TestCase):
             "Historical full-repository source-archive result: `FAIL`",
             "No Vast offer search has been performed",
             "No paid Vast instance has been created",
-            "No live workflow run has occurred",
+            "No post-migration live workflow run has occurred",
         ):
             with self.subTest(text=required_text):
                 self.assertIn(required_text, normalized)
@@ -227,15 +227,84 @@ class RepositoryContractTests(unittest.TestCase):
             "Maximum total instance creates",
             "limited to `1` or `2`",
             "before any replacement offer search or create",
-            "No immutable Remote Worker release has been published",
-            "No private project-specific Vast template has been created",
+            "No new Python 3.12 Remote Worker release has been published",
+            "No new private project-specific Vast template has been created",
             "No local live `worker-release.json` exists",
+            "No post-migration ComfyUI restart has occurred",
             "No Vast offer search has been performed",
             "No paid Vast instance has been created",
-            "No live workflow run has occurred",
+            "No post-migration live workflow run has occurred",
         ):
             with self.subTest(text=required_text):
                 self.assertIn(required_text, normalized)
+
+    def test_offline_docs_record_the_exact_official_runtime_contract(self):
+        documents = {
+            path.name: path.read_text(encoding="utf-8")
+            for path in (
+                REPOSITORY_ROOT / "README.md",
+                REPOSITORY_ROOT / "docs" / "project-state.md",
+                REPOSITORY_ROOT
+                / "docs"
+                / "remote-worker-bootstrap-review.md",
+            )
+        }
+        combined = "\n".join(documents.values())
+        for required_text in (
+            "docker.io/vastai/comfy@sha256:"
+            "9852fae86527d0be097ffcb90dc18368ff808bcbb7c41fbabd538bff3eb6ab9c",
+            "v0.29.0-cuda-12.9-py312",
+            "sha256:7a83c93be852db309d4be3e415cf38e186977c202638f1ef1b4a605a3bc49f0a",
+            "sha256:992e89c2d0641a6c894885d4246dc706911c7a02266f368337b41bf968eaaaf2",
+            "38584 bytes",
+            "org.opencontainers.image.revision",
+            "in-toto",
+            "Python `3.12`",
+            "Python `3.13.12`",
+            "`cp312`",
+            "`py3`",
+            "`/venv/main/bin/python`",
+            "`CLOUD_RUN_COMFY_ROOT=/opt/workspace-internal/ComfyUI`",
+            "only `hash_id`, `use_ssh`, and `ssh_direct`",
+            "`runtype=ssh`",
+            "`jup_direct=false`",
+            "`jupyter_dir=/workspace`",
+            "`use_jupyter_lab=false`",
+            "`-p 8765:8765`",
+            "`private=true`",
+            '"gpu_arch": {"eq": "nvidia"}',
+            '"cpu_arch": {"eq": "amd64"}',
+            '"cuda_max_good": {"gte": 12.9}',
+            '"compute_cap": {"gte": 750}',
+            '"num_gpus": {"eq": 1}',
+            "`worker_release`",
+            "`WorkerRelease.to_record()`",
+        ):
+            with self.subTest(text=required_text):
+                self.assertIn(required_text, combined)
+
+        for name, text in documents.items():
+            normalized = " ".join(text.split())
+            for required_text in (
+                "No new Python 3.12 Remote Worker release has been published",
+                "No new private project-specific Vast template has been created",
+                "No local live `worker-release.json` exists",
+                "No post-migration ComfyUI restart has occurred",
+                "No Vast offer search has been performed",
+                "No paid Vast instance has been created",
+                "No post-migration live workflow run has occurred",
+            ):
+                with self.subTest(document=name, text=required_text):
+                    self.assertIn(required_text, normalized)
+
+    def test_readme_audits_the_base_before_rendering_the_private_request(self):
+        readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
+        audit = "python3 scripts/publish_worker_template.py \\\n  audit-base"
+        renderer = "python3 scripts/render_worker_template.py"
+
+        self.assertIn(audit, readme)
+        self.assertIn(renderer, readme)
+        self.assertLess(readme.index(audit), readme.index(renderer))
 
     def test_gate_is_executable(self):
         gate = REPOSITORY_ROOT / "scripts" / "check.sh"

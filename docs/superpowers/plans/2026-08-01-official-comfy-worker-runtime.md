@@ -67,15 +67,31 @@
 - Modify: `scripts/render_worker_template.py`
 - Modify: `scripts/publish_worker_template.py`
 
-1. Change the sanitized base-audit tests so the official template supplies only its identity and SSH launch flags; it is not an image source.
-2. Add failing renderer assertions for the exact official image/tag, four fixed `extra_filters`, `/venv/main/bin/python`, and `CLOUD_RUN_COMFY_ROOT=/opt/workspace-internal/ComfyUI`.
+1. Change the sanitized base-audit tests so the official template supplies only its identity plus exact `use_ssh` and `ssh_direct` flags; it is not an image or mutable `runtype` source.
+2. Add failing renderer assertions for the exact official image/tag, the four fixed compatibility `extra_filters` plus `num_gpus == 1`, `/venv/main/bin/python`, and `CLOUD_RUN_COMFY_ROOT=/opt/workspace-internal/ComfyUI`.
 3. Assert the generated `onstart` does not call the image entrypoint, Supervisor, the official ComfyUI wrapper, or a shell-derived executable.
 4. Add failing publication tests requiring `extra_filters` in request validation, wildcard-row projection, duplicate reconciliation, and exact post-create readback.
 5. Run the two focused test modules and observe the intended failures.
 6. Implement the deterministic renderer and publisher changes, preserving the one-POST and secret-safe transport.
 7. Re-run both focused modules green.
 
-## Task 4: Update truthful public documentation
+After the first authorized live audit, Vast returned `runtype="jupyter"` instead of the historical composite string while preserving both SSH flags. Add a regression test that excludes `runtype` and `jupyter_dir` from the base-audit query and record, keep the private request's exact `runtype="ssh"` and Jupyter flags unchanged, then re-run the real read-only audit before any publication.
+
+## Task 4: Expose the exact loaded worker release
+
+**Files:**
+
+- Modify: `tests/python/test_routes.py`
+- Modify: `cloud_run/routes.py`
+
+1. Add failing settings-route tests requiring `worker_release == null` when service construction has no valid lock.
+2. Add a failing route test whose supplied service contains a valid `WorkerRelease`; require exact equality with `release.to_record()` on the same-origin settings response.
+3. Assert the response contains no lock path, archive URL, credential, token, session secret, workflow, model, or private template payload.
+4. Run the focused route tests and observe the intended failures.
+5. Add the minimal browser-safe projection from the service instance used by that request. Do not reload the file independently and do not weaken `WorkerRelease` validation.
+6. Re-run route tests green.
+
+## Task 5: Update truthful public documentation
 
 **Files:**
 
@@ -85,10 +101,10 @@
 
 1. Record the exact selected image identities and the distinction between immutable bytes and incomplete source-revision proof.
 2. Record remote Python series `3.12`, direct venv/workspace startup, single-GPU constraints, and the retained local Python `3.13.12` pin.
-3. State that release/template publication, local lock rotation, restart, real workflow preflight, offer search, and GPU execution have not yet occurred.
+3. State that release/template publication, local lock creation, restart, real workflow preflight, offer search, and GPU execution have not yet occurred.
 4. Run documentation contracts and `git diff --check`.
 
-## Task 5: Verify, review, and commit the implementation
+## Task 6: Verify, review, and commit the implementation
 
 1. Run every focused module changed above.
 2. Run `scripts/check.sh` twice consecutively on the same tree.
@@ -97,7 +113,7 @@
 5. Stage only the intended files, run `git diff --cached --check`, and commit on `fix/vast-template-live-audit`.
 6. Verify a clean worktree and record the exact reviewed commit. Do not merge PR `#2`.
 
-## Task 6: Publication gate
+## Task 7: Publication gate
 
 1. Present the verified image evidence and its absent revision label. Obtain an explicit choice to accept that evidence or authorize verification of the digest-pinned attestation.
 2. Reconfirm no release/tag/name collision and no existing project template using only the reviewed read-only commands.
@@ -107,9 +123,9 @@
 6. Audit the official Vast template read-only, render the exact private request, inspect it without printing private bodies, and create exactly one private template through `scripts/publish_worker_template.py` only under explicit template authorization.
 7. Verify the exact readback and retain only the public private-template hash.
 
-## Task 7: Rotate the local lock and stop before the real workflow
+## Task 8: Create the local lock and stop before the real workflow
 
-1. Replace the obsolete local lock through an explicit owner-private rotation that preserves the old file recoverably until the new lock passes `load_worker_release()`; never let the existing no-overwrite writer silently replace it.
+1. Reconfirm the expected local lock is absent, then create it with the existing no-overwrite writer. If a lock unexpectedly exists, stop rather than rotate or replace it.
 2. Require parent mode `0700`, final mode `0600`, current ownership, regular-file/no-symlink checks, and exact metadata round-trip.
 3. Restart only the pinned ComfyUI Desktop process and verify the exact worker commit/template hash are loaded and the Cloud Run UI/status endpoint is available.
 4. Remove private temporary release/template material.

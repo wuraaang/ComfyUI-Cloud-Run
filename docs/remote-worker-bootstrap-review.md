@@ -3,10 +3,17 @@
 This document is the offline review handoff and public source-publication
 record. It is not a release lock, Vast template, or permission to spend.
 
-No immutable Remote Worker release has been published. No private
+The immutable Remote Worker release for commit
+`d317e2f5b69725ae92fd0d3b1dc6273623cf2407` pins remote Python `3.13.12` and is
+preserved unchanged as a historical rollback. It is incompatible with the new
+official Python `3.12` runtime.
+
+At the 2026-08-01 source-review checkpoint, before live publication: No new
+Python 3.12 Remote Worker release has been published. No new private
 project-specific Vast template has been created. No local live
-`worker-release.json` exists. No Vast offer search has been performed. No paid
-Vast instance has been created. No live workflow run has occurred.
+`worker-release.json` exists. No post-migration ComfyUI restart has occurred.
+No Vast offer search has been performed. No paid Vast instance has been
+created. No post-migration live workflow run has occurred.
 
 Publishing source alone does not create a worker release lock, authorize Vast
 activity, or convert deterministic offline review material into a live
@@ -52,6 +59,9 @@ The deterministic review artifact remained `51590 bytes` with SHA-256
 `783a8f180365f6401af69679ba7681401aa123c50d050ead47c4f6faeb8df06f`.
 It is not byte-identical to the fetched full-repository archive and its digest
 must not be copied into a live lock for those GitHub bytes.
+Those values are historical evidence for the old worker policy, not the
+current Python `3.12` worker. The new release requires a fresh deterministic
+build, size, SHA-256, and two identical final gates before publication.
 
 Historical full-repository source-archive result: `FAIL`.
 
@@ -135,6 +145,14 @@ python_version
 destination
 ```
 
+The remote lock's `python_version` is the exact series string `3.12`, never a
+patch value. Remote Comfy health accepts only reports beginning `3.12.` and
+rejects Python 3.11, Python 3.13, and an unqualified `3.12`. Custom-node wheels
+are limited to compatible `cp312` or universal `py3` wheels with compatible
+ABIs and platform `any` or Linux x86_64-family; other interpreters, operating
+systems, and CPU architectures fail closed. The local ComfyUI Desktop remains
+pinned separately to Python `3.13.12`.
+
 The worker commit is exactly 40 lowercase hex characters. The immutable GitHub
 Release asset URL is bound to the fixed repository, that commit, and the exact
 archive SHA-256. Its only accepted shape is:
@@ -157,11 +175,15 @@ only; it rejects absolute/traversal paths, duplicates, symlinks, devices,
 sparse/PAX metadata, unsafe modes, excess members, and expansion beyond the
 fixed limit.
 
-The installed tree is atomically placed at `/opt/comfyui-cloud-run`. Bootstrap
-then uses `os.execv` with only:
+The deterministic `onstart` exports
+`CLOUD_RUN_COMFY_ROOT=/opt/workspace-internal/ComfyUI` and directly invokes the
+bootstrap with `/venv/main/bin/python`. It does not call the image entrypoint,
+Supervisor, portal/serverless tooling, the official ComfyUI wrapper, or a
+shell-derived executable. The installed worker tree is atomically placed at
+`/opt/comfyui-cloud-run`; bootstrap then uses `os.execv` with only:
 
 ```text
-<current-python> -m remote_worker.gateway \
+/venv/main/bin/python -m remote_worker.gateway \
   --state-directory /var/lib/comfyui-cloud-run
 ```
 
@@ -184,15 +206,15 @@ python3 scripts/build_worker_release_bundle.py \
   --output-directory <owner-private-output-directory> \
   --worker-commit <40-lowercase-hex-commit>
 
+python3 scripts/publish_worker_template.py \
+  audit-base \
+  --output-directory <owner-private-output-directory>
+
 python3 scripts/render_worker_template.py \
   --repository-root <repository-root> \
   --output-directory <owner-private-output-directory> \
   --release-metadata <owner-private-release-metadata> \
   --base-template-audit <owner-private-base-template-audit>
-
-python3 scripts/publish_worker_template.py \
-  audit-base \
-  --output-directory <owner-private-output-directory>
 
 python3 scripts/publish_worker_template.py \
   publish \
@@ -207,32 +229,77 @@ python3 scripts/write_worker_release_lock.py \
 
 The release builder produces a deterministic archive and sanitized metadata
 whose tag, asset name, URL, commit, byte size, SHA-256, protocol, runtime
-versions, and destination agree exactly. The renderer accepts only the fixed
-audited base-template schema and deterministically creates the remote lock,
-fixed bootstrap program, and template request with no embedded token, session,
-workflow, model locator, signed target, or caller command.
+versions, and destination agree exactly. The base audit records only `hash_id`,
+`use_ssh`, and `ssh_direct`; it does not trust or retain base `runtype`,
+`jupyter_dir`, image, tag, or unrelated provider fields. The renderer owns the
+runtime identity and deterministically creates the remote lock, fixed bootstrap
+program, and template request with no embedded token, session, workflow, model
+locator, signed target, or caller command.
+
+The exact private payload fixes `runtype=ssh`, `use_ssh=true`,
+`ssh_direct=true`, `jup_direct=false`, `jupyter_dir=/workspace`,
+`use_jupyter_lab=false`, empty registry credentials, `-p 8765:8765`, an 80 GiB
+recommended disk, and `private=true`. It includes exactly these typed
+single-GPU filters:
+
+```json
+{
+  "gpu_arch": {"eq": "nvidia"},
+  "cpu_arch": {"eq": "amd64"},
+  "cuda_max_good": {"gte": 12.9},
+  "compute_cap": {"gte": 750},
+  "num_gpus": {"eq": 1}
+}
+```
 
 The template publisher fixes the Vast template HTTPS endpoint and exposes only
 base audit plus one private-template publication. It validates exact lookup and
 request schemas, disables redirects and ambient proxies, bounds time and
 response bytes, obtains the API key through a no-follow owner-private settings
 read instead of argv, performs at most one POST, and reconciles ambiguity only
-with one exact-name GET. It has no update, delete, arbitrary URL/method,
-offer, instance, or volume capability, and never prints a request, response,
-authorization header, key, `onstart`, or base64 body.
-Audit, render, and publish require the exact image repository form
-`docker.io/vastai/base-image@sha256:<lowercase-64-hex>`. Before any HTTP,
-publication decodes `onstart`, compares its bootstrap bytes with the reviewed
-`remote_worker/bootstrap.py`, and validates the remote lock as the one
-canonical immutable release contract. This structural lock does not replace
-Task 8's separate pre-POST verification of the digest-scoped OCI
-manifest/config bytes and exact source/revision labels.
+with one exact-name GET. Request validation, wildcard worker-row projection,
+ambiguous-POST reconciliation, and exact-hash readback all compare the exact
+image, tag, launch fields, and `extra_filters`. It has no update, delete,
+arbitrary URL/method, offer, instance, or volume capability, and never prints a
+request, response, authorization header, key, `onstart`, or base64 body. Before
+any HTTP, publication decodes `onstart`, compares its bootstrap bytes with the
+reviewed `remote_worker/bootstrap.py`, and validates the remote lock as the one
+canonical immutable release contract.
 
 Every input and output remains outside the repository. The output directory
 must be owner-private and every generated file has mode `0600`. The local lock
 writer accepts only a nonexistent target beneath an owner-private directory,
 publishes by no-overwrite atomic hard link, synchronizes the directory, and
 round-trips every field through `load_worker_release()` before success.
+
+The same-origin GET and PUT settings responses expose browser-safe
+`worker_release`: `null` when the service instance has no validated lock, or
+the exact `WorkerRelease.to_record()` loaded on that same service instance.
+They do not reload the file independently and never expose the lock path,
+archive URL, credential, token, session secret, workflow, model, or private
+template payload.
+
+## Selected official image and provenance
+
+The renderer and publisher accept exactly:
+
+```text
+image: docker.io/vastai/comfy@sha256:9852fae86527d0be097ffcb90dc18368ff808bcbb7c41fbabd538bff3eb6ab9c
+tag: v0.29.0-cuda-12.9-py312
+linux/amd64 child: sha256:7a83c93be852db309d4be3e415cf38e186977c202638f1ef1b4a605a3bc49f0a
+config: sha256:992e89c2d0641a6c894885d4246dc706911c7a02266f368337b41bf968eaaaf2
+config size: 38584 bytes
+```
+
+The selected digest makes the runtime bytes immutable. It does not prove every
+source revision: the config carries official Vast source and maintainer labels
+but no `org.opencontainers.image.revision` label. Vast's successful public
+build at source commit `46e032d852ece6edb2a2a477c5b9557cba6645bf` correlates
+with the digest without cryptographically binding that revision. Before the
+sole provider POST, the publication gate requires the human either to accept
+this narrower official-image evidence or explicitly authorize inspection of
+the digest-pinned in-toto attestation. No template is published while that
+gate remains open.
 
 ## Caddy and inbound boundary
 
@@ -241,7 +308,9 @@ the Vast-provided Jupyter bearer token, strips `Authorization`, discards any
 caller-supplied `X-Cloud-Run-Boundary`, adds the authenticated boundary marker,
 and proxies only to `127.0.0.1:8766`.
 
-At official Vast base-image source commit
+The following official Vast base-image source review is inherited launch-path
+evidence, not the selected `vastai/comfy` image identity or complete provenance.
+At source commit
 `46e032d852ece6edb2a2a477c5b9557cba6645bf`, `Dockerfile.runtime` inherits its
 stock base image, `caddy.conf` invokes `/opt/supervisor-scripts/caddy.sh`, and
 that script directly executes `/opt/portal-aio/caddy_manager/caddy`. This
@@ -313,11 +382,14 @@ A publication review must record all of the following:
    size/digest, unsafe archives, extra lock fields, and shell fields;
 6. Caddy header stripping, loopback binding, and worker-route review;
 7. the exact fetched publication bytes, size, SHA-256, commit, and archive URL;
-8. a new project-specific Vast template ID derived from the reviewed official
-   base, with no embedded user secret or mutable dependency;
-9. a private `0600` `worker-release.json` matching that template, commit,
-   digest, protocol, versions, and port;
-10. a separate paid-Gold GO stating maximum instances, hourly price, and
+8. the exact selected image index, amd64 child, config digest/size, and the
+   explicit human decision on its incomplete revision provenance;
+9. a new project-specific Vast template ID whose base audit supplied only the
+   reviewed hash and SSH flags, with exact private launch fields and five
+   filters and no embedded user secret or mutable dependency;
+10. a private `0600` `worker-release.json` matching that template, commit,
+   digest, protocol, versions, and port, created only after exact readback;
+11. a separate paid-Gold GO stating maximum instances, hourly price, and
     absolute duration or cost.
 
 Publishing an artifact or template is not itself authorization to rent a GPU.
