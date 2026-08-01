@@ -140,7 +140,7 @@ The final Gold test uses the saved workflow:
 
 Its workflow ID is `f6a8a9d4-8763-4f73-aaae-06ee57580d9c`. The real input must remain selected. The test uses the real Cloud Run frontend capture and never posts the canvas to local `/prompt`.
 
-The human chooses the offer and presses every paid confirmation, run, and destroy control. Use `max_instance_creates=1`, the human's saved hourly-price ceiling, and the reviewed finite deadline. Observe the session through ComfyUI Desktop/Agent Panel and direct same-origin status endpoints.
+The human chooses the offer and presses every paid confirmation, run, deadline, and destroy control. Use `max_instance_creates=1` and the human's saved hourly-price ceiling. For this test, honor the human's explicit choice to disable the automatic deadline through the frontend acknowledgement; the human remains responsible for timing and manual destruction. Observe the session through ComfyUI Desktop/Agent Panel and direct same-origin status endpoints.
 
 Gold validation requires all of these outcomes:
 
