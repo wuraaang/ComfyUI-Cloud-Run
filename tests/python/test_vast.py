@@ -97,7 +97,6 @@ class VastRequestTests(unittest.TestCase):
                                 "num_gpus": 1,
                                 "rentable": True,
                                 "verified": True,
-                                "type": "ondemand",
                             }
                         ]
                     },
@@ -279,6 +278,55 @@ class VastRequestTests(unittest.TestCase):
 
 
 class VastNormalizationAndErrorTests(unittest.TestCase):
+    def test_missing_response_type_requires_trusted_ondemand_request(self):
+        from cloud_run.vast import normalize_offers
+
+        raw = {
+            "id": 10,
+            "gpu_name": "RTX 5090",
+            "gpu_ram": 32768,
+            "dph_total": 0.25,
+            "reliability": 0.99,
+            "inet_down": 500,
+            "disk_bw": 400,
+            "disk_space": 80,
+            "gpu_arch": "nvidia",
+            "cpu_arch": "amd64",
+            "cuda_max_good": 12.9,
+            "compute_cap": 750,
+            "num_gpus": 1,
+            "rentable": True,
+            "verification": "verified",
+        }
+        arguments = {
+            "max_price_per_hour": 0.75,
+            "min_vram_gb": 24,
+        }
+
+        self.assertEqual(normalize_offers({"offers": [raw]}, **arguments), [])
+        accepted = normalize_offers(
+            {"offers": [raw]},
+            requested_rental_type="ondemand",
+            **arguments,
+        )
+        self.assertEqual([offer["offer_id"] for offer in accepted], [10])
+        self.assertEqual(
+            normalize_offers(
+                {"offers": [{**raw, "type": "bid"}]},
+                requested_rental_type="ondemand",
+                **arguments,
+            ),
+            [],
+        )
+        self.assertEqual(
+            normalize_offers(
+                {"offers": [{**raw, "type": None}]},
+                requested_rental_type="ondemand",
+                **arguments,
+            ),
+            [],
+        )
+
     def test_normalization_requires_complete_quality_and_provider_evidence(self):
         from cloud_run.vast import normalize_offers
 

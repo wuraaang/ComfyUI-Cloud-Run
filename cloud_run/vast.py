@@ -180,6 +180,7 @@ def normalize_offers(
     min_reliability=MIN_VAST_RELIABILITY,
     verified_only=True,
     secure_cloud_only=False,
+    requested_rental_type=None,
 ):
     disk_required = _validate_disk_gb(disk_gb)
     reliability_floor = _validated_minimum(
@@ -201,6 +202,10 @@ def normalize_offers(
     if not isinstance(raw_offers, list):
         raise OfferSearchError("Vast returned an invalid offer response.")
 
+    request_guarantees_ondemand = (
+        isinstance(requested_rental_type, str)
+        and requested_rental_type.casefold() == "ondemand"
+    )
     offers = []
     for raw in raw_offers:
         if not isinstance(raw, dict):
@@ -222,6 +227,11 @@ def normalize_offers(
         cuda_max_good = _finite_number(raw.get("cuda_max_good"))
         compute_cap = _finite_number(raw.get("compute_cap"))
         rental_type = raw.get("type")
+        has_rental_type = "type" in raw
+        rental_type_is_valid = (
+            isinstance(rental_type, str)
+            and rental_type.casefold() == "ondemand"
+        ) or (not has_rental_type and request_guarantees_ondemand)
         num_gpus = raw.get("num_gpus")
         rentable = raw.get("rentable")
         verified = raw.get("verified")
@@ -253,8 +263,7 @@ def normalize_offers(
             or price > float(max_price_per_hour)
             or reliability is None
             or not reliability_floor <= reliability <= 1
-            or not isinstance(rental_type, str)
-            or rental_type.casefold() != "ondemand"
+            or not rental_type_is_valid
             or isinstance(num_gpus, bool)
             or not isinstance(num_gpus, (int, float))
             or float(num_gpus) != 1
@@ -363,6 +372,7 @@ async def _search_with_session(
             min_reliability=search_options["min_reliability"],
             verified_only=search_options["verified_only"],
             secure_cloud_only=search_options["secure_cloud_only"],
+            requested_rental_type=request_payload.get("type"),
         )
     except OfferSearchError:
         raise
