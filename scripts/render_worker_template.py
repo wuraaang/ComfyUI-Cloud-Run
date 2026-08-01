@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import base64
 from dataclasses import dataclass
+import gzip
 import json
 import os
 from pathlib import Path
@@ -56,6 +57,7 @@ _POLICY = {
     "worker_port": 8765,
 }
 _WORKER_JUPYTER_DIRECTORY = "/workspace"
+MAX_ONSTART_CHARACTERS = 16384
 
 
 class TemplateRenderError(RuntimeError):
@@ -180,6 +182,10 @@ def _json_bytes(payload):
     )
 
 
+def _deterministic_gzip(content):
+    return gzip.compress(content, compresslevel=9, mtime=0)
+
+
 def _write_private_atomic(path, content):
     destination = Path(path)
     temporary_name = None
@@ -209,7 +215,9 @@ def _write_private_atomic(path, content):
 
 
 def _onstart(bootstrap, remote_lock_bytes, worker_commit):
-    bootstrap_base64 = base64.b64encode(bootstrap).decode("ascii")
+    bootstrap_base64 = base64.b64encode(
+        _deterministic_gzip(bootstrap)
+    ).decode("ascii")
     lock_base64 = base64.b64encode(remote_lock_bytes).decode("ascii")
     return "\n".join(
         (
@@ -219,7 +227,7 @@ def _onstart(bootstrap, remote_lock_bytes, worker_commit):
             "mkdir -m 0700 " + BOOTSTRAP_DIRECTORY,
             "printf '%s' '"
             + bootstrap_base64
-            + "' | base64 -d > "
+            + "' | base64 -d | gzip -d > "
             + BOOTSTRAP_DIRECTORY
             + "/bootstrap.py",
             "chmod 0600 " + BOOTSTRAP_DIRECTORY + "/bootstrap.py",
@@ -276,6 +284,8 @@ def render_worker_template(
         remote_lock_bytes,
         validated_metadata.worker_commit,
     )
+    if len(onstart) > MAX_ONSTART_CHARACTERS:
+        raise TemplateRenderError("Rendered onstart exceeds Vast's limit.")
     request = {
         "name": "cloud-run-worker-" + validated_metadata.worker_commit,
         "image": OFFICIAL_IMAGE,

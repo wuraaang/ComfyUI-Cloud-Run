@@ -247,12 +247,15 @@ not a cryptographic source-revision binding. The publication gate requires an
 explicit human provenance decision: before the sole template POST, accept this
 narrower official-image evidence or authorize inspection of the digest-pinned
 in-toto attestation. No template publication occurs while that decision is
-open.
+open. The narrower official-image evidence was explicitly accepted for the
+2026-08-01 release attempts.
 
-The deterministic `onstart` exports
-`CLOUD_RUN_COMFY_ROOT=/opt/workspace-internal/ComfyUI` and directly executes
-`/venv/main/bin/python` on the reviewed bootstrap. It does not invoke the image
-entrypoint, Supervisor, portal/serverless tooling, or an official wrapper.
+The deterministic `onstart` gzip-compresses the reviewed bootstrap, remains
+below Vast's live `16384`-character limit, exports
+`CLOUD_RUN_COMFY_ROOT=/opt/workspace-internal/ComfyUI`, and directly executes
+`/venv/main/bin/python` on the restored bytes. The raw canonical lock remains
+separately encoded. It adds no download and does not invoke the image entrypoint,
+Supervisor, portal/serverless tooling, or an official wrapper.
 `remote_worker/gateway.py` then starts one fixed Caddy binary and the loopback
 Python worker without a shell. Only Caddy receives the validated Jupyter
 token. The worker receives an explicit runtime allowlist plus Vast's
@@ -337,13 +340,16 @@ ambiguous-POST reconciliation and exact-hash readback, disables ambient proxies
 and redirects, reads the owner-private API key without argv, and performs at
 most one POST. It never prints payloads or credentials and exposes no update,
 delete, arbitrary URL/method, offer, instance, or volume operation. Publication
-also requires the encoded bootstrap bytes to equal the reviewed repository file
-and the remote lock to be the exact canonical release contract. Automated
-coverage injects only fake transports and synthetic keys.
+also rejects `onstart` beyond Vast's live `16384`-character limit, requires the
+encoded bootstrap gzip member to equal the deterministic compression of the
+reviewed repository file, and requires the raw remote lock to be the exact
+canonical release contract. Automated coverage injects only fake transports and
+synthetic keys.
 
-At the 2026-08-01 source-review checkpoint, before live publication: No new
-Python 3.12 Remote Worker release has been published. No new private
-project-specific Vast template has been created. No local live
+At the 2026-08-01 live `onstart` correction checkpoint. Immutable Python 3.12
+Remote Worker releases for `005a4b018d9e9404640340d720fbeb43c10f19c2` and
+`f41409946bd756ce141651e651585a9077b0f809` were published and verified. No
+private project-specific Vast template exists. No local live
 `worker-release.json` exists. No post-migration ComfyUI restart has occurred.
 No Vast offer search has been performed. No paid Vast instance has been
 created. No post-migration live workflow run has occurred.

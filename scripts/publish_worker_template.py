@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import gzip
 import hashlib
 import json
 import os
@@ -68,6 +69,7 @@ BASE_LOOKUP_COLUMNS = [
 HTTP_TIMEOUT_SECONDS = 15
 MAX_RESPONSE_BYTES = 256 * 1024
 MAX_PRIVATE_JSON_BYTES = 64 * 1024
+MAX_ONSTART_CHARACTERS = 16384
 
 _FAILURE = "Private template publication failed."
 _NAME = re.compile(r"cloud-run-worker-([0-9a-f]{40})")
@@ -110,7 +112,7 @@ _ONSTART = re.compile(
     r"set -eu\n"
     r"umask 077\n"
     r"mkdir -m 0700 /opt/comfyui-cloud-run-bootstrap\n"
-    r"printf '%s' '([A-Za-z0-9+/]+={0,2})' \| base64 -d > "
+    r"printf '%s' '([A-Za-z0-9+/]+={0,2})' \| base64 -d \| gzip -d > "
     r"/opt/comfyui-cloud-run-bootstrap/bootstrap\.py\n"
     r"chmod 0600 /opt/comfyui-cloud-run-bootstrap/bootstrap\.py\n"
     r"printf '%s' '([A-Za-z0-9+/]+={0,2})' \| base64 -d > "
@@ -159,6 +161,10 @@ def _compact_json(payload):
         ).encode("utf-8")
     except (TypeError, ValueError):
         _fail()
+
+
+def _deterministic_gzip(content):
+    return gzip.compress(content, compresslevel=9, mtime=0)
 
 
 def _strict_object(pairs):
@@ -499,13 +505,19 @@ def _resolved_settings_path():
 
 
 def _validate_onstart(value, worker_commit):
-    if not isinstance(value, str):
+    if (
+        not isinstance(value, str)
+        or len(value) > MAX_ONSTART_CHARACTERS
+    ):
         _fail()
     match = _ONSTART.fullmatch(value)
     if match is None or match.group(3) != worker_commit:
         _fail()
     try:
-        bootstrap = base64.b64decode(match.group(1), validate=True)
+        compressed_bootstrap = base64.b64decode(
+            match.group(1),
+            validate=True,
+        )
         lock = base64.b64decode(match.group(2), validate=True)
         lock_payload = json.loads(lock.decode("utf-8"))
     except (ValueError, UnicodeError, json.JSONDecodeError):
@@ -544,7 +556,8 @@ def _validate_onstart(value, worker_commit):
             not stat.S_ISREG(bootstrap_metadata.st_mode)
             or stat.S_ISLNK(bootstrap_metadata.st_mode)
             or bootstrap_metadata.st_nlink != 1
-            or bootstrap != bootstrap_path.read_bytes()
+            or compressed_bootstrap
+            != _deterministic_gzip(bootstrap_path.read_bytes())
         ):
             _fail()
     except (OSError, ReleaseBuildError):

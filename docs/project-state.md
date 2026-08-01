@@ -89,14 +89,17 @@ authoritative.
   closed. It isolates the Jupyter token to Caddy, passes the worker only an
   explicit environment allowlist, and boundedly terminates and reaps the
   sibling process when either child exits.
-- Deterministic `onstart` exports
-  `CLOUD_RUN_COMFY_ROOT=/opt/workspace-internal/ComfyUI` and executes
-  `/venv/main/bin/python` directly. It starts neither the image entrypoint nor
+- Deterministic `onstart` gzip-compresses only the reviewed bootstrap before
+  base64 encoding, remains below Vast's live `16384`-character limit, exports
+  `CLOUD_RUN_COMFY_ROOT=/opt/workspace-internal/ComfyUI`, and executes
+  `/venv/main/bin/python` directly. The canonical release lock remains raw
+  base64. This adds no download and starts neither the image entrypoint nor
   Supervisor, portal/serverless tooling, or an official ComfyUI wrapper.
 - Deterministic commands build the release bundle, render strict private Vast
   template inputs, and atomically write an owner-private `0600` local release
-  lock without overwrite. These commands have been certified only with
-  synthetic private inputs; they have not published or created live material.
+  lock without overwrite. Synthetic tests and the live private render exercise
+  the same validation; the failed over-limit publication created no template or
+  local release lock.
 - A single-purpose Vast template publisher now performs only the exact base
   audit, exact-name absence check, at-most-once private-template create, and
   read-back comparison required by the reviewed contract. It fixes the HTTPS
@@ -108,6 +111,9 @@ authoritative.
   `use_ssh=true`, `ssh_direct=true`, `jup_direct=false`,
   `jupyter_dir=/workspace`, `use_jupyter_lab=false`, empty registry
   credentials, `-p 8765:8765`, recommended disk 80, and `private=true`.
+  Before credential lookup or HTTP, it enforces the live `16384`-character
+  limit, requires the exact deterministic gzip member for the reviewed
+  bootstrap, and revalidates the raw canonical release lock.
 - Renderer and publisher pin exactly
   `docker.io/vastai/comfy@sha256:9852fae86527d0be097ffcb90dc18368ff808bcbb7c41fbabd538bff3eb6ab9c`
   with tag `v0.29.0-cuda-12.9-py312`. The linux/amd64 child is
@@ -148,15 +154,22 @@ authoritative.
 
 ## Safety and release status
 
-State recorded at the 2026-08-01 source-review checkpoint, before live
-publication:
+State recorded at the 2026-08-01 live `onstart` correction checkpoint, before
+any separately authorized retry:
 
 - The immutable worker release for
   `d317e2f5b69725ae92fd0d3b1dc6273623cf2407` pins Python `3.13.12` and remains
   unchanged as a historical rollback; it is not compatible with the selected
   Python `3.12` runtime.
-- No new Python 3.12 Remote Worker release has been published.
-- No new private project-specific Vast template has been created.
+- Immutable Python 3.12 Remote Worker releases for reviewed commits
+  `005a4b018d9e9404640340d720fbeb43c10f19c2` and
+  `f41409946bd756ce141651e651585a9077b0f809` were published and verified. The
+  latter remains the newest published rollback point; this size correction is
+  not yet released.
+- The official base-template audit succeeded. The one authorized private
+  template POST for `f41409946bd756ce141651e651585a9077b0f809` exceeded Vast's
+  live `onstart` limit, created no discoverable template, and left its durable
+  no-retry intent intact. No private project-specific Vast template exists.
 - No local live `worker-release.json` exists.
 - No post-migration ComfyUI restart has occurred.
 - No Vast offer search has been performed.

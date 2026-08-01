@@ -1,5 +1,6 @@
 import dataclasses
 import base64
+import gzip
 import json
 import os
 import stat
@@ -427,15 +428,23 @@ class TemplateRendererTests(unittest.TestCase):
                 base_template_audit(),
             )
 
-            encoded = []
-            for line in rendered.onstart.splitlines():
-                prefix = "printf '%s' '"
-                suffix = "' | base64 -d > "
-                if line.startswith(prefix) and suffix in line:
-                    encoded.append(line[len(prefix):].split(suffix, 1)[0])
-            self.assertEqual(len(encoded), 2)
+            prefix = "printf '%s' '"
+            bootstrap_suffix = "' | base64 -d | gzip -d > "
+            lock_suffix = "' | base64 -d > "
+            bootstrap_encoded = next(
+                line[len(prefix):].split(bootstrap_suffix, 1)[0]
+                for line in rendered.onstart.splitlines()
+                if line.startswith(prefix) and bootstrap_suffix in line
+            )
+            lock_encoded = next(
+                line[len(prefix):].split(lock_suffix, 1)[0]
+                for line in rendered.onstart.splitlines()
+                if line.startswith(prefix) and lock_suffix in line
+            )
             self.assertEqual(
-                base64.b64decode(encoded[0], validate=True),
+                gzip.decompress(
+                    base64.b64decode(bootstrap_encoded, validate=True)
+                ),
                 (REPOSITORY_ROOT / "remote_worker" / "bootstrap.py").read_bytes(),
             )
             compact_lock = (
@@ -447,9 +456,10 @@ class TemplateRendererTests(unittest.TestCase):
                 + b"\n"
             )
             self.assertEqual(
-                base64.b64decode(encoded[1], validate=True),
+                base64.b64decode(lock_encoded, validate=True),
                 compact_lock,
             )
+            self.assertLessEqual(len(rendered.onstart), 16384)
             self.assertEqual(rendered.remote_lock_path.read_bytes(), compact_lock)
             self.assertEqual(rendered.onstart_path.read_text(), rendered.onstart)
 

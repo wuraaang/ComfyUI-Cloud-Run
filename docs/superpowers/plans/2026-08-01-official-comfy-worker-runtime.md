@@ -85,8 +85,10 @@ After the first authorized live audit, Vast returned `runtype="jupyter"` instead
 
 - Modify: `tests/python/test_worker_release_tools.py`
 - Modify: `tests/python/test_worker_template_api.py`
+- Modify: `tests/python/test_repository_contract.py`
 - Modify: `scripts/render_worker_template.py`
 - Modify: `scripts/publish_worker_template.py`
+- Modify: `README.md`
 - Modify: `docs/remote-worker-bootstrap-review.md`
 - Modify: `docs/project-state.md`
 
@@ -95,14 +97,14 @@ After the first authorized live audit, Vast returned `runtype="jupyter"` instead
 - Consumes: exact reviewed `remote_worker/bootstrap.py` bytes and the existing canonical remote-lock JSON bytes.
 - Produces: deterministic gzip bytes for the bootstrap, a fixed `onstart` no longer than `16384` characters, and pre-HTTP publisher validation of both properties.
 
-- [ ] **Step 1: Add the failing renderer contract**
+- [x] **Step 1: Add the failing renderer contract**
 
   Update `test_onstart_round_trips_bootstrap_and_compact_remote_lock` to extract
   the first fixed pipeline ending in `| base64 -d | gzip -d >`, inflate it with
   `gzip.decompress`, require equality with `remote_worker/bootstrap.py`, retain
   the raw lock round-trip, and assert `len(rendered.onstart) <= 16384`.
 
-- [ ] **Step 2: Add the failing publisher contracts**
+- [x] **Step 2: Add the failing publisher contracts**
 
   Make the synthetic request helper gzip the bootstrap with
   `gzip.compress(bootstrap_bytes, compresslevel=9, mtime=0)`. Add one request
@@ -111,13 +113,13 @@ After the first authorized live audit, Vast returned `runtype="jupyter"` instead
   request containing a valid gzip member for the reviewed bytes with non-zero
   `mtime`; require rejection before HTTP as non-canonical.
 
-- [ ] **Step 3: Observe RED**
+- [x] **Step 3: Observe RED**
 
   Run:
 
   ```text
   python3 -m unittest \
-    tests.python.test_worker_release_tools.WorkerTemplateRendererTests.test_onstart_round_trips_bootstrap_and_compact_remote_lock \
+    tests.python.test_worker_release_tools.TemplateRendererTests.test_onstart_round_trips_bootstrap_and_compact_remote_lock \
     tests.python.test_worker_template_api.WorkerTemplateApiTests.test_publish_rejects_oversized_onstart_before_credentials_or_http \
     tests.python.test_worker_template_api.WorkerTemplateApiTests.test_publish_rejects_noncanonical_compressed_bootstrap_before_http -v
   ```
@@ -125,7 +127,7 @@ After the first authorized live audit, Vast returned `runtype="jupyter"` instead
   Expected: failures because the renderer still embeds raw bootstrap bytes and
   the publisher has neither the `16384` guard nor the compressed grammar.
 
-- [ ] **Step 4: Implement the minimal deterministic encoding**
+- [x] **Step 4: Implement the minimal deterministic encoding**
 
   In both renderer and publisher, define the same fixed operation:
 
@@ -138,16 +140,17 @@ After the first authorized live audit, Vast returned `runtype="jupyter"` instead
   gzip member byte-for-byte with the recomputed canonical member, and reject
   `len(onstart) > 16384` at the start of `_validate_onstart()`.
 
-- [ ] **Step 5: Obtain GREEN and update the truthful review docs**
+- [x] **Step 5: Obtain GREEN and update the truthful review docs**
 
   Run the three focused tests, then the complete
-  `WorkerTemplateRendererTests` and `WorkerTemplateApiTests`. Record the live
+  `TemplateRendererTests` and `WorkerTemplateApiTests`. Record the live
   limit, deterministic compression, exact inflate round-trip, and absence of
-  any new download or provider action in the two public state documents.
+  any new download or provider action in the three public state documents, and
+  update their exact repository contract assertions.
 
 - [ ] **Step 6: Commit the correction**
 
-  Run `git diff --check`, stage only the six listed files, inspect the staged
+  Run `git diff --check`, stage only the eight listed files, inspect the staged
   diff, and commit with `fix: fit Vast template onstart limit`.
 
 ## Task 4: Expose the exact loaded worker release

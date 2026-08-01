@@ -8,9 +8,10 @@ The immutable Remote Worker release for commit
 preserved unchanged as a historical rollback. It is incompatible with the new
 official Python `3.12` runtime.
 
-At the 2026-08-01 source-review checkpoint, before live publication: No new
-Python 3.12 Remote Worker release has been published. No new private
-project-specific Vast template has been created. No local live
+At the 2026-08-01 live `onstart` correction checkpoint. Immutable Python 3.12
+Remote Worker releases for `005a4b018d9e9404640340d720fbeb43c10f19c2` and
+`f41409946bd756ce141651e651585a9077b0f809` were published and verified. No
+private project-specific Vast template exists. No local live
 `worker-release.json` exists. No post-migration ComfyUI restart has occurred.
 No Vast offer search has been performed. No paid Vast instance has been
 created. No post-migration live workflow run has occurred.
@@ -178,7 +179,11 @@ only; it rejects absolute/traversal paths, duplicates, symlinks, devices,
 sparse/PAX metadata, unsafe modes, excess members, and expansion beyond the
 fixed limit.
 
-The deterministic `onstart` exports
+The deterministic `onstart` stays below Vast's live `16384`-character limit by
+gzip-compressing only the exact reviewed bootstrap before base64 encoding it.
+The fixed shell pipeline inflates those bytes into the private bootstrap file;
+the small canonical release lock remains raw base64. This introduces no new
+download. The script exports
 `CLOUD_RUN_COMFY_ROOT=/opt/workspace-internal/ComfyUI` and directly invokes the
 bootstrap with `/venv/main/bin/python`. It does not call the image entrypoint,
 Supervisor, portal/serverless tooling, the official ComfyUI wrapper, or a
@@ -265,9 +270,10 @@ ambiguous-POST reconciliation, and exact-hash readback all compare the exact
 image, tag, launch fields, and `extra_filters`. It has no update, delete,
 arbitrary URL/method, offer, instance, or volume capability, and never prints a
 request, response, authorization header, key, `onstart`, or base64 body. Before
-any HTTP, publication decodes `onstart`, compares its bootstrap bytes with the
-reviewed `remote_worker/bootstrap.py`, and validates the remote lock as the one
-canonical immutable release contract.
+credential lookup or HTTP, publication rejects `onstart` beyond `16384`
+characters, requires the decoded bootstrap gzip member to equal a canonical
+deterministic compression of the reviewed `remote_worker/bootstrap.py`, and
+validates the raw remote lock as the one canonical immutable release contract.
 
 Every input and output remains outside the repository. The output directory
 must be owner-private and every generated file has mode `0600`. The local lock

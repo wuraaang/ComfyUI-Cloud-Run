@@ -1,6 +1,7 @@
 import io
 import base64
 import contextlib
+import gzip
 import inspect
 import json
 import os
@@ -95,6 +96,7 @@ def remote_lock_payload():
 def template_request(
     *,
     bootstrap_bytes=None,
+    bootstrap_gzip=None,
     lock_payload=None,
     image=IMAGE,
     tag=TAG,
@@ -104,11 +106,17 @@ def template_request(
         bootstrap_bytes = (
             REPOSITORY_ROOT / "remote_worker" / "bootstrap.py"
         ).read_bytes()
+    if bootstrap_gzip is None:
+        bootstrap_gzip = gzip.compress(
+            bootstrap_bytes,
+            compresslevel=9,
+            mtime=0,
+        )
     if lock_payload is None:
         lock_payload = remote_lock_payload()
     if extra_filters is None:
         extra_filters = EXTRA_FILTERS
-    bootstrap = base64.b64encode(bootstrap_bytes).decode("ascii")
+    bootstrap = base64.b64encode(bootstrap_gzip).decode("ascii")
     lock_bytes = (
         json.dumps(
             lock_payload,
@@ -126,7 +134,7 @@ def template_request(
             "set -eu",
             "umask 077",
             "mkdir -m 0700 /opt/comfyui-cloud-run-bootstrap",
-            "printf '%s' '" + bootstrap + "' | base64 -d > /opt/comfyui-cloud-run-bootstrap/bootstrap.py",
+            "printf '%s' '" + bootstrap + "' | base64 -d | gzip -d > /opt/comfyui-cloud-run-bootstrap/bootstrap.py",
             "chmod 0600 /opt/comfyui-cloud-run-bootstrap/bootstrap.py",
             "printf '%s' '" + lock + "' | base64 -d > /opt/comfyui-cloud-run-bootstrap/release-lock.json",
             "chmod 0600 /opt/comfyui-cloud-run-bootstrap/release-lock.json",
@@ -1003,6 +1011,81 @@ class WorkerTemplateApiTests(unittest.TestCase):
                             transport=VastTemplateTransport(opener=opener),
                         )
                     self.assertEqual(opener.calls, [])
+
+    def test_publish_rejects_oversized_onstart_before_credentials_or_http(self):
+        request = template_request()
+        request["onstart"] = "x" * 16385
+        canonical = template_request()
+        bootstrap = (
+            REPOSITORY_ROOT / "remote_worker" / "bootstrap.py"
+        ).read_bytes()
+        bootstrap_encoded = base64.b64encode(bootstrap).decode("ascii")
+        lock_line = next(
+            line
+            for line in canonical["onstart"].splitlines()
+            if line.startswith("printf '%s' '")
+            and line.endswith(
+                " > /opt/comfyui-cloud-run-bootstrap/release-lock.json"
+            )
+        )
+        lock_encoded = lock_line.split("'", 2)[1]
+        match = mock.Mock()
+        match.group.side_effect = {
+            1: bootstrap_encoded,
+            2: lock_encoded,
+            3: WORKER_COMMIT,
+        }.__getitem__
+        pattern = mock.Mock()
+        pattern.fullmatch.return_value = match
+        settings_resolver = mock.Mock(
+            side_effect=AssertionError("credential lookup must not run")
+        )
+
+        with tempfile.TemporaryDirectory() as root:
+            _settings, output, request_path = self._private_inputs(root)
+            request_path.write_text(json.dumps(request))
+            os.chmod(request_path, 0o600)
+            opener = FakeOpener([])
+            with mock.patch(
+                "scripts.publish_worker_template._ONSTART",
+                pattern,
+            ):
+                with self.assertRaises(TemplatePublicationError):
+                    publish_worker_template(
+                        request_path,
+                        output,
+                        settings_path_resolver=settings_resolver,
+                        transport=VastTemplateTransport(opener=opener),
+                    )
+
+        pattern.fullmatch.assert_not_called()
+        settings_resolver.assert_not_called()
+        self.assertEqual(opener.calls, [])
+
+    def test_publish_rejects_noncanonical_compressed_bootstrap_before_http(self):
+        bootstrap = (
+            REPOSITORY_ROOT / "remote_worker" / "bootstrap.py"
+        ).read_bytes()
+        request = template_request(
+            bootstrap_gzip=gzip.compress(
+                bootstrap,
+                compresslevel=9,
+                mtime=1,
+            )
+        )
+        with tempfile.TemporaryDirectory() as root:
+            settings, output, request_path = self._private_inputs(root)
+            request_path.write_text(json.dumps(request))
+            os.chmod(request_path, 0o600)
+            opener = FakeOpener([])
+            with self.assertRaises(TemplatePublicationError):
+                publish_worker_template(
+                    request_path,
+                    output,
+                    settings_path_resolver=lambda: settings,
+                    transport=VastTemplateTransport(opener=opener),
+                )
+        self.assertEqual(opener.calls, [])
 
     def test_ambiguous_post_is_not_retried_and_adopts_one_exact_name_match(self):
         request = template_request()
