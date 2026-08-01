@@ -90,6 +90,10 @@ class VastRequestTests(unittest.TestCase):
                                 "inet_down_cost": 0.01,
                                 "inet_up_cost": 0.02,
                                 "disk_space": 96,
+                                "gpu_arch": "nvidia",
+                                "cpu_arch": "amd64",
+                                "cuda_max_good": 12.9,
+                                "compute_cap": 750,
                                 "num_gpus": 1,
                                 "rentable": True,
                                 "verified": True,
@@ -133,6 +137,10 @@ class VastRequestTests(unittest.TestCase):
                 "dph_total": {"lte": 0.75},
                 "disk_space": {"gte": 96},
                 "allocated_storage": 96,
+                "gpu_arch": {"eq": "nvidia"},
+                "cpu_arch": {"eq": "amd64"},
+                "cuda_max_good": {"gte": 12.9},
+                "compute_cap": {"gte": 750},
                 "num_gpus": {"eq": 1},
                 "verified": {"eq": True},
                 "type": "ondemand",
@@ -201,6 +209,10 @@ class VastRequestTests(unittest.TestCase):
             "inet_down": 500,
             "disk_bw": 400,
             "disk_space": 96,
+            "gpu_arch": "nvidia",
+            "cpu_arch": "amd64",
+            "cuda_max_good": 12.9,
+            "compute_cap": 750,
         }
         matching_session = FakeSession(
             FakeResponse(200, {"offers": [matching_offer]})
@@ -231,6 +243,10 @@ class VastRequestTests(unittest.TestCase):
         self.assertEqual(request["json"]["allocated_storage"], 96)
         self.assertEqual(request["json"]["reliability"], {"gte": 0.99})
         self.assertEqual(request["json"]["inet_down"], {"gte": 500})
+        self.assertEqual(request["json"]["gpu_arch"], {"eq": "nvidia"})
+        self.assertEqual(request["json"]["cpu_arch"], {"eq": "amd64"})
+        self.assertEqual(request["json"]["cuda_max_good"], {"gte": 12.9})
+        self.assertEqual(request["json"]["compute_cap"], {"gte": 750})
 
         mismatched_session = FakeSession(
             FakeResponse(200, {"offers": [{**matching_offer, "id": 99}]})
@@ -278,6 +294,10 @@ class VastNormalizationAndErrorTests(unittest.TestCase):
             "inet_down_cost": -1,
             "inet_up_cost": math.inf,
             "disk_space": 80,
+            "gpu_arch": "nvidia",
+            "cpu_arch": "amd64",
+            "cuda_max_good": 12.9,
+            "compute_cap": 750,
             "type": "ondemand",
             "num_gpus": 1,
             "rentable": True,
@@ -313,6 +333,66 @@ class VastNormalizationAndErrorTests(unittest.TestCase):
         )
         self.assertEqual([offer["offer_id"] for offer in accepted], [10])
 
+    def test_normalization_rejects_invalid_hardware_contract_evidence(self):
+        from cloud_run.vast import normalize_offers
+
+        base = {
+            "id": 11,
+            "gpu_name": "RTX 5090",
+            "gpu_ram": 32768,
+            "dph_total": 0.25,
+            "reliability": 0.99,
+            "inet_down": 500,
+            "disk_bw": 400,
+            "disk_space": 80,
+            "gpu_arch": "nvidia",
+            "cpu_arch": "amd64",
+            "cuda_max_good": 12.9,
+            "compute_cap": 750,
+            "type": "ondemand",
+            "num_gpus": 1,
+            "rentable": True,
+            "verified": True,
+        }
+        invalid_variants = {
+            "missing GPU architecture": {"gpu_arch": None},
+            "wrong GPU architecture type": {"gpu_arch": 1},
+            "wrong GPU architecture": {"gpu_arch": "amd"},
+            "missing CPU architecture": {"cpu_arch": None},
+            "wrong CPU architecture type": {"cpu_arch": 1},
+            "wrong CPU architecture": {"cpu_arch": "arm64"},
+            "missing CUDA maximum": {"cuda_max_good": None},
+            "wrong CUDA maximum type": {"cuda_max_good": "12.9"},
+            "non-finite CUDA maximum": {"cuda_max_good": math.inf},
+            "below CUDA maximum floor": {"cuda_max_good": 12.8},
+            "missing compute capability": {"compute_cap": None},
+            "wrong compute capability type": {"compute_cap": "750"},
+            "non-finite compute capability": {"compute_cap": math.nan},
+            "below compute capability floor": {"compute_cap": 749},
+        }
+        for name, changes in invalid_variants.items():
+            with self.subTest(case=name):
+                self.assertEqual(
+                    normalize_offers(
+                        {"offers": [{**base, **changes}]},
+                        max_price_per_hour=0.75,
+                        min_vram_gb=24,
+                    ),
+                    [],
+                )
+
+        self.assertEqual(
+            [
+                offer["offer_id"]
+                for offer in normalize_offers(
+                    {"offers": [base]},
+                    max_price_per_hour=0.75,
+                    min_vram_gb=24,
+                )
+            ],
+            [11],
+        )
+
     def test_documented_verification_string_is_accepted_without_conflicts(self):
         from cloud_run.vast import normalize_offers
 
@@ -325,6 +405,10 @@ class VastNormalizationAndErrorTests(unittest.TestCase):
             "inet_down": 500,
             "disk_bw": 400,
             "disk_space": 80,
+            "gpu_arch": "nvidia",
+            "cpu_arch": "amd64",
+            "cuda_max_good": 12.9,
+            "compute_cap": 750,
             "type": "ondemand",
             "num_gpus": 1,
             "rentable": True,
@@ -358,6 +442,10 @@ class VastNormalizationAndErrorTests(unittest.TestCase):
                 "inet_down": speed,
                 "disk_bw": 600,
                 "disk_space": 80,
+                "gpu_arch": "nvidia",
+                "cpu_arch": "amd64",
+                "cuda_max_good": 12.9,
+                "compute_cap": 750,
                 "type": "ondemand",
                 "num_gpus": 1,
                 "rentable": True,
@@ -457,6 +545,10 @@ class VastNormalizationAndErrorTests(unittest.TestCase):
                     "dph_total": 0.2,
                     "reliability2": 0.99,
                     "disk_space": 79.9,
+                    "gpu_arch": "nvidia",
+                    "cpu_arch": "amd64",
+                    "cuda_max_good": 12.9,
+                    "compute_cap": 750,
                     "inet_down": 500,
                     "disk_bw": 400,
                     "rentable": True,

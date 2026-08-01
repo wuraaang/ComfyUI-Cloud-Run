@@ -148,6 +148,10 @@ def build_search_payload(
         "dph_total": {"lte": float(max_price_per_hour)},
         "disk_space": {"gte": disk},
         "allocated_storage": disk,
+        "gpu_arch": {"eq": "nvidia"},
+        "cpu_arch": {"eq": "amd64"},
+        "cuda_max_good": {"gte": 12.9},
+        "compute_cap": {"gte": 750},
         "num_gpus": {"eq": 1},
         "type": "ondemand",
         "limit": OFFER_SEARCH_LIMIT,
@@ -213,6 +217,10 @@ def normalize_offers(
         inet_down = _finite_number(raw.get("inet_down"))
         disk_bw = _finite_number(raw.get("disk_bw"))
         disk_space = _finite_number(raw.get("disk_space"))
+        gpu_arch = raw.get("gpu_arch")
+        cpu_arch = raw.get("cpu_arch")
+        cuda_max_good = _finite_number(raw.get("cuda_max_good"))
+        compute_cap = _finite_number(raw.get("compute_cap"))
         rental_type = raw.get("type")
         num_gpus = raw.get("num_gpus")
         rentable = raw.get("rentable")
@@ -261,6 +269,12 @@ def normalize_offers(
             )
             or disk_space is None
             or disk_space < disk_required
+            or gpu_arch != "nvidia"
+            or cpu_arch != "amd64"
+            or cuda_max_good is None
+            or cuda_max_good < 12.9
+            or compute_cap is None
+            or compute_cap < 750
         ):
             continue
         offers.append(

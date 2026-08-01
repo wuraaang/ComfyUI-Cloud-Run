@@ -55,6 +55,10 @@ class ProviderConstraintTests(unittest.TestCase):
             "inet_down": 500,
             "disk_bw": 600,
             "disk_space": 80,
+            "gpu_arch": "nvidia",
+            "cpu_arch": "amd64",
+            "cuda_max_good": 12.9,
+            "compute_cap": 750,
         }
         invalid_variants = {
             "VRAM": {"gpu_ram": 16384},
