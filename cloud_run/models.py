@@ -10,6 +10,7 @@ import time
 import uuid
 
 from .constants import MAX_SESSION_DISK_GB, MIN_SESSION_DISK_GB
+from .worker_protocol import is_boundary_token
 
 
 class SessionState(str, Enum):
@@ -638,6 +639,11 @@ class CloudSession:
         ):
             if digest is not None and not re.fullmatch(r"[0-9a-f]{64}", digest):
                 raise ValueError(f"Invalid {name}.")
+        if (
+            self.provider_token is not None
+            and not is_boundary_token(self.provider_token)
+        ):
+            raise ValueError("Invalid provider token.")
         if self.session_secret_hex is not None and not re.fullmatch(
             r"[0-9a-f]{64}",
             self.session_secret_hex,
@@ -832,6 +838,12 @@ class CloudAttempt:
         unknown = set(changes) - allowed_changes
         if unknown:
             raise TypeError("Unsupported attempt fields: " + ", ".join(sorted(unknown)))
+        provider_token = changes.get("provider_token", self.provider_token)
+        if (
+            provider_token is not None
+            and not is_boundary_token(provider_token)
+        ):
+            raise ValueError("Invalid provider token.")
         retry_count = int(changes.get("retry_count", self.retry_count))
         if retry_count not in (0, 1):
             raise ValueError("At most one automatic retry is allowed.")

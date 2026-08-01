@@ -40,13 +40,43 @@ class RecordingTransport:
 
 
 class WorkerClientTests(unittest.TestCase):
+    def test_client_rejects_invalid_boundary_tokens_before_transport(self):
+        from cloud_run.worker_client import WorkerClient, WorkerClientError
+
+        class Transport:
+            requests = []
+
+            async def request(self, request, *, max_bytes):
+                self.requests.append(request)
+
+        for value in (
+            "a" * 63,
+            "a" * 65,
+            "A" * 64,
+            " " + "a" * 63,
+            "a" * 63 + "!",
+            b"a" * 64,
+            None,
+        ):
+            with self.subTest(provider_token=value):
+                transport = Transport()
+                with self.assertRaises(WorkerClientError):
+                    WorkerClient(
+                        base_url="http://8.8.8.8:30000",
+                        provider_token=value,
+                        session_id="session-1",
+                        session_secret=b"s" * 32,
+                        transport=transport,
+                    )
+                self.assertEqual(transport.requests, [])
+
     def test_client_claims_through_vast_bearer_then_uses_hmac(self):
         from cloud_run.worker_client import WorkerClient
 
         transport = RecordingTransport()
         client = WorkerClient(
             base_url="http://8.8.8.8:30000",
-            provider_token="vast-boundary-token",
+            provider_token="a" * 64,
             session_id="session-1",
             session_secret=b"s" * 32,
             transport=transport,
@@ -61,7 +91,7 @@ class WorkerClientTests(unittest.TestCase):
         self.assertTrue(health["claimed"])
         self.assertEqual(
             transport.requests[0].headers["Authorization"],
-            "Bearer vast-boundary-token",
+            "Bearer " + "a" * 64,
         )
         self.assertNotIn(
             "X-Cloud-Run-Signature",
@@ -69,7 +99,7 @@ class WorkerClientTests(unittest.TestCase):
         )
         self.assertEqual(
             transport.requests[1].headers["Authorization"],
-            "Bearer vast-boundary-token",
+            "Bearer " + "a" * 64,
         )
         self.assertIn(
             "X-Cloud-Run-Signature",
@@ -109,7 +139,7 @@ class WorkerClientTests(unittest.TestCase):
                 transport.requests,
             ]
         )
-        self.assertNotIn("vast-boundary-token", exposed)
+        self.assertNotIn("a" * 64, exposed)
         self.assertNotIn((b"s" * 32).hex(), exposed)
         self.assertNotIn("8.8.8.8", repr(client.public_payload()))
 
@@ -129,7 +159,7 @@ class WorkerClientTests(unittest.TestCase):
                 with self.assertRaises(WorkerClientError):
                     WorkerClient(
                         base_url=url,
-                        provider_token="provider-token",
+                        provider_token="a" * 64,
                         session_id="session-1",
                         session_secret=b"s" * 32,
                         transport=RecordingTransport(),
@@ -166,7 +196,7 @@ class WorkerClientTests(unittest.TestCase):
             transport = RefusingTransport(response)
             client = WorkerClient(
                 base_url="http://8.8.8.8:30000",
-                provider_token="provider-token",
+                provider_token="a" * 64,
                 session_id="session-1",
                 session_secret=b"s" * 32,
                 transport=transport,
@@ -177,7 +207,7 @@ class WorkerClientTests(unittest.TestCase):
                 asyncio.run(client.health())
             self.assertEqual(len(transport.requests), 1)
             self.assertNotIn("127.0.0.1", str(raised.exception))
-            self.assertNotIn("provider-token", str(raised.exception))
+            self.assertNotIn("a" * 64, str(raised.exception))
 
     def test_download_binds_resume_offset_into_the_signed_request(self):
         from cloud_run.worker_client import (
@@ -226,7 +256,7 @@ class WorkerClientTests(unittest.TestCase):
         transport = StreamingTransport()
         client = WorkerClient(
             base_url="http://8.8.8.8:30000",
-            provider_token="provider-token",
+            provider_token="a" * 64,
             session_id="session-1",
             session_secret=b"s" * 32,
             transport=transport,
@@ -276,7 +306,7 @@ class WorkerClientTests(unittest.TestCase):
 
         client = WorkerClient(
             base_url="http://8.8.8.8:30000",
-            provider_token="provider-token",
+            provider_token="a" * 64,
             session_id="session-1",
             session_secret=b"s" * 32,
             transport=RecordingTransport(),
@@ -334,7 +364,7 @@ class WorkerClientTests(unittest.TestCase):
             transport = UploadTransport()
             client = WorkerClient(
                 base_url="http://8.8.8.8:30000",
-                provider_token="provider-token",
+                provider_token="a" * 64,
                 session_id="session-1",
                 session_secret=b"s" * 32,
                 transport=transport,
@@ -436,7 +466,7 @@ class WorkerClientTests(unittest.TestCase):
         transport = StatusTransport()
         client = WorkerClient(
             base_url="http://8.8.8.8:30000",
-            provider_token="provider-token",
+            provider_token="a" * 64,
             session_id="session-1",
             session_secret=b"s" * 32,
             transport=transport,

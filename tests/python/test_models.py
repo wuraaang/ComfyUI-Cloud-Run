@@ -48,6 +48,68 @@ def quote(OfferQuote):
 
 
 class LifecycleModelTests(unittest.TestCase):
+    def test_boundary_tokens_use_the_shared_private_contract(self):
+        from dataclasses import replace
+
+        from cloud_run.models import (
+            AttemptState,
+            CloudAttempt,
+            CloudSession,
+            OfferQuote,
+            SessionState,
+        )
+
+        session = CloudSession.new(
+            "session-key",
+            session_id="session-1",
+            manifest_digest="a" * 64,
+            deadline_at=7_300.0,
+            deadline_mode="finite",
+            disk_gb=80,
+            now=100.0,
+        )
+        boundary_session = session.transition(
+            SessionState.PREFLIGHT,
+            provider_token="a" * 64,
+        )
+        self.assertEqual(boundary_session.provider_token, "a" * 64)
+        self.assertNotIn("provider_token", boundary_session.public_payload())
+        for value in ("a" * 63, "A" * 64, b"a" * 64):
+            with self.subTest(session_provider_token=value):
+                with self.assertRaises(ValueError):
+                    session.transition(
+                        SessionState.PREFLIGHT,
+                        provider_token=value,
+                    )
+
+        attempt = CloudAttempt.new(
+            "attempt-key",
+            quote(OfferQuote),
+            attempt_id="attempt-1",
+            now=100.0,
+        )
+        boundary_attempt = attempt.transition(
+            AttemptState.CREATING,
+            provider_token="a" * 64,
+        )
+        self.assertEqual(boundary_attempt.provider_token, "a" * 64)
+        self.assertNotIn("provider_token", boundary_attempt.public_payload())
+        for value in ("a" * 65, "a" * 63 + "!", b"a" * 64):
+            with self.subTest(attempt_provider_token=value):
+                with self.assertRaises(ValueError):
+                    attempt.transition(
+                        AttemptState.CREATING,
+                        provider_token=value,
+                    )
+        with self.assertRaises(ValueError):
+            replace(
+                attempt,
+                provider_token="a" * 63,
+            ).transition(AttemptState.CREATING)
+        self.assertIsNone(
+            attempt.transition(AttemptState.CREATING).provider_token
+        )
+
     def test_quote_contains_complete_paid_session_contract_without_secrets(self):
         from cloud_run.models import OfferQuote
 
@@ -255,7 +317,7 @@ class LifecycleModelTests(unittest.TestCase):
             installed_manifest_digest="a" * 64,
             instance_id="77",
             worker_base_url="http://8.8.8.8:30000",
-            provider_token="private-provider-token",
+            provider_token="d" * 64,
             session_secret_hex="b" * 64,
             deadline_at=7200.0,
             deadline_mode="finite",
@@ -288,7 +350,7 @@ class LifecycleModelTests(unittest.TestCase):
             installed_manifest_digest="b" * 64,
             instance_id="77",
             worker_base_url="http://8.8.8.8:30000",
-            provider_token="private-provider-token",
+            provider_token="d" * 64,
             session_secret_hex="c" * 64,
             deadline_at=7200.0,
             deadline_mode="finite",
@@ -305,7 +367,7 @@ class LifecycleModelTests(unittest.TestCase):
         encoded = json.dumps(session.public_payload(), sort_keys=True)
 
         self.assertNotIn("private-idempotency-key", encoded)
-        self.assertNotIn("private-provider-token", encoded)
+        self.assertNotIn("d" * 64, encoded)
         self.assertNotIn("http://8.8.8.8:30000", encoded)
         self.assertNotIn("c" * 64, encoded)
         self.assertNotIn("manifest_digest", encoded)
@@ -472,7 +534,7 @@ class LifecycleModelTests(unittest.TestCase):
             AttemptState.FAILED,
             now=101.0,
             instance_id="instance-9",
-            provider_token="provider-secret-token",
+            provider_token="d" * 64,
             sanitized_error="Sanitized failure.",
         )
 
@@ -485,7 +547,7 @@ class LifecycleModelTests(unittest.TestCase):
         self.assertEqual(payload["offer"]["offer_id"], "42")
         self.assertEqual(payload["offer"]["max_price_per_hour"], 0.55)
         self.assertNotIn("idempotency", encoded)
-        self.assertNotIn("provider-secret-token", encoded)
+        self.assertNotIn("d" * 64, encoded)
         self.assertNotIn("machine-7", encoded)
         self.assertNotIn("203.0.113.7", encoded)
 

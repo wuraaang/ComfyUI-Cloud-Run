@@ -16,6 +16,10 @@ from .manifest import PINNED_COMFYUI_FRONTEND_VERSION, PROTOCOL_VERSION
 
 MAX_CAPTURE_BYTES = 16 * 1024 * 1024
 PINNED_FRONTEND_VERSION = PINNED_COMFYUI_FRONTEND_VERSION
+BOUNDARY_TOKEN_ENVIRONMENT = "CLOUD_RUN_BOUNDARY_TOKEN"
+SESSION_ID_ENVIRONMENT = "CLOUD_RUN_SESSION_ID"
+_BOUNDARY_TOKEN = re.compile(r"[0-9a-f]{64}")
+_WORKER_SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}")
 ALLOWED_QUEUE_OPTIONS = {
     "front",
     "number",
@@ -31,6 +35,20 @@ FORBIDDEN_KEYS = {
     "signed_url",
 }
 MAX_NESTING_DEPTH = 64
+
+
+def is_boundary_token(value):
+    return (
+        isinstance(value, str)
+        and _BOUNDARY_TOKEN.fullmatch(value) is not None
+    )
+
+
+def is_worker_session_id(value):
+    return (
+        isinstance(value, str)
+        and _WORKER_SESSION_ID.fullmatch(value) is not None
+    )
 
 
 class CaptureValidationError(ValueError):

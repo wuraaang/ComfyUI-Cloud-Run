@@ -18,7 +18,11 @@ from urllib.parse import urlsplit
 
 from .manifest import PROTOCOL_VERSION
 from .vast import derive_base_url
-from .worker_protocol import sign_request
+from .worker_protocol import (
+    is_boundary_token,
+    is_worker_session_id,
+    sign_request,
+)
 
 
 MAX_WORKER_JSON_BYTES = 16 * 1024 * 1024
@@ -307,12 +311,8 @@ class WorkerClient:
     ):
         self._base_url = _validated_base_url(base_url)
         if (
-            not isinstance(provider_token, str)
-            or not provider_token
-            or provider_token != provider_token.strip()
-            or len(provider_token) > 4096
-            or any(ord(character) < 33 for character in provider_token)
-            or not _identifier(session_id)
+            not is_boundary_token(provider_token)
+            or not is_worker_session_id(session_id)
             or not isinstance(session_secret, bytes)
             or len(session_secret) != 32
         ):

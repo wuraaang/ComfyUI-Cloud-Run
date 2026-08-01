@@ -178,7 +178,7 @@ class SettingsRouteTests(unittest.TestCase):
             "/private/worker-release.json",
             "https://signed.example/private-worker.tar.gz",
             "credential-marker",
-            "provider-token-marker",
+            "a" * 64,
             "session-secret-marker",
             "private-workflow-marker",
             "private-model-marker",
@@ -241,7 +241,7 @@ class SettingsRouteTests(unittest.TestCase):
                 SessionState.READY,
                 now=100.0,
                 instance_id="77",
-                provider_token="private-provider-token",
+                provider_token="a" * 64,
                 session_secret_hex="d" * 64,
             )
             sessions.create_or_get(ready)
@@ -274,7 +274,7 @@ class SettingsRouteTests(unittest.TestCase):
         )
         self.assertEqual(active[0]["status"], "ready")
         self.assertNotIn("private-session-key", repr(active))
-        self.assertNotIn("private-provider-token", repr(active))
+        self.assertNotIn("a" * 64, repr(active))
         self.assertNotIn("d" * 64, repr(active))
 
     def test_put_saves_key_but_returns_only_public_settings(self):

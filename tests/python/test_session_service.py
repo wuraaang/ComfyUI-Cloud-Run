@@ -758,7 +758,7 @@ class SessionProvisioningTests(unittest.TestCase):
             now=100.0,
             instance_id="77",
             worker_base_url="http://8.8.8.8:30000",
-            provider_token="provider-token",
+            provider_token="a" * 64,
             session_secret_hex="e" * 64,
         )
         self.sessions.create_or_get(session)
@@ -1100,7 +1100,7 @@ class ReusableSessionTests(unittest.TestCase):
             installed_manifest_digest=initial.digest,
             instance_id="77",
             worker_base_url="http://8.8.8.8:30000",
-            provider_token="provider-token",
+            provider_token="a" * 64,
             session_secret_hex="d" * 64,
         )
         self.sessions.create_or_get(session)
@@ -1200,7 +1200,7 @@ class ReusableSessionTests(unittest.TestCase):
         self.assertEqual(latest.transferred_bytes, total_bytes)
         self.assertEqual(latest.total_bytes, total_bytes)
         self.assertNotIn("huggingface.co", repr(latest))
-        self.assertNotIn("provider-token", repr(latest))
+        self.assertNotIn("a" * 64, repr(latest))
 
     def test_provision_progress_identity_is_session_scoped_and_retry_idempotent(self):
         manifest = self.initial_manifest
@@ -1238,7 +1238,7 @@ class ReusableSessionTests(unittest.TestCase):
             installed_manifest_digest=manifest.digest,
             instance_id="88",
             worker_base_url="http://8.8.4.4:30000",
-            provider_token="second-provider-token",
+            provider_token="b" * 64,
             session_secret_hex="e" * 64,
         )
         self.sessions.create_or_get(second_session)
@@ -1587,7 +1587,7 @@ class ReusableSessionTests(unittest.TestCase):
             now=100.0,
             instance_id="88",
             worker_base_url="http://8.8.8.8:30001",
-            provider_token="provider-token-boot",
+            provider_token="c" * 64,
             session_secret_hex="e" * 64,
         )
         self.sessions.create_or_get(boot)

@@ -4,6 +4,43 @@ import unittest
 
 
 class WorkerProtocolTests(unittest.TestCase):
+    def test_controller_boundary_values_have_strict_shapes(self):
+        from cloud_run.worker_protocol import (
+            BOUNDARY_TOKEN_ENVIRONMENT,
+            SESSION_ID_ENVIRONMENT,
+            is_boundary_token,
+            is_worker_session_id,
+        )
+
+        self.assertEqual(
+            BOUNDARY_TOKEN_ENVIRONMENT,
+            "CLOUD_RUN_BOUNDARY_TOKEN",
+        )
+        self.assertEqual(SESSION_ID_ENVIRONMENT, "CLOUD_RUN_SESSION_ID")
+        self.assertTrue(is_boundary_token("a" * 64))
+        for value in (
+            "a" * 63,
+            "a" * 65,
+            "A" * 64,
+            " " + "a" * 63,
+            "a" * 63 + "!",
+            b"a" * 64,
+            None,
+        ):
+            with self.subTest(boundary_token=value):
+                self.assertFalse(is_boundary_token(value))
+
+        for value in (
+            "session-1",
+            "A" + "a" * 199,
+            "session.id:1",
+        ):
+            with self.subTest(worker_session_id=value):
+                self.assertTrue(is_worker_session_id(value))
+        for value in ("", ".session", "a" * 201, "session/1", b"s"):
+            with self.subTest(worker_session_id=value):
+                self.assertFalse(is_worker_session_id(value))
+
     def test_signed_request_binds_method_path_body_time_and_nonce(self):
         from cloud_run.worker_protocol import (
             ProtocolAuthenticationError,

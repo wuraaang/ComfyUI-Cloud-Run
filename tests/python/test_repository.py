@@ -178,7 +178,7 @@ class SessionRepositoryTests(unittest.TestCase):
             AttemptState.CREATING,
             now=101.0,
             instance_id="77",
-            provider_token="private-boundary-token",
+            provider_token="a" * 64,
         )
         legacy.transition(
             attempt.attempt_id,
@@ -192,7 +192,7 @@ class SessionRepositoryTests(unittest.TestCase):
         self.assertEqual(session.state, SessionState.BOOTSTRAPPING)
         self.assertEqual(session.instance_id, "77")
         self.assertEqual(session.label, "comfy-cloud-run-attempt-1")
-        self.assertEqual(session.provider_token, "private-boundary-token")
+        self.assertEqual(session.provider_token, "a" * 64)
 
     def test_session_round_trip_and_optimistic_version_survive_reopen(self):
         sessions = repository.SessionRepository(self.database_path)
