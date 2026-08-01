@@ -351,6 +351,14 @@ def _normalize_row(row):
 
 
 def _normalize_lookup(payload, row_normalizer):
+    if (
+        isinstance(payload, dict)
+        and set(payload) == {"success", "msg"}
+        and payload.get("success") is False
+        and type(payload.get("msg")) is str
+        and payload["msg"] == "No templates found"
+    ):
+        return []
     if not isinstance(payload, dict) or set(payload) != {
         "success",
         "templates_found",

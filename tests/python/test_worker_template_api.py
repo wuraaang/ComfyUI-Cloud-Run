@@ -294,6 +294,27 @@ class WorkerTemplateApiTests(unittest.TestCase):
             ("self", "api_key", "template_payload"),
         )
 
+    def test_transport_rejects_near_miss_no_template_responses(self):
+        invalid_payloads = (
+            {"success": 0, "msg": "No templates found"},
+            {"success": False, "msg": "no templates found"},
+            {"success": False, "msg": "No templates found."},
+            {
+                "success": False,
+                "msg": "No templates found",
+                "templates": [],
+            },
+        )
+        for index, payload in enumerate(invalid_payloads):
+            with self.subTest(index=index):
+                opener = FakeOpener([FakeResponse(payload)])
+                with self.assertRaises(TemplatePublicationError):
+                    VastTemplateTransport(opener=opener).lookup_name(KEY, NAME)
+                self.assertEqual(
+                    [call[0].method for call in opener.calls],
+                    ["GET"],
+                )
+
     def test_worker_lookup_uses_wildcard_and_projects_exact_compared_fields(self):
         provider_marker = "provider-worker-extra-marker"
         response = FakeResponse(
@@ -598,7 +619,7 @@ class WorkerTemplateApiTests(unittest.TestCase):
     def test_publish_checks_absence_posts_once_and_verifies_exact_hash(self):
         request = template_request()
         responses = [
-            FakeResponse({"success": True, "templates_found": 0, "templates": []}),
+            FakeResponse({"success": False, "msg": "No templates found"}),
             FakeResponse(
                 {
                     "success": True,
