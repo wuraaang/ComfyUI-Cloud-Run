@@ -68,19 +68,43 @@ Source of truth:
   validated `302` to the fixed GitHub release-assets host without retaining the
   signed target.
 - The reviewed gateway supervises one fixed Caddy binary and the loopback
-  Python worker. It isolates the Jupyter token to Caddy, passes the worker only
-  an explicit environment allowlist, and boundedly terminates and reaps the
+  Python worker. The sole candidate is the official Vast launch path
+  `/opt/portal-aio/caddy_manager/caddy`; generic paths and symlinks fail
+  closed. It isolates the Jupyter token to Caddy, passes the worker only an
+  explicit environment allowlist, and boundedly terminates and reaps the
   sibling process when either child exits.
 - Deterministic commands build the release bundle, render strict private Vast
   template inputs, and atomically write an owner-private `0600` local release
   lock without overwrite. These commands have been certified only with
   synthetic private inputs; they have not published or created live material.
+- A single-purpose Vast template publisher now performs only the exact base
+  audit, exact-name absence check, at-most-once private-template create, and
+  read-back comparison required by the reviewed contract. It fixes the HTTPS
+  endpoint, disables redirects and ambient proxies, obtains the API key only
+  from the validated owner-private settings file, exposes no generic or delete
+  surface, and is tested exclusively with fake transports and synthetic keys.
+  Audit, render, and publish reject every image outside the exact
+  `docker.io/vastai/base-image@sha256:<lowercase-64-hex>` form. Publication
+  also compares the decoded bootstrap to the reviewed repository bytes and
+  validates one canonical release lock before any HTTP. The separate Task 8
+  provenance gate must still verify the digest-scoped OCI manifest/config and
+  exact source/revision labels before the sole POST is allowed.
 - **Maximum total instance creates** is an immutable reviewed quote field
   limited to `1` or `2`, conservatively defaulted to `1` for legacy records,
   and enforced at confirmation and before any replacement offer search or
   create. The initial create plus durable retry count consumes the budget;
   recovery, idempotent retries, and ambiguous-create reconciliation never
   replenish it.
+- Vast offer policy requires complete verified on-demand evidence,
+  reliability `>= 0.99`, and finite provider-advertised download bandwidth
+  `>= 500` Mbps. Disjoint target (`>= 1,000`) and fallback (`500–999`) queries
+  feed one ranking whose speed component saturates at `1,000` Mbps; neither
+  floor is relaxed automatically. Offers and paid review expose network/disk
+  metrics and a preflight-byte-derived theoretical transfer lower bound.
+  Confirmation reapplies the hard policy and rejects a material bandwidth
+  downgrade before the initial create. Both replacement paths separately
+  reapply the reliability/download floors before selecting or creating from a
+  fresh search result.
 
 ## Safety and release status
 
@@ -112,9 +136,11 @@ Source of truth:
 
 ## Next gated action
 
-The free boundary is complete. No offer search, provider mutation, release
-publication, or paid Gold execution is authorized in the current run. A paid
-Gold GO must separately state all of:
+The authorized current path, after the final offline gates and reviewed push,
+conditionally permits only the immutable release publication and, after its
+success, one provenance-verified private template plus its local lock/restart.
+It still permits no offer search, instance creation, workflow execution, or
+paid Gold action. A later paid Gold GO must separately state all of:
 
 1. maximum instance count;
 2. maximum hourly price;

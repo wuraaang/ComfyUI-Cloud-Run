@@ -190,6 +190,15 @@ python3 scripts/render_worker_template.py \
   --release-metadata <owner-private-release-metadata> \
   --base-template-audit <owner-private-base-template-audit>
 
+python3 scripts/publish_worker_template.py \
+  audit-base \
+  --output-directory <owner-private-output-directory>
+
+python3 scripts/publish_worker_template.py \
+  publish \
+  --request-file <owner-private-template-request> \
+  --output-directory <owner-private-output-directory>
+
 python3 scripts/write_worker_release_lock.py \
   --output <owner-private-data-directory>/worker-release.json \
   --template-hash-id <32-lowercase-hex-template-id> \
@@ -202,6 +211,22 @@ versions, and destination agree exactly. The renderer accepts only the fixed
 audited base-template schema and deterministically creates the remote lock,
 fixed bootstrap program, and template request with no embedded token, session,
 workflow, model locator, signed target, or caller command.
+
+The template publisher fixes the Vast template HTTPS endpoint and exposes only
+base audit plus one private-template publication. It validates exact lookup and
+request schemas, disables redirects and ambient proxies, bounds time and
+response bytes, obtains the API key through a no-follow owner-private settings
+read instead of argv, performs at most one POST, and reconciles ambiguity only
+with one exact-name GET. It has no update, delete, arbitrary URL/method,
+offer, instance, or volume capability, and never prints a request, response,
+authorization header, key, `onstart`, or base64 body.
+Audit, render, and publish require the exact image repository form
+`docker.io/vastai/base-image@sha256:<lowercase-64-hex>`. Before any HTTP,
+publication decodes `onstart`, compares its bootstrap bytes with the reviewed
+`remote_worker/bootstrap.py`, and validates the remote lock as the one
+canonical immutable release contract. This structural lock does not replace
+Task 8's separate pre-POST verification of the digest-scoped OCI
+manifest/config bytes and exact source/revision labels.
 
 Every input and output remains outside the repository. The output directory
 must be owner-private and every generated file has mode `0600`. The local lock
@@ -216,11 +241,24 @@ the Vast-provided Jupyter bearer token, strips `Authorization`, discards any
 caller-supplied `X-Cloud-Run-Boundary`, adds the authenticated boundary marker,
 and proxies only to `127.0.0.1:8766`.
 
-`remote_worker/gateway.py` requires exactly one executable regular Caddy binary
-from its two fixed absolute candidates, validates the token without disclosing
-it, and starts Caddy plus the worker with fixed argv and no shell. Only Caddy's
-minimal environment receives the token. The worker receives only an explicit
-runtime allowlist plus Vast's own-instance `CONTAINER_ID` and
+At official Vast base-image source commit
+`46e032d852ece6edb2a2a477c5b9557cba6645bf`, `Dockerfile.runtime` inherits its
+stock base image, `caddy.conf` invokes `/opt/supervisor-scripts/caddy.sh`, and
+that script directly executes `/opt/portal-aio/caddy_manager/caddy`. This
+source review proves the launch path, not the live filesystem or the inherited
+layer that installed the binary.
+
+Reviewed public permalinks:
+
+- `Dockerfile.runtime`: https://github.com/vast-ai/base-image/blob/46e032d852ece6edb2a2a477c5b9557cba6645bf/Dockerfile.runtime
+- `caddy.sh`: https://github.com/vast-ai/base-image/blob/46e032d852ece6edb2a2a477c5b9557cba6645bf/ROOT/opt/supervisor-scripts/caddy.sh
+- `caddy.conf`: https://github.com/vast-ai/base-image/blob/46e032d852ece6edb2a2a477c5b9557cba6645bf/ROOT/etc/supervisor/conf.d/caddy.conf
+
+`remote_worker/gateway.py` requires exactly that one executable regular Caddy
+binary, rejects symlinks and generic system paths, validates the token without
+disclosing it, and starts Caddy plus the worker with fixed argv and no shell.
+Only Caddy's minimal environment receives the token. The worker receives only
+an explicit runtime allowlist plus Vast's own-instance `CONTAINER_ID` and
 `CONTAINER_API_KEY` required by its deadline watchdog; it receives neither the
 Jupyter token nor a provider-account key. When either child exits, the
 supervisor terminates the sibling, waits for the fixed bound, kills only after

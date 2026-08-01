@@ -222,6 +222,19 @@ kills, the sibling when either process exits. Caddy exposes `:8765`, strips
 inbound authorization and boundary headers, and proxies only to
 `127.0.0.1:8766`.
 
+Every Vast offer must carry complete verified, rentable, one-GPU, on-demand
+evidence, reliability of at least `0.99`, and finite provider-advertised
+download bandwidth of at least `500` Mbps. A default search uses disjoint
+target (`>= 1,000` Mbps) and fallback (`500–999` Mbps) queries, never relaxes
+either floor, and ranks with download speed saturated at `1,000` Mbps before
+reliability, disk bandwidth, price, and offer ID. Offer and paid-review views
+show the advertised network/disk metrics and
+`ceil(bytes * 8 / (Mbps * 1_000_000))` as a theoretical transfer lower bound,
+not measured startup time. Exact-offer confirmation reapplies the hard policy
+and rejects a drop below `min(reviewed Mbps, 1,000)` before any initial create.
+Both replacement paths independently reapply the `0.99`/`500` floors before
+selecting or creating from a fresh search result.
+
 The deterministic commands are:
 
 ```sh
@@ -236,6 +249,15 @@ python3 scripts/render_worker_template.py \
   --release-metadata <owner-private-release-metadata> \
   --base-template-audit <owner-private-base-template-audit>
 
+python3 scripts/publish_worker_template.py \
+  audit-base \
+  --output-directory <owner-private-output-directory>
+
+python3 scripts/publish_worker_template.py \
+  publish \
+  --request-file <owner-private-template-request> \
+  --output-directory <owner-private-output-directory>
+
 python3 scripts/write_worker_release_lock.py \
   --output <owner-private-data-directory>/worker-release.json \
   --template-hash-id <32-lowercase-hex-template-id> \
@@ -246,6 +268,19 @@ All generation inputs and outputs stay outside the repository in existing
 owner-private directories. Generated files use mode `0600`. The final local
 lock is created atomically without overwrite and must round-trip through the
 runtime loader before it is accepted.
+
+The template publisher is a single-purpose client for the fixed Vast template
+endpoint. It exposes only exact base audit and one-create publication actions,
+disables ambient proxies and redirects, reads the existing owner-private API
+key without accepting it on argv, never prints payloads or credentials, and
+never offers update, delete, arbitrary URL/method, offer, instance, or volume
+operations. Audit, render, and publish accept only
+`docker.io/vastai/base-image@sha256:<lowercase-64-hex>`; publication also
+requires the encoded bootstrap bytes to equal the reviewed repository file and
+the remote lock to be the exact canonical release contract. The separate
+pre-POST Task 8 gate still verifies the digest-scoped OCI manifest/config and
+required source/revision labels. Automated coverage injects only fake
+transports and synthetic keys.
 
 No immutable Remote Worker release has been published. No private
 project-specific Vast template has been created. No local live

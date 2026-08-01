@@ -2,9 +2,10 @@
 
 Date: 2026-07-31
 
-Status: approved for implementation planning. This document does not authorize
-its implementation, a GitHub release, a Vast template mutation, an offer
-search, or a paid instance.
+Status: approved through the original offline implementation and the
+2026-08-01 connection-quality amendment. This document does not itself
+authorize implementation, a GitHub release, a Vast template mutation, an
+offer search, or a paid instance.
 
 ## Relationship to the existing designs
 
@@ -18,7 +19,9 @@ Those documents remain authoritative for canvas capture, dependency
 resolution, worker authentication, provisioning, execution, deadlines,
 verified outputs, and destruction. This continuation resolves the remaining
 release bootstrap contradiction, makes the human instance-count authorization
-machine-enforceable, and defines the first real remote acceptance run.
+machine-enforceable, defines a reusable connection-quality policy for every
+workflow-derived Vast search, and defines the first real remote acceptance
+run.
 
 The older documents call the manual acceptance run `Gold`. In this continuation
 it is called the **live workflow acceptance** or **live goal test** to avoid
@@ -194,6 +197,25 @@ directory only:
 - the fixed template `onstart` payload;
 - the private-template request body.
 
+A second focused repository script is the only allowed authenticated template
+transport. It uses the documented `GET` and `POST`
+`https://console.vast.ai/api/v0/template/` operations, with exact
+`select_filters`, `select_cols`, and `order_by` values for lookup. It accepts
+the Vast API key only from the process environment or the existing
+owner-private credential source, never from argv, and never prints a request,
+response, authorization header, key, `onstart`, or base64 body. HTTPS is
+fixed, redirects and ambient proxies are disabled, time and response sizes are
+bounded, and responses are normalized into a small typed schema before use.
+The script has no update, delete, arbitrary-URL, arbitrary-method, or generic
+payload surface. Creation is attempted at most once. An ambiguous POST result
+is followed only by one exact-name read-only reconciliation; it is never
+blindly retried. These contracts follow Vast's documented template search,
+creation, and API workflow:
+
+- https://docs.vast.ai/api-reference/search/search-templates
+- https://docs.vast.ai/api-reference/templates/create-template
+- https://docs.vast.ai/api-reference/creating-and-using-templates-with-api
+
 The fixed `onstart` payload contains the reviewed `remote_worker/bootstrap.py`
 bytes and remote lock encoded as base64 constants. It creates one private
 bootstrap directory with mode `0700`, writes both files with mode `0600`, sets
@@ -217,16 +239,44 @@ Vast-injected `CONTAINER_ID` and `CONTAINER_API_KEY` required for its
 own-instance deadline watchdog; it never receives `JUPYTER_TOKEN` or a
 provider-account credential. Caddy's fixed configuration disables the admin
 endpoint and automatic HTTPS.
-The supervisor accepts only one proven
-absolute Caddy path from `/usr/bin/caddy` or `/usr/local/bin/caddy`; zero or two
-matches fail closed. The official base-template audit must establish which one
-exists before template creation.
+At official Vast base-image source commit
+`46e032d852ece6edb2a2a477c5b9557cba6645bf`, `Dockerfile.runtime` inherits the
+stock base image and does not itself copy Caddy. The reviewed Supervisor
+configuration invokes `/opt/supervisor-scripts/caddy.sh`, and that script
+executes `/opt/portal-aio/caddy_manager/caddy` directly. This is exact launch
+path evidence, not a claim about which inherited build layer installs the
+binary. Before the worker release is rebuilt, a focused TDD change replaces
+the incorrect generic `/usr/bin` and `/usr/local/bin` candidates with that one
+regular executable path. The private-template audit must still bind an
+immutable official image digest and pinned tag. Before creation it also requires
+one executable provenance rule: the audited image must be the official
+`docker.io/vastai/base-image` repository at a lowercase SHA-256 digest; a
+digest-scoped Docker Registry manifest and its small content-addressed config
+blob must verify byte-for-byte and contain
+`org.opencontainers.image.source=https://github.com/vast-ai/base-image` plus
+`org.opencontainers.image.revision=46e032d852ece6edb2a2a477c5b9557cba6645bf`.
+Only that manifest and bounded config blob may be retrieved overnight; a tag,
+manifest list without one unambiguous Linux/amd64 child, absent/conflicting
+label, redirect, proxy, foreign registry/repository, image layer, SBOM guessed
+from a tag, or unsigned free-form claim is insufficient. If this exact rule
+cannot be satisfied, template creation stops and reports that single blocker
+rather than pretending the source inspection describes the chosen image. Even
+with this provenance, source evidence is not described as a live
+filesystem measurement: the gateway rechecks the actual path, ownership,
+regular-file type, and executable bit at boot and fails closed if the image no
+longer matches. No paid probe is created merely to prove the path.
 
 To keep Caddyfile environment expansion inert, the bounded token alphabet is
 `[A-Za-z0-9._~+/=-]` and its UTF-8 length is 1 through 4096 bytes. A provider
 token outside that contract fails closed before either child process starts.
 
-The private template exposes port `8765` and sets no user secret. Vast injects
+The private template sets `private: true` and exposes only container port
+`8765` through Vast's documented `env` Docker-flag field as the fixed value
+`-p 8765:8765`. It uses Vast's documented `runtype: "ssh"` with
+`use_ssh: true` and `ssh_direct: true`; legacy combined runtype strings and the
+undocumented `ports` field are rejected. Jupyter-direct flags are false and
+all three documented Docker-registry credential fields are explicit empty
+strings. It sets no environment variable or user secret. Vast injects
 per-instance credentials at runtime. The local owner-private
 `worker-release.json` stores only the template hash, worker commit, archive
 digest, versions, protocol, and port. It remains outside Git, is a regular file
@@ -253,6 +303,103 @@ adoption. More than one matching instance remains a residual-billing failure.
 The first live acceptance should use `max_instance_creates = 1` unless the
 human explicitly authorizes two total creates.
 
+## Connection-quality policy
+
+The first real workflow has at least `29,347,330,907` public model bytes to
+transfer. Host reliability and network throughput are different signals:
+reliability is historical uptime/health, while Vast's `inet_down` field is the
+advertised download bandwidth. A reliable host can still be too slow for this
+workload.
+
+The provider contracts are documented at:
+
+- https://docs.vast.ai/api-reference/search/search-offers
+- https://docs.vast.ai/cli/reference/search-instances
+- https://docs.vast.ai/guides/instances/choosing/find-and-rent
+
+Vast's Search Offers API page currently labels `inet_down` as `MB/s`, while
+its CLI reference and marketplace offer guide label the same field as
+`Mb/s`/Mbps. This design makes an explicit contract choice instead of silently
+mixing the two: `inet_down_mbps` follows the CLI and user-facing marketplace
+unit, which also matches the repository's existing normalized field name.
+The theoretical estimate is valid only under that documented Mbps contract;
+the UI identifies the value as provider-advertised and links no promise to it.
+
+The policy is reusable for every workflow rather than special-cased to the
+first canvas:
+
+- keep only verified, rentable, one-GPU, on-demand offers;
+- require reliability of at least `0.99`;
+- require a finite `inet_down` of at least `500` Mbps;
+- prefer `1,000` Mbps or more, without treating bandwidth above that target as
+  increasingly valuable;
+- keep the existing human maximum hourly-price, VRAM, disk, template, and
+  instance-create boundaries;
+- reject an absent or malformed reliability or download-bandwidth value;
+- never lower either threshold automatically when no offer matches.
+
+One default UI search performs exactly two bounded read-only Vast queries. The
+target query requests `inet_down >= 1000` and orders by reliability, disk
+bandwidth, then price and offer ID. The fallback query requests
+`500 <= inet_down < 1000` and orders first by download speed, then by the same
+reliability, disk, price, and ID tie-breakers. This aligns provider-side truncation with the shared local
+quality policy: very fast rows above the saturated target cannot crowd out a
+more reliable, faster-disk, cheaper target-class host, while the fallback query
+still supplies the best 500--999 Mbps fallbacks. Both require
+`reliability >= 0.99`, use the existing finite result limit, and are merged by
+offer ID before local policy. A stricter caller floor below 1,000 raises the
+fallback lower bound; a caller floor at or above 1,000 makes only the target
+query because the fallback class is empty. Exact-offer revalidation remains
+one ID-scoped query with the hard 500 Mbps floor.
+
+Local normalization requires explicit verified, rentable, one-GPU, on-demand,
+disk-space, reliability, and bandwidth evidence; verification accepts only the
+documented boolean `verified == true` or string `verification == "verified"`
+forms and rejects a conflict. Absence is not treated as success. Public helper
+overrides may only make thresholds stricter and reject attempts to pass values
+below the fixed floors. After normalization, merge, blacklist, and bait-price
+removal, the shared deterministic quality key is:
+
+1. `min(inet_down_mbps, 1000)` descending;
+2. reliability descending;
+3. disk bandwidth descending;
+4. total hourly price ascending;
+5. offer ID ascending.
+
+Saturating the first key at `1,000` Mbps means a 1,000 Mbps host reaches the
+startup target and is not displaced merely by a much more expensive 5,000
+Mbps host. When no target-speed offer exists, the fastest eligible fallback
+between 500 and 999 Mbps is shown first. The same key governs initial display
+order and any separately authorized replacement; there is no second hidden
+selection policy.
+
+The offer list and paid review expose provider-advertised download Mbps, disk
+MB/s, reliability, download/upload prices, and a raw-transfer lower bound:
+
+```text
+ceil(transfer_bytes * 8 / (inet_down_mbps * 1_000_000))
+```
+
+For the current model-only floor, that is about `470` seconds at 500 Mbps and
+`235` seconds at 1,000 Mbps. The UI labels this as theoretical transfer time,
+not startup time. Container/image loading, source throttling, congestion,
+checksumming, disk writes, installation, and ComfyUI startup can only make the
+observed duration longer.
+
+`OfferQuote` persists the reviewed `inet_down_mbps` and `disk_bw_mbps`. Exact
+offer confirmation repeats the provider lookup and all hard gates. It also
+requires the current bandwidth to remain at least
+`min(quoted_inet_down_mbps, 1000)`: a 1,200 Mbps quote may fall to 1,000 and
+remain target-class, while a 1,000 Mbps quote falling to 999 or an 850 Mbps
+fallback falling below 850 requires a new search and human review. It never
+rents against a stale, slower quote.
+
+Two alternatives are intentionally rejected. A hard 1,000 Mbps floor makes
+the four-minute target clearer but can eliminate every otherwise safe offer.
+Ranking without a 500 Mbps floor preserves marketplace availability but allows
+unbounded model-transfer delay. The selected two-tier policy keeps a useful
+floor while aiming for the target.
+
 ## Real workflow preflight
 
 The real private workflow must be open in the pinned ComfyUI frontend. It is
@@ -260,6 +407,14 @@ captured through the existing Cloud Run action without local execution or
 export into this repository. Its selected `LoadImage` input must resolve to the
 actual intended private source under the approved ComfyUI input root. A
 synthetic substitute blocks the live acceptance.
+
+This is a deliberate human/browser boundary. Canvas state and in-memory native
+annotations are owned by the live frontend; neither the backend nor a fresh
+unattended Codex process can read or click them. Overnight work may finish the
+code, release, template, local lock, and restart, but the human must return to
+the browser, open/confirm the actual workflow and input, and invoke the Cloud
+Run capture/preflight action. Filesystem scraping, browser-profile mutation,
+synthetic exports, and local prompt execution are not substitutes.
 
 Each active model loader must have one exact native `properties.models` record.
 The five already proven public identities are reused only when the live
@@ -298,6 +453,14 @@ applicable boundary explicitly:
    maximum hourly price, and absolute maximum duration or total cost.
 
 The current plan-writing session authorizes none of these execution actions.
+
+For unattended non-paid preparation, one fresh-session handoff may itemize the
+implementation, release, and template permissions separately and condition
+each later permission on all preceding gates. A release permission for a
+future implementation commit is valid only for the unique final reviewed HEAD
+produced by the listed tasks; any later commit, failed review/gate, collision,
+or ambiguity cancels that permission. The handoff cannot preauthorize the
+live-browser workflow capture or any paid action.
 
 The paid authorization must be a new message in the execution session. For
 example:
@@ -383,6 +546,23 @@ separate destructive operations requiring separate approval.
 - duplicate preview/confirm and recovery never increase create count;
 - quote/UI expose the exact persisted total-create limit.
 
+### Connection quality
+
+- the two bounded provider query tiers cover target and floor candidates
+  without allowing raw speeds above the target to monopolize the result limit;
+- provider queries and local normalization require reliability `>= 0.99` and
+  advertised download bandwidth `>= 500` Mbps;
+- missing, non-finite, below-floor, or incomplete provider constraint evidence
+  fails closed, and explicit overrides cannot weaken the fixed floors;
+- target saturation ranks 1,000 Mbps ahead of 999 Mbps but does not reward
+  bandwidth beyond 1,000 Mbps before reliability, disk, and price;
+- initial offer order and replacement selection use the same stable key;
+- quote persistence and confirmation reject a material bandwidth downgrade;
+- offer and paid-review UI show Mbps, disk MB/s, bandwidth prices, and the
+  theoretical estimate without presenting it as measured startup time;
+- an empty result stops without threshold relaxation, template mutation, or
+  provider create.
+
 ### Repository and publication
 
 - focused tests follow an observed red-green cycle;
@@ -410,6 +590,10 @@ separate destructive operations requiring separate approval.
   workflows, inputs, outputs, instance IDs, or signed URLs;
 - guessing a model or input from its filename;
 - enabling automatic replacement beyond the human total-create limit;
+- promising a four-minute startup or measuring throughput by renting a probe
+  instance;
+- an adaptive optimizer, per-workflow network settings, or silent quality
+  fallback for the first acceptance;
 - merging PR `#2`, publishing to Comfy Registry, or announcing general
   availability as part of the first live acceptance.
 
@@ -425,6 +609,10 @@ separate destructive operations requiring separate approval.
   protocol, versions, and port.
 - The persisted total-create limit cannot be exceeded by confirmation,
   replacement, retry, or recovery.
+- Every searched, previewed, confirmed, or replacement offer satisfies the
+  fixed reliability/download floors, uses the one shared target-saturated
+  ranking, and exposes its reviewed connection metrics and theoretical
+  transfer estimate.
 - The actual workflow and actual private input pass a new free preflight.
 - A separately bounded live run produces one coherent verified output or a
   sanitized failure, then destroys every managed instance.

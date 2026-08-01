@@ -2,16 +2,16 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Publish and consume one deterministic immutable Remote Worker release, enforce the human-authorized total Vast instance-create limit, then run one separately authorized live workflow acceptance with verified teardown.
+**Goal:** Publish and consume one deterministic immutable Remote Worker release, enforce the human-authorized total Vast instance-create limit and a reusable connection-quality floor, then run one separately authorized live workflow acceptance with verified teardown.
 
-**Architecture:** Keep the reviewed worker-only archive and strict extractor. Serve that archive as an immutable GitHub Release asset, permit only GitHub's single release-asset redirect, supervise the loopback worker behind Caddy, and generate the private Vast template from deterministic repository tooling. Persist `max_instance_creates` in the paid quote so confirmation, recovery, and boot replacement cannot exceed the human boundary.
+**Architecture:** Keep the reviewed worker-only archive and strict extractor. Serve that archive as an immutable GitHub Release asset, permit only GitHub's single release-asset redirect, supervise the loopback worker behind Caddy, and generate the private Vast template from deterministic repository tooling. Apply fixed provider and local connection-quality gates before displaying an offer, use one target-saturated ranking for initial and replacement selection, and persist both `max_instance_creates` and reviewed connection metrics in the paid quote so confirmation cannot cross either human or quality boundaries.
 
 **Tech Stack:** Python 3 standard library and `unittest`, aiohttp application code already in the repository, JavaScript ES modules and Node test runner, SQLite repositories, GitHub CLI/API, and Vast.ai HTTP API.
 
 ## Global Constraints
 
 - Begin from branch `feat/vast-cloud-run-lifecycle` in worktree `/Users/wuraaang/.worktrees/comfyui-cloud-run/mission-hermes`.
-- Require commit `1fc5ddc8e4e6569bb6af8642ee84846f91ca11b0` to be an ancestor of `HEAD`; do not redo Tasks 1 through 10 or the three review corrections already contained in that commit.
+- Require commit `1fc5ddc8e4e6569bb6af8642ee84846f91ca11b0` to be an ancestor of `HEAD`; do not redo Tasks 1 through 10 of `docs/superpowers/plans/2026-07-31-workflow-embedded-model-metadata-bridge.md` or the three review corrections already contained in that commit.
 - Read `AGENTS.md`, the design paired with this plan, the two preceding workflow designs, and `docs/remote-worker-bootstrap-review.md` completely before editing.
 - Use `superpowers:receiving-code-review` before evaluating review findings, `superpowers:test-driven-development` for every behavior change, `superpowers:verification-before-completion` before success claims or commits, and `superpowers:requesting-code-review` at the review gates.
 - Use `certifying-comfyui-cloud-workflows` for the actual canvas metadata and free Cloud Run preflight in Task 9 and for sanitized certification evidence in Task 11.
@@ -27,6 +27,9 @@
 - The first live acceptance uses the actual intended private input, not the previous 206-byte synthetic proof input.
 - Before paid confirmation require a new message stating maximum total instance creates, maximum hourly price, and either absolute maximum duration or total maximum cost.
 - Default the first live acceptance to `max_instance_creates = 1`; a value of `2` is valid only when the new paid authorization explicitly allows two total creates.
+- Require verified on-demand offers with reliability `>= 0.99` and finite advertised download bandwidth `>= 500` Mbps. Prefer `1,000` Mbps, saturate ranking at that target, and never relax either floor automatically.
+- Treat the displayed transfer duration as a theoretical lower bound derived from fresh preflight bytes, never as a four-minute startup guarantee.
+- Use only `/opt/portal-aio/caddy_manager/caddy`, the path invoked by the reviewed official Vast base-image source; reject generic or duplicate Caddy candidates and revalidate the real regular executable at worker boot.
 - After every code change run focused tests, then the complete suite, then `scripts/check.sh` twice consecutively before publication or paid use.
 - Stop at every authorization boundary. The session that wrote and pushed this plan authorizes none of its implementation or publication tasks.
 
@@ -53,6 +56,13 @@ Expected:
 - PR `#2` is open and draft;
 - only changes intentionally made in this plan are present.
 
+The 2026-08-01 planning baseline before Task 6A is commit
+`cd041cae3dbe87fd67751f20586c6714708cf7ca`. If the human validates the
+amendment by pasting the fresh-session handoff below, the only expected
+uncommitted starting changes are this plan and its paired design. Preserve
+them, inspect them, and include them in the reviewed Task 6A commit; do not
+discard or overwrite them.
+
 Read all required contracts:
 
 ```bash
@@ -63,7 +73,7 @@ sed -n '261,620p' docs/superpowers/specs/2026-07-31-workflow-derived-vast-gpu-se
 sed -n '621,980p' docs/superpowers/specs/2026-07-31-workflow-derived-vast-gpu-session-design.md
 sed -n '1,260p' docs/superpowers/specs/2026-07-31-workflow-embedded-model-metadata-bridge-design.md
 sed -n '261,620p' docs/superpowers/specs/2026-07-31-workflow-embedded-model-metadata-bridge-design.md
-sed -n '1,460p' docs/superpowers/specs/2026-07-31-immutable-worker-release-and-live-workflow-acceptance-design.md
+sed -n '1,560p' docs/superpowers/specs/2026-07-31-immutable-worker-release-and-live-workflow-acceptance-design.md
 sed -n '1,300p' docs/remote-worker-bootstrap-review.md
 ```
 
@@ -79,15 +89,20 @@ Before Task 1, obtain explicit authorization to edit code/tests/docs and push im
 - `tests/python/test_worker_gateway.py`: isolated process, environment, binary-selection, secret-redaction, and shutdown tests.
 - `scripts/build_worker_release_bundle.py`: create the deterministic archive with its exact immutable tag, asset name, URL, size, digest, and sanitized metadata.
 - `scripts/render_worker_template.py`: validate the release metadata and render the fixed remote lock, fixed base64 `onstart`, and private-template request in a private output directory.
+- `scripts/publish_worker_template.py`: perform only the exact Vast template list, single-create, and read-back operations with bounded secret-safe transport and typed response normalization.
 - `scripts/write_worker_release_lock.py`: atomically write the final owner-private `0600` local lock after a verified template creation.
 - `tests/python/test_worker_release_tools.py`: deterministic release naming, template rendering, secret exclusion, round-trip, file-permission, and fail-closed input tests.
+- `tests/python/test_worker_template_api.py`: exact template API queries, response schemas, credential non-disclosure, no-redirect/no-proxy transport, single-create, and ambiguous-result reconciliation tests.
 
 ### Existing files changed together
 
 - `remote_worker/bootstrap.py` and `tests/python/test_worker_bootstrap.py`: immutable release URL validation and the single-host redirect transport.
+- `remote_worker/gateway.py` and `tests/python/test_worker_gateway.py`: replace the incorrect generic Caddy candidates with the one official Vast portal path and preserve fail-closed runtime validation.
 - `remote_worker/Caddyfile`, `scripts/build_worker_artifact.py`, `tests/python/test_worker_bootstrap.py`, and `tests/python/test_repository_contract.py`: disable unused Caddy services and explicitly review/package the gateway file.
 - `cloud_run/models.py`, `cloud_run/service.py`, `cloud_run/lifecycle.py`, `cloud_run/routes.py`, `web/js/cloud-run.js`, and `web/js/session-console.js`: persist, revalidate, enforce, submit, and render `max_instance_creates`.
 - `tests/python/test_models.py`, `tests/python/test_service.py`, `tests/python/test_lifecycle.py`, `tests/python/test_routes.py`, `tests/python/test_repository.py`, `tests/python/test_fake_session_integration.py`, `tests/js/cloud-run-ui.test.mjs`, and `tests/js/session-console.test.mjs`: regression coverage for the total-create boundary.
+- `cloud_run/constants.py`, `cloud_run/vast.py`, `cloud_run/offers.py`, `cloud_run/session_service.py`, `cloud_run/models.py`, `cloud_run/service.py`, `cloud_run/lifecycle.py`, `web/js/cloud-run.js`, and `web/js/session-console.js`: fixed connection floors, target-saturated ordering, theoretical estimates, quote persistence, confirmation revalidation, and inert UI rendering.
+- `tests/python/test_vast.py`, `tests/python/test_offers.py`, `tests/python/test_session_service.py`, `tests/python/test_models.py`, `tests/python/test_service.py`, `tests/python/test_lifecycle.py`, `tests/python/test_fake_session_integration.py`, `tests/js/cloud-run-ui.test.mjs`, and `tests/js/session-console.test.mjs`: connection-quality provider, policy, persistence, lifecycle, and UI regression coverage.
 - `scripts/check.sh`: include the new reviewed worker and release-tool files in repository gates.
 - `README.md`, `docs/project-state.md`, and `docs/remote-worker-bootstrap-review.md`: record the implemented offline contract, then separately record sanitized publication/live evidence only after it exists.
 
@@ -97,6 +112,7 @@ Before Task 1, obtain explicit authorization to edit code/tests/docs and push im
 - `release-metadata.json`;
 - `remote-release-lock.json`;
 - `template-request.json`;
+- `base-template-audit.json` and `template-publication.json`;
 - the local data-directory `worker-release.json`;
 - downloaded verification asset and any live output.
 
@@ -133,7 +149,10 @@ Expected at plan creation: `enabled` is `false`. Do not call `PUT` in this task.
 
 - [ ] **Step 3: Record the no-mutation checkpoint**
 
-State in commentary that the implementation authorization covers local code/tests/docs and branch pushes only. Explicitly state that Tasks 7 through 11 each retain their documented new authorization gate.
+State in commentary that the implementation authorization covers local
+code/tests/docs and branch pushes only. Explicitly state that Tasks 7 through
+11 each retain their documented authorization gate; only the validated
+overnight handoff may conditionally preauthorize Tasks 7 and 8, never 9--11.
 
 ---
 
@@ -291,11 +310,14 @@ git commit -m "fix: bootstrap immutable worker release asset"
 
 - [ ] **Step 1: Write failing gateway tests**
 
-Test these exact requirements with fake `lstat`/`access` results for the two hard-coded absolute candidates and fake process objects:
+Test these exact requirements with fake `lstat`/`access` results for the one
+hard-coded absolute candidate and fake process objects:
 
 - a token outside `[A-Za-z0-9._~+/=-]{1,4096}` in UTF-8 bytes is rejected with `GatewayError("Remote Worker gateway configuration is unavailable.")`;
-- exactly one regular non-symlink executable at `/usr/bin/caddy` or `/usr/local/bin/caddy` is required;
-- zero or two matching candidates fail closed;
+- exactly one regular non-symlink executable at
+  `/opt/portal-aio/caddy_manager/caddy` is required;
+- the documented `/opt/instance-tools/bin/caddy` symlink and generic system
+  paths fail closed;
 - Caddy argv is `[caddy, "run", "--config", Caddyfile, "--adapter", "caddyfile"]`;
 - worker argv is `[sys.executable, "-m", "remote_worker.main", "--state-directory", "/var/lib/comfyui-cloud-run"]`;
 - Caddy receives only `JUPYTER_TOKEN` plus fixed `HOME`, `XDG_CONFIG_HOME`, and `XDG_DATA_HOME`; the worker environment contains only the explicit runtime and own-instance deadline allowlist and never `JUPYTER_TOKEN`;
@@ -316,13 +338,29 @@ Expected: import failure because `remote_worker.gateway` does not exist.
 Define these constants exactly:
 
 ```python
-CADDY_CANDIDATES = (Path("/usr/bin/caddy"), Path("/usr/local/bin/caddy"))
+CADDY_CANDIDATES = (
+    Path("/opt/portal-aio/caddy_manager/caddy"),
+)
 STATE_DIRECTORY = Path("/var/lib/comfyui-cloud-run")
 MAX_TOKEN_BYTES = 4096
 SHUTDOWN_TIMEOUT_SECONDS = 10
 ```
 
-Validate the two hard-coded candidate files with `os.lstat`: regular file, not symlink, owned by root or the current user, and executable according to `os.access`. Resolve neither caller paths nor `PATH`. Resolve the Caddyfile only as `Path(__file__).with_name("Caddyfile")`, require it to be a regular non-symlink file, and pass that exact path. Create fixed private Caddy config/data directories beneath `/var/lib/comfyui-cloud-run`, then build a Caddy environment containing only `JUPYTER_TOKEN`, `HOME=/var/lib/comfyui-cloud-run`, and those two fixed XDG paths. Build the worker environment from an explicit allowlist containing `CLOUD_RUN_SESSION_ID`, `CLOUD_RUN_COMFY_ROOT`, `CLOUD_RUN_WORKER_VERSION`, `CONTAINER_ID`, `CONTAINER_API_KEY`, `HOME`, `LANG`, `LC_ALL`, `PATH`, `PYTHONPATH`, `PYTHONUNBUFFERED`, and `TMPDIR`. The two `CONTAINER_*` values are the Vast-injected, own-instance credentials required by the independently enforced billing deadline; always remove `JUPYTER_TOKEN`, provider-account credentials such as `VAST_API_KEY`, and every other variable.
+Validate the one hard-coded candidate file with `os.lstat`: regular file, not
+symlink, owned by root or the current user, and executable according to
+`os.access`. Resolve neither caller paths nor `PATH`. Resolve the Caddyfile only
+as `Path(__file__).with_name("Caddyfile")`, require it to be a regular
+non-symlink file, and pass that exact path. Create fixed private Caddy
+config/data directories beneath `/var/lib/comfyui-cloud-run`, then build a
+Caddy environment containing only `JUPYTER_TOKEN`,
+`HOME=/var/lib/comfyui-cloud-run`, and those two fixed XDG paths. Build the
+worker environment from an explicit allowlist containing
+`CLOUD_RUN_SESSION_ID`, `CLOUD_RUN_COMFY_ROOT`, `CLOUD_RUN_WORKER_VERSION`,
+`CONTAINER_ID`, `CONTAINER_API_KEY`, `HOME`, `LANG`, `LC_ALL`, `PATH`,
+`PYTHONPATH`, `PYTHONUNBUFFERED`, and `TMPDIR`. The two `CONTAINER_*` values are
+the Vast-injected, own-instance credentials required by the independently
+enforced billing deadline; always remove `JUPYTER_TOKEN`, provider-account
+credentials such as `VAST_API_KEY`, and every other variable.
 
 Add the fixed global Caddy options `admin off` and `auto_https off`. Preserve the exact `:8765` bearer matcher, request-header stripping, authenticated boundary header, and `127.0.0.1:8766` reverse proxy.
 
@@ -477,7 +515,7 @@ base = {
     "hash_id": "027fba7753c024be019030fb42aed900",
     "image": "reviewed-image.example/comfyui@sha256:" + "d" * 64,
     "tag": "reviewed-pinned-tag",
-    "runtype": "jupyter_direc ssh_direc",
+    "runtype": "ssh",
     "use_ssh": True,
     "ssh_direct": True,
     "jupyter_dir": "/workspace",
@@ -488,10 +526,18 @@ Assert the renderer rejects missing, additional, mutable, control-character, she
 
 ```text
 name, image, tag, runtype, use_ssh, ssh_direct, jupyter_dir,
-onstart, ports, env, recommended_disk_space
+jup_direct, use_jupyter_lab, docker_login_repo, docker_login_user,
+docker_login_pass, onstart, env, recommended_disk_space, private
 ```
 
-Require `ports == ["8765/tcp"]`, `env == ""`, and no API key, token, session identity, workflow field, model URL, signed URL, or arbitrary command. Decode the two base64 constants from `onstart` and assert byte equality with `remote_worker/bootstrap.py` and the compact remote lock.
+Require `env == "-p 8765:8765"`, `private is True`, and no environment
+variable, API key, token, session identity, workflow field, model URL, signed
+URL, or arbitrary command. Require `jup_direct is False`,
+`use_jupyter_lab is False`, and every `docker_login_*` value to be the empty
+string. The fixed `env` value is Vast's documented Docker flag field for port
+mappings; no undocumented `ports` key is sent. Decode the
+two base64 constants from `onstart` and assert byte equality with
+`remote_worker/bootstrap.py` and the compact remote lock.
 
 - [ ] **Step 6: Run renderer tests red**
 
@@ -531,7 +577,15 @@ Render a fixed POSIX `onstart` program that performs only these operations:
 
 Use no downloaded script, interpolated shell path, caller command, `eval`, pipe-to-shell, here-document delimiter derived from input, or secret. The only substituted strings are validated commit and base64 alphabets. Write outputs atomically as private regular files.
 
-Set request `name` to `cloud-run-worker-` plus the full 40-hex commit and `recommended_disk_space` to the fixed minimum `80`. Copy the validated immutable `image`, pinned `tag`, `runtype`, SSH booleans, and Jupyter directory from the exact audited base record; do not copy any additional base-template field.
+Set request `name` to `cloud-run-worker-` plus the full 40-hex commit,
+`recommended_disk_space` to the fixed minimum `80`, `private` to `true`, and
+`env` to the single fixed port mapping `-p 8765:8765`. Copy the validated
+immutable `image`, pinned `tag`, and Jupyter directory from the exact audited
+base record. Require and emit the documented fixed connection contract
+`runtype == "ssh"`, `use_ssh is True`, and `ssh_direct is True`; reject legacy
+combined runtype strings. Emit false Jupyter-direct flags and explicit empty
+Docker-registry credential fields as required by Vast's documented complete
+template request. Do not copy any additional base-template field.
 
 If the real read-only base-template record in Task 8 cannot be reduced exactly to the tested input schema without copying a secret or mutable launch field, stop. Do not loosen this renderer during publication; return to a reviewed TDD change.
 
@@ -804,6 +858,8 @@ git commit -m "fix: enforce total Vast instance create limit"
 
 - Modify: `README.md`
 - Modify: `docs/project-state.md`
+- Modify: `docs/superpowers/specs/2026-07-31-immutable-worker-release-and-live-workflow-acceptance-design.md`
+- Modify: `docs/superpowers/plans/2026-07-31-immutable-worker-release-and-live-workflow-acceptance.md`
 - Modify: `docs/remote-worker-bootstrap-review.md`
 - Modify: `tests/python/test_repository_contract.py`
 - Modify: only source/test files required by demonstrated review findings
@@ -930,15 +986,710 @@ git status --short --branch
 
 Expected: local and remote SHA match, PR remains open/draft, and the worktree is clean.
 
-- [ ] **Step 9: Stop at the first external-mutation boundary**
+- [ ] **Step 9: Stop at the next authorization boundary**
 
-Report the offline evidence and request a separate GitHub release authorization. Do not continue automatically to Task 7.
+Report the offline evidence. If the 2026-08-01 connection-quality amendment has
+not received explicit implementation permission, stop before Task 6A. After
+Tasks 6A, 6B, and 6C are green, reviewed, committed, pushed, and re-verified,
+request the separate or conditionally preauthorized GitHub release permission
+required by Task 7.
+
+---
+
+## Approved accelerated execution amendment — 2026-08-01
+
+The human approved a file-disjoint parallel execution of Tasks 6A, 6B, and 6C
+after the original sequential run proved unnecessarily slow. Each behavior
+change still follows an observed focused RED/GREEN cycle. Implementers do not
+commit independently and may not overlap file ownership. The controller then
+integrates documentation, runs the combined suites, obtains one whole-change
+review covering every risk named by the three task gates, processes every
+demonstrated finding with TDD, and runs `scripts/check.sh` twice consecutively
+on the final reviewed code. Targeted commits and the branch push occur only
+after that integrated gate. This changes scheduling and removes redundant
+intermediate full-gate/review repetitions; it does not weaken provider,
+publication, provenance, secret, immutability, or paid-action boundaries.
+
+---
+
+### Task 6A: Enforce and expose the reusable Vast connection-quality policy
+
+**Authorization gate:** Obtain an explicit message authorizing the
+2026-08-01 connection-quality amendment, its tests/documentation, commits, and
+push to the existing draft PR. This permits only code and offline/fake-provider
+verification. It does not authorize a real offer search, GitHub release
+publication, Vast template mutation, instance creation, model download, or
+workflow execution.
+
+**Files:**
+
+- Modify: `cloud_run/constants.py`
+- Modify: `cloud_run/vast.py`
+- Modify: `cloud_run/offers.py`
+- Modify: `cloud_run/session_service.py`
+- Modify: `cloud_run/models.py`
+- Modify: `cloud_run/service.py`
+- Modify: `cloud_run/lifecycle.py`
+- Modify: `web/js/cloud-run.js`
+- Modify: `web/js/session-console.js`
+- Modify: `tests/python/test_vast.py`
+- Modify: `tests/python/test_offers.py`
+- Modify: `tests/python/test_session_service.py`
+- Modify: `tests/python/test_models.py`
+- Modify: `tests/python/test_service.py`
+- Modify: `tests/python/test_lifecycle.py`
+- Modify: `tests/python/test_fake_session_integration.py`
+- Modify: `tests/js/cloud-run-ui.test.mjs`
+- Modify: `tests/js/session-console.test.mjs`
+- Modify: `README.md`
+- Modify: `docs/project-state.md`
+
+**Interfaces:**
+
+- Consumes: normalized Vast `reliability`, `inet_down`, `disk_bw`, bandwidth
+  prices, the fresh preflight `transfer_bytes`, the existing hourly/VRAM/disk
+  caps, blacklist, and exact-offer revalidation.
+- Produces: constants `MIN_VAST_RELIABILITY = 0.99`,
+  `MIN_VAST_INET_DOWN_MBPS = 500`, and
+  `PREFERRED_VAST_INET_DOWN_MBPS = 1000`; one shared
+  `offer_quality_key(offer)`; one
+  `estimated_transfer_seconds(transfer_bytes, inet_down_mbps)` helper; offer
+  payload field `estimated_transfer_seconds`; and persisted quote fields
+  `inet_down_mbps` and `disk_bw_mbps`.
+
+- [ ] **Step 1: Write failing provider-contract tests**
+
+Update `tests/python/test_vast.py` so one default `search_offers()` call makes
+exactly two provider requests. Both retain the existing GPU, price, disk,
+rental, and verification clauses and require reliability `0.99`. The target
+request contains:
+
+```python
+"reliability": {"gte": 0.99},
+"inet_down": {"gte": 1000},
+"order": [["reliability", "desc"], ["disk_bw", "desc"], ["dph_total", "asc"], ["id", "asc"]],
+```
+
+The fallback request contains:
+
+```python
+"reliability": {"gte": 0.99},
+"inet_down": {"gte": 500, "lt": 1000},
+"order": [["inet_down", "desc"], ["reliability", "desc"], ["disk_bw", "desc"], ["dph_total", "asc"], ["id", "asc"]],
+```
+
+Add table-driven normalization cases proving that missing/non-finite
+`inet_down`, `499`, reliability `0.989`, and missing `type`, `num_gpus`,
+`rentable`, both verification forms, or `disk_space` evidence are rejected, while a complete
+offer at exactly `500` Mbps and reliability `0.99` is accepted. Prove that the
+documented `verification == "verified"` string is also accepted, while a
+conflict with boolean `verified` is rejected. Prove that the
+two normalized result sets merge by offer ID and return at most
+`2 * OFFER_SEARCH_LIMIT` unique candidates for the shared local quality sort.
+Add tests that stricter explicit floors remain supported and any explicit value
+below `0.99` or `500` is rejected before HTTP. A stricter download floor below
+`1000` raises both applicable lower bounds; at `1000` or above, only the target
+request is made because the fallback interval is empty. Exact-ID `get_offer()`
+still makes one request with the hard floors.
+
+- [ ] **Step 2: Run the provider tests red**
+
+```bash
+python3 -m unittest \
+  tests.python.test_vast.VastRequestTests.test_search_posts_exact_read_only_contract_and_normalizes_result \
+  tests.python.test_vast.VastNormalizationAndErrorTests -v
+```
+
+Expected: failures show that the current implementation makes one legacy
+request, defaults to reliability `0.95`, has no bandwidth floor, accepts
+incomplete provider evidence, and permits weaker explicit values.
+
+- [ ] **Step 3: Implement the fixed provider and local floors**
+
+Add to `cloud_run/constants.py`:
+
+```python
+MIN_VAST_RELIABILITY = 0.99
+MIN_VAST_INET_DOWN_MBPS = 500
+PREFERRED_VAST_INET_DOWN_MBPS = 1000
+```
+
+Import those values in `cloud_run/vast.py`. Validate every caller-provided
+minimum before HTTP and raise `VastConfigurationError` when it is below the
+fixed floor; a default argument alone is insufficient. `search_offers()` uses
+one owned HTTP session. The target lower bound is
+`max(PREFERRED_VAST_INET_DOWN_MBPS, min_inet_down_mbps)`. When the caller floor
+is below the preferred target, execute the disjoint fallback interval from the
+caller floor inclusive to the preferred target exclusive; otherwise omit that
+empty query. Execute the target and applicable fallback payloads, then merge
+normalized offers by exact ID in deterministic order with a hard maximum
+of `2 * OFFER_SEARCH_LIMIT` unique candidates.
+The target query orders by reliability, disk bandwidth, price, and offer ID.
+The fallback query is capped below 1,000 Mbps, orders first by speed, and then
+uses the same tie-breakers.
+Provider-side truncation therefore matches the saturated local quality policy
+as closely as the bounded query surface allows: raw 5,000 Mbps rows cannot
+crowd out a better 1,000 Mbps target, and the fallback query supplies the best
+fallback if no target exists. Any query failure fails the whole search; it
+never becomes permission to weaken a threshold.
+
+`get_offer()` stays one ID-scoped request with reliability `0.99` and bandwidth
+`500`. Local normalization requires explicit complete evidence for every
+provider gate and rejects missing, non-finite, or below-floor values. Keep the
+normalized public field name `inet_down_mbps`: the implementation explicitly
+follows Vast's CLI and marketplace-guide Mbps contract, while documenting the
+conflicting `MB/s` label on the API page instead of silently changing scale.
+
+- [ ] **Step 4: Run provider tests green**
+
+```bash
+python3 -m unittest tests.python.test_vast -v
+```
+
+Expected: every Vast request, normalization, exact-offer lookup, and sanitized
+error test passes without a network request.
+
+- [ ] **Step 5: Write failing shared-ranking and estimate tests**
+
+In `tests/python/test_offers.py`, replace the ten-percent-cheapest behavior
+test with exact cases proving:
+
+```text
+999 Mbps loses to 1000 Mbps even when 999 Mbps is cheaper or more reliable
+1000 Mbps beats 5000 Mbps when reliability/disk are equal and 1000 is cheaper
+900 Mbps beats 600 Mbps when no target-class offer exists
+equal capped speed -> reliability -> disk speed -> price -> offer ID
+apply_offer_policy order equals select_best_offer priority
+```
+
+Add exact estimate assertions:
+
+```python
+self.assertEqual(
+    estimated_transfer_seconds(29_347_330_907, 500),
+    470,
+)
+self.assertEqual(
+    estimated_transfer_seconds(29_347_330_907, 1000),
+    235,
+)
+```
+
+Also assert that booleans, negative bytes, absent/non-finite speeds, and zero
+speed return `None` rather than raising or displaying a fabricated estimate.
+
+- [ ] **Step 6: Run ranking and estimate tests red**
+
+```bash
+python3 -m unittest tests.python.test_offers.RankingPolicyTests -v
+```
+
+Expected: failures identify the current ten-percent price window,
+reliability-first key, and missing estimate helper.
+
+- [ ] **Step 7: Implement one saturated quality key and estimate helper**
+
+In `cloud_run/offers.py`, remove the similar-price shortlist from
+`select_best_offer()` and define the reusable key with this behavior:
+
+```python
+def offer_quality_key(offer):
+    down = _finite(offer.get("inet_down_mbps"), default=-math.inf)
+    return (
+        -min(down, PREFERRED_VAST_INET_DOWN_MBPS),
+        -_finite(offer.get("reliability")),
+        -_finite(offer.get("disk_bw_mbps")),
+        _finite(offer.get("dph_total"), default=math.inf),
+        _offer_id_key(offer),
+    )
+```
+
+Both `apply_offer_policy()` and `select_best_offer()` use this exact key after
+their existing blacklist, bait-price, and exact requested-GPU checks. Define:
+
+```python
+def estimated_transfer_seconds(transfer_bytes, inet_down_mbps):
+    if type(transfer_bytes) is not int or transfer_bytes < 0:
+        return None
+    speed = _finite(inet_down_mbps, default=-1)
+    if speed <= 0:
+        return None
+    return math.ceil(transfer_bytes * 8 / (speed * 1_000_000))
+```
+
+Do not add adaptive thresholds, regional heuristics, probes, or new settings.
+
+- [ ] **Step 8: Run ranking and offer-policy tests green**
+
+```bash
+python3 -m unittest tests.python.test_offers -v
+```
+
+Expected: all blacklist, bait-price, deterministic ordering, exact GPU, target
+saturation, fallback, and estimate tests pass.
+
+- [ ] **Step 9: Write failing preflight, quote, revalidation, and UI tests**
+
+Add coverage proving all of the following before implementation:
+
+- `SessionService.search_offers()` attaches the estimate derived from that
+  exact preflight's aggregate `transfer_bytes`, without exposing a workflow or
+  private input identity;
+- `OfferQuote` record/public round-trips preserve finite nonnegative
+  `inet_down_mbps` and `disk_bw_mbps`; malformed values fail closed and legacy
+  unbound records receive `None` only for backward-compatible inspection;
+- both session and legacy-attempt preview paths plus both replacement quote
+  construction paths copy the two reviewed metrics;
+- both `_revalidated_session_offer()` and legacy `_revalidated_offer()` accept
+  1,200 -> 1,000 Mbps, reject 1,200 -> 999 Mbps, accept an unchanged 850 Mbps
+  fallback, and reject 850 -> 849 Mbps without `create_instance()`;
+- offer rows render `1000 Mbps download`, disk MB/s, bandwidth prices, and a
+  label containing `theoretical`; paid review renders the same metrics and
+  derives the estimate from persisted quote bytes;
+- all provider strings remain inert `textContent`; missing metrics display
+  `unavailable` and never `NaN`, `Infinity`, or HTML.
+
+- [ ] **Step 10: Run the cross-layer tests red**
+
+```bash
+python3 -m unittest \
+  tests.python.test_session_service \
+  tests.python.test_models \
+  tests.python.test_service \
+  tests.python.test_lifecycle \
+  tests.python.test_fake_session_integration -v
+node --test tests/js/cloud-run-ui.test.mjs tests/js/session-console.test.mjs
+```
+
+Expected: focused failures are limited to the new estimate, quote fields,
+revalidation, and display assertions.
+
+- [ ] **Step 11: Implement estimate propagation, durable review, and display**
+
+In `cloud_run/session_service.py`, await the existing offer search once and
+return a new sanitized offer mapping per result containing:
+
+```python
+"estimated_transfer_seconds": estimated_transfer_seconds(
+    result.transfer_bytes,
+    offer.get("inet_down_mbps"),
+)
+```
+
+Do not mutate the provider's input mapping. Add optional
+`inet_down_mbps`/`disk_bw_mbps` fields to `OfferQuote`, validate them as finite
+nonnegative numbers when present, include them in record/public payloads, and
+copy them at all four initial/replacement quote constructors across the session
+and legacy-attempt paths.
+
+During exact-offer confirmation, make both `_revalidated_session_offer()` and
+legacy `_revalidated_offer()` first reapply the hard provider/local policy,
+then require:
+
+```python
+current_inet_down_mbps >= min(
+    quoted_inet_down_mbps,
+    PREFERRED_VAST_INET_DOWN_MBPS,
+)
+```
+
+If the quoted or current metric is absent, malformed, or below the fixed
+floor, return unavailable before any create. In `web/js/cloud-run.js` and
+`web/js/session-console.js`, use finite-number helpers and `textContent` to
+show provider-advertised download Mbps, disk MB/s, target/fallback status,
+bandwidth prices, and `theoretical transfer ≈ ...`; explicitly state that
+actual startup can be longer.
+
+- [ ] **Step 12: Run all connection-quality tests green**
+
+```bash
+python3 -m unittest \
+  tests.python.test_vast \
+  tests.python.test_offers \
+  tests.python.test_session_service \
+  tests.python.test_models \
+  tests.python.test_service \
+  tests.python.test_lifecycle \
+  tests.python.test_fake_session_integration \
+  tests.python.test_routes \
+  tests.python.test_repository -v
+npm test
+```
+
+Expected: all selected Python tests and the complete Node suite pass.
+
+- [ ] **Step 13: Update truthful public documentation**
+
+Record the fixed `0.99` reliability floor, 500 Mbps hard floor, 1,000 Mbps
+target, capped ranking, theoretical-estimate formula, exact-offer downgrade
+rule, and no-silent-relaxation behavior in `README.md` and
+`docs/project-state.md`. Do not claim measured throughput, marketplace
+availability, a four-minute startup, or a successful real search.
+
+When and only when the human pasted the fresh-session handoff that explicitly
+validates this amendment, update the paired design status from awaiting review
+to approved on `2026-08-01` in the same focused documentation commit.
+
+- [ ] **Step 14: Run the complete gate twice and obtain review**
+
+```bash
+scripts/check.sh
+scripts/check.sh
+git diff --check
+git status --short
+```
+
+Expected on both gate runs: all Python/Node tests, security scans, and public
+artifact checks pass. Use `superpowers:requesting-code-review`; require the
+reviewer to inspect unit semantics, provider/local double enforcement,
+the two-query provider-limit strategy, target-saturated ordering, quote
+migration, both confirmation downgrade paths, replacement parity, UI wording,
+and proof that no create can occur after quality revalidation fails. Process
+demonstrated findings with
+`superpowers:receiving-code-review` and TDD, then repeat both full gates.
+
+- [ ] **Step 15: Commit and push only the reviewed amendment**
+
+```bash
+git add \
+  cloud_run/constants.py cloud_run/vast.py cloud_run/offers.py \
+  cloud_run/session_service.py cloud_run/models.py cloud_run/service.py \
+  cloud_run/lifecycle.py web/js/cloud-run.js web/js/session-console.js \
+  tests/python/test_vast.py tests/python/test_offers.py \
+  tests/python/test_session_service.py tests/python/test_models.py \
+  tests/python/test_service.py tests/python/test_lifecycle.py \
+  tests/python/test_fake_session_integration.py \
+  tests/js/cloud-run-ui.test.mjs tests/js/session-console.test.mjs \
+  README.md docs/project-state.md \
+  docs/superpowers/specs/2026-07-31-immutable-worker-release-and-live-workflow-acceptance-design.md \
+  docs/superpowers/plans/2026-07-31-immutable-worker-release-and-live-workflow-acceptance.md
+git diff --cached --check
+git commit -m "feat: require fast reliable Vast offers"
+git push origin feat/vast-cloud-run-lifecycle
+```
+
+Re-run `scripts/check.sh` once on the committed tree, require a clean worktree,
+local/remote/PR head equality, and keep PR `#2` open and draft. Continue to the
+separately reviewed Task 6B before any release. Task 7 may use only the final
+HEAD after Tasks 6A, 6B, and 6C and only when its explicit conditional publication
+authorization is present in the same execution session.
+
+---
+
+### Task 6B: Bind the gateway to the official Vast portal Caddy path
+
+**Authorization gate:** The validated overnight handoff must explicitly
+authorize this focused pre-release correction, its offline tests, documentation,
+commit, and push. It authorizes read-only retrieval of the listed public Vast
+source files. It does not authorize pulling/running a container, creating a
+template or instance, or any paid action.
+
+**Files:**
+
+- Modify: `remote_worker/gateway.py`
+- Modify: `tests/python/test_worker_gateway.py`
+- Modify: `docs/remote-worker-bootstrap-review.md`
+- Modify: `docs/project-state.md`
+
+**Interfaces:**
+
+- Consumes: official Vast base-image source commit
+  `46e032d852ece6edb2a2a477c5b9557cba6645bf`, whose runtime Dockerfile
+  inherits the stock base image, whose Supervisor configuration invokes
+  `caddy.sh`, and whose script directly executes
+  `/opt/portal-aio/caddy_manager/caddy`.
+- Produces: one allowlisted Caddy candidate at that path, with the existing
+  regular-file, non-symlink, owner, and executable runtime checks unchanged.
+
+- [ ] **Step 1: Reconfirm the immutable public source evidence read-only**
+
+Fetch only these files at the exact commit through GitHub's contents API:
+
+```text
+Dockerfile.runtime
+ROOT/opt/supervisor-scripts/caddy.sh
+ROOT/etc/supervisor/conf.d/caddy.conf
+```
+
+Require `Dockerfile.runtime` to identify the inherited runtime image,
+`caddy.conf` to invoke `/opt/supervisor-scripts/caddy.sh`, and that script to
+execute `/opt/portal-aio/caddy_manager/caddy` directly. Record the commit and
+public permalinks, not raw API bodies. Do not infer that `Dockerfile.runtime`
+copies Caddy: it does not. If any of these exact facts differ, stop and revise
+the design; do not guess or inspect a paid instance.
+
+- [ ] **Step 2: Write the failing exact-path tests**
+
+Update `tests/python/test_worker_gateway.py` to require:
+
+```python
+CADDY_CANDIDATES == (
+    Path("/opt/portal-aio/caddy_manager/caddy"),
+)
+```
+
+Prove `/usr/bin/caddy`, `/usr/local/bin/caddy`, the documented symlink
+`/opt/instance-tools/bin/caddy`, a symlink at the accepted path, wrong owner,
+non-regular file, and non-executable file all fail closed. Keep the exact argv,
+minimal environment, shutdown, and secret-redaction assertions.
+
+- [ ] **Step 3: Run the gateway test red**
+
+```bash
+python3 -m unittest \
+  tests.python.test_worker_gateway.GatewayBinarySelectionTests -v
+```
+
+Expected: the exact-candidate assertion fails because production still lists
+the two generic paths.
+
+- [ ] **Step 4: Implement the one-path allowlist**
+
+Replace only the candidate tuple in `remote_worker/gateway.py`:
+
+```python
+CADDY_CANDIDATES = (
+    Path("/opt/portal-aio/caddy_manager/caddy"),
+)
+```
+
+Do not accept the symlink, search `PATH`, install/download Caddy, loosen file
+validation, or change gateway process behavior.
+
+- [ ] **Step 5: Run focused and related tests green**
+
+```bash
+python3 -m unittest \
+  tests.python.test_worker_gateway \
+  tests.python.test_worker_bootstrap \
+  tests.python.test_worker_release_tools -v
+```
+
+Expected: every gateway, artifact membership, bootstrap, and deterministic
+release-tool test passes.
+
+- [ ] **Step 6: Update truthful evidence and verify twice**
+
+Document the exact source commit/path and explicitly state that source review
+is not a live filesystem measurement; the worker runtime remains the final
+fail-closed check. Then run:
+
+```bash
+scripts/check.sh
+scripts/check.sh
+git diff --check
+```
+
+Use `superpowers:requesting-code-review` for the source-to-path evidence,
+symlink rejection, allowlist, worker artifact SHA change, and absence of a new
+download/install surface. Process demonstrated findings with TDD and repeat
+both gates.
+
+- [ ] **Step 7: Commit, push, and freeze the release candidate**
+
+```bash
+git add remote_worker/gateway.py tests/python/test_worker_gateway.py \
+  docs/remote-worker-bootstrap-review.md docs/project-state.md
+git diff --cached --check
+git commit -m "fix: use official Vast Caddy path"
+git push origin feat/vast-cloud-run-lifecycle
+```
+
+Re-run `scripts/check.sh` on the committed tree. Require a clean worktree and
+local/remote/PR head equality. Continue to the separately reviewed Task 6C;
+Task 7 may use only the final HEAD after Tasks 6A, 6B, and 6C.
+
+---
+
+### Task 6C: Add the single-purpose Vast private-template transport
+
+**Authorization gate:** The validated overnight handoff must explicitly
+authorize this focused pre-publication implementation, its fake-transport
+tests, documentation, commit, and push. It authorizes read-only access to the
+three listed official Vast template API documents and registry
+manifest/config metadata for the exact audited official image. It does not
+authorize an offer query, image-layer pull, container execution, real template
+mutation during tests, instance creation, or any paid action.
+
+**Files:**
+
+- Create: `scripts/publish_worker_template.py`
+- Create: `tests/python/test_worker_template_api.py`
+- Modify: `scripts/render_worker_template.py`
+- Modify: `tests/python/test_worker_release_tools.py`
+- Modify: `tests/python/test_repository_contract.py`
+- Modify: `scripts/check.sh`
+- Modify: `docs/remote-worker-bootstrap-review.md`
+- Modify: `docs/project-state.md`
+
+**Interfaces:**
+
+- Consumes: the existing owner-private API key from the settings path resolved
+  by `SettingsStore`, but never through the current permissive `load()` file
+  open, plus exact base hash
+  `027fba7753c024be019030fb42aed900`, a generated name matching
+  `cloud-run-worker-[0-9a-f]{40}`, and the exact strict request emitted by
+  `render_worker_template.py`.
+- Uses only: `GET https://console.vast.ai/api/v0/template/` with exact encoded
+  `select_filters`, `select_cols`, and `order_by`, plus at most one
+  `POST https://console.vast.ai/api/v0/template/`.
+- Produces: a sanitized base-template audit or a sanitized publication record
+  containing only the validated public template ID/hash and comparison result.
+  Raw requests, raw responses, authorization headers, the API key, `onstart`,
+  and base64 bodies are never printed or persisted.
+
+Authoritative transport references:
+
+- https://docs.vast.ai/api-reference/search/search-templates
+- https://docs.vast.ai/api-reference/templates/create-template
+- https://docs.vast.ai/api-reference/creating-and-using-templates-with-api
+
+- [ ] **Step 1: Write the fake-transport tests red**
+
+Create table-driven tests that require both lookup forms to call only the fixed
+template endpoint. Base audit uses the exact filter:
+
+```python
+{"hash_id": {"eq": "027fba7753c024be019030fb42aed900"}}
+```
+
+Project lookup uses one exact validated generated name. Both send compact,
+sorted JSON in `select_filters`, set `select_cols` to exactly
+`["id","name","hash_id","image","tag","env","onstart","runtype","ssh_direct","use_ssh","jup_direct","jupyter_dir","use_jupyter_lab","docker_login_repo","docker_login_user","docker_login_pass","recommended_disk_space","private"]`,
+and set deterministic `order_by=id`. Require an exact HTTP `200`, JSON object, documented success
+shape, bounded response body, and either zero or exactly one normalized match
+as appropriate. Missing, duplicate, malformed, additional security-relevant,
+wrong-type, secret-bearing, mutable-image, uppercase hash, or conflicting rows
+fail with one static sanitized exception.
+
+Prove the transport:
+
+- obtains the key only from a synthetic owner-private settings file through a
+  supplied fake path resolver in tests and never accepts a key on argv;
+- fixes HTTPS host, path, method, headers, timeout, and maximum response bytes;
+- disables redirects and ambient proxies and closes every response;
+- has no arbitrary URL, method, header, query, or generic payload parameter;
+- never renders the authorization header, key, request, response, `onstart`, or
+  base64 content through stdout, stderr, return errors, or exception chains;
+- performs no POST in audit and absence-check modes.
+
+Then prove publication validates the renderer's exact request schema before
+HTTP, makes one POST at most, accepts only documented `success`, `msg`, and
+`template` response fields, and requires one numeric ID plus one lowercase
+32-hex `hash_id`. It then performs one exact-hash GET and compares every
+security-relevant field: image digest, tag, runtype, SSH flags, Jupyter
+directory, fixed `onstart`, exact `-p 8765:8765` port-only `env`, false
+Jupyter-direct flags, three empty registry-credential fields, recommended disk,
+and private visibility. An ambiguous connection or response failure never retries
+POST; it makes only one exact-name GET and adopts only one exact content match.
+
+Add failing renderer tests proving that the current legacy combined runtype
+and undocumented `ports` request are rejected. Require the corrected renderer
+to emit exactly `runtype == "ssh"`, `use_ssh is True`, `ssh_direct is True`,
+`env == "-p 8765:8765"`, false Jupyter-direct flags, three empty
+`docker_login_*` values, and `private is True` with no `ports` key.
+
+- [ ] **Step 2: Run the focused tests red**
+
+```bash
+python3 -m unittest \
+  tests.python.test_worker_template_api \
+  tests.python.test_worker_release_tools.TemplateRendererTests -v
+```
+
+Expected: import failure because `scripts.publish_worker_template` does not
+exist plus renderer failures for the current legacy runtype and `ports` payload.
+
+- [ ] **Step 3: Implement the bounded client**
+
+First make the focused renderer correction described in Step 1; do not change
+its bootstrap or release-lock bytes. Then use a small injectable
+standard-library HTTPS transport with a no-proxy opener and redirect handler
+that always rejects. Use `SettingsStore` only to resolve the expected
+`settings.json` path. Before any read, validate the parent and file with
+`lstat`, open the file read-only with `O_NOFOLLOW`, and use `fstat` on the open
+descriptor to require a current-user-owned regular file with exact mode `0600`
+and unchanged device/inode. Read a bounded JSON document from that descriptor,
+extract and validate only `api_key`, close it on every path, and never call the
+existing `SettingsStore.load()` for this publication credential. Keep the key
+in memory only and read no unrelated credential value. Tests must cover
+symlinks, mode/owner/type mismatch, swap races, oversize/invalid JSON, missing
+key, closure, and secret-free errors. Enforce a finite HTTP timeout, a small
+fixed response cap, identity content encoding, UTF-8 JSON object, and static
+sanitized failures.
+
+Expose only these CLI actions:
+
+```text
+audit-base --output-directory PRIVATE_DIRECTORY
+publish --request-file TEMPLATE_REQUEST --output-directory PRIVATE_DIRECTORY
+```
+
+`audit-base` writes one compact `base-template-audit.json` with mode `0600` and
+only the renderer schema. `publish` validates the exact generated request,
+checks exact-name absence, attempts one create, reconciles ambiguity read-only,
+reads back by exact returned hash, compares the full security contract, and
+writes one compact `template-publication.json` with mode `0600`. It prints only
+the action result, public numeric ID, public hash, and boolean verified flag.
+It implements no PUT, PATCH, DELETE, arbitrary endpoint, general HTTP helper,
+or retrying mutation.
+
+- [ ] **Step 4: Run focused and repository tests green**
+
+```bash
+python3 -m unittest \
+  tests.python.test_worker_template_api \
+  tests.python.test_worker_release_tools \
+  tests.python.test_repository_contract -v
+bash -n scripts/check.sh
+```
+
+Add the script and test to the explicit reviewed/public artifact lists. Tests
+must use only fake sessions and synthetic keys.
+
+- [ ] **Step 5: Verify twice and review**
+
+```bash
+scripts/check.sh
+scripts/check.sh
+git diff --check
+```
+
+Use `superpowers:requesting-code-review` specifically for credential flow,
+redirect/proxy behavior, exact lookup filters, schema normalization,
+single-mutation semantics, ambiguous-result reconciliation, response cleanup,
+and absence of generic/provider-paid surfaces. Process demonstrated findings
+with `superpowers:receiving-code-review` and TDD, then repeat both gates.
+
+- [ ] **Step 6: Commit, push, and freeze the release candidate**
+
+```bash
+git add scripts/publish_worker_template.py \
+  scripts/render_worker_template.py tests/python/test_worker_template_api.py \
+  tests/python/test_worker_release_tools.py \
+  tests/python/test_repository_contract.py scripts/check.sh \
+  docs/remote-worker-bootstrap-review.md docs/project-state.md
+git diff --cached --check
+git commit -m "feat: publish private worker template safely"
+git push origin feat/vast-cloud-run-lifecycle
+```
+
+Re-run `scripts/check.sh` on the committed tree. Require a clean worktree and
+local/remote/PR head equality. This exact final reviewed HEAD, not an earlier
+Task 6A or 6B SHA, is the only release candidate authorized by the conditional
+Task 7 permission in the overnight handoff.
 
 ---
 
 ### Task 7: Publish and verify the immutable GitHub worker release
 
-**Authorization gate:** Obtain a new explicit message authorizing both repository-level immutable-release enablement and publication of one exact worker release for the reviewed `HEAD`. The message must also authorize uploading and downloading the small worker archive for verification. It does not authorize Vast mutation or paid use.
+**Authorization gate:** Obtain a new explicit message authorizing both
+repository-level immutable-release enablement and publication of one exact
+worker release for the reviewed `HEAD`, or use the itemized Task 7 permission
+in the validated fresh-session overnight handoff in this same execution
+session. The authorization must also cover uploading and downloading the small
+worker archive for verification. It does not authorize Vast mutation or paid
+use.
 
 **Files:**
 
@@ -948,7 +1699,10 @@ Report the offline evidence and request a separate GitHub release authorization.
 
 **Interfaces:**
 
-- Consumes: clean pushed reviewed `HEAD`, two consecutive offline gates, `build_worker_release_bundle()`, and explicit release authorization.
+- Consumes: clean pushed reviewed `HEAD` including Tasks 6A, 6B, and 6C, two
+  consecutive offline gates after the final worker change,
+  `build_worker_release_bundle()`, and explicit conditional release
+  authorization for that final reviewed HEAD.
 - Produces: one immutable release whose tag, asset name, browser URL, size, and SHA-256 match local metadata, plus a real production-bootstrap transport proof.
 
 - [ ] **Step 1: Reconfirm the exact release scope**
@@ -1046,30 +1800,74 @@ Resolve and validate that the temporary root is the exact directory created in S
 
 - [ ] **Step 8: Report and stop**
 
-Report only tag, commit, asset filename, byte size, SHA-256, public release URL, redirect count, bootstrap proof result, and immutable verification result. Request separate Vast template authorization. Do not proceed automatically.
+Report only tag, commit, asset filename, byte size, SHA-256, public release
+URL, redirect count, bootstrap proof result, and immutable verification result.
+If no explicit Task 8 permission exists, request it and stop. If the validated
+overnight handoff explicitly granted Task 8, continue only after every Task 7
+check succeeded; no offer search or paid action is implied.
 
 ---
 
 ### Task 8: Create one private Vast template and its matching local lock
 
-**Authorization gate:** Obtain a new explicit message authorizing creation of one private project-specific Vast template, one matching owner-private local release lock, and the local ComfyUI restart needed to load it. This permission does not authorize offer search, instance creation, or workflow execution.
+**Authorization gate:** Obtain a new explicit message authorizing creation of
+one private project-specific Vast template, one matching owner-private local
+release lock, and the local ComfyUI restart needed to load it, or use the
+itemized Task 8 permission in the validated fresh-session overnight handoff in
+this same execution session. This permission does not authorize offer search,
+instance creation, or workflow execution.
 
 **Files:**
 
-- Create outside Git only: sanitized base-template audit record, remote lock, `onstart`, private template request, raw private API response, local `worker-release.json`
+- Create outside Git only: sanitized base-template audit record, remote lock, `onstart`, private template request, sanitized publication record, local `worker-release.json`
 - Modify on Vast only after authorization: one private template
 - Modify in worktree: none
 
 **Interfaces:**
 
-- Consumes: the verified immutable release metadata, official base hash `027fba7753c024be019030fb42aed900`, deterministic renderer, and explicit template authorization.
+- Consumes: the verified immutable release metadata, official base hash `027fba7753c024be019030fb42aed900`, deterministic renderer, the reviewed Task 6C transport, exact image-digest provenance, and explicit template authorization.
 - Produces: exactly one verified private template hash and one local `0600` lock accepted after ComfyUI restart.
 
 - [ ] **Step 1: Audit the official base template read-only**
 
-Use the authenticated Vast template-list endpoint without offer search. Require exactly one record whose content-derived `hash_id` is `027fba7753c024be019030fb42aed900`. Record only the sanitized fields required by `render_worker_template.py`.
+Run only:
 
-Verify from immutable image metadata or reviewed base-template launch content that exactly one Caddy binary will exist at `/usr/bin/caddy` or `/usr/local/bin/caddy`. If the record is absent, duplicated, mutable, secret-bearing, unexpectedly shaped, or cannot prove the Caddy path, stop before creating anything.
+```bash
+python3 scripts/publish_worker_template.py \
+  audit-base --output-directory "$PRIVATE_TEMPLATE_ROOT"
+```
+
+The script uses the exact authenticated `GET /api/v0/template/` lookup without
+offer search. Require exactly one record whose content-derived `hash_id` is
+`027fba7753c024be019030fb42aed900`. Record only the sanitized fields required
+by `render_worker_template.py`; never print or retain the raw response.
+
+Require the base record to use an immutable official image digest and pinned
+tag consistent with the reviewed Vast base-image family. Apply this one exact
+trust rule, with no judgment-based substitute:
+
+1. canonicalize and require repository `docker.io/vastai/base-image` plus one
+   lowercase `sha256:` digest from the audited record; never resolve provenance
+   from its tag;
+2. with proxies and redirects disabled, retrieve only the digest-scoped Docker
+   Registry manifest. Require the returned `Docker-Content-Digest` and locally
+   hashed bytes to equal the audited digest. If it is a manifest list, accept
+   only one Linux/amd64 child and verify that child digest identically;
+3. retrieve only that manifest's config descriptor, cap it at 1 MiB, and
+   require its byte count and SHA-256 to match the descriptor; retrieve no
+   layer;
+4. require exact config labels
+   `org.opencontainers.image.source=https://github.com/vast-ai/base-image` and
+   `org.opencontainers.image.revision=46e032d852ece6edb2a2a477c5b9557cba6645bf`.
+
+The official repository plus content-addressed config labels bind the selected
+image to Task 6B's reviewed source revision, whose Dockerfile and supervisor
+prove `/opt/portal-aio/caddy_manager/caddy`. A tag, absent/conflicting label,
+ambiguous platform, foreign registry/repository, response mismatch, redirect,
+proxy, SBOM guessed from a tag, or free-form unsigned claim is insufficient.
+Do not pull image layers or claim this is a live filesystem measurement. The
+gateway will still revalidate the real regular executable at boot. If any rule
+fails, stop before creating anything and report the one precise blocker.
 
 - [ ] **Step 2: Render and inspect the private request offline**
 
@@ -1078,25 +1876,45 @@ Run `scripts/render_worker_template.py` in a fresh owner-private temporary direc
 Expected:
 
 - exact base hash and immutable image digest;
-- port `8765/tcp` only;
-- empty static environment;
+- fixed `env == "-p 8765:8765"`, exposing port `8765` only and no environment variable;
+- `private is True`;
+- documented `runtype == "ssh"` with SSH flags true, Jupyter-direct flags false, and registry credential fields empty;
 - no API key, Jupyter token, session identity, workflow, model, signed URL, caller shell, or path outside the fixed bootstrap destination;
 - decoded bootstrap hash equals the repository file;
 - decoded remote lock equals the verified release metadata.
 
 - [ ] **Step 3: Reconfirm no existing project template**
 
-Perform one read-only template lookup by the exact generated name and release tag. Require zero matches. If any match exists, stop and reconcile it; never create a duplicate or overwrite a template.
+Use the Task 6C `publish` action's mandatory exact-name precheck. Require zero
+matches. If any match exists, the script stops and reports sanitized identity;
+never create a duplicate or overwrite a template.
 
 - [ ] **Step 4: Create exactly one private template**
 
-POST the exact private `template-request.json` to `/api/v0/template/` with the existing owner-private Vast credential transport. Keep the response in a `0600` temporary file. Never print request, response, authorization header, or key.
+Run only the reviewed single-purpose transport:
+
+```bash
+python3 scripts/publish_worker_template.py \
+  publish \
+  --request-file "$PRIVATE_TEMPLATE_ROOT/template-request.json" \
+  --output-directory "$PRIVATE_TEMPLATE_ROOT"
+```
+
+It POSTs the exact private request to the fixed template endpoint once at most
+using the existing owner-private Vast credential. It never prints or persists
+the raw request, response, authorization header, key, `onstart`, or base64
+body.
 
 Expected: one success response containing one 32-lowercase-hex template `hash_id`. Any ambiguous timeout or response stops further mutation and triggers a read-only lookup by exact generated name; adopt only one exact content match.
 
 - [ ] **Step 5: Read back and compare the template**
 
-Fetch the created template read-only. Normalize only documented transport fields and require every security-relevant field to equal the rendered request: immutable image, tag, runtype, SSH booleans, Jupyter directory, fixed `onstart`, one port, empty environment, and recommended disk. Require it to be private.
+The same Task 6C command fetches the created template read-only by exact
+returned hash. It normalizes only documented transport fields and requires
+every security-relevant field to equal the rendered request: immutable image,
+tag, runtype, SSH booleans, Jupyter directory, fixed `onstart`, exact port-only
+`env`, false Jupyter-direct flags, empty registry credential fields,
+recommended disk, and private visibility.
 
 If comparison fails, report the template identifier and stop. Do not automatically delete or edit it.
 
@@ -1110,13 +1928,33 @@ Restart the local ComfyUI/extension process without opening the private workflow
 
 - [ ] **Step 8: Remove temporary template material and stop**
 
-Delete the validated private temporary root containing audit/request/response/onstart/remote-lock files. Preserve only the owner-private local release lock and private Vast template. Report sanitized hashes and the lock-loaded result. Request the actual workflow/input free-certification step; no paid authorization is implied.
+Delete the validated private temporary root containing
+audit/request/publication/onstart/remote-lock files. Preserve only the
+owner-private local release lock and private Vast template. Report sanitized
+hashes and the lock-loaded result. If no explicit Task 9 permission exists,
+request the actual workflow/input free-certification step and stop. If the
+validated overnight handoff explicitly granted Task 9, continue only after
+the lock-loaded proof succeeds; no offer search or paid authorization is
+implied.
 
 ---
 
 ### Task 9: Re-certify the actual workflow and actual private input for free
 
-**Authorization gate:** Obtain a new explicit message authorizing read-only inspection/capture of the actual private workflow and input plus in-memory native metadata annotations. This permission does not authorize local execution, export, model download, offer search, or paid use.
+**Authorization gate:** Obtain a new explicit message authorizing read-only
+inspection/capture of the actual private workflow and input plus in-memory
+native metadata annotations after the human has opened the actual workflow and
+selected the actual input in the pinned ComfyUI browser. This permission does
+not authorize local execution, export, model download, offer search, or paid
+use.
+
+**Human/browser gate:** This task is intentionally not part of the unattended
+overnight handoff. The canvas and its in-memory annotations exist only in the
+live frontend; the backend and a fresh Codex session cannot read or click that
+browser state. The morning human must open/confirm the workflow and input, then
+invoke the Cloud Run capture/preflight action while Codex verifies the
+sanitized result. Do not replace that gesture with filesystem scraping,
+browser-profile manipulation, synthetic workflow export, or local execution.
 
 **Files:**
 
@@ -1220,9 +2058,19 @@ Fetch Vast inventory read-only. Require no instance carrying this project's mana
 
 - [ ] **Step 3: Search once and review one eligible offer**
 
-Click Search Vast GPUs once. Select only an on-demand, one-GPU offer within hourly, VRAM, disk, reliability, worker-template, and authorized bounds. Generate the paid preview with the authorized total-create value and finite deadline.
+Click Search Vast GPUs once. Select only a verified on-demand, one-GPU offer
+within hourly, VRAM, disk, worker-template, and authorized bounds, with
+reliability at least `0.99` and advertised download bandwidth at least `500`
+Mbps. Prefer a target-class offer at `1,000` Mbps or more; if only a 500--999
+Mbps fallback exists, require the human to review its longer theoretical
+estimate rather than silently lowering the floor. Generate the paid preview
+with the authorized total-create value and finite deadline.
 
-Review exact offer ID, GPU, hourly price, bandwidth prices, disk, transfer bytes, output allowance, approximate active charge, duration, template hash, worker commit, archive digest, protocol, manifest digest, and maximum total instance creates.
+Review exact offer ID, GPU, hourly price, reliability, advertised download
+Mbps, disk MB/s, theoretical transfer estimate, bandwidth prices, disk,
+transfer bytes, output allowance, approximate active charge, duration,
+template hash, worker commit, archive digest, protocol, manifest digest, and
+maximum total instance creates.
 
 If any reviewed value differs from the authorization or fresh preflight, do not confirm.
 
@@ -1348,7 +2196,14 @@ Report exact commits, gate outputs, immutable release identity, sanitized live r
 | Read-only official-base audit and one private template | Task 8 |
 | Owner-private local release lock | Tasks 4 and 8 |
 | Machine-enforced total-create authorization | Task 5 |
-| Two full offline gates and code review before publication | Task 6 |
+| Fixed reliability/download floors at provider and local boundaries | Task 6A |
+| Shared target-saturated initial/replacement ordering | Task 6A |
+| Preflight-derived theoretical estimate and inert UI wording | Task 6A |
+| Quote persistence and bandwidth-downgrade revalidation | Task 6A |
+| Official Vast portal Caddy path with fail-closed runtime validation | Task 6B |
+| Secret-safe exact template API transport and single-create reconciliation | Task 6C |
+| Exact image digest bound to reviewed build provenance before template creation | Tasks 6B and 8 |
+| Two full offline gates and code review before publication | Tasks 6, 6A, 6B, and 6C |
 | Actual workflow and actual private input | Task 9 |
 | Exact native model metadata with no filename guessing | Task 9 |
 | Separately bounded paid authorization | Task 10 |
@@ -1361,6 +2216,10 @@ Report exact commits, gate outputs, immutable release identity, sanitized live r
 - `DownloadStream.source_url` is always the reviewed GitHub URL; `redirect_count` is integer `0` or `1`; no final/signed URL field exists.
 - `WorkerRelease` keeps the existing local lock fields; the archive URL and byte size stay in private publication inputs, not the runtime public payload.
 - `OfferQuote.max_instance_creates` is an integer `1` or `2`, survives record/public round-trip, and remains the only source of replacement authority.
+- `OfferQuote.inet_down_mbps` and `.disk_bw_mbps` are provider-advertised finite nonnegative metrics; `estimated_transfer_seconds` is derived from aggregate preflight bytes and is never persisted as measured startup time.
+- `MIN_VAST_RELIABILITY`, `MIN_VAST_INET_DOWN_MBPS`, and `PREFERRED_VAST_INET_DOWN_MBPS` are exactly `0.99`, `500`, and `1000`; search, normalization, ordering, quote review, confirmation, and replacement use those same values.
+- `CADDY_CANDIDATES` contains only `/opt/portal-aio/caddy_manager/caddy`; the documented `/opt/instance-tools/bin/caddy` symlink and generic system paths remain rejected.
+- `publish_worker_template.py` fixes one HTTPS template endpoint, accepts no API key on argv, performs at most one POST, and emits only sanitized ID/hash/verification evidence.
 - `retry_count` remains `0` or `1`; consumed creates are `1 + retry_count` after initial confirmation.
 - External port stays `8765`; the Python worker stays loopback on `8766`.
 
@@ -1384,13 +2243,27 @@ PY
 
 Expected: `plan placeholder scan passed`. Then run `scripts/check.sh` so the repository-wide public-artifact scan covers this plan as committed text.
 
-## Fresh-session handoff
+## Fresh-session overnight handoff after human validation
 
-Start a new session in the exact worktree and paste this instruction only when intentionally granting offline implementation permission:
+Start a new session in the exact worktree and paste the following instruction
+only after the human has reviewed and accepted this amended design and plan.
+The message explicitly grants each listed non-paid boundary; it grants no paid
+GPU action:
 
 ```text
 Worktree: /Users/wuraaang/.worktrees/comfyui-cloud-run/mission-hermes
 Branch: feat/vast-cloud-run-lifecycle
+Planning baseline HEAD: cd041cae3dbe87fd67751f20586c6714708cf7ca
+
+Je valide la politique générale de qualité Vast du 2026-08-01 et les deux
+modifications de documentation actuellement non commitées : fiabilité minimale
+0,99, débit descendant annoncé minimal 500 Mbps, cible 1 000 Mbps avec score
+saturé à cette cible, deux requêtes read-only bornées pour éviter le biais de
+la limite fournisseur, aucun relâchement automatique, métriques/estimation
+théorique visibles et revalidation des deux chemins avant création. Je valide
+aussi la correction ciblée du chemin Caddy officiel Vast vers
+/opt/portal-aio/caddy_manager/caddy et l'ajout du transport template Vast
+spécialisé, testé, sans redirection/proxy ni clé sur argv.
 
 Read AGENTS.md and these files completely:
 - docs/superpowers/specs/2026-07-31-immutable-worker-release-and-live-workflow-acceptance-design.md
@@ -1399,18 +2272,84 @@ Read AGENTS.md and these files completely:
 - docs/superpowers/specs/2026-07-31-workflow-embedded-model-metadata-bridge-design.md
 - docs/remote-worker-bootstrap-review.md
 
-Use superpowers:executing-plans, superpowers:receiving-code-review,
-superpowers:test-driven-development for every correction,
-superpowers:verification-before-completion, and
-superpowers:requesting-code-review. Use certifying-comfyui-cloud-workflows
-for the actual workflow metadata/preflight and sanitized certification.
+Utilise le mécanisme Goal dès le début. Appelle d'abord get_goal. Si le goal
+existant avec l'objectif de préparer ComfyUI-Cloud-Run pour le workflow réel
+est marqué blocked, ce message constitue sa reprise explicite : poursuis-le
+sans créer de doublon. S'il n'existe aucun goal, crée-en un avec cet objectif.
+Travaille jusqu'à avoir terminé les tâches autorisées ci-dessous ou jusqu'à un
+blocage réel vérifié; respecte les règles du Goal pour complete/blocked.
 
-I authorize offline implementation, tests, documentation, commits, and pushes
-for Tasks 1 through 6 of the immutable-worker-release plan. Do not execute
-Tasks 7 through 11 without their new explicit authorization gates. In
-particular: no GitHub release mutation, no Vast template mutation, no offer
-search, no instance creation, no paid confirmation, no model download, and no
-workflow execution. Stop after Task 6 and report the exact evidence.
+Utilise superpowers:executing-plans pour exécuter le plan, strictement
+superpowers:test-driven-development pour Tasks 6A, 6B et 6C,
+superpowers:verification-before-completion avant tout commit ou affirmation,
+superpowers:requesting-code-review aux gates de review et
+superpowers:receiving-code-review pour chaque finding. Utilise
+certifying-comfyui-cloud-workflows pour le canvas réel, ses métadonnées natives,
+le préflight gratuit et les preuves sanitisées.
+
+Autorisations explicites pour cette session :
+
+1. J'autorise Tasks 6A, 6B et 6C : modifier uniquement les fichiers listés par ces
+   tâches, lire les trois fichiers publics du dépôt officiel vast-ai/base-image
+   au commit exact indiqué, les trois pages officielles de l'API template Vast,
+   ainsi que le seul manifeste OCI et le petit blob de configuration publics,
+   adressés par digest, de l'image officielle exacte auditée. J'autorise
+   l'exécution des tests
+   offline/fake-provider, la mise à jour de la documentation, les commits
+   ciblés et le push de la branche
+   feat/vast-cloud-run-lifecycle afin de mettre à jour la PR draft #2. Cela
+   autorise explicitement l'inclusion des deux docs intentionnellement modifiés
+   au départ dans le commit ciblé de Task 6A. Préserve-les. Ne touche pas aux
+   autres changements éventuels, ne télécharge aucune couche d'image OCI et
+   n'exécute aucune image.
+2. Après Tasks 6A, 6B et 6C, deux scripts/check.sh consécutifs sur le dernier code,
+   une review sans défaut démontré restant, un worktree propre et l'égalité
+   HEAD local/distant/PR, j'autorise conditionnellement Task 7 pour cet unique
+   HEAD final revu : activer les immutable releases du dépôt GitHub si
+   nécessaire, créer exactement une release ciblant ce HEAD, uploader
+   exactement le petit worker archive déterministe, le retélécharger pour
+   vérification, publier la release immuable et vérifier
+   tag/asset/taille/SHA-256/bootstrap. Cette autorisation ne couvre aucun autre
+   commit. Ne remplace, n'édite et ne supprime aucune release existante; en cas
+   de collision, de nouveau commit après review ou d'ambiguïté, arrête cette
+   branche d'action.
+3. Si Task 7 réussit, j'autorise Task 8 : lire/auditer le template officiel
+   Vast exact 027fba7753c024be019030fb42aed900, créer exactement un template
+   privé spécifique au projet uniquement via scripts/publish_worker_template.py
+   avec le payload déterministe revu, écrire son unique worker-release.json
+   local privé en mode 0600, redémarrer proprement le ComfyUI Desktop épinglé
+   et vérifier gratuitement que le lock exact est chargé. Cette création n'est
+   autorisée que si le manifeste/config vérifié par digest contient exactement
+   les labels source et revision exigés par Task 8; sinon arrête-toi avant le
+   POST et rapporte ce seul blocage. Ne modifie, ne supprime et ne duplique
+   aucun template existant.
+Interdictions absolues pour cette session : ne lance aucune recherche d'offre
+Vast, ne crée/loue aucune instance, ne confirme aucun devis, n'effectue aucun
+téléchargement/transfert de modèle, n'exécute le workflow ni localement ni à
+distance, ne crée aucun volume, et n'engage aucune dépense. N'exécute pas Tasks
+9, 10 ou 11 : Task 9 exige demain le vrai navigateur/canvas et un geste humain
+que tu ne dois ni simuler ni contourner. Ne merge pas la PR #2, ne ferme pas
+d'issue/PR, ne publie pas au
+Comfy Registry, ne mets pas à jour ComfyUI ou ses dépendances et ne généralise
+pas au-delà de Tasks 6A, 6B et 6C. N'utilise aucun client HTTP/CLI improvisé
+pour le template et n'effectue aucune autre mutation fournisseur.
+
+Si une étape est bloquée mais qu'une autre autorisée et indépendante peut
+avancer sans contourner le gate, poursuis cette autre étape. Ne devine jamais
+une identité de modèle, un template, une release ou un état fournisseur. À la
+fin, laisse un worktree propre quand c'est possible et fournis un rapport du
+matin avec : commits et SHA local/distant/PR, résultats exacts des gates,
+identité publique de la release, hash public du template privé sans payload,
+état du lock/restart, preuve que l'UI est prête, l'unique checkpoint humain
+restant pour ouvrir/confirmer le vrai workflow et lancer capture/préflight,
+puis ce qui restera avant le test payant. Ne fournis le prompt GO payant
+qu'après un futur préflight réel réussi; il devra exiger maximum de créations,
+prix horaire maximal, durée/coût maximal et acceptation explicite des frais de
+bande passante/stockage.
 ```
 
-After Task 6, give only the next boundary's explicit permission. Never bundle release, template, and paid permissions into an implied continuation.
+The handoff intentionally combines explicit non-paid permissions so the
+overnight session can progress through Tasks 6A--8. It stops at the unavoidable
+live-browser gate before Task 9, before offer search, and before every paid
+action. A new morning workflow/preflight permission and a later separately
+bounded paid GO remain mandatory.
