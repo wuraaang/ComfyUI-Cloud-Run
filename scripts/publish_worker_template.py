@@ -161,6 +161,15 @@ def _compact_json(payload):
         _fail()
 
 
+def _strict_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            _fail()
+        result[key] = value
+    return result
+
+
 class VastTemplateTransport:
     """Bounded fixed-endpoint transport for GET template and one POST."""
 
@@ -187,7 +196,10 @@ class VastTemplateTransport:
             body = response.read(MAX_RESPONSE_BYTES + 1)
             if len(body) > MAX_RESPONSE_BYTES:
                 _fail()
-            payload = json.loads(body.decode("utf-8"))
+            payload = json.loads(
+                body.decode("utf-8"),
+                object_pairs_hook=_strict_object,
+            )
             if not isinstance(payload, dict):
                 _fail()
             return payload

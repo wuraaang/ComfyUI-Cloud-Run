@@ -210,6 +210,14 @@ class FakeResponse:
         self.closed = True
 
 
+class RawFakeResponse(FakeResponse):
+    def __init__(self, body, *, status=200, content_encoding="identity"):
+        self.status = status
+        self.headers = {"Content-Encoding": content_encoding}
+        self._body = io.BytesIO(body)
+        self.closed = False
+
+
 class FakeOpener:
     def __init__(self, responses):
         self.responses = list(responses)
@@ -314,6 +322,18 @@ class WorkerTemplateApiTests(unittest.TestCase):
                     [call[0].method for call in opener.calls],
                     ["GET"],
                 )
+
+    def test_transport_rejects_duplicate_json_members(self):
+        response = RawFakeResponse(
+            b'{"success":true,"success":false,"msg":"No templates found"}'
+        )
+        opener = FakeOpener([response])
+
+        with self.assertRaises(TemplatePublicationError):
+            VastTemplateTransport(opener=opener).lookup_name(KEY, NAME)
+
+        self.assertTrue(response.closed)
+        self.assertEqual([call[0].method for call in opener.calls], ["GET"])
 
     def test_worker_lookup_uses_wildcard_and_projects_exact_compared_fields(self):
         provider_marker = "provider-worker-extra-marker"
