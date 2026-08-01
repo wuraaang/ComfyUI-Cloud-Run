@@ -1012,7 +1012,7 @@ def _wheel_identity(path):
     if "any" not in platform_tags and not any(
         tag == "linux_x86_64"
         or (
-            tag.startswith(("manylinux", "musllinux"))
+            tag.startswith("manylinux")
             and tag.endswith("_x86_64")
         )
         for tag in platform_tags

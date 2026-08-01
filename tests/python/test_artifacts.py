@@ -951,6 +951,7 @@ class ArtifactTests(unittest.TestCase):
             "dependency-1.0-cp312-cp313-linux_x86_64.whl",
             "dependency-1.0-cp312-cp312-win_amd64.whl",
             "dependency-1.0-cp312-cp312-manylinux_2_28_aarch64.whl",
+            "dependency-1.0-cp312-cp312-musllinux_1_2_x86_64.whl",
             "dependency-1.0-cp312-cp312-linux_armv7l.whl",
         )
 
