@@ -29,6 +29,18 @@ from scripts.write_worker_release_lock import (
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 WORKER_COMMIT = "a" * 40
+OFFICIAL_IMAGE = (
+    "docker.io/vastai/comfy@sha256:"
+    "9852fae86527d0be097ffcb90dc18368ff808bcbb7c41fbabd538bff3eb6ab9c"
+)
+OFFICIAL_TAG = "v0.29.0-cuda-12.9-py312"
+EXTRA_FILTERS = {
+    "gpu_arch": {"eq": "nvidia"},
+    "cpu_arch": {"eq": "amd64"},
+    "cuda_max_good": {"gte": 12.9},
+    "compute_cap": {"gte": 750},
+    "num_gpus": {"eq": 1},
+}
 
 
 def release_metadata():
@@ -68,8 +80,6 @@ def base_template_audit():
     return {
         "schema_version": 1,
         "hash_id": "027fba7753c024be019030fb42aed900",
-        "image": "docker.io/vastai/base-image@sha256:" + "d" * 64,
-        "tag": "reviewed-pinned-tag",
         "runtype": "jupyter_direc ssh_direc",
         "use_ssh": True,
         "ssh_direct": True,
@@ -356,10 +366,14 @@ class TemplateRendererTests(unittest.TestCase):
                 "docker_login_pass",
                 "onstart",
                 "env",
+                "extra_filters",
                 "recommended_disk_space",
                 "private",
             },
         )
+        self.assertEqual(rendered.request["image"], OFFICIAL_IMAGE)
+        self.assertEqual(rendered.request["tag"], OFFICIAL_TAG)
+        self.assertEqual(rendered.request["extra_filters"], EXTRA_FILTERS)
         self.assertEqual(rendered.request["runtype"], "ssh")
         self.assertIs(rendered.request["use_ssh"], True)
         self.assertIs(rendered.request["ssh_direct"], True)
@@ -453,30 +467,51 @@ class TemplateRendererTests(unittest.TestCase):
             rendered.onstart,
         )
         self.assertIn(
-            "exec python3 /opt/comfyui-cloud-run-bootstrap/bootstrap.py "
+            "CLOUD_RUN_COMFY_ROOT=/opt/workspace-internal/ComfyUI",
+            rendered.onstart,
+        )
+        self.assertIn("export CLOUD_RUN_COMFY_ROOT", rendered.onstart)
+        self.assertIn(
+            "exec /venv/main/bin/python /opt/comfyui-cloud-run-bootstrap/bootstrap.py "
             "/opt/comfyui-cloud-run-bootstrap/release-lock.json",
             rendered.onstart,
         )
-        for forbidden in ("curl", "wget", "eval", "sh -c", "bash -c"):
-            self.assertNotIn(forbidden, rendered.onstart)
+        exec_line = next(
+            line for line in rendered.onstart.splitlines()
+            if line.startswith("exec ")
+        )
+        self.assertEqual(
+            exec_line,
+            "exec /venv/main/bin/python "
+            "/opt/comfyui-cloud-run-bootstrap/bootstrap.py "
+            "/opt/comfyui-cloud-run-bootstrap/release-lock.json",
+        )
+        for forbidden in (
+            "curl",
+            "wget",
+            "eval",
+            "sh -c",
+            "bash -c",
+            "entrypoint",
+            "boot_default",
+            "supervisor",
+            "comfyui-wrapper",
+            "portal_config",
+            "serverless",
+            "$(",
+            "${",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, rendered.onstart.casefold())
 
     def test_renderer_rejects_non_exact_base_template_audits(self):
         invalid = []
         missing = base_template_audit()
-        missing.pop("tag")
+        missing.pop("jupyter_dir")
         invalid.append(missing)
         invalid.append({**base_template_audit(), "env": "SECRET=value"})
-        invalid.append({**base_template_audit(), "tag": "latest"})
-        invalid.append({**base_template_audit(), "tag": "reviewed\ntag"})
-        invalid.append({**base_template_audit(), "tag": "reviewed;shutdown"})
-        invalid.append({**base_template_audit(), "image": "image.example/latest"})
-        invalid.append(
-            {
-                **base_template_audit(),
-                "image": "registry.example/vastai/base-image@sha256:"
-                + "d" * 64,
-            }
-        )
+        invalid.append({**base_template_audit(), "image": OFFICIAL_IMAGE})
+        invalid.append({**base_template_audit(), "tag": OFFICIAL_TAG})
         invalid.append({**base_template_audit(), "hash_id": "e" * 32})
         invalid.append({**base_template_audit(), "schema_version": 1.0})
         invalid.append({**base_template_audit(), "runtype": "ssh_direc"})

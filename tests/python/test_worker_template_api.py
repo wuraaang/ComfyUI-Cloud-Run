@@ -25,10 +25,42 @@ from scripts.publish_worker_template import (
 KEY = "synthetic-template-test-key"
 WORKER_COMMIT = "a" * 40
 NAME = "cloud-run-worker-" + WORKER_COMMIT
-IMAGE = "docker.io/vastai/base-image@sha256:" + "d" * 64
+IMAGE = (
+    "docker.io/vastai/comfy@sha256:"
+    "9852fae86527d0be097ffcb90dc18368ff808bcbb7c41fbabd538bff3eb6ab9c"
+)
+TAG = "v0.29.0-cuda-12.9-py312"
+EXTRA_FILTERS = {
+    "gpu_arch": {"eq": "nvidia"},
+    "cpu_arch": {"eq": "amd64"},
+    "cuda_max_good": {"gte": 12.9},
+    "compute_cap": {"gte": 750},
+    "num_gpus": {"eq": 1},
+}
 HASH_ID = "e" * 32
 WORKER_ARCHIVE_SHA256 = "b" * 64
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+
+
+def invalid_extra_filters():
+    return (
+        {**EXTRA_FILTERS, "compute_cap": {"gte": True}},
+        {**EXTRA_FILTERS, "num_gpus": {"eq": True}},
+        {**EXTRA_FILTERS, "cuda_max_good": {"gte": "12.9"}},
+        {**EXTRA_FILTERS, "compute_cap": {"gte": 800}},
+        {
+            key: value
+            for key, value in EXTRA_FILTERS.items()
+            if key != "gpu_arch"
+        },
+        {**EXTRA_FILTERS, "extra": {"eq": 1}},
+        {**EXTRA_FILTERS, "compute_cap": {"eq": 750}},
+        {
+            **EXTRA_FILTERS,
+            "compute_cap": {"gte": 750, "eq": 750},
+        },
+        {**EXTRA_FILTERS, "gpu_arch": {"eq": "amd"}},
+    )
 
 
 def remote_lock_payload():
@@ -60,13 +92,22 @@ def remote_lock_payload():
     }
 
 
-def template_request(*, bootstrap_bytes=None, lock_payload=None, image=IMAGE):
+def template_request(
+    *,
+    bootstrap_bytes=None,
+    lock_payload=None,
+    image=IMAGE,
+    tag=TAG,
+    extra_filters=None,
+):
     if bootstrap_bytes is None:
         bootstrap_bytes = (
             REPOSITORY_ROOT / "remote_worker" / "bootstrap.py"
         ).read_bytes()
     if lock_payload is None:
         lock_payload = remote_lock_payload()
+    if extra_filters is None:
+        extra_filters = EXTRA_FILTERS
     bootstrap = base64.b64encode(bootstrap_bytes).decode("ascii")
     lock_bytes = (
         json.dumps(
@@ -91,14 +132,16 @@ def template_request(*, bootstrap_bytes=None, lock_payload=None, image=IMAGE):
             "chmod 0600 /opt/comfyui-cloud-run-bootstrap/release-lock.json",
             "CLOUD_RUN_WORKER_VERSION=" + WORKER_COMMIT,
             "export CLOUD_RUN_WORKER_VERSION",
-            "exec python3 /opt/comfyui-cloud-run-bootstrap/bootstrap.py /opt/comfyui-cloud-run-bootstrap/release-lock.json",
+            "CLOUD_RUN_COMFY_ROOT=/opt/workspace-internal/ComfyUI",
+            "export CLOUD_RUN_COMFY_ROOT",
+            "exec /venv/main/bin/python /opt/comfyui-cloud-run-bootstrap/bootstrap.py /opt/comfyui-cloud-run-bootstrap/release-lock.json",
             "",
         )
     )
     return {
         "name": NAME,
         "image": image,
-        "tag": "reviewed-pinned-tag",
+        "tag": tag,
         "runtype": "ssh",
         "use_ssh": True,
         "ssh_direct": True,
@@ -110,6 +153,7 @@ def template_request(*, bootstrap_bytes=None, lock_payload=None, image=IMAGE):
         "docker_login_pass": "",
         "onstart": onstart,
         "env": "-p 8765:8765",
+        "extra_filters": extra_filters,
         "recommended_disk_space": 80,
         "private": True,
     }
@@ -124,6 +168,7 @@ def template_row(request=None, *, template_id=17, hash_id=HASH_ID):
         "image": request["image"],
         "tag": request["tag"],
         "env": request["env"],
+        "extra_filters": request["extra_filters"],
         "onstart": request["onstart"],
         "runtype": request["runtype"],
         "ssh_direct": request["ssh_direct"],
@@ -137,6 +182,18 @@ def template_row(request=None, *, template_id=17, hash_id=HASH_ID):
         "recommended_disk_space": request["recommended_disk_space"],
         "private": request["private"],
     }
+
+
+def base_template_row(**overrides):
+    row = {
+        "hash_id": BASE_TEMPLATE_HASH_ID,
+        "runtype": "jupyter_direc ssh_direc",
+        "use_ssh": True,
+        "ssh_direct": True,
+        "jupyter_dir": None,
+    }
+    row.update(overrides)
+    return row
 
 
 class FakeResponse:
@@ -239,22 +296,32 @@ class WorkerTemplateApiTests(unittest.TestCase):
             ("self", "api_key", "template_payload"),
         )
 
-    def test_audit_base_uses_exact_hash_and_writes_sanitized_private_record(self):
-        base_request = template_request()
-        base_request.update(
+    def test_worker_lookup_uses_wildcard_and_projects_exact_compared_fields(self):
+        provider_marker = "provider-worker-extra-marker"
+        response = FakeResponse(
             {
-                "name": "base",
-                "runtype": "jupyter_direc ssh_direc",
-                "jup_direct": True,
-                "use_jupyter_lab": True,
-                "jupyter_dir": None,
+                "success": True,
+                "templates_found": 1,
+                "templates": [
+                    {**template_row(), "description": provider_marker}
+                ],
             }
         )
-        base_row = template_row(
-            base_request,
-            template_id=1,
-            hash_id=BASE_TEMPLATE_HASH_ID,
-        )
+        opener = FakeOpener([response])
+
+        rows = VastTemplateTransport(opener=opener).lookup_name(KEY, NAME)
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(set(rows[0]), set(LOOKUP_COLUMNS))
+        self.assertEqual(rows[0]["image"], IMAGE)
+        self.assertEqual(rows[0]["tag"], TAG)
+        self.assertEqual(rows[0]["extra_filters"], EXTRA_FILTERS)
+        self.assertNotIn(provider_marker, json.dumps(rows[0]))
+        query = parse_qs(urlsplit(opener.calls[0][0].full_url).query)
+        self.assertEqual(json.loads(query["select_cols"][0]), ["*"])
+
+    def test_audit_base_uses_exact_hash_and_writes_sanitized_private_record(self):
+        base_row = base_template_row()
         response = FakeResponse(
             {"success": True, "templates_found": 1, "templates": [base_row]}
         )
@@ -274,26 +341,27 @@ class WorkerTemplateApiTests(unittest.TestCase):
             request = opener.calls[0][0]
             filters = json.loads(parse_qs(urlsplit(request.full_url).query)["select_filters"][0])
             self.assertEqual(filters, {"hash_id": {"eq": BASE_TEMPLATE_HASH_ID}})
+            columns = json.loads(
+                parse_qs(urlsplit(request.full_url).query)["select_cols"][0]
+            )
+            self.assertEqual(
+                columns,
+                [
+                    "hash_id",
+                    "runtype",
+                    "use_ssh",
+                    "ssh_direct",
+                    "jupyter_dir",
+                ],
+            )
             self.assertEqual(request.method, "GET")
 
     def test_audit_projects_allowlisted_fields_from_wildcard_response(self):
         provider_marker = "provider-extra-field-marker"
-        base_request = template_request()
-        base_request.update(
-            {
-                "name": "base",
-                "runtype": "jupyter_direc ssh_direc",
-                "jup_direct": True,
-                "use_jupyter_lab": True,
-                "jupyter_dir": None,
-            }
-        )
         base_row = {
-            **template_row(
-                base_request,
-                template_id=1,
-                hash_id=BASE_TEMPLATE_HASH_ID,
-            ),
+            **base_template_row(),
+            "image": "provider.example/mutable:latest",
+            "tag": "latest",
             "description": provider_marker,
             "extra_filters": {"marker": provider_marker},
         }
@@ -322,8 +390,6 @@ class WorkerTemplateApiTests(unittest.TestCase):
             {
                 "schema_version",
                 "hash_id",
-                "image",
-                "tag",
                 "runtype",
                 "use_ssh",
                 "ssh_direct",
@@ -335,11 +401,30 @@ class WorkerTemplateApiTests(unittest.TestCase):
 
     def test_audit_rejects_malformed_or_conflicting_lookup_without_post(self):
         invalid_payloads = (
-            {"success": True, "templates_found": 2, "templates": [template_row(), template_row()]},
-            {"success": True, "templates_found": 1, "templates": [{**template_row(), "api_key": KEY}]},
-            {"success": True, "templates_found": 1, "templates": [{**template_row(), "hash_id": HASH_ID.upper()}]},
-            {"success": True, "templates_found": 1, "templates": [{**template_row(), "image": "registry.example/latest"}]},
-            {"success": True, "templates_found": 1, "templates": [{**template_row(), "private": 1}]},
+            {
+                "success": True,
+                "templates_found": 2,
+                "templates": [base_template_row(), base_template_row()],
+            },
+            {
+                "success": True,
+                "templates_found": 1,
+                "templates": [
+                    {**base_template_row(), "hash_id": HASH_ID.upper()}
+                ],
+            },
+            {
+                "success": True,
+                "templates_found": 1,
+                "templates": [{**base_template_row(), "use_ssh": 1}],
+            },
+            {
+                "success": True,
+                "templates_found": 1,
+                "templates": [
+                    {**base_template_row(), "jupyter_dir": "/workspace"}
+                ],
+            },
         )
         for index, payload in enumerate(invalid_payloads):
             with self.subTest(index=index), tempfile.TemporaryDirectory() as root:
@@ -359,9 +444,7 @@ class WorkerTemplateApiTests(unittest.TestCase):
                 self.assertEqual([call[0].method for call in opener.calls], ["GET"])
 
     def test_audit_rejects_altered_base_security_contract(self):
-        base = template_request()
-        base.update({"name": "base", "runtype": "ssh"})
-        row = template_row(base, template_id=1, hash_id=BASE_TEMPLATE_HASH_ID)
+        row = base_template_row(runtype="ssh")
         opener = FakeOpener(
             [FakeResponse({"success": True, "templates_found": 1, "templates": [row]})]
         )
@@ -375,22 +458,11 @@ class WorkerTemplateApiTests(unittest.TestCase):
                 )
             self.assertEqual(tuple(output.iterdir()), ())
 
-    def test_audit_rejects_nonofficial_digest_pinned_registry(self):
-        base = template_request(
-            image="registry.example/vastai/base-image@sha256:" + "d" * 64
-        )
-        base.update(
-            {
-                "name": "base",
-                "runtype": "jupyter_direc ssh_direc",
-                "jup_direct": True,
-                "use_jupyter_lab": True,
-            }
-        )
-        row = template_row(
-            base,
-            template_id=1,
-            hash_id=BASE_TEMPLATE_HASH_ID,
+    def test_audit_never_uses_or_records_the_base_image_and_tag(self):
+        provider_marker = "untrusted-provider-image-marker"
+        row = base_template_row(
+            image=provider_marker + ":latest",
+            tag="latest",
         )
         opener = FakeOpener(
             [
@@ -405,13 +477,15 @@ class WorkerTemplateApiTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as root:
             settings, output, _request = self._private_inputs(root)
-            with self.assertRaises(TemplatePublicationError):
-                audit_base_template(
-                    output,
-                    settings_path_resolver=lambda: settings,
-                    transport=VastTemplateTransport(opener=opener),
-                )
-            self.assertEqual(tuple(output.iterdir()), ())
+            record = audit_base_template(
+                output,
+                settings_path_resolver=lambda: settings,
+                transport=VastTemplateTransport(opener=opener),
+            )
+            artifact = (output / "base-template-audit.json").read_text()
+        self.assertNotIn("image", record)
+        self.assertNotIn("tag", record)
+        self.assertNotIn(provider_marker, artifact)
 
     def test_response_is_closed_when_json_is_invalid(self):
         response = FakeResponse({"success": True})
@@ -421,7 +495,7 @@ class WorkerTemplateApiTests(unittest.TestCase):
             VastTemplateTransport(opener=opener).lookup_base(KEY)
         self.assertTrue(response.closed)
 
-    def test_lookup_normalizes_invalid_onstart_unicode_without_echo(self):
+    def test_worker_lookup_normalizes_invalid_onstart_unicode_without_echo(self):
         provider_marker = "provider-unicode-marker"
         row = template_row()
         row["onstart"] = "\ud800" + provider_marker
@@ -438,7 +512,7 @@ class WorkerTemplateApiTests(unittest.TestCase):
             TemplatePublicationError,
             "^Private template publication failed\\.$",
         ) as caught:
-            VastTemplateTransport(opener=opener).lookup_base(KEY)
+            VastTemplateTransport(opener=opener).lookup_name(KEY, NAME)
 
         self.assertIsNone(caught.exception.__cause__)
         self.assertNotIn(provider_marker, repr(caught.exception))
@@ -572,6 +646,36 @@ class WorkerTemplateApiTests(unittest.TestCase):
                         )
                     self.assertEqual(opener.calls, [])
 
+    def test_publish_rejects_non_exact_runtime_and_filters_before_http(self):
+        missing_filters = template_request()
+        missing_filters.pop("extra_filters")
+        invalid_requests = [
+            missing_filters,
+            template_request(
+                image="docker.io/vastai/comfy@sha256:" + "d" * 64
+            ),
+            template_request(tag="v0.29.0-cuda-12.8-py312"),
+        ]
+        invalid_requests.extend(
+            template_request(extra_filters=filters)
+            for filters in invalid_extra_filters()
+        )
+        with tempfile.TemporaryDirectory() as root:
+            settings, output, request_path = self._private_inputs(root)
+            for index, payload in enumerate(invalid_requests):
+                with self.subTest(index=index):
+                    request_path.write_text(json.dumps(payload))
+                    os.chmod(request_path, 0o600)
+                    opener = FakeOpener([])
+                    with self.assertRaises(TemplatePublicationError):
+                        publish_worker_template(
+                            request_path,
+                            output,
+                            settings_path_resolver=lambda: settings,
+                            transport=VastTemplateTransport(opener=opener),
+                        )
+                    self.assertEqual(opener.calls, [])
+
     def test_publish_rejects_non_renderer_bootstrap_and_lock_before_http(self):
         invalid_requests = (
             template_request(bootstrap_bytes=b"arbitrary bootstrap"),
@@ -621,6 +725,115 @@ class WorkerTemplateApiTests(unittest.TestCase):
         self.assertEqual([call[0].method for call in opener.calls], ["GET", "POST", "GET", "GET"])
         filters = json.loads(parse_qs(urlsplit(opener.calls[2][0].full_url).query)["select_filters"][0])
         self.assertEqual(filters, {"name": {"eq": NAME}})
+
+    def test_ambiguous_post_reconciliation_rejects_runtime_or_filter_mismatch(self):
+        altered_rows = []
+        for field, value in (
+            ("image", "docker.io/vastai/comfy@sha256:" + "d" * 64),
+            ("tag", "v0.29.0-cuda-12.8-py312"),
+            (
+                "extra_filters",
+                {**EXTRA_FILTERS, "num_gpus": {"eq": True}},
+            ),
+            (
+                "extra_filters",
+                {**EXTRA_FILTERS, "compute_cap": {"gte": 800}},
+            ),
+        ):
+            altered_rows.append({**template_row(), field: value})
+
+        for index, row in enumerate(altered_rows):
+            with self.subTest(index=index), tempfile.TemporaryDirectory() as root:
+                settings, output, request_path = self._private_inputs(root)
+                opener = FakeOpener(
+                    [
+                        FakeResponse(
+                            {
+                                "success": True,
+                                "templates_found": 0,
+                                "templates": [],
+                            }
+                        ),
+                        OSError("ambiguous " + KEY),
+                        FakeResponse(
+                            {
+                                "success": True,
+                                "templates_found": 1,
+                                "templates": [row],
+                            }
+                        ),
+                    ]
+                )
+                with self.assertRaises(TemplatePublicationError):
+                    publish_worker_template(
+                        request_path,
+                        output,
+                        settings_path_resolver=lambda: settings,
+                        transport=VastTemplateTransport(opener=opener),
+                    )
+                self.assertEqual(
+                    [call[0].method for call in opener.calls].count("POST"),
+                    1,
+                )
+                self.assertEqual(tuple(output.iterdir()), ())
+
+    def test_exact_hash_readback_rejects_runtime_or_filter_mismatch(self):
+        altered_rows = [
+            {**template_row(), field: value}
+            for field, value in (
+                ("image", "docker.io/vastai/comfy@sha256:" + "d" * 64),
+                ("tag", "v0.29.0-cuda-12.8-py312"),
+            )
+        ]
+        altered_rows.extend(
+            {**template_row(), "extra_filters": filters}
+            for filters in invalid_extra_filters()
+        )
+
+        for index, row in enumerate(altered_rows):
+            with self.subTest(index=index), tempfile.TemporaryDirectory() as root:
+                settings, output, request_path = self._private_inputs(root)
+                opener = FakeOpener(
+                    [
+                        FakeResponse(
+                            {
+                                "success": True,
+                                "templates_found": 0,
+                                "templates": [],
+                            }
+                        ),
+                        FakeResponse(
+                            {
+                                "success": True,
+                                "msg": "created",
+                                "template": {
+                                    "id": 17,
+                                    "name": NAME,
+                                    "hash_id": HASH_ID,
+                                },
+                            }
+                        ),
+                        FakeResponse(
+                            {
+                                "success": True,
+                                "templates_found": 1,
+                                "templates": [row],
+                            }
+                        ),
+                    ]
+                )
+                with self.assertRaises(TemplatePublicationError):
+                    publish_worker_template(
+                        request_path,
+                        output,
+                        settings_path_resolver=lambda: settings,
+                        transport=VastTemplateTransport(opener=opener),
+                    )
+                self.assertEqual(
+                    [call[0].method for call in opener.calls],
+                    ["GET", "POST", "GET"],
+                )
+                self.assertEqual(tuple(output.iterdir()), ())
 
     def test_failed_publication_is_static_and_secret_safe(self):
         opener = FakeOpener(

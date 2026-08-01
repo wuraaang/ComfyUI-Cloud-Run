@@ -25,6 +25,18 @@ from scripts.build_worker_release_bundle import (
 
 
 BASE_TEMPLATE_HASH_ID = "027fba7753c024be019030fb42aed900"
+OFFICIAL_IMAGE = (
+    "docker.io/vastai/comfy@sha256:"
+    "9852fae86527d0be097ffcb90dc18368ff808bcbb7c41fbabd538bff3eb6ab9c"
+)
+OFFICIAL_TAG = "v0.29.0-cuda-12.9-py312"
+EXTRA_FILTERS = {
+    "gpu_arch": {"eq": "nvidia"},
+    "cpu_arch": {"eq": "amd64"},
+    "cuda_max_good": {"gte": 12.9},
+    "compute_cap": {"gte": 750},
+    "num_gpus": {"eq": 1},
+}
 TEMPLATE_ENDPOINT = "https://console.vast.ai/api/v0/template/"
 LOOKUP_COLUMNS = [
     "id",
@@ -33,6 +45,7 @@ LOOKUP_COLUMNS = [
     "image",
     "tag",
     "env",
+    "extra_filters",
     "onstart",
     "runtype",
     "ssh_direct",
@@ -46,6 +59,13 @@ LOOKUP_COLUMNS = [
     "recommended_disk_space",
     "private",
 ]
+BASE_LOOKUP_COLUMNS = [
+    "hash_id",
+    "runtype",
+    "use_ssh",
+    "ssh_direct",
+    "jupyter_dir",
+]
 HTTP_TIMEOUT_SECONDS = 15
 MAX_RESPONSE_BYTES = 256 * 1024
 MAX_PRIVATE_JSON_BYTES = 64 * 1024
@@ -53,11 +73,6 @@ MAX_PRIVATE_JSON_BYTES = 64 * 1024
 _FAILURE = "Private template publication failed."
 _NAME = re.compile(r"cloud-run-worker-([0-9a-f]{40})")
 _HASH = re.compile(r"[0-9a-f]{32}")
-_IMAGE = re.compile(
-    r"docker\.io/vastai/base-image@sha256:[0-9a-f]{64}"
-)
-_TAG = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
-_MUTABLE_TAGS = {"edge", "latest", "main", "master", "nightly", "stable"}
 _REQUEST_FIELDS = {
     "name",
     "image",
@@ -73,6 +88,7 @@ _REQUEST_FIELDS = {
     "docker_login_pass",
     "onstart",
     "env",
+    "extra_filters",
     "recommended_disk_space",
     "private",
 }
@@ -89,6 +105,7 @@ _REMOTE_LOCK_FIELDS = {
     "destination",
 }
 _ROW_FIELDS = set(LOOKUP_COLUMNS)
+_BASE_ROW_FIELDS = set(BASE_LOOKUP_COLUMNS)
 _ONSTART = re.compile(
     r"#!/bin/sh\n"
     r"set -eu\n"
@@ -102,7 +119,10 @@ _ONSTART = re.compile(
     r"chmod 0600 /opt/comfyui-cloud-run-bootstrap/release-lock\.json\n"
     r"CLOUD_RUN_WORKER_VERSION=([0-9a-f]{40})\n"
     r"export CLOUD_RUN_WORKER_VERSION\n"
-    r"exec python3 /opt/comfyui-cloud-run-bootstrap/bootstrap\.py "
+    r"CLOUD_RUN_COMFY_ROOT=/opt/workspace-internal/ComfyUI\n"
+    r"export CLOUD_RUN_COMFY_ROOT\n"
+    r"exec /venv/main/bin/python "
+    r"/opt/comfyui-cloud-run-bootstrap/bootstrap\.py "
     r"/opt/comfyui-cloud-run-bootstrap/release-lock\.json\n"
 )
 
@@ -193,13 +213,20 @@ class VastTemplateTransport:
             "Authorization": "Bearer " + api_key,
         }
 
-    def _lookup(self, api_key, filters):
+    def _lookup(
+        self,
+        api_key,
+        filters,
+        *,
+        select_columns=None,
+        row_normalizer=None,
+    ):
+        columns = ["*"] if select_columns is None else select_columns
+        normalizer = _normalize_row if row_normalizer is None else row_normalizer
         query = parse.urlencode(
             {
                 "select_filters": _compact_json(filters).decode("ascii"),
-                "select_cols": json.dumps(
-                    ["*"], separators=(",", ":")
-                ),
+                "select_cols": json.dumps(columns, separators=(",", ":")),
             }
         )
         http_request = request.Request(
@@ -207,12 +234,17 @@ class VastTemplateTransport:
             headers=self._headers(api_key),
             method="GET",
         )
-        return _normalize_lookup(self._response_object(http_request))
+        return _normalize_lookup(
+            self._response_object(http_request),
+            normalizer,
+        )
 
     def lookup_base(self, api_key):
         return self._lookup(
             api_key,
             {"hash_id": {"eq": BASE_TEMPLATE_HASH_ID}},
+            select_columns=BASE_LOOKUP_COLUMNS,
+            row_normalizer=_normalize_base_row,
         )
 
     def lookup_name(self, api_key, name):
@@ -239,6 +271,41 @@ class VastTemplateTransport:
         return self._response_object(http_request)
 
 
+def _valid_extra_filters(value):
+    if not isinstance(value, dict) or set(value) != set(EXTRA_FILTERS):
+        return False
+    for name, expected_constraint in EXTRA_FILTERS.items():
+        constraint = value.get(name)
+        if (
+            not isinstance(constraint, dict)
+            or set(constraint) != set(expected_constraint)
+        ):
+            return False
+        operator, expected_value = next(iter(expected_constraint.items()))
+        actual_value = constraint.get(operator)
+        if (
+            type(actual_value) is not type(expected_value)
+            or actual_value != expected_value
+        ):
+            return False
+    return True
+
+
+def _normalize_base_row(row):
+    if not isinstance(row, dict) or not _BASE_ROW_FIELDS.issubset(row):
+        _fail()
+    if (
+        not isinstance(row.get("hash_id"), str)
+        or _HASH.fullmatch(row["hash_id"]) is None
+        or not isinstance(row.get("runtype"), str)
+        or type(row.get("use_ssh")) is not bool
+        or type(row.get("ssh_direct")) is not bool
+        or row.get("jupyter_dir") is not None
+    ):
+        _fail()
+    return {column: row[column] for column in BASE_LOOKUP_COLUMNS}
+
+
 def _normalize_row(row):
     if not isinstance(row, dict) or not _ROW_FIELDS.issubset(row):
         _fail()
@@ -260,12 +327,10 @@ def _normalize_row(row):
         or not row["name"]
         or not isinstance(hash_id, str)
         or _HASH.fullmatch(hash_id) is None
-        or not isinstance(image, str)
-        or _IMAGE.fullmatch(image) is None
-        or not isinstance(tag, str)
-        or _TAG.fullmatch(tag) is None
-        or tag.casefold() in _MUTABLE_TAGS
+        or image != OFFICIAL_IMAGE
+        or tag != OFFICIAL_TAG
         or not isinstance(row.get("env"), str)
+        or not _valid_extra_filters(row.get("extra_filters"))
         or not isinstance(onstart, str)
         or onstart_size > MAX_PRIVATE_JSON_BYTES
         or not isinstance(row.get("runtype"), str)
@@ -288,7 +353,7 @@ def _normalize_row(row):
     return {column: row[column] for column in LOOKUP_COLUMNS}
 
 
-def _normalize_lookup(payload):
+def _normalize_lookup(payload, row_normalizer):
     if not isinstance(payload, dict) or set(payload) != {
         "success",
         "templates_found",
@@ -305,7 +370,7 @@ def _normalize_lookup(payload):
         or len(templates) != count
     ):
         _fail()
-    return [_normalize_row(row) for row in templates]
+    return [row_normalizer(row) for row in templates]
 
 
 def _private_path(path, *, require_directory=False):
@@ -474,11 +539,8 @@ def _validate_request(payload):
     tag = payload.get("tag")
     if (
         name_match is None
-        or not isinstance(image, str)
-        or _IMAGE.fullmatch(image) is None
-        or not isinstance(tag, str)
-        or _TAG.fullmatch(tag) is None
-        or tag.casefold() in _MUTABLE_TAGS
+        or image != OFFICIAL_IMAGE
+        or tag != OFFICIAL_TAG
         or payload.get("runtype") != "ssh"
         or payload.get("use_ssh") is not True
         or payload.get("ssh_direct") is not True
@@ -489,6 +551,7 @@ def _validate_request(payload):
         or payload.get("docker_login_user") != ""
         or payload.get("docker_login_pass") != ""
         or payload.get("env") != "-p 8765:8765"
+        or not _valid_extra_filters(payload.get("extra_filters"))
         or type(payload.get("recommended_disk_space")) is not int
         or payload.get("recommended_disk_space") != 80
         or payload.get("private") is not True
@@ -594,8 +657,6 @@ def audit_base_template(
         record = {
             "schema_version": 1,
             "hash_id": row["hash_id"],
-            "image": row["image"],
-            "tag": row["tag"],
             "runtype": row["runtype"],
             "use_ssh": row["use_ssh"],
             "ssh_direct": row["ssh_direct"],
