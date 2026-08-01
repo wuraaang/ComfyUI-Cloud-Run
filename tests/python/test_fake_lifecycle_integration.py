@@ -266,6 +266,7 @@ class FullOfflineLifecycleTests(unittest.TestCase):
                 SessionState.BOOTSTRAPPING,
                 now=100.0,
                 instance_id="900",
+                provider_token="a" * 64,
                 session_secret_hex="d" * 64,
             )
             sessions.create_or_get(session)
@@ -276,7 +277,7 @@ class FullOfflineLifecycleTests(unittest.TestCase):
                     "actual_status": "running",
                     "public_ipaddr": "8.8.8.8",
                     "ports": {"8765/tcp": [{"HostPort": "32100"}]},
-                    "jupyter_token": "offline-boundary-token",
+                    "jupyter_token": "intentionally-wrong-provider-token",
                 }
             ]
             sleeps = []

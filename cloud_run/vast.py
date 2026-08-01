@@ -697,7 +697,6 @@ def _normalize_instance(raw):
         "label": _safe_identifier(raw.get("label")),
         "dph_total": _finite_number(raw.get("dph_total")),
         "status_msg": _safe_identifier(raw.get("status_msg")),
-        "jupyter_token": _safe_identifier(raw.get("jupyter_token")),
     }
 
 

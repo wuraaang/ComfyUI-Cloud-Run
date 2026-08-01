@@ -255,7 +255,7 @@ class FakeVastProvider:
                 "public_ipaddr": offer["public_ipaddr"],
                 "machine_id": offer["machine_id"],
                 "host_id": offer["host_id"],
-                "jupyter_token": "instance-scoped-token",
+                "jupyter_token": "intentionally-wrong-provider-token",
                 "ports": {
                     "8765/tcp": [
                         {"HostPort": str(32_100 + self.create_count)}
@@ -1183,6 +1183,52 @@ class FakeCloudRunSystem:
 
 
 class FakeReusableSessionIntegrationTests(unittest.TestCase):
+    def test_controller_owned_boundary_ignores_provider_jupyter_token_through_full_fake_run(self):
+        system = FakeCloudRunSystem()
+        self.addCleanup(system.close)
+        capture = system.capture(
+            native_capture(
+                model="model-a",
+                input_name="input-a.jpg",
+                seed=11,
+            )
+        )
+
+        session = system.quote_confirm_and_ready(
+            system.preflight(capture),
+            offer_id="42",
+            idempotency_key="controller-boundary-session-key",
+            duration_seconds=7_200,
+        )
+
+        self.assertEqual(session.state, SessionState.READY)
+        self.assertEqual(len(system.vast.create_boundaries), 1)
+        boundary = system.vast.create_boundaries[0]
+        self.assertEqual(boundary.session_id, session.session_id)
+        self.assertEqual(session.provider_token, boundary.boundary_token)
+        self.assertNotEqual(
+            session.provider_token,
+            "intentionally-wrong-provider-token",
+        )
+
+        job = system.run_job(session, capture, "controller-boundary-job-key")
+        self.assertEqual(job.state, JobState.SUCCEEDED)
+        self.assertTrue(job.outputs)
+        self.assertTrue(all(output.local_verified for output in job.outputs))
+
+        destroyed = system.destroy(
+            session,
+            confirmed(system.review_destroy(session)),
+        )
+        inventory = asyncio.run(
+            system.vast.list_instances("synthetic-offline-key")
+        )
+
+        self.assertEqual(destroyed.state, SessionState.DESTROYED)
+        self.assertEqual(system.vast.create_count, 1)
+        self.assertEqual(system.vast.destroy_count, 1)
+        self.assertEqual(inventory, [])
+
     def test_source_first_native_metadata_full_fake_lifecycle(self):
         system = FakeCloudRunSystem()
         self.addCleanup(system.close)

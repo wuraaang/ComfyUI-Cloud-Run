@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import secrets
 import time
 
 from .constants import COMFYUI_CONTAINER_PORT, DEFAULT_DISK_GB
@@ -13,6 +14,7 @@ from .offers import (
     select_best_offer,
 )
 from .session_service import TerminalProvisioningError
+from .worker_protocol import is_boundary_token
 from .worker_release import WorkerRelease
 from . import vast
 
@@ -619,6 +621,7 @@ class CloudRunLifecycle:
             now=float(self.clock()),
             quote=replacement_quote,
             retry_count=1,
+            provider_token=secrets.token_hex(32),
         )
         try:
             instance_id = await self.provider.create_instance(
@@ -627,6 +630,8 @@ class CloudRunLifecycle:
                 disk_gb=replacement_quote.disk_gb,
                 label=attempt.label,
                 release=self.release,
+                boundary_token=attempt.provider_token,
+                session_id=attempt.attempt_id,
             )
         except Exception:
             inventory = await self._inventory(api_key)
@@ -723,11 +728,10 @@ class CloudRunLifecycle:
             key=lambda item: str(item.get("instance_id") or ""),
         )
 
-    def _session_connection(self, instance):
+    def _session_connection(self, session, instance):
         if self.release is None:
             return None
         status = str(instance.get("actual_status") or "").casefold()
-        token = instance.get("jupyter_token")
         base_url = vast.derive_base_url(
             instance,
             self.release.worker_port,
@@ -735,14 +739,10 @@ class CloudRunLifecycle:
         if (
             status not in {"running", "ready"}
             or not base_url
-            or not isinstance(token, str)
-            or not token
-            or token != token.strip()
-            or len(token) > 4096
-            or any(ord(character) < 33 for character in token)
+            or not is_boundary_token(session.provider_token)
         ):
             return None
-        return base_url, token
+        return base_url
 
     def _finalize_session_destroyed(self, session, *, terminal_error=None):
         if session.state == SessionState.DESTROYED:
@@ -783,10 +783,9 @@ class CloudRunLifecycle:
         )
 
     async def _activate_session_instance(self, session, instance):
-        connection = self._session_connection(instance)
-        if connection is None:
+        base_url = self._session_connection(session, instance)
+        if base_url is None:
             return session
-        base_url, token = connection
         instance_id = str(instance.get("instance_id") or "")
         if not instance_id or instance.get("label") != session.label:
             return session
@@ -796,7 +795,6 @@ class CloudRunLifecycle:
             now=float(self.clock()),
             instance_id=instance_id,
             worker_base_url=base_url,
-            provider_token=token,
             residual_inventory=(),
             sanitized_error=None,
         )
@@ -1428,6 +1426,7 @@ class CloudRunLifecycle:
             quote=replacement_quote,
             retry_count=1,
             instance_id=None,
+            provider_token=secrets.token_hex(32),
             residual_inventory=(),
             sanitized_error=None,
         )
@@ -1438,6 +1437,8 @@ class CloudRunLifecycle:
                 disk_gb=replacement_quote.disk_gb,
                 label=session.label,
                 release=self.release,
+                boundary_token=session.provider_token,
+                session_id=session.session_id,
             )
         except Exception:
             inventory = await self._inventory(api_key)

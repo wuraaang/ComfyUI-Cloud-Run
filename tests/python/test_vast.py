@@ -884,7 +884,7 @@ class VastLifecycleRequestTests(unittest.TestCase):
         self.assertEqual(list_session.methods, ["GET"])
         self.assertEqual(list_session.calls[0][0], VAST_API_V1 + "/instances/")
         self.assertEqual(listed[0]["instance_id"], "987")
-        self.assertEqual(listed[0]["jupyter_token"], "provider-secret")
+        self.assertNotIn("jupyter_token", listed[0])
 
         get_session = FakeSession(
             FakeResponse(200, {"instances": raw_instance})

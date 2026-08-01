@@ -2,6 +2,7 @@ import asyncio
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from cloud_run.models import (
     AttemptState,
@@ -277,6 +278,7 @@ class LifecycleTestCase(unittest.TestCase):
         retry_count=0,
         cancel_requested=False,
         selected_quote=None,
+        provider_token=None,
     ):
         attempt = CloudAttempt.new(
             idempotency_key="idem-" + attempt_id,
@@ -285,13 +287,19 @@ class LifecycleTestCase(unittest.TestCase):
             state=state,
             now=self.clock(),
         )
-        if instance_id is not None or retry_count or cancel_requested:
+        if (
+            instance_id is not None
+            or retry_count
+            or cancel_requested
+            or provider_token is not None
+        ):
             attempt = attempt.transition(
                 state,
                 now=self.clock(),
                 instance_id=instance_id,
                 retry_count=retry_count,
                 cancel_requested=cancel_requested,
+                provider_token=provider_token,
             )
         return self.repository.create_or_get(attempt)[0]
 
@@ -702,6 +710,65 @@ class RecoveryAndReplacementTests(LifecycleTestCase):
             1,
         )
 
+    def test_attempt_replacement_rotates_boundary_before_create(self):
+        attempt = self.save_attempt(
+            AttemptState.STARTING,
+            instance_id="instance-1",
+            selected_quote=quote(max_instance_creates=2),
+            provider_token="a" * 64,
+        )
+        self.provider.instances = [
+            provider_instance("instance-1", attempt.label)
+        ]
+        self.provider.search_results = [
+            {
+                "offer_id": 43,
+                "gpu_name": "RTX 4090",
+                "gpu_ram_gb": 24.0,
+                "dph_total": 0.44,
+                "reliability": 0.995,
+                "machine_id": "machine-8",
+                "host_id": "host-4",
+                "public_ipaddr": "1.1.1.1",
+                "inet_down_mbps": 1200.0,
+                "disk_bw_mbps": 700.0,
+            }
+        ]
+        original_create = self.provider.create_instance
+
+        async def ambiguous_create(*args, **kwargs):
+            persisted = self.repository.get(attempt.attempt_id)
+            self.assertEqual(persisted.state, AttemptState.CREATING)
+            self.assertEqual(persisted.provider_token, "b" * 64)
+            self.assertEqual(kwargs["boundary_token"], "b" * 64)
+            self.assertNotEqual(kwargs["boundary_token"], "a" * 64)
+            self.assertEqual(kwargs["session_id"], attempt.attempt_id)
+            await original_create(*args, **kwargs)
+            self.provider.instances = [
+                provider_instance("instance-2", attempt.label)
+            ]
+            raise VastError("Synthetic lost response.", retryable=True)
+
+        self.provider.create_instance = ambiguous_create
+
+        with patch("secrets.token_hex", return_value="b" * 64):
+            replacement = asyncio.run(
+                self.lifecycle().handle_start_failure(
+                    attempt.attempt_id,
+                    failure_code="boot_timeout",
+                )
+            )
+
+        self.assertEqual(replacement.state, AttemptState.STARTING)
+        self.assertEqual(replacement.instance_id, "instance-2")
+        self.assertEqual(replacement.provider_token, "b" * 64)
+        self.assertEqual(len(self.provider.create_boundaries), 1)
+        boundary = self.provider.create_boundaries[0]
+        self.assertEqual(boundary.boundary_token, "b" * 64)
+        self.assertEqual(boundary.session_id, attempt.attempt_id)
+        self.assertNotIn("provider_token", repr(replacement))
+        self.assertNotIn("provider_token", replacement.public_payload())
+
     def test_replacement_reapplies_connection_floors_before_create(self):
         attempt = self.save_attempt(
             AttemptState.STARTING,
@@ -1026,6 +1093,7 @@ class SessionLifecycleTests(LifecycleTestCase):
             now=self.clock(),
             instance_id=instance_id,
             retry_count=retry_count,
+            provider_token="a" * 64,
             session_secret_hex="d" * 64,
         )
         return self.sessions.create_or_get(session)[0]
@@ -1039,7 +1107,7 @@ class SessionLifecycleTests(LifecycleTestCase):
             "public_ipaddr": "8.8.8.8",
             "ports": {"8765/tcp": [{"HostPort": "32100"}]},
             "status_msg": None,
-            "jupyter_token": "instance-boundary-token",
+            "jupyter_token": "intentionally-wrong-provider-token",
         }
 
     def test_boot_adopts_exact_worker_mapping_and_private_boundary_token(self):
@@ -1060,11 +1128,11 @@ class SessionLifecycleTests(LifecycleTestCase):
         )
         self.assertEqual(
             connected.provider_token,
-            "instance-boundary-token",
+            "a" * 64,
         )
         self.assertEqual(len(self.session_service.bootstrap_calls), 1)
         self.assertNotIn(
-            "instance-boundary-token",
+            "a" * 64,
             repr(connected.public_payload()),
         )
 
@@ -1263,6 +1331,7 @@ class SessionLifecycleTests(LifecycleTestCase):
             self.sessions.get(session.session_id).worker_base_url,
             "http://8.8.8.8:32100",
         )
+        self.assertEqual(recovered[0].provider_token, "a" * 64)
         self.assertEqual(len(self.session_service.recovery_calls), 1)
         self.assertEqual(
             [call[0] for call in self.provider.calls],
@@ -1465,6 +1534,65 @@ class SessionLifecycleTests(LifecycleTestCase):
             len([call for call in self.provider.calls if call[0] == "create"]),
             1,
         )
+
+    def test_session_replacement_rotates_boundary_before_create(self):
+        session = self.save_session(max_instance_creates=2)
+        original_secret = session.session_secret_hex
+        self.provider.instances = [
+            self.worker_instance("instance-1", session.label)
+        ]
+        self.provider.search_results = [
+            {
+                "offer_id": 43,
+                "gpu_name": "RTX 4090",
+                "gpu_ram_gb": 24.0,
+                "dph_total": 0.44,
+                "reliability": 0.995,
+                "machine_id": "machine-8",
+                "host_id": "host-4",
+                "public_ipaddr": "1.1.1.1",
+                "inet_down_mbps": 1000.0,
+                "disk_bw_mbps": 750.0,
+            }
+        ]
+        original_create = self.provider.create_instance
+
+        async def ambiguous_create(*args, **kwargs):
+            persisted = self.sessions.get(session.session_id)
+            self.assertEqual(persisted.state, SessionState.CREATING)
+            self.assertEqual(persisted.provider_token, "b" * 64)
+            self.assertEqual(persisted.session_secret_hex, original_secret)
+            self.assertEqual(kwargs["boundary_token"], "b" * 64)
+            self.assertNotEqual(kwargs["boundary_token"], "a" * 64)
+            self.assertEqual(kwargs["session_id"], session.session_id)
+            await original_create(*args, **kwargs)
+            self.provider.instances = [
+                self.worker_instance("instance-2", session.label)
+            ]
+            raise VastError("Synthetic lost response.", retryable=True)
+
+        self.provider.create_instance = ambiguous_create
+
+        with patch("secrets.token_hex", return_value="b" * 64):
+            replacement = asyncio.run(
+                self.session_lifecycle().handle_session_boot_failure(
+                    session.session_id,
+                    failure_code="boot_timeout",
+                )
+            )
+
+        self.assertEqual(replacement.state, SessionState.BOOTSTRAPPING)
+        self.assertEqual(replacement.instance_id, "instance-2")
+        self.assertEqual(replacement.provider_token, "b" * 64)
+        self.assertEqual(replacement.session_secret_hex, original_secret)
+        self.assertEqual(len(self.provider.create_boundaries), 1)
+        boundary = self.provider.create_boundaries[0]
+        self.assertEqual(boundary.boundary_token, "b" * 64)
+        self.assertEqual(boundary.session_id, session.session_id)
+        rendered = repr(replacement)
+        self.assertNotIn("provider_token", rendered)
+        self.assertNotIn("session_secret_hex", rendered)
+        self.assertNotIn("provider_token", replacement.public_payload())
 
     def test_session_replacement_reapplies_connection_floors_before_create(self):
         session = self.save_session(max_instance_creates=2)
