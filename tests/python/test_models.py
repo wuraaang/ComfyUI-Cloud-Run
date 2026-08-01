@@ -48,6 +48,41 @@ def quote(OfferQuote):
 
 
 class LifecycleModelTests(unittest.TestCase):
+    def test_model_representations_omit_boundary_tokens(self):
+        from cloud_run.models import (
+            AttemptState,
+            CloudAttempt,
+            CloudSession,
+            OfferQuote,
+            SessionState,
+        )
+
+        session = CloudSession.new(
+            "session-key",
+            session_id="session-1",
+            manifest_digest="a" * 64,
+            deadline_at=7_300.0,
+            deadline_mode="finite",
+            disk_gb=80,
+            now=100.0,
+        ).transition(
+            SessionState.PREFLIGHT,
+            provider_token="d" * 64,
+        )
+        attempt = CloudAttempt.new(
+            "attempt-key",
+            quote(OfferQuote),
+            attempt_id="attempt-1",
+            now=100.0,
+        ).transition(
+            AttemptState.CREATING,
+            provider_token="e" * 64,
+        )
+
+        for model, token in ((session, "d" * 64), (attempt, "e" * 64)):
+            with self.subTest(model=type(model).__name__):
+                self.assertNotIn(token, repr(model))
+
     def test_boundary_tokens_use_the_shared_private_contract(self):
         from dataclasses import replace
 

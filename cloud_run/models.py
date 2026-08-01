@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
 import math
 import re
@@ -482,7 +482,7 @@ class CloudSession:
     installed_manifest_digest: str | None
     instance_id: str | None
     worker_base_url: str | None
-    provider_token: str | None
+    provider_token: str | None = field(repr=False)
     session_secret_hex: str | None
     deadline_at: float | None
     deadline_mode: str
@@ -787,7 +787,7 @@ class CloudAttempt:
     quote: OfferQuote
     instance_id: str | None = None
     ready_url: str | None = None
-    provider_token: str | None = None
+    provider_token: str | None = field(default=None, repr=False)
     retry_count: int = 0
     cancel_requested: bool = False
     sanitized_error: str | None = None
