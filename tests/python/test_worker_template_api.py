@@ -215,9 +215,8 @@ class WorkerTemplateApiTests(unittest.TestCase):
                     )
                 ],
                 "select_cols": [
-                    json.dumps(LOOKUP_COLUMNS, separators=(",", ":"))
+                    json.dumps(["*"], separators=(",", ":"))
                 ],
-                "order_by": ["id"],
             },
         )
         self.assertEqual(request.get_header("Authorization"), "Bearer " + KEY)
@@ -248,6 +247,7 @@ class WorkerTemplateApiTests(unittest.TestCase):
                 "runtype": "jupyter_direc ssh_direc",
                 "jup_direct": True,
                 "use_jupyter_lab": True,
+                "jupyter_dir": None,
             }
         )
         base_row = template_row(
@@ -275,6 +275,63 @@ class WorkerTemplateApiTests(unittest.TestCase):
             filters = json.loads(parse_qs(urlsplit(request.full_url).query)["select_filters"][0])
             self.assertEqual(filters, {"hash_id": {"eq": BASE_TEMPLATE_HASH_ID}})
             self.assertEqual(request.method, "GET")
+
+    def test_audit_projects_allowlisted_fields_from_wildcard_response(self):
+        provider_marker = "provider-extra-field-marker"
+        base_request = template_request()
+        base_request.update(
+            {
+                "name": "base",
+                "runtype": "jupyter_direc ssh_direc",
+                "jup_direct": True,
+                "use_jupyter_lab": True,
+                "jupyter_dir": None,
+            }
+        )
+        base_row = {
+            **template_row(
+                base_request,
+                template_id=1,
+                hash_id=BASE_TEMPLATE_HASH_ID,
+            ),
+            "description": provider_marker,
+            "extra_filters": {"marker": provider_marker},
+        }
+        opener = FakeOpener(
+            [
+                FakeResponse(
+                    {
+                        "success": True,
+                        "templates_found": 1,
+                        "templates": [base_row],
+                    }
+                )
+            ]
+        )
+        with tempfile.TemporaryDirectory() as root:
+            settings, output, _request = self._private_inputs(root)
+            record = audit_base_template(
+                output,
+                settings_path_resolver=lambda: settings,
+                transport=VastTemplateTransport(opener=opener),
+            )
+            artifact_text = (output / "base-template-audit.json").read_text()
+
+        self.assertEqual(
+            set(record),
+            {
+                "schema_version",
+                "hash_id",
+                "image",
+                "tag",
+                "runtype",
+                "use_ssh",
+                "ssh_direct",
+                "jupyter_dir",
+            },
+        )
+        self.assertNotIn(provider_marker, json.dumps(record))
+        self.assertNotIn(provider_marker, artifact_text)
 
     def test_audit_rejects_malformed_or_conflicting_lookup_without_post(self):
         invalid_payloads = (
@@ -362,6 +419,30 @@ class WorkerTemplateApiTests(unittest.TestCase):
         opener = FakeOpener([response])
         with self.assertRaises(TemplatePublicationError):
             VastTemplateTransport(opener=opener).lookup_base(KEY)
+        self.assertTrue(response.closed)
+
+    def test_lookup_normalizes_invalid_onstart_unicode_without_echo(self):
+        provider_marker = "provider-unicode-marker"
+        row = template_row()
+        row["onstart"] = "\ud800" + provider_marker
+        response = FakeResponse(
+            {
+                "success": True,
+                "templates_found": 1,
+                "templates": [row],
+            }
+        )
+        opener = FakeOpener([response])
+
+        with self.assertRaisesRegex(
+            TemplatePublicationError,
+            "^Private template publication failed\\.$",
+        ) as caught:
+            VastTemplateTransport(opener=opener).lookup_base(KEY)
+
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertNotIn(provider_marker, repr(caught.exception))
+        self.assertNotIn(KEY, repr(caught.exception))
         self.assertTrue(response.closed)
 
     def test_credential_read_rejects_symlink_permissions_and_oversize(self):
@@ -570,7 +651,6 @@ class WorkerTemplateApiTests(unittest.TestCase):
         combined = stdout.getvalue() + stderr.getvalue()
         self.assertNotIn(KEY, combined)
         self.assertNotIn("Traceback", combined)
-
 
 if __name__ == "__main__":
     unittest.main()

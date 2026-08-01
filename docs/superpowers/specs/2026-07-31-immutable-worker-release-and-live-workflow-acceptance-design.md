@@ -199,8 +199,11 @@ directory only:
 
 A second focused repository script is the only allowed authenticated template
 transport. It uses the documented `GET` and `POST`
-`https://console.vast.ai/api/v0/template/` operations, with exact
-`select_filters`, `select_cols`, and `order_by` values for lookup. It accepts
+`https://console.vast.ai/api/v0/template/` operations. Lookup uses the exact
+filter, `select_cols=["*"]`, and no `order_by`, matching Vast's current official
+client; the bounded wildcard response is immediately projected into the fixed
+typed field allowlist, so additional provider fields are never returned,
+printed, or persisted. It accepts
 the Vast API key only from the process environment or the existing
 owner-private credential source, never from argv, and never prints a request,
 response, authorization header, key, `onstart`, or base64 body. HTTPS is
@@ -215,6 +218,11 @@ creation, and API workflow:
 - https://docs.vast.ai/api-reference/search/search-templates
 - https://docs.vast.ai/api-reference/templates/create-template
 - https://docs.vast.ai/api-reference/creating-and-using-templates-with-api
+
+The exact official base currently exposes the documented nullable
+`jupyter_dir` as `null`. The audit preserves that value. The private worker
+template does not copy it: with Jupyter disabled and `runtype="ssh"`, the
+renderer deterministically emits `jupyter_dir="/workspace"`.
 
 The fixed `onstart` payload contains the reviewed `remote_worker/bootstrap.py`
 bytes and remote lock encoded as base64 constants. It creates one private

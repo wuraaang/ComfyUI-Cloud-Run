@@ -198,9 +198,8 @@ class VastTemplateTransport:
             {
                 "select_filters": _compact_json(filters).decode("ascii"),
                 "select_cols": json.dumps(
-                    LOOKUP_COLUMNS, separators=(",", ":")
+                    ["*"], separators=(",", ":")
                 ),
-                "order_by": "id",
             }
         )
         http_request = request.Request(
@@ -241,12 +240,19 @@ class VastTemplateTransport:
 
 
 def _normalize_row(row):
-    if not isinstance(row, dict) or set(row) != _ROW_FIELDS:
+    if not isinstance(row, dict) or not _ROW_FIELDS.issubset(row):
         _fail()
     template_id = row.get("id")
     hash_id = row.get("hash_id")
     image = row.get("image")
     tag = row.get("tag")
+    onstart = row.get("onstart")
+    onstart_size = None
+    if isinstance(onstart, str):
+        try:
+            onstart_size = len(onstart.encode("utf-8"))
+        except UnicodeError:
+            _fail()
     if (
         type(template_id) is not int
         or template_id <= 0
@@ -260,13 +266,16 @@ def _normalize_row(row):
         or _TAG.fullmatch(tag) is None
         or tag.casefold() in _MUTABLE_TAGS
         or not isinstance(row.get("env"), str)
-        or not isinstance(row.get("onstart"), str)
-        or len(row["onstart"].encode("utf-8")) > MAX_PRIVATE_JSON_BYTES
+        or not isinstance(onstart, str)
+        or onstart_size > MAX_PRIVATE_JSON_BYTES
         or not isinstance(row.get("runtype"), str)
         or type(row.get("ssh_direct")) is not bool
         or type(row.get("use_ssh")) is not bool
         or type(row.get("jup_direct")) is not bool
-        or not isinstance(row.get("jupyter_dir"), str)
+        or (
+            row.get("jupyter_dir") is not None
+            and not isinstance(row.get("jupyter_dir"), str)
+        )
         or type(row.get("use_jupyter_lab")) is not bool
         or row.get("docker_login_repo") != ""
         or row.get("docker_login_user") != ""
@@ -579,7 +588,7 @@ def audit_base_template(
             or row["runtype"] != "jupyter_direc ssh_direc"
             or row["use_ssh"] is not True
             or row["ssh_direct"] is not True
-            or row["jupyter_dir"] != "/workspace"
+            or row["jupyter_dir"] is not None
         ):
             _fail()
         record = {

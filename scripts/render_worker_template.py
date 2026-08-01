@@ -53,6 +53,7 @@ _IMAGE_DIGEST = re.compile(
 )
 _PINNED_TAG = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _MUTABLE_TAGS = {"edge", "latest", "main", "master", "nightly", "stable"}
+_WORKER_JUPYTER_DIRECTORY = "/workspace"
 
 
 class TemplateRenderError(RuntimeError):
@@ -129,7 +130,7 @@ def _validated_base_template(base_template):
         or base_template.get("use_ssh") is not True
         or type(base_template.get("ssh_direct")) is not bool
         or base_template.get("ssh_direct") is not True
-        or base_template.get("jupyter_dir") != "/workspace"
+        or base_template.get("jupyter_dir") is not None
     ):
         raise TemplateRenderError("Base template audit is invalid.")
     return {
@@ -140,7 +141,7 @@ def _validated_base_template(base_template):
         "runtype": "jupyter_direc ssh_direc",
         "use_ssh": True,
         "ssh_direct": True,
-        "jupyter_dir": "/workspace",
+        "jupyter_dir": None,
     }
 
 
@@ -292,7 +293,7 @@ def render_worker_template(
         "use_ssh": validated_base["use_ssh"],
         "ssh_direct": validated_base["ssh_direct"],
         "jup_direct": False,
-        "jupyter_dir": validated_base["jupyter_dir"],
+        "jupyter_dir": _WORKER_JUPYTER_DIRECTORY,
         "use_jupyter_lab": False,
         "docker_login_repo": "",
         "docker_login_user": "",

@@ -73,7 +73,7 @@ def base_template_audit():
         "runtype": "jupyter_direc ssh_direc",
         "use_ssh": True,
         "ssh_direct": True,
-        "jupyter_dir": "/workspace",
+        "jupyter_dir": None,
     }
 
 
@@ -365,6 +365,7 @@ class TemplateRendererTests(unittest.TestCase):
         self.assertIs(rendered.request["ssh_direct"], True)
         self.assertIs(rendered.request["jup_direct"], False)
         self.assertIs(rendered.request["use_jupyter_lab"], False)
+        self.assertEqual(rendered.request["jupyter_dir"], "/workspace")
         self.assertEqual(rendered.request["docker_login_repo"], "")
         self.assertEqual(rendered.request["docker_login_user"], "")
         self.assertEqual(rendered.request["docker_login_pass"], "")
