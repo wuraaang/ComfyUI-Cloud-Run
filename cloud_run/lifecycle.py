@@ -9,8 +9,10 @@ from .constants import COMFYUI_CONTAINER_PORT, DEFAULT_DISK_GB
 from .models import AttemptState, OfferQuote, SessionState
 from .offers import (
     apply_offer_policy,
+    offer_meets_connection_quality_policy,
     select_best_offer,
 )
+from .session_service import TerminalProvisioningError
 from .worker_release import WorkerRelease
 from . import vast
 
@@ -369,6 +371,19 @@ class CloudRunLifecycle:
                 session = await self.reconcile_session_once(session_id)
             except (asyncio.CancelledError, KeyboardInterrupt):
                 raise
+            except TerminalProvisioningError as error:
+                diagnostic = str(error)
+                session = self._session(session_id)
+                session = self.session_repository.transition(
+                    session.session_id,
+                    SessionState.FAILED,
+                    now=float(self.clock()),
+                    sanitized_error=diagnostic,
+                )
+                return await self.destroy_session(
+                    session.session_id,
+                    terminal_error=diagnostic,
+                )
             except Exception:
                 session = self._session(session_id)
             if session.state in {
@@ -475,14 +490,17 @@ class CloudRunLifecycle:
                     "Vast console immediately."
                 ),
             )
-        if attempt.retry_count >= 1:
+        if (
+            1 + attempt.retry_count
+            >= attempt.quote.max_instance_creates
+        ):
             return self.repository.transition(
                 attempt.attempt_id,
                 AttemptState.FAILED,
                 now=float(self.clock()),
                 instance_id=None,
                 sanitized_error=(
-                    "The single automatic replacement was exhausted."
+                    "The authorized total instance-create limit was reached."
                 ),
             )
 
@@ -534,6 +552,7 @@ class CloudRunLifecycle:
                     for offer in offers
                     if float(offer.get("dph_total", float("inf")))
                     <= attempt.quote.max_price_per_hour
+                    and offer_meets_connection_quality_policy(offer)
                 ],
                 blacklist=self.blacklist,
                 now=float(self.clock()),
@@ -562,6 +581,8 @@ class CloudRunLifecycle:
                 if selected.get("reliability") is not None
                 else None
             ),
+            inet_down_mbps=selected.get("inet_down_mbps"),
+            disk_bw_mbps=selected.get("disk_bw_mbps"),
             max_price_per_hour=attempt.quote.max_price_per_hour,
             expires_at=float(self.clock()) + 120,
             disk_gb=attempt.quote.disk_gb,
@@ -590,6 +611,7 @@ class CloudRunLifecycle:
             machine_id=selected.get("machine_id"),
             host_id=selected.get("host_id"),
             public_ipaddr=selected.get("public_ipaddr"),
+            max_instance_creates=attempt.quote.max_instance_creates,
         )
         attempt = self.repository.transition(
             attempt.attempt_id,
@@ -722,7 +744,7 @@ class CloudRunLifecycle:
             return None
         return base_url, token
 
-    def _finalize_session_destroyed(self, session):
+    def _finalize_session_destroyed(self, session, *, terminal_error=None):
         if session.state == SessionState.DESTROYED:
             return session
         if session.state not in {
@@ -754,7 +776,7 @@ class CloudRunLifecycle:
             provider_token=None,
             session_secret_hex=None,
             residual_inventory=(),
-            sanitized_error=None,
+            sanitized_error=terminal_error,
             pending_deadline_at=None,
             pending_deadline_mode=None,
             pending_deadline_action=None,
@@ -856,7 +878,7 @@ class CloudRunLifecycle:
             return session
         return await self._activate_session_instance(session, instance)
 
-    async def destroy_session(self, session_id):
+    async def destroy_session(self, session_id, *, terminal_error=None):
         session = self._session(session_id)
         if session.state == SessionState.DESTROYED:
             return session
@@ -869,7 +891,10 @@ class CloudRunLifecycle:
             and session.instance_id is None
             and not session.destroy_requested
         ):
-            return self._finalize_session_destroyed(session)
+            return self._finalize_session_destroyed(
+                session,
+                terminal_error=terminal_error,
+            )
         original_state = session.state
         if session.state not in {
             SessionState.DESTROY_REQUESTED,
@@ -880,7 +905,7 @@ class CloudRunLifecycle:
                 SessionState.DESTROY_REQUESTED,
                 now=float(self.clock()),
                 destroy_requested=True,
-                sanitized_error=None,
+                sanitized_error=terminal_error,
             )
         _settings, api_key = self._api_key()
         instance_id = session.instance_id
@@ -948,7 +973,10 @@ class CloudRunLifecycle:
             ):
                 return session
             else:
-                return self._finalize_session_destroyed(session)
+                return self._finalize_session_destroyed(
+                    session,
+                    terminal_error=terminal_error,
+                )
         if session.state != SessionState.DESTROYING:
             session = self.session_repository.transition(
                 session.session_id,
@@ -1005,7 +1033,10 @@ class CloudRunLifecycle:
                     "the Vast console immediately."
                 ),
             )
-        return self._finalize_session_destroyed(session)
+        return self._finalize_session_destroyed(
+            session,
+            terminal_error=terminal_error,
+        )
 
     async def enforce_session_deadline(self, session_id):
         session = self._session(session_id)
@@ -1183,6 +1214,27 @@ class CloudRunLifecycle:
                 )
             except (asyncio.CancelledError, KeyboardInterrupt):
                 raise
+            except TerminalProvisioningError as error:
+                diagnostic = str(error)
+                session = repository.get(session.session_id)
+                session = repository.transition(
+                    session.session_id,
+                    SessionState.FAILED,
+                    now=float(self.clock()),
+                    sanitized_error=diagnostic,
+                )
+                session = await self.destroy_session(
+                    session.session_id,
+                    terminal_error=diagnostic,
+                )
+                if session.state == SessionState.DESTROYED:
+                    confirmed = getattr(
+                        self.session_service,
+                        "confirmed_terminal_destroy",
+                        None,
+                    )
+                    if callable(confirmed):
+                        confirmed(session.session_id)
             except Exception:
                 session = repository.get(session.session_id)
             recovered.append(session)
@@ -1253,7 +1305,11 @@ class CloudRunLifecycle:
                     "the Vast console immediately."
                 ),
             )
-        if session.retry_count >= 1:
+        if (
+            session.quote is not None
+            and 1 + session.retry_count
+            >= session.quote.max_instance_creates
+        ):
             return self.session_repository.transition(
                 session.session_id,
                 SessionState.FAILED,
@@ -1261,7 +1317,7 @@ class CloudRunLifecycle:
                 instance_id=None,
                 residual_inventory=(),
                 sanitized_error=(
-                    "The single automatic replacement was exhausted."
+                    "The authorized total instance-create limit was reached."
                 ),
             )
         if (
@@ -1304,6 +1360,7 @@ class CloudRunLifecycle:
                     for offer in offers
                     if float(offer.get("dph_total", float("inf")))
                     <= session.quote.max_price_per_hour
+                    and offer_meets_connection_quality_policy(offer)
                 ],
                 blacklist=self.blacklist,
                 now=float(self.clock()),
@@ -1332,6 +1389,8 @@ class CloudRunLifecycle:
                 if selected.get("reliability") is not None
                 else None
             ),
+            inet_down_mbps=selected.get("inet_down_mbps"),
+            disk_bw_mbps=selected.get("disk_bw_mbps"),
             max_price_per_hour=session.quote.max_price_per_hour,
             expires_at=float(self.clock()) + 120,
             disk_gb=session.quote.disk_gb,
@@ -1360,6 +1419,7 @@ class CloudRunLifecycle:
             machine_id=selected.get("machine_id"),
             host_id=selected.get("host_id"),
             public_ipaddr=selected.get("public_ipaddr"),
+            max_instance_creates=session.quote.max_instance_creates,
         )
         session = self.session_repository.transition(
             session.session_id,

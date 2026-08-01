@@ -51,6 +51,10 @@ class ProvisionTransaction:
     planned_restart_count: int
     repair_count: int
     repair_restart_count: int
+    phase: str | None
+    current_dependency_id: str | None
+    transferred_bytes: int
+    total_bytes: int
     last_progress_at: float
     sanitized_error: str | None
 
@@ -85,6 +89,20 @@ _JOB_COLUMNS = """
     manifest_digest, remote_prompt_id, sanitized_error, created_at, updated_at,
     version
 """
+_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}")
+_PROVISION_PHASES = {
+    "dependency_transfer",
+    "model_transfer",
+    "digest_verification",
+    "comfyui_startup",
+    "environment_validation",
+    "ready",
+}
+_ARTIFACT_PROVISION_PHASES = {
+    "dependency_transfer",
+    "model_transfer",
+    "digest_verification",
+}
 
 
 def _require_digest(value, name):
@@ -99,6 +117,83 @@ def _require_identifier(value, name):
     if not normalized or len(normalized) > 200:
         raise ValueError(f"Invalid {name}.")
     return normalized
+
+
+def _require_strict_identifier(value, name, *, optional=False):
+    if value is None and optional:
+        return None
+    if not isinstance(value, str) or not _IDENTIFIER.fullmatch(value):
+        raise ValueError(f"Invalid {name}.")
+    return value
+
+
+def _require_finite_timestamp(value, name):
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+    ):
+        raise ValueError(f"Invalid {name}.")
+    return float(value)
+
+
+def _require_sanitized_error(value):
+    if value is None:
+        return None
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 500
+        or any(ord(character) < 32 for character in value)
+        or any(
+            marker in value.casefold()
+            for marker in (
+                "://",
+                "bearer ",
+                "token=",
+                "secret",
+                "/users/",
+            )
+        )
+    ):
+        raise ValueError("Invalid sanitized provisioning error.")
+    return value
+
+
+def _provision_progress_values(
+    *,
+    phase,
+    current_dependency_id,
+    transferred_bytes,
+    total_bytes,
+):
+    if phase is not None and (
+        not isinstance(phase, str) or phase not in _PROVISION_PHASES
+    ):
+        raise ValueError("Invalid provisioning phase.")
+    current = _require_strict_identifier(
+        current_dependency_id,
+        "current dependency ID",
+        optional=True,
+    )
+    if (
+        isinstance(transferred_bytes, bool)
+        or not isinstance(transferred_bytes, int)
+        or isinstance(total_bytes, bool)
+        or not isinstance(total_bytes, int)
+        or not 0 <= transferred_bytes <= total_bytes
+        or (
+            phase in _ARTIFACT_PROVISION_PHASES
+            and current is None
+        )
+        or (
+            phase not in _ARTIFACT_PROVISION_PHASES
+            and current is not None
+        )
+        or (phase == "ready" and transferred_bytes != total_bytes)
+    ):
+        raise ValueError("Invalid provisioning progress.")
+    return phase, current, transferred_bytes, total_bytes
 
 
 class JobRepository:
@@ -864,12 +959,17 @@ class JobRepository:
                 SELECT
                     transaction_id, session_id, job_id, manifest_digest, state,
                     planned_restart_count, repair_count, repair_restart_count,
-                    last_progress_at, sanitized_error
+                    phase, current_dependency_id, transferred_bytes,
+                    total_bytes, last_progress_at, sanitized_error
                 FROM provision_transactions
                 WHERE transaction_id = ?
                 """,
                 (str(transaction_id),),
             ).fetchone()
+        return self._provision_transaction_from_row(row)
+
+    @staticmethod
+    def _provision_transaction_from_row(row):
         if row is None:
             return None
         return ProvisionTransaction(
@@ -881,9 +981,123 @@ class JobRepository:
             planned_restart_count=int(row["planned_restart_count"]),
             repair_count=int(row["repair_count"]),
             repair_restart_count=int(row["repair_restart_count"]),
+            phase=row["phase"],
+            current_dependency_id=row["current_dependency_id"],
+            transferred_bytes=int(row["transferred_bytes"]),
+            total_bytes=int(row["total_bytes"]),
             last_progress_at=float(row["last_progress_at"]),
             sanitized_error=row["sanitized_error"],
         )
+
+    def record_provision_progress(
+        self,
+        *,
+        transaction_id,
+        session_id,
+        job_id,
+        manifest_digest,
+        state,
+        phase,
+        current_dependency_id,
+        transferred_bytes,
+        total_bytes,
+        last_progress_at,
+        sanitized_error=None,
+    ):
+        phase, current_dependency_id, transferred_bytes, total_bytes = (
+            _provision_progress_values(
+                phase=phase,
+                current_dependency_id=current_dependency_id,
+                transferred_bytes=transferred_bytes,
+                total_bytes=total_bytes,
+            )
+        )
+        values = (
+            _require_strict_identifier(
+                transaction_id,
+                "transaction ID",
+            ),
+            _require_strict_identifier(session_id, "session ID"),
+            _require_strict_identifier(
+                job_id,
+                "job ID",
+                optional=True,
+            ),
+            _require_digest(manifest_digest, "manifest digest"),
+            _require_strict_identifier(state, "transaction state"),
+            phase,
+            current_dependency_id,
+            transferred_bytes,
+            total_bytes,
+            _require_finite_timestamp(
+                last_progress_at,
+                "last progress timestamp",
+            ),
+            _require_sanitized_error(sanitized_error),
+        )
+        with closing(self._connect()) as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO provision_transactions(
+                    transaction_id, session_id, job_id, manifest_digest, state,
+                    planned_restart_count, repair_count, repair_restart_count,
+                    phase, current_dependency_id, transferred_bytes,
+                    total_bytes, last_progress_at, sanitized_error
+                ) VALUES (?, ?, ?, ?, ?, 0, 0, 0, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(transaction_id) DO UPDATE SET
+                    job_id = excluded.job_id,
+                    state = excluded.state,
+                    phase = excluded.phase,
+                    current_dependency_id = excluded.current_dependency_id,
+                    transferred_bytes = excluded.transferred_bytes,
+                    total_bytes = excluded.total_bytes,
+                    last_progress_at = excluded.last_progress_at,
+                    sanitized_error = excluded.sanitized_error
+                WHERE
+                    provision_transactions.session_id = excluded.session_id
+                    AND provision_transactions.manifest_digest =
+                        excluded.manifest_digest
+                    AND provision_transactions.transferred_bytes <=
+                        excluded.transferred_bytes
+                    AND (
+                        provision_transactions.total_bytes = 0
+                        OR provision_transactions.total_bytes =
+                            excluded.total_bytes
+                    )
+                    AND provision_transactions.last_progress_at <=
+                        excluded.last_progress_at
+                """,
+                values,
+            )
+            if cursor.rowcount != 1:
+                connection.rollback()
+                raise ValueError(
+                    "Provisioning progress identity or order changed."
+                )
+            connection.commit()
+        return self.get_provision_transaction(values[0])
+
+    def latest_provision_transaction(self, session_id):
+        session_identifier = _require_strict_identifier(
+            session_id,
+            "session ID",
+        )
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    transaction_id, session_id, job_id, manifest_digest, state,
+                    planned_restart_count, repair_count, repair_restart_count,
+                    phase, current_dependency_id, transferred_bytes,
+                    total_bytes, last_progress_at, sanitized_error
+                FROM provision_transactions
+                WHERE session_id = ?
+                ORDER BY last_progress_at DESC, transaction_id DESC
+                LIMIT 1
+                """,
+                (session_identifier,),
+            ).fetchone()
+        return self._provision_transaction_from_row(row)
 
     def replace_installed_set(self, session_id, dependencies):
         session_identifier = _require_identifier(session_id, "session ID")

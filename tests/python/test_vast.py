@@ -71,28 +71,35 @@ class VastRequestTests(unittest.TestCase):
         from cloud_run.vast import OFFER_SEARCH_URL, search_offers
 
         session = FakeSession(
-            FakeResponse(
-                200,
-                {
-                    "offers": [
-                        {
-                            "id": 42,
-                            "gpu_name": "RTX 4090",
-                            "gpu_ram": 24576,
-                            "dph_total": 0.42,
-                            "reliability": 0.96,
-                            "reliability2": 0.987,
-                            "machine_id": 77,
-                            "host_id": 123,
-                            "public_ipaddr": "192.0.2.10",
-                            "inet_down": 850.0,
-                            "disk_bw": 640.0,
-                            "inet_down_cost": 0.01,
-                            "inet_up_cost": 0.02,
-                        }
-                    ]
-                },
-            )
+            [
+                FakeResponse(
+                    200,
+                    {
+                        "offers": [
+                            {
+                                "id": 42,
+                                "gpu_name": "RTX 4090",
+                                "gpu_ram": 24576,
+                                "dph_total": 0.42,
+                                "reliability2": 0.99,
+                                "machine_id": 77,
+                                "host_id": 123,
+                                "public_ipaddr": "192.0.2.10",
+                                "inet_down": 1200.0,
+                                "disk_bw": 640.0,
+                                "inet_down_cost": 0.01,
+                                "inet_up_cost": 0.02,
+                                "disk_space": 96,
+                                "num_gpus": 1,
+                                "rentable": True,
+                                "verified": True,
+                                "type": "ondemand",
+                            }
+                        ]
+                    },
+                ),
+                FakeResponse(200, {"offers": []}),
+            ]
         )
 
         offers = asyncio.run(
@@ -109,21 +116,19 @@ class VastRequestTests(unittest.TestCase):
             OFFER_SEARCH_URL,
             "https://console.vast.ai/api/v0/bundles/",
         )
-        self.assertEqual(len(session.calls), 1)
-        url, request = session.calls[0]
-        self.assertEqual(url, OFFER_SEARCH_URL)
-        self.assertEqual(
-            request["headers"],
-            {
-                "Authorization": "Bearer synthetic-value",
-                "Accept": "application/json",
-            },
-        )
-        self.assertEqual(
-            request["json"],
-            {
+        self.assertEqual(len(session.calls), 2)
+        for url, request in session.calls:
+            self.assertEqual(url, OFFER_SEARCH_URL)
+            self.assertEqual(
+                request["headers"],
+                {
+                    "Authorization": "Bearer synthetic-value",
+                    "Accept": "application/json",
+                },
+            )
+        common = {
                 "gpu_ram": {"gte": 24 * 1024},
-                "reliability": {"gte": 0.95},
+                "reliability": {"gte": 0.99},
                 "rentable": {"eq": True},
                 "dph_total": {"lte": 0.75},
                 "disk_space": {"gte": 96},
@@ -132,7 +137,32 @@ class VastRequestTests(unittest.TestCase):
                 "verified": {"eq": True},
                 "type": "ondemand",
                 "limit": 20,
-                "order": [["dph_total", "asc"]],
+        }
+        self.assertEqual(
+            session.calls[0][1]["json"],
+            {
+                **common,
+                "inet_down": {"gte": 1000},
+                "order": [
+                    ["reliability", "desc"],
+                    ["disk_bw", "desc"],
+                    ["dph_total", "asc"],
+                    ["id", "asc"],
+                ],
+            },
+        )
+        self.assertEqual(
+            session.calls[1][1]["json"],
+            {
+                **common,
+                "inet_down": {"gte": 500, "lt": 1000},
+                "order": [
+                    ["inet_down", "desc"],
+                    ["reliability", "desc"],
+                    ["disk_bw", "desc"],
+                    ["dph_total", "asc"],
+                    ["id", "asc"],
+                ],
             },
         )
         self.assertEqual(
@@ -143,11 +173,11 @@ class VastRequestTests(unittest.TestCase):
                     "gpu_name": "RTX 4090",
                     "gpu_ram_gb": 24.0,
                     "dph_total": 0.42,
-                    "reliability": 0.987,
+                    "reliability": 0.99,
                     "machine_id": "77",
                     "host_id": "123",
                     "public_ipaddr": "192.0.2.10",
-                    "inet_down_mbps": 850.0,
+                    "inet_down_mbps": 1200.0,
                     "disk_bw_mbps": 640.0,
                     "inet_down_cost": 0.01,
                     "inet_up_cost": 0.02,
@@ -168,6 +198,9 @@ class VastRequestTests(unittest.TestCase):
             "verified": True,
             "num_gpus": 1,
             "type": "ondemand",
+            "inet_down": 500,
+            "disk_bw": 400,
+            "disk_space": 96,
         }
         matching_session = FakeSession(
             FakeResponse(200, {"offers": [matching_offer]})
@@ -196,6 +229,8 @@ class VastRequestTests(unittest.TestCase):
         self.assertEqual(request["json"]["gpu_ram"], {"gte": 24576})
         self.assertEqual(request["json"]["disk_space"], {"gte": 96})
         self.assertEqual(request["json"]["allocated_storage"], 96)
+        self.assertEqual(request["json"]["reliability"], {"gte": 0.99})
+        self.assertEqual(request["json"]["inet_down"], {"gte": 500})
 
         mismatched_session = FakeSession(
             FakeResponse(200, {"offers": [{**matching_offer, "id": 99}]})
@@ -228,154 +263,187 @@ class VastRequestTests(unittest.TestCase):
 
 
 class VastNormalizationAndErrorTests(unittest.TestCase):
-    def test_normalization_sanitizes_filters_and_sorts_offers(self):
+    def test_normalization_requires_complete_quality_and_provider_evidence(self):
         from cloud_run.vast import normalize_offers
 
-        payload = {
-            "offers": [
-                {
-                    "id": 20,
-                    "gpu_name": " RTX 4090 ",
-                    "gpu_ram": 24576,
-                    "dph_total": 0.5,
-                    "reliability": 0.96,
-                    "host_id": 88,
-                    "public_ipaddr": "192.0.2.1",
-                },
-                {
-                    "id": 10,
-                    "gpu_name": "RTX 5090",
-                    "gpu_ram": 32768,
-                    "dph_total": 0.25,
-                    "reliability": 0.97,
-                    "reliability2": 0.99,
-                    "machine_id": 77,
-                    "inet_down": 500,
-                    "disk_bw": 400,
-                    "inet_down_cost": -1,
-                    "inet_up_cost": math.inf,
-                },
-                {
-                    "id": 30,
-                    "gpu_name": "too expensive",
-                    "gpu_ram": 49152,
-                    "dph_total": 0.76,
-                    "reliability": 0.99,
-                },
-                {
-                    "id": 31,
-                    "gpu_name": "too little VRAM",
-                    "gpu_ram": 16384,
-                    "dph_total": 0.1,
-                    "reliability": 0.99,
-                },
-                {
-                    "id": 32,
-                    "gpu_name": "not reliable",
-                    "gpu_ram": 24576,
-                    "dph_total": 0.1,
-                    "reliability": 0.94,
-                },
-                {
-                    "id": None,
-                    "gpu_name": "missing id",
-                    "gpu_ram": 24576,
-                    "dph_total": 0.1,
-                    "reliability": 0.99,
-                },
-                {
-                    "id": 33,
-                    "gpu_name": {"not": "text"},
-                    "gpu_ram": 24576,
-                    "dph_total": 0.1,
-                    "reliability": 0.99,
-                },
-                {
-                    "id": 34,
-                    "gpu_name": "non-finite",
-                    "gpu_ram": 24576,
-                    "dph_total": math.nan,
-                    "reliability": 0.99,
-                },
-            ],
-            "provider_metadata": "must not survive",
+        base = {
+            "id": 10,
+            "gpu_name": "RTX 5090",
+            "gpu_ram": 32768,
+            "dph_total": 0.25,
+            "reliability2": 0.99,
+            "machine_id": 77,
+            "inet_down": 500,
+            "disk_bw": 400,
+            "inet_down_cost": -1,
+            "inet_up_cost": math.inf,
+            "disk_space": 80,
+            "type": "ondemand",
+            "num_gpus": 1,
+            "rentable": True,
+            "verified": True,
         }
+        invalid_variants = {
+            "missing inet_down": {"inet_down": None},
+            "non-finite inet_down": {"inet_down": math.inf},
+            "below bandwidth floor": {"inet_down": 499},
+            "below reliability floor": {"reliability2": 0.989},
+            "missing type": {"type": None},
+            "missing GPU count": {"num_gpus": None},
+            "missing rentable": {"rentable": None},
+            "missing verification": {"verified": None},
+            "missing disk space": {"disk_space": None},
+        }
+        for name, changes in invalid_variants.items():
+            with self.subTest(case=name):
+                raw = {**base, **changes}
+                self.assertEqual(
+                    normalize_offers(
+                        {"offers": [raw]},
+                        max_price_per_hour=0.75,
+                        min_vram_gb=24,
+                    ),
+                    [],
+                )
 
-        offers = normalize_offers(
-            payload,
+        accepted = normalize_offers(
+            {"offers": [base]},
             max_price_per_hour=0.75,
             min_vram_gb=24,
         )
+        self.assertEqual([offer["offer_id"] for offer in accepted], [10])
 
+    def test_documented_verification_string_is_accepted_without_conflicts(self):
+        from cloud_run.vast import normalize_offers
+
+        base = {
+            "id": 10,
+            "gpu_name": "RTX 5090",
+            "gpu_ram": 32768,
+            "dph_total": 0.25,
+            "reliability": 0.99,
+            "inet_down": 500,
+            "disk_bw": 400,
+            "disk_space": 80,
+            "type": "ondemand",
+            "num_gpus": 1,
+            "rentable": True,
+            "verification": "verified",
+        }
+        accepted = normalize_offers(
+            {"offers": [base]},
+            max_price_per_hour=0.75,
+            min_vram_gb=24,
+        )
+        self.assertEqual([offer["offer_id"] for offer in accepted], [10])
         self.assertEqual(
-            offers,
+            normalize_offers(
+                {"offers": [{**base, "verified": False}]},
+                max_price_per_hour=0.75,
+                min_vram_gb=24,
+            ),
+            [],
+        )
+
+    def test_search_merges_disjoint_results_by_id_and_caps_unique_candidates(self):
+        from cloud_run.vast import OFFER_SEARCH_LIMIT, search_offers
+
+        def raw(offer_id, speed):
+            return {
+                "id": offer_id,
+                "gpu_name": "RTX 4090",
+                "gpu_ram": 24576,
+                "dph_total": 0.5,
+                "reliability": 0.99,
+                "inet_down": speed,
+                "disk_bw": 600,
+                "disk_space": 80,
+                "type": "ondemand",
+                "num_gpus": 1,
+                "rentable": True,
+                "verified": True,
+            }
+
+        target = [raw(index, 1000 + index) for index in range(OFFER_SEARCH_LIMIT)]
+        fallback = [raw(0, 900)] + [
+            raw(index, 999 - index)
+            for index in range(OFFER_SEARCH_LIMIT, 2 * OFFER_SEARCH_LIMIT + 5)
+        ]
+        session = FakeSession(
             [
-                {
-                    "offer_id": 10,
-                    "gpu_name": "RTX 5090",
-                    "gpu_ram_gb": 32.0,
-                    "dph_total": 0.25,
-                    "reliability": 0.99,
-                    "machine_id": "77",
-                    "host_id": None,
-                    "public_ipaddr": None,
-                    "inet_down_mbps": 500.0,
-                    "disk_bw_mbps": 400.0,
-                    "inet_down_cost": None,
-                    "inet_up_cost": None,
-                },
-                {
-                    "offer_id": 20,
-                    "gpu_name": "RTX 4090",
-                    "gpu_ram_gb": 24.0,
-                    "dph_total": 0.5,
-                    "reliability": 0.96,
-                    "machine_id": None,
-                    "host_id": "88",
-                    "public_ipaddr": "192.0.2.1",
-                    "inet_down_mbps": None,
-                    "disk_bw_mbps": None,
-                    "inet_down_cost": None,
-                    "inet_up_cost": None,
-                },
-            ],
+                FakeResponse(200, {"offers": target}),
+                FakeResponse(200, {"offers": fallback}),
+            ]
         )
+        offers = asyncio.run(
+            search_offers(
+                "synthetic-value",
+                max_price_per_hour=0.75,
+                min_vram_gb=24,
+                session=session,
+            )
+        )
+        self.assertEqual(len(offers), 2 * OFFER_SEARCH_LIMIT - 1)
+        self.assertLessEqual(len(offers), 2 * OFFER_SEARCH_LIMIT)
+        self.assertEqual(len({offer["offer_id"] for offer in offers}), len(offers))
+        self.assertEqual(sum(offer["offer_id"] == 0 for offer in offers), 1)
+
+    def test_explicit_floors_cannot_weaken_policy_and_stricter_values_shape_queries(self):
+        from cloud_run.vast import OfferSearchConfigurationError, search_offers
+
+        for kwargs in (
+            {"min_reliability": 0.989},
+            {"min_inet_down_mbps": 499},
+        ):
+            with self.subTest(kwargs=kwargs):
+                session = FakeSession(FakeResponse(200, {"offers": []}))
+                with self.assertRaises(OfferSearchConfigurationError):
+                    asyncio.run(
+                        search_offers(
+                            "synthetic-value",
+                            max_price_per_hour=0.75,
+                            min_vram_gb=24,
+                            session=session,
+                            **kwargs,
+                        )
+                    )
+                self.assertEqual(session.calls, [])
+
+        session = FakeSession(
+            [FakeResponse(200, {"offers": []}), FakeResponse(200, {"offers": []})]
+        )
+        asyncio.run(
+            search_offers(
+                "synthetic-value",
+                max_price_per_hour=0.75,
+                min_vram_gb=24,
+                min_reliability=0.995,
+                min_inet_down_mbps=750,
+                session=session,
+            )
+        )
+        self.assertEqual(session.calls[0][1]["json"]["inet_down"], {"gte": 1000})
         self.assertEqual(
-            set(offers[0]),
-            {
-                "offer_id",
-                "gpu_name",
-                "gpu_ram_gb",
-                "dph_total",
-                "reliability",
-                "machine_id",
-                "host_id",
-                "public_ipaddr",
-                "inet_down_mbps",
-                "disk_bw_mbps",
-                "inet_down_cost",
-                "inet_up_cost",
-            },
+            session.calls[1][1]["json"]["inet_down"],
+            {"gte": 750, "lt": 1000},
         )
+        self.assertEqual(session.calls[0][1]["json"]["reliability"], {"gte": 0.995})
 
-    def test_quality_filters_are_forwarded_to_vast(self):
-        from cloud_run.vast import build_search_payload
-
-        payload = build_search_payload(
-            0.75,
-            24,
-            min_inet_down_mbps=250,
-            min_disk_bw_mbps=300,
-            min_reliability=0.98,
-            verified_only=False,
-            secure_cloud_only=True,
+        target_only = FakeSession(FakeResponse(200, {"offers": []}))
+        asyncio.run(
+            search_offers(
+                "synthetic-value",
+                max_price_per_hour=0.75,
+                min_vram_gb=24,
+                min_inet_down_mbps=1200,
+                session=target_only,
+            )
         )
-
-        self.assertNotIn("verified", payload)
-        self.assertEqual(payload["datacenter"], {"eq": True})
-        self.assertEqual(payload["inet_down"], {"gte": 250})
-        self.assertEqual(payload["disk_bw"], {"gte": 300})
-        self.assertEqual(payload["reliability"], {"gte": 0.98})
+        self.assertEqual(len(target_only.calls), 1)
+        self.assertEqual(
+            target_only.calls[0][1]["json"]["inet_down"],
+            {"gte": 1200},
+        )
 
     def test_normalization_rejects_explicitly_insufficient_disk_space(self):
         from cloud_run.vast import normalize_offers
@@ -389,6 +457,12 @@ class VastNormalizationAndErrorTests(unittest.TestCase):
                     "dph_total": 0.2,
                     "reliability2": 0.99,
                     "disk_space": 79.9,
+                    "inet_down": 500,
+                    "disk_bw": 400,
+                    "rentable": True,
+                    "verified": True,
+                    "num_gpus": 1,
+                    "type": "ondemand",
                 }
             ]
         }
@@ -480,7 +554,12 @@ class VastNormalizationAndErrorTests(unittest.TestCase):
 
         class ManagedSession(FakeSession):
             def __init__(self, timeout):
-                super().__init__(FakeResponse(200, {"offers": []}))
+                super().__init__(
+                    [
+                        FakeResponse(200, {"offers": []}),
+                        FakeResponse(200, {"offers": []}),
+                    ]
+                )
                 captured["session_timeout"] = timeout
 
             async def __aenter__(self):

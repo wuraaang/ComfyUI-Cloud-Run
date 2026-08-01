@@ -97,7 +97,8 @@ function ensureStyles(document) {
   font-weight: 700;
 }
 .cloud-run-field { display: grid; gap: 5px; margin: 10px 0; }
-.cloud-run-field input {
+.cloud-run-field input,
+.cloud-run-field select {
   box-sizing: border-box;
   width: 100%;
   border: 1px solid var(--border-color, #4b5563);
@@ -174,6 +175,42 @@ function hourlyText(value) {
 }
 
 
+function finiteNonnegativeNumber(value) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? value
+    : null;
+}
+
+
+function metricNumberText(value) {
+  return value.toFixed(1).replace(/\.0$/, "");
+}
+
+
+function downloadClassText(downloadMbps) {
+  if (downloadMbps === null || downloadMbps < 500) {
+    return "download class unavailable";
+  }
+  return downloadMbps >= 1000
+    ? "target download class"
+    : "fallback download class";
+}
+
+
+function theoreticalTransferText(value) {
+  if (
+    typeof value !== "number"
+    || !Number.isSafeInteger(value)
+    || value < 0
+  ) {
+    return "unavailable";
+  }
+  if (value < 60) return `${value} second${value === 1 ? "" : "s"}`;
+  const minutes = Math.ceil(value / 60);
+  return `${minutes} minute${minutes === 1 ? "" : "s"}`;
+}
+
+
 function createIdempotencyKey(browserWindow) {
   const cryptography = browserWindow?.crypto ?? globalThis.crypto;
   if (typeof cryptography?.randomUUID === "function") {
@@ -211,16 +248,30 @@ export function renderOffers(document, container, offers, onSelect) {
     const reliability = Number.isFinite(Number(offer?.reliability))
       ? `${(Number(offer.reliability) * 100).toFixed(1)}% reliability`
       : "reliability unavailable";
-    const down = Number.isFinite(Number(offer?.inet_down_cost))
-      ? `$${Number(offer.inet_down_cost).toFixed(3)}/GB down`
+    const downloadMbps = finiteNonnegativeNumber(offer?.inet_down_mbps);
+    const diskSpeed = finiteNonnegativeNumber(offer?.disk_bw_mbps);
+    const down = finiteNonnegativeNumber(offer?.inet_down_cost);
+    const up = finiteNonnegativeNumber(offer?.inet_up_cost);
+    const downloadPrice = down !== null
+      ? `$${down.toFixed(3)}/GB down`
       : "download price unavailable";
-    const up = Number.isFinite(Number(offer?.inet_up_cost))
-      ? `$${Number(offer.inet_up_cost).toFixed(3)}/GB up`
+    const uploadPrice = up !== null
+      ? `$${up.toFixed(3)}/GB up`
       : "upload price unavailable";
+    const download = downloadMbps !== null
+      ? `${metricNumberText(downloadMbps)} Mbps download`
+      : "download unavailable";
+    const disk = diskSpeed !== null
+      ? `${metricNumberText(diskSpeed)} MB/s disk`
+      : "disk speed unavailable";
+    const estimate = theoreticalTransferText(offer?.estimated_transfer_seconds);
     details.textContent =
       `${String(offer?.gpu_name ?? "Unknown GPU")} — ` +
       `${decimalText(offer?.gpu_ram_gb)} GB — ` +
-      `${hourlyText(offer?.dph_total)} — ${reliability} — ${down}, ${up}`;
+      `${hourlyText(offer?.dph_total)} — ${reliability} — ${download} — ` +
+      `${disk} — ${downloadClassText(downloadMbps)} — ` +
+      `${downloadPrice}, ${uploadPrice} — theoretical transfer ≈ ${estimate}; ` +
+      "actual startup can be longer";
     selector.addEventListener("click", () => onSelect(offer));
     row.append(selector, details);
     container.appendChild(row);
@@ -349,6 +400,18 @@ export function mountCloudRun(
   vramInput.setAttribute("min", "1");
   vramInput.setAttribute("max", "1024");
   vramInput.setAttribute("step", "1");
+  const createLimitSelect = createElement(document, "select", {
+    id: "cloud-run-max-instance-creates",
+    testId: "cloud-run-max-instance-creates",
+  });
+  for (const value of [1, 2]) {
+    const option = createElement(document, "option", {
+      text: String(value),
+    });
+    option.value = String(value);
+    createLimitSelect.appendChild(option);
+  }
+  createLimitSelect.value = "1";
 
   const primaryActions = createElement(document, "div", {
     className: "cloud-run-actions",
@@ -454,6 +517,12 @@ export function mountCloudRun(
   appendField(document, card, "Vast API key", apiKeyInput);
   appendField(document, card, "Maximum hourly price ($/h)", priceInput);
   appendField(document, card, "Minimum VRAM (GB)", vramInput);
+  appendField(
+    document,
+    card,
+    "Maximum total instance creates",
+    createLimitSelect,
+  );
   card.append(
     primaryActions,
     status,
@@ -626,6 +695,7 @@ export function mountCloudRun(
           mode: "finite",
           duration_seconds: DEFAULT_SESSION_SECONDS,
         },
+        max_instance_creates: Number(createLimitSelect.value),
       });
       sessionConsole.renderQuote(session, {
         idempotencyKey: sessionIdempotencyKey,

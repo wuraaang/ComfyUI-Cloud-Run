@@ -60,6 +60,7 @@ function quoteSession(status = "offer_selected", overrides = {}) {
       worker_archive_sha256: "b".repeat(64),
       protocol_version: "1",
       manifest_digest: "c".repeat(64),
+      max_instance_creates: 1,
     },
     instance_id: status === "offer_selected" ? null : "77",
     deadline_at: 8_200,
@@ -299,7 +300,7 @@ test("registers through the pinned ComfyUI extension API", async () => {
 });
 
 
-test("capture preflight offer and paid review use only session routes", async () => {
+test("capture preflight offer and paid review enforce instance creates", async () => {
   const document = new FakeDocument();
   mountLocalRunButton(document);
   const { api, app, localSubmissions } = captureHost();
@@ -321,8 +322,11 @@ test("capture preflight offer and paid review use only session routes", async ()
           gpu_ram_gb: 24,
           dph_total: 0.5,
           reliability: 0.99,
+          inet_down_mbps: 1000,
+          disk_bw_mbps: 900,
           inet_down_cost: 0.01,
           inet_up_cost: 0.02,
+          estimated_transfer_seconds: 235,
         }],
       });
     }
@@ -357,6 +361,14 @@ test("capture preflight offer and paid review use only session routes", async ()
   assert.equal(document.getElementById("cloud-run-search").disabled, false);
   await document.getElementById("cloud-run-search").click();
   await document.getElementById("cloud-run-offer-0").click();
+  const createLimit = document.getElementById(
+    "cloud-run-max-instance-creates",
+  );
+  assert.deepEqual(
+    createLimit.children.map((option) => option.value),
+    ["1", "2"],
+  );
+  assert.equal(createLimit.value, "1");
   await document.getElementById("cloud-run-review-session").click();
 
   const sessionRequest = calls.find(
@@ -367,16 +379,43 @@ test("capture preflight offer and paid review use only session routes", async ()
     offer_id: "42",
     idempotency_key: "session-key",
     deadline: { mode: "finite", duration_seconds: 7_200 },
+    max_instance_creates: 1,
   });
   assert.match(
     document.getElementById("cloud-run-dependency-console").textContent,
     /approximately \$1\.00 active\/storage/,
   );
   assert.match(
+    document.getElementById("cloud-run-dependency-console").textContent,
+    /Maximum total instance creates: 1/,
+  );
+  assert.match(
     document.getElementById("cloud-run-offers").textContent,
     /<RTX 4090>/,
   );
+  for (const expected of [
+    "1000 Mbps download",
+    "900 MB/s disk",
+    "target download class",
+    "theoretical transfer ≈ 4 minutes",
+    "actual startup can be longer",
+  ]) {
+    assert.ok(
+      document.getElementById("cloud-run-offers").textContent.includes(expected),
+      expected,
+    );
+  }
   assert.equal(document.querySelector("script"), null);
+
+  createLimit.value = "2";
+  await document.getElementById("cloud-run-review-session").click();
+  const selectedLimitRequest = calls.filter(
+    ([endpoint]) => endpoint === "/cloud-run/api/sessions",
+  )[1];
+  assert.equal(
+    JSON.parse(selectedLimitRequest[1].body).max_instance_creates,
+    2,
+  );
 
   await document.getElementById("cloud-run-confirm-session").click();
 
@@ -547,6 +586,32 @@ test("offer rendering treats provider strings as inert text", async () => {
 });
 
 
+test("offer rendering marks missing connection metrics unavailable", () => {
+  const document = new FakeDocument();
+  const container = document.createElement("div");
+  document.body.appendChild(container);
+
+  renderOffers(document, container, [{
+    offer_id: "42",
+    gpu_name: "RTX 4090",
+    gpu_ram_gb: 24,
+    dph_total: 0.5,
+    reliability: 0.99,
+    inet_down_mbps: Infinity,
+    disk_bw_mbps: NaN,
+    inet_down_cost: Infinity,
+    inet_up_cost: NaN,
+    estimated_transfer_seconds: Infinity,
+  }], () => {});
+
+  assert.match(container.textContent, /download unavailable/);
+  assert.match(container.textContent, /disk speed unavailable/);
+  assert.match(container.textContent, /download class unavailable/);
+  assert.match(container.textContent, /theoretical transfer ≈ unavailable/);
+  assert.doesNotMatch(container.textContent, /NaN|Infinity/);
+});
+
+
 test("frontend source has no legacy, browser-secret, or provider URL surface", async () => {
   const sources = await Promise.all([
     "../../web/js/cloud-run.js",
@@ -565,6 +630,8 @@ test("frontend source has no legacy, browser-secret, or provider URL surface", a
     "sessionStorage",
     "window.location",
     "console.vast.ai",
+    "http://",
+    "https://",
     "/cloud-run/api/quotes",
     "/cloud-run/api/attempts/",
   ]) {

@@ -1,15 +1,18 @@
 # Project state
 
 Status: workflow-derived reusable sessions implemented and fake/offline
-certified on the pinned local ComfyUI Desktop environment. The exact reviewed
-source commit has been published and its immutable GitHub archive audited. All
-worker-template and real paid activity remains human-gated.
+certified on the pinned local ComfyUI environment. The workflow-embedded model
+metadata consumer bridge, native missing-model visibility, and the free,
+read-only Gold preflight are also complete. All worker-template and real paid
+activity remains human-gated.
 
 Source of truth:
 
 - `AGENTS.md`;
 - `docs/superpowers/specs/2026-07-31-workflow-derived-vast-gpu-session-design.md`;
-- `docs/superpowers/plans/2026-07-31-workflow-derived-vast-gpu-session.md`.
+- `docs/superpowers/plans/2026-07-31-workflow-derived-vast-gpu-session.md`;
+- `docs/superpowers/specs/2026-07-31-workflow-embedded-model-metadata-bridge-design.md`;
+- `docs/superpowers/plans/2026-07-31-workflow-embedded-model-metadata-bridge.md`.
 
 ## Implemented offline
 
@@ -22,6 +25,11 @@ Source of truth:
 - Preflight resolves core/custom nodes, models, inputs, masks, and other
   file-backed dependencies before offer search. All non-core material is bound
   to immutable origin, exact size, SHA-256, and safe ComfyUI destination.
+- Exact native model annotations classify active loader selections even when a
+  model is absent locally or exposed through a schema-based `COMBO`. Public
+  Hugging Face sources are resolved to immutable revisions, exact sizes, and
+  SHA-256 values without downloading model content. Existing private inputs
+  become verified local-upload artifacts without exposing their identity.
 - Custom-node candidate precedence is approved mapping, Registry, installed Git
   identity, Agent suggestion, then manual mapping. Candidates require separate
   explicit approval; Agent suggestions have no spend, secret, shell, or
@@ -53,12 +61,65 @@ Source of truth:
   replacement, idempotency, and Agent Panel isolation.
 - A deterministic source-only worker artifact, strict GitHub commit bootstrap,
   and synthetic-only Gold structural validator are implemented and gated.
+- Offline release tooling now binds a deterministic source-only worker archive
+  to an immutable GitHub Release asset name, a 40-character lowercase commit,
+  exact size and SHA-256, protocol, and pinned runtime versions. Bootstrap
+  accepts only the exact release identity and either a direct `200` or one
+  validated `302` to the fixed GitHub release-assets host without retaining the
+  signed target.
+- The reviewed gateway supervises one fixed Caddy binary and the loopback
+  Python worker. The sole candidate is the official Vast launch path
+  `/opt/portal-aio/caddy_manager/caddy`; generic paths and symlinks fail
+  closed. It isolates the Jupyter token to Caddy, passes the worker only an
+  explicit environment allowlist, and boundedly terminates and reaps the
+  sibling process when either child exits.
+- Deterministic commands build the release bundle, render strict private Vast
+  template inputs, and atomically write an owner-private `0600` local release
+  lock without overwrite. These commands have been certified only with
+  synthetic private inputs; they have not published or created live material.
+- A single-purpose Vast template publisher now performs only the exact base
+  audit, exact-name absence check, at-most-once private-template create, and
+  read-back comparison required by the reviewed contract. It fixes the HTTPS
+  endpoint, disables redirects and ambient proxies, obtains the API key only
+  from the validated owner-private settings file, exposes no generic or delete
+  surface, and is tested exclusively with fake transports and synthetic keys.
+  Audit, render, and publish reject every image outside the exact
+  `docker.io/vastai/base-image@sha256:<lowercase-64-hex>` form. Publication
+  also compares the decoded bootstrap to the reviewed repository bytes and
+  validates one canonical release lock before any HTTP. The separate Task 8
+  provenance gate must still verify the digest-scoped OCI manifest/config and
+  exact source/revision labels before the sole POST is allowed.
+- **Maximum total instance creates** is an immutable reviewed quote field
+  limited to `1` or `2`, conservatively defaulted to `1` for legacy records,
+  and enforced at confirmation and before any replacement offer search or
+  create. The initial create plus durable retry count consumes the budget;
+  recovery, idempotent retries, and ambiguous-create reconciliation never
+  replenish it.
+- Vast offer policy requires complete verified on-demand evidence,
+  reliability `>= 0.99`, and finite provider-advertised download bandwidth
+  `>= 500` Mbps. Disjoint target (`>= 1,000`) and fallback (`500–999`) queries
+  feed one ranking whose speed component saturates at `1,000` Mbps; neither
+  floor is relaxed automatically. Offers and paid review expose network/disk
+  metrics and a preflight-byte-derived theoretical transfer lower bound.
+  Confirmation reapplies the hard policy and rejects a material bandwidth
+  downgrade before the initial create. Both replacement paths separately
+  reapply the reliability/download floors before selecting or creating from a
+  fresh search result.
 
 ## Safety and release status
 
+- No immutable Remote Worker release has been published.
+- No private project-specific Vast template has been created.
+- No local live `worker-release.json` exists.
+- No Vast offer search has been performed.
+- No paid Vast instance has been created.
+- No live workflow run has occurred.
 - No real Vast rental or Gold run has occurred.
+- The native fixture exposed `Download All`, but it was not clicked. The free
+  Gold preflight resolved exactly five public model sources and one verified
+  local input; no model file was created. Sanitized evidence is recorded in
+  `docs/workflow-model-metadata-proof.md`.
 - No project-specific worker template has been published or pinned.
-- No live `worker-release.json` exists.
 - No Vast provider mutation, upload, Registry publication, worker release, or
   GPU rental occurred.
 - Public source repository: https://github.com/wuraaang/ComfyUI-Cloud-Run.
@@ -75,17 +136,11 @@ Source of truth:
 
 ## Next gated action
 
-The current bootstrap rejects both GitHub's observed redirect and the fetched
-archive's metadata/full-repository layout. The next action is not template
-creation: invoke `superpowers:brainstorming` for a narrowly scoped
-bootstrap/publication correction, obtain explicit design approval, then use
-`superpowers:writing-plans` and strict red-green TDD for a new immutable
-commit. Redirect, extraction, allowlist, digest, and shell restrictions remain
-fail-closed until that approved work is complete and reviewed.
-
-Only after a corrected public artifact is manually reviewed may separate
-authorization create a project-specific Vast template and its owner-private
-`0600` release lock. A later paid Gold GO must still state all of:
+The authorized current path, after the final offline gates and reviewed push,
+conditionally permits only the immutable release publication and, after its
+success, one provenance-verified private template plus its local lock/restart.
+It still permits no offer search, instance creation, workflow execution, or
+paid Gold action. A later paid Gold GO must separately state all of:
 
 1. maximum instance count;
 2. maximum hourly price;

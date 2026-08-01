@@ -27,7 +27,6 @@ DEFAULT_DESTINATION = Path("/opt/comfyui-cloud-run")
 STATE_DIRECTORY = "/var/lib/comfyui-cloud-run"
 _HEX_40 = re.compile(r"[0-9a-f]{40}")
 _HEX_64 = re.compile(r"[0-9a-f]{64}")
-_GITHUB_PART = r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}"
 _LOCK_FIELDS = {
     "schema_version",
     "archive_url",
@@ -40,6 +39,27 @@ _LOCK_FIELDS = {
     "python_version",
     "destination",
 }
+_REVIEWED_ARCHIVE_FILES = frozenset(
+    {
+        "cloud_run/manifest.py",
+        "cloud_run/worker_protocol.py",
+        "remote_worker/Caddyfile",
+        "remote_worker/__init__.py",
+        "remote_worker/bootstrap.py",
+        "remote_worker/comfy.py",
+        "remote_worker/deadline.py",
+        "remote_worker/gateway.py",
+        "remote_worker/install.py",
+        "remote_worker/jobs.py",
+        "remote_worker/main.py",
+        "remote_worker/provision.py",
+        "remote_worker/server.py",
+        "remote_worker/state.py",
+        "remote_worker/template-policy.json",
+        "remote_worker/transfers.py",
+    }
+)
+_REVIEWED_ARCHIVE_DIRECTORIES = frozenset({"cloud_run", "remote_worker"})
 
 
 class BootstrapError(RuntimeError):
@@ -48,7 +68,8 @@ class BootstrapError(RuntimeError):
 
 @dataclass(frozen=True)
 class DownloadStream:
-    final_url: str
+    source_url: str
+    redirect_count: int
     chunks: object
 
 
@@ -63,6 +84,49 @@ class _NoRedirect(urlrequest.HTTPRedirectHandler):
         )
 
 
+_TRANSPORT_REJECTED = object()
+
+
+def _close_response(response):
+    if response is None:
+        return
+    try:
+        response.close()
+    except Exception:
+        return
+
+
+class _BufferedChunks:
+    def __init__(self, buffered):
+        self._buffered = buffered
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        buffered = self._buffered
+        if buffered is None:
+            raise StopIteration
+        try:
+            chunk = buffered.read(1024 * 1024)
+        except Exception:
+            chunk = _TRANSPORT_REJECTED
+        if chunk is _TRANSPORT_REJECTED or not isinstance(chunk, bytes):
+            self.close()
+            raise BootstrapError(
+                "Reviewed worker archive is unavailable."
+            )
+        if not chunk:
+            self.close()
+            raise StopIteration
+        return chunk
+
+    def close(self):
+        buffered = self._buffered
+        self._buffered = None
+        _close_response(buffered)
+
+
 class HttpsTransport:
     """HTTPS-only stream that neither follows redirects nor uses a shell."""
 
@@ -70,54 +134,115 @@ class HttpsTransport:
         self.timeout_seconds = timeout_seconds
 
     def stream(self, url):
-        opener = urlrequest.build_opener(
-            urlrequest.ProxyHandler({}),
-            _NoRedirect(),
-        )
-        request = urlrequest.Request(
-            url,
-            headers={
+        result = self._stream_result(url)
+        if result is _TRANSPORT_REJECTED:
+            raise BootstrapError(
+                "Reviewed worker archive is unavailable."
+            )
+        return result
+
+    def _stream_result(self, url):
+        response = None
+        buffered = None
+        accepted = False
+        try:
+            opener = urlrequest.build_opener(
+                urlrequest.ProxyHandler({}),
+                _NoRedirect(),
+            )
+            headers = {
                 "Accept": "application/octet-stream",
                 "Accept-Encoding": "identity",
                 "User-Agent": "ComfyUI-Cloud-Run-Bootstrap/1",
-            },
-            method="GET",
-        )
-        try:
-            response = opener.open(
-                request,
-                timeout=self.timeout_seconds,
+            }
+            request = urlrequest.Request(
+                url,
+                headers=headers,
+                method="GET",
             )
-        except (OSError, urlerror.URLError, urlerror.HTTPError):
-            raise BootstrapError(
-                "Reviewed worker archive is unavailable."
-            ) from None
-        if (
-            getattr(response, "status", None) != 200
-            or response.headers.get(
-                "Content-Encoding",
-                "identity",
-            ).casefold()
-            != "identity"
-        ):
-            response.close()
-            raise BootstrapError(
-                "Reviewed worker archive is unavailable."
-            )
-
-        def chunks():
+            redirect_count = 0
             try:
-                while True:
-                    chunk = response.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    yield chunk
-            finally:
-                response.close()
+                response = opener.open(
+                    request,
+                    timeout=self.timeout_seconds,
+                )
+            except urlerror.HTTPError as redirect:
+                try:
+                    if redirect.code != 302:
+                        return _TRANSPORT_REJECTED
+                    redirect_target = redirect.headers.get("Location")
+                    if not isinstance(redirect_target, str):
+                        return _TRANSPORT_REJECTED
+                    parsed = urlsplit(redirect_target)
+                    if (
+                        parsed.scheme != "https"
+                        or parsed.hostname
+                        != "release-assets.githubusercontent.com"
+                        or parsed.username is not None
+                        or parsed.password is not None
+                        or parsed.port is not None
+                        or parsed.fragment
+                    ):
+                        return _TRANSPORT_REJECTED
+                except Exception:
+                    return _TRANSPORT_REJECTED
+                finally:
+                    _close_response(redirect)
+                redirect_count = 1
+                request = urlrequest.Request(
+                    redirect_target,
+                    headers=headers,
+                    method="GET",
+                )
+                response = opener.open(
+                    request,
+                    timeout=self.timeout_seconds,
+                )
+            encoding = response.headers.get("Content-Encoding", "identity")
+            if getattr(response, "status", None) != 200 or (
+                not isinstance(encoding, str)
+                or encoding.casefold() != "identity"
+            ):
+                return _TRANSPORT_REJECTED
+            buffered = tempfile.SpooledTemporaryFile(
+                max_size=1024 * 1024,
+                mode="w+b",
+            )
+            size = 0
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not isinstance(chunk, bytes):
+                    return _TRANSPORT_REJECTED
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > MAX_ARCHIVE_BYTES:
+                    return _TRANSPORT_REJECTED
+                buffered.write(chunk)
+            if size == 0:
+                return _TRANSPORT_REJECTED
+            buffered.flush()
+            buffered.seek(0)
+            accepted = True
+        except urlerror.HTTPError as terminal_error:
+            _close_response(terminal_error)
+            return _TRANSPORT_REJECTED
+        except Exception:
+            return _TRANSPORT_REJECTED
+        finally:
+            _close_response(response)
+            response = None
+            if not accepted:
+                _close_response(buffered)
+                buffered = None
+
+        chunks = _BufferedChunks(buffered)
+        buffered = None
 
         return DownloadStream(
-            final_url=response.geturl(),
-            chunks=chunks(),
+            source_url=url,
+            redirect_count=redirect_count,
+            chunks=chunks,
         )
 
 
@@ -165,10 +290,15 @@ def _validated_lock(payload, allowed_destination):
         raise _bootstrap_error()
     try:
         parsed = urlsplit(url)
-        expected_path = re.fullmatch(
-            rf"/{_GITHUB_PART}/{_GITHUB_PART}/archive/"
-            rf"({commit})\.tar\.gz",
-            parsed.path,
+        expected_path = (
+            "/wuraaang/ComfyUI-Cloud-Run/releases/download/"
+            + "worker-v1-"
+            + commit
+            + "/comfyui-cloud-run-worker-"
+            + commit
+            + "-"
+            + digest
+            + ".tar.gz"
         )
     except (TypeError, ValueError):
         raise _bootstrap_error() from None
@@ -179,7 +309,7 @@ def _validated_lock(payload, allowed_destination):
         or parsed.password is not None
         or parsed.query
         or parsed.fragment
-        or expected_path is None
+        or parsed.path != expected_path
     ):
         raise _bootstrap_error()
     return dict(payload)
@@ -212,6 +342,7 @@ def _validated_members(archive):
         raise _bootstrap_error()
     records = []
     kinds = {}
+    observed_files = set()
     total = 0
     for member in members:
         relative = _archive_name(member.name)
@@ -239,6 +370,13 @@ def _validated_members(archive):
         else:
             raise _bootstrap_error()
         name = relative.as_posix()
+        if kind == "directory":
+            if name not in _REVIEWED_ARCHIVE_DIRECTORIES:
+                raise _bootstrap_error()
+        elif name not in _REVIEWED_ARCHIVE_FILES:
+            raise _bootstrap_error()
+        else:
+            observed_files.add(name)
         if name in kinds:
             raise _bootstrap_error()
         for parent in relative.parents:
@@ -250,6 +388,8 @@ def _validated_members(archive):
             raise _bootstrap_error()
         kinds[name] = kind
         records.append((relative, member, kind))
+    if observed_files != _REVIEWED_ARCHIVE_FILES:
+        raise _bootstrap_error()
     return tuple(records)
 
 
@@ -325,12 +465,6 @@ def _safe_extract(tar_path, destination):
 
 
 def _verify_layout(destination):
-    required = {
-        "remote_worker/__init__.py",
-        "remote_worker/main.py",
-        "cloud_run/manifest.py",
-        "cloud_run/worker_protocol.py",
-    }
     observed = set()
     try:
         for path in destination.rglob("*"):
@@ -339,20 +473,12 @@ def _verify_layout(destination):
             if stat.S_ISLNK(metadata.st_mode):
                 raise _bootstrap_error()
             if stat.S_ISDIR(metadata.st_mode):
+                if relative not in _REVIEWED_ARCHIVE_DIRECTORIES:
+                    raise _bootstrap_error()
                 continue
             if not stat.S_ISREG(metadata.st_mode):
                 raise _bootstrap_error()
-            if (
-                relative.startswith("remote_worker/")
-                and (
-                    relative.endswith(".py")
-                    or relative.endswith(".json")
-                    or relative == "remote_worker/Caddyfile"
-                )
-            ) or relative in {
-                "cloud_run/manifest.py",
-                "cloud_run/worker_protocol.py",
-            }:
+            if relative in _REVIEWED_ARCHIVE_FILES:
                 observed.add(relative)
             else:
                 raise _bootstrap_error()
@@ -360,7 +486,7 @@ def _verify_layout(destination):
         raise
     except (OSError, RuntimeError, ValueError):
         raise _bootstrap_error() from None
-    if not required.issubset(observed):
+    if observed != _REVIEWED_ARCHIVE_FILES:
         raise _bootstrap_error()
 
 
@@ -430,15 +556,17 @@ class Bootstrap:
             raise _bootstrap_error() from None
         if (
             not isinstance(stream, DownloadStream)
-            or stream.final_url != lock["archive_url"]
+            or stream.source_url != lock["archive_url"]
+            or stream.redirect_count not in {0, 1}
         ):
             raise _bootstrap_error()
         digest = hashlib.sha256()
         size = 0
+        chunks = stream.chunks
         try:
             with Path(path).open("xb") as destination:
                 os.chmod(path, 0o600)
-                for chunk in stream.chunks:
+                for chunk in chunks:
                     if not isinstance(chunk, bytes) or not chunk:
                         raise _bootstrap_error()
                     size += len(chunk)
@@ -455,6 +583,8 @@ class Bootstrap:
             raise
         except (OSError, TypeError):
             raise _bootstrap_error() from None
+        finally:
+            _close_response(chunks)
         if (
             size != lock["worker_archive_size_bytes"]
             or digest.hexdigest() != lock["worker_archive_sha256"]
@@ -523,7 +653,7 @@ class Bootstrap:
         argv = [
             sys.executable,
             "-m",
-            "remote_worker.main",
+            "remote_worker.gateway",
             "--state-directory",
             STATE_DIRECTORY,
         ]

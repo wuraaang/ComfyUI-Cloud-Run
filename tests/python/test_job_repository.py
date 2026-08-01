@@ -1,5 +1,6 @@
 import json
 import os
+import sqlite3
 import tempfile
 import types
 import unittest
@@ -116,8 +117,141 @@ class JobRepositoryTests(unittest.TestCase):
             ),
             (1, 1, 1),
         )
+        self.assertIsNone(transaction.phase)
+        self.assertIsNone(transaction.current_dependency_id)
+        self.assertEqual(transaction.transferred_bytes, 0)
+        self.assertEqual(transaction.total_bytes, 0)
         self.assertEqual(installed[0].digest, "b" * 64)
         self.assertEqual(installed[0].destination, "models/a")
+
+    def test_provision_progress_upserts_exact_bounds_and_selects_latest(self):
+        jobs = JobRepository(self.path)
+        base = {
+            "session_id": "session-1",
+            "job_id": "job-1",
+            "manifest_digest": "a" * 64,
+            "state": "applying",
+            "sanitized_error": None,
+        }
+
+        first = jobs.record_provision_progress(
+            transaction_id="provision-a",
+            phase="model_transfer",
+            current_dependency_id="model-" + "b" * 64,
+            transferred_bytes=4,
+            total_bytes=10,
+            last_progress_at=50.0,
+            **base,
+        )
+        ready = jobs.record_provision_progress(
+            transaction_id="provision-a",
+            phase="ready",
+            current_dependency_id=None,
+            transferred_bytes=10,
+            total_bytes=10,
+            last_progress_at=55.0,
+            **{**base, "state": "ready"},
+        )
+        latest = jobs.record_provision_progress(
+            transaction_id="provision-b",
+            phase="environment_validation",
+            current_dependency_id=None,
+            transferred_bytes=2,
+            total_bytes=20,
+            last_progress_at=60.0,
+            **{**base, "manifest_digest": "c" * 64},
+        )
+
+        self.assertEqual(first.phase, "model_transfer")
+        self.assertEqual(ready.transferred_bytes, 10)
+        self.assertEqual(
+            JobRepository(self.path).latest_provision_transaction(
+                "session-1"
+            ),
+            latest,
+        )
+
+        valid = {
+            "transaction_id": "provision-invalid",
+            "phase": "model_transfer",
+            "current_dependency_id": "model-1",
+            "transferred_bytes": 1,
+            "total_bytes": 2,
+            "last_progress_at": 70.0,
+            **base,
+        }
+        invalid = (
+            {**valid, "phase": "unknown"},
+            {**valid, "phase": []},
+            {**valid, "current_dependency_id": "https://example.com/file"},
+            {**valid, "transferred_bytes": -1},
+            {**valid, "transferred_bytes": 3},
+            {**valid, "last_progress_at": float("nan")},
+            {**valid, "sanitized_error": "secret\nheader"},
+        )
+        for payload in invalid:
+            with self.subTest(payload=payload):
+                with self.assertRaises(ValueError):
+                    jobs.record_provision_progress(**payload)
+
+    def test_legacy_provision_table_is_migrated_idempotently(self):
+        self.path.parent.mkdir(parents=True)
+        with sqlite3.connect(self.path) as connection:
+            connection.execute(
+                """
+                CREATE TABLE provision_transactions (
+                    transaction_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    job_id TEXT,
+                    manifest_digest TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    planned_restart_count INTEGER NOT NULL,
+                    repair_count INTEGER NOT NULL,
+                    repair_restart_count INTEGER NOT NULL,
+                    last_progress_at REAL NOT NULL,
+                    sanitized_error TEXT
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO provision_transactions VALUES (
+                    'legacy-tx', 'session-1', NULL, ?, 'applying',
+                    0, 0, 0, 25.0, NULL
+                )
+                """,
+                ("d" * 64,),
+            )
+            connection.commit()
+
+        jobs = JobRepository(self.path)
+        reopened = JobRepository(self.path)
+        legacy = reopened.get_provision_transaction("legacy-tx")
+        with sqlite3.connect(self.path) as connection:
+            columns = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(provision_transactions)"
+                )
+            }
+            schema_version = connection.execute(
+                "SELECT value FROM schema_meta WHERE key = 'schema_version'"
+            ).fetchone()[0]
+
+        self.assertIsNotNone(jobs)
+        self.assertEqual(
+            {
+                "phase",
+                "current_dependency_id",
+                "transferred_bytes",
+                "total_bytes",
+            }.difference(columns),
+            set(),
+        )
+        self.assertIsNone(legacy.phase)
+        self.assertEqual(legacy.transferred_bytes, 0)
+        self.assertEqual(legacy.total_bytes, 0)
+        self.assertEqual(schema_version, "5")
 
     def test_duplicate_job_key_returns_original_and_stale_save_is_rejected(self):
         jobs = JobRepository(self.path)

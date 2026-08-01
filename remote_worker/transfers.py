@@ -25,6 +25,18 @@ MAX_CONCURRENT_TRANSFERS = 4
 MAX_TRANSFER_RETRIES = 3
 MAX_REDIRECTS = 3
 _CONTENT_RANGE = re.compile(r"bytes ([0-9]+)-([0-9]+)/([0-9]+)")
+_HUGGINGFACE_ORIGIN = ("https", "huggingface.co", 443)
+_HUGGINGFACE_BLOB_ORIGINS = frozenset(
+    {
+        ("https", "cas-bridge.xethub.hf.co", 443),
+        ("https", "cdn-lfs-eu-1.hf.co", 443),
+        ("https", "cdn-lfs-us-1.hf.co", 443),
+        ("https", "transfer.xethub-eu.hf.co", 443),
+        ("https", "transfer.xethub.hf.co", 443),
+        ("https", "us.aws.cdn.hf.co", 443),
+        ("https", "us.gcp.cdn.hf.co", 443),
+    }
+)
 
 
 class TransferError(RuntimeError):
@@ -474,11 +486,17 @@ class TransferManager:
         for parent in changed_parents:
             _fsync_directory(parent)
 
-    async def _notify_progress(self, artifact, offset):
+    async def _notify_progress(self, artifact, offset, event):
         if self.progress is None:
             return
+        if event not in {"transferring", "verifying", "verified"}:
+            raise _transfer_error()
         try:
-            result = self.progress(artifact.artifact_id, int(offset))
+            result = self.progress(
+                artifact.artifact_id,
+                int(offset),
+                event,
+            )
             if inspect.isawaitable(result):
                 await result
         except (asyncio.CancelledError, KeyboardInterrupt):
@@ -536,8 +554,10 @@ class TransferManager:
             raise _transfer_error()
         return metadata.st_size
 
-    async def _response(self, client, url, request_headers):
-        approved_origin = _origin(url)
+    async def _response(self, artifact, client, url, request_headers):
+        original_origin = _origin(url)
+        current_origin = original_origin
+        crossed_origin = False
         current_url = url
         for redirect_count in range(MAX_REDIRECTS + 1):
             try:
@@ -555,7 +575,7 @@ class TransferManager:
                 if isinstance(status, bool) or not isinstance(status, int):
                     raise _transfer_error()
                 response_url = str(getattr(response, "url", current_url))
-                if _origin(response_url) != approved_origin:
+                if _origin(response_url) != current_origin:
                     raise _transfer_error()
                 response_headers = _headers(
                     getattr(response, "headers", {})
@@ -569,11 +589,22 @@ class TransferManager:
                     await _close_response(response)
                     raise _transfer_error()
                 redirected = urljoin(current_url, location)
-                if _origin(redirected) != approved_origin:
+                redirected_origin = _origin(redirected)
+                if redirected_origin != current_origin and (
+                    crossed_origin
+                    or artifact.kind != "model"
+                    or artifact.source.kind != "huggingface"
+                    or original_origin != _HUGGINGFACE_ORIGIN
+                    or current_origin != _HUGGINGFACE_ORIGIN
+                    or redirected_origin not in _HUGGINGFACE_BLOB_ORIGINS
+                ):
                     await _close_response(response)
                     raise _transfer_error()
+                if redirected_origin != current_origin:
+                    crossed_origin = True
                 await _close_response(response)
                 current_url = redirected
+                current_origin = redirected_origin
                 continue
             return response, response_headers
         raise _transfer_error()
@@ -669,7 +700,11 @@ class TransferManager:
                         handle.flush()
                         os.fsync(handle.fileno())
                         _fsync_directory(part.parent)
-                        await self._notify_progress(artifact, written)
+                        await self._notify_progress(
+                            artifact,
+                            written,
+                            "transferring",
+                        )
             except (TransferError, asyncio.CancelledError, KeyboardInterrupt):
                 raise
             except Exception:
@@ -709,6 +744,7 @@ class TransferManager:
             if offset:
                 request_headers["Range"] = f"bytes={offset}-"
             response, response_headers = await self._response(
+                artifact,
                 client,
                 source_url,
                 request_headers,
@@ -734,6 +770,7 @@ class TransferManager:
                     raise _transfer_error() from None
                 offset = 0
                 response, response_headers = await self._response(
+                    artifact,
                     client,
                     source_url,
                     {},
@@ -754,6 +791,11 @@ class TransferManager:
                 offset=offset,
                 response=response,
             )
+        await self._notify_progress(
+            artifact,
+            artifact.size_bytes,
+            "verifying",
+        )
         if not _verified_file(part, artifact):
             try:
                 part.unlink()
@@ -769,7 +811,11 @@ class TransferManager:
             raise
         except OSError:
             raise _transfer_error() from None
-        await self._notify_progress(artifact, artifact.size_bytes)
+        await self._notify_progress(
+            artifact,
+            artifact.size_bytes,
+            "verified",
+        )
         return self._result(
             artifact,
             destination,
@@ -780,6 +826,11 @@ class TransferManager:
     async def download(self, artifact, *, client, source_url=None):
         artifact = self._artifact(artifact)
         source_url = source_url or artifact.source.locator
+        if (
+            artifact.source.kind == "huggingface"
+            and source_url != artifact.source.locator
+        ):
+            raise _transfer_error()
         _origin(source_url)
         async with self._transfer_semaphore():
             for attempt in range(self.max_retries + 1):
@@ -908,7 +959,11 @@ class TransferManager:
 
             next_offset = end + 1
             _fsync_directory(part.parent)
-            await self._notify_progress(artifact, next_offset)
+            await self._notify_progress(
+                artifact,
+                next_offset,
+                "transferring",
+            )
             if next_offset < artifact.size_bytes:
                 return self._result(
                     artifact,
@@ -916,6 +971,11 @@ class TransferManager:
                     "receiving",
                     next_offset,
                 )
+            await self._notify_progress(
+                artifact,
+                next_offset,
+                "verifying",
+            )
             if not _verified_file(part, artifact):
                 try:
                     part.unlink()
@@ -931,6 +991,11 @@ class TransferManager:
                 raise
             except OSError:
                 raise _transfer_error() from None
+            await self._notify_progress(
+                artifact,
+                next_offset,
+                "verified",
+            )
             return self._result(
                 artifact,
                 destination,

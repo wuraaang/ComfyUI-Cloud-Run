@@ -16,7 +16,13 @@ from cloud_run.manifest import (
     PythonWheelSpec,
     SourceSpec,
 )
-from cloud_run.models import CloudJob, CloudSession, JobState, SessionState
+from cloud_run.models import (
+    CloudJob,
+    CloudSession,
+    JobState,
+    SessionState,
+    TransferState,
+)
 from cloud_run.relay import RelaySyncResult
 from cloud_run.repository import SessionRepository
 from cloud_run.resolver import NodeResolution
@@ -26,9 +32,12 @@ from cloud_run.session_service import (
     DestroyConfirmationError,
     IncompatibleSession,
     PreflightBlocked,
+    PreflightRow,
     SessionBusy,
+    SessionExecutionError,
     SessionService,
     SessionServiceError,
+    TerminalProvisioningError,
 )
 from cloud_run.worker_release import WorkerRelease
 
@@ -98,11 +107,16 @@ class FakeOfferSearch:
     def __init__(self):
         self.calls = 0
         self.mutations = []
+        self.provider_offer = {
+            "offer_id": 42,
+            "inet_down_mbps": 500.0,
+            "private_provider_identity": "must-not-leak-through-preflight",
+        }
 
     async def __call__(self, *, disk_gb):
         self.calls += 1
         self.disk_gb = disk_gb
-        return [{"offer_id": 42}]
+        return [self.provider_offer]
 
 
 def blocked_resolution():
@@ -159,6 +173,157 @@ def resolved_resolution():
         disk_gb=80,
         rentable=True,
     )
+
+
+def huggingface_resolution():
+    revision = "b" * 40
+    artifact = ArtifactSpec(
+        artifact_id="model-" + "c" * 64,
+        kind="model",
+        logical_name="example.safetensors",
+        destination="models/diffusion_models/example.safetensors",
+        size_bytes=4096,
+        sha256="c" * 64,
+        source=SourceSpec(
+            "huggingface",
+            (
+                "https://huggingface.co/example/public-model/resolve/"
+                + revision
+                + "/files/example.safetensors"
+            ),
+            immutable_revision=revision,
+        ),
+    )
+    return types.SimpleNamespace(
+        node_rows=(NodeResolution("KSampler", "resolved", "core"),),
+        artifact_rows=(
+            ArtifactResolution(
+                node_id="1",
+                class_type="UNETLoader",
+                input_name="model_name",
+                kind="model",
+                status="resolved",
+                destination=artifact.destination,
+                size_bytes=artifact.size_bytes,
+                sha256=artifact.sha256,
+                artifact_id=artifact.artifact_id,
+            ),
+        ),
+        custom_nodes=(),
+        artifacts=(artifact,),
+        output_allowance_bytes=8,
+        disk_gb=80,
+        rentable=True,
+    )
+
+
+class PreflightRowTests(unittest.TestCase):
+    revision = "a" * 40
+    locator = (
+        "https://huggingface.co/example/public-model/resolve/"
+        + revision
+        + "/files/example.safetensors"
+    )
+
+    def row(self, **overrides):
+        values = {
+            "dependency_id": "artifact:model-example",
+            "kind": "model",
+            "display_name": "example.safetensors",
+            "status": "resolved",
+            "source_kind": "huggingface",
+            "immutable_revision": self.revision,
+            "size_bytes": 4096,
+            "sha256": "c" * 64,
+            "destination": "models/diffusion_models/example.safetensors",
+            "reason": None,
+            "source_locator": self.locator,
+        }
+        values.update(overrides)
+        return PreflightRow(**values)
+
+    def test_resolved_huggingface_row_exposes_only_its_pinned_locator(self):
+        row = self.row()
+
+        self.assertEqual(row.source_locator, self.locator)
+        self.assertEqual(row.public_payload()["source_locator"], self.locator)
+
+    def test_locator_is_forbidden_for_other_sources_or_unresolved_rows(self):
+        invalid = {
+            "local upload": {
+                "source_kind": "local-upload",
+                "immutable_revision": None,
+            },
+            "r2": {"source_kind": "r2", "immutable_revision": None},
+            "custom node": {
+                "kind": "custom_node",
+                "source_kind": "approved",
+            },
+            "mapping required": {
+                "status": "mapping_required",
+                "source_kind": None,
+                "immutable_revision": None,
+                "size_bytes": None,
+                "sha256": None,
+                "reason": "Native model metadata is missing or ambiguous.",
+            },
+            "unsupported": {
+                "status": "unsupported",
+                "source_kind": None,
+                "immutable_revision": None,
+                "size_bytes": None,
+                "sha256": None,
+                "reason": "Native model metadata is invalid.",
+            },
+        }
+
+        for label, overrides in invalid.items():
+            with self.subTest(label=label):
+                with self.assertRaises(SessionServiceError):
+                    self.row(**overrides)
+
+    def test_locator_and_revision_are_jointly_validated_as_source_spec(self):
+        invalid = {
+            "mutable": self.locator.replace(self.revision, "main"),
+            "wrong revision": self.locator.replace(self.revision, "b" * 40),
+            "other host": self.locator.replace(
+                "huggingface.co",
+                "example.com",
+            ),
+            "userinfo": self.locator.replace(
+                "huggingface.co",
+                "user@huggingface.co",
+            ),
+            "port": self.locator.replace(
+                "huggingface.co",
+                "huggingface.co:443",
+            ),
+            "fragment": self.locator + "#secret",
+            "query": self.locator + "?download=true",
+            "percent": self.locator.replace("files", "%66iles"),
+        }
+
+        for label, locator in invalid.items():
+            with self.subTest(label=label):
+                with self.assertRaises(SessionServiceError):
+                    self.row(source_locator=locator)
+
+    def test_legacy_and_new_payload_shapes_round_trip_exactly(self):
+        new_payload = self.row().public_payload()
+        restored = PreflightRow.from_payload(new_payload)
+        self.assertEqual(restored, self.row())
+
+        legacy_payload = dict(new_payload)
+        legacy_payload.pop("source_locator")
+        legacy = PreflightRow.from_payload(legacy_payload)
+        self.assertIsNone(legacy.source_locator)
+        self.assertEqual(
+            set(legacy.public_payload()),
+            set(new_payload),
+        )
+
+        with self.assertRaises(SessionServiceError):
+            PreflightRow.from_payload({**new_payload, "extra": True})
 
 
 class SessionServiceTests(unittest.TestCase):
@@ -263,13 +428,70 @@ class SessionServiceTests(unittest.TestCase):
         self.assertIsNotNone(
             self.repository.get_manifest(result.manifest_digest)
         )
-        self.assertEqual(offers, [{"offer_id": 42}])
+        self.assertEqual(
+            offers,
+            [
+                {
+                    "offer_id": 42,
+                    "inet_down_mbps": 500.0,
+                    "private_provider_identity": (
+                        "must-not-leak-through-preflight"
+                    ),
+                    "estimated_transfer_seconds": 1,
+                }
+            ],
+        )
+        self.assertNotIn(
+            "estimated_transfer_seconds",
+            self.offer_search.provider_offer,
+        )
         self.assertEqual(self.offer_search.calls, 1)
         self.assertEqual(self.offer_search.disk_gb, 80)
         self.assertEqual(self.offer_search.mutations, [])
         public = result.public_payload()
         self.assertNotIn("private_path", repr(public))
         self.assertNotIn("'source':", repr(public))
+
+    def test_huggingface_locator_round_trips_through_public_and_storage(self):
+        resolution = huggingface_resolution()
+        service = self.service(resolution)
+
+        result = asyncio.run(service.preflight(self.capture.capture_id))
+        public = result.public_payload()
+        reopened = service.get_preflight(result.preflight_id)
+        artifact = resolution.artifacts[0]
+
+        self.assertEqual(
+            public["rows"][1]["source_locator"],
+            artifact.source.locator,
+        )
+        self.assertEqual(
+            reopened.rows[1].source_locator,
+            artifact.source.locator,
+        )
+        self.assertTrue(result.rentable)
+        self.assertEqual(
+            asyncio.run(service.search_offers(result.preflight_id)),
+            [
+                {
+                    "offer_id": 42,
+                    "inet_down_mbps": 500.0,
+                    "private_provider_identity": (
+                        "must-not-leak-through-preflight"
+                    ),
+                    "estimated_transfer_seconds": 1,
+                }
+            ],
+        )
+
+    def test_non_huggingface_row_does_not_expose_locator(self):
+        result = asyncio.run(
+            self.service(resolved_resolution()).preflight(
+                self.capture.capture_id
+            )
+        )
+
+        self.assertIsNone(result.rows[1].source_locator)
 
     def test_tampered_or_missing_manifest_blocks_offer_search(self):
         result = asyncio.run(
@@ -495,6 +717,304 @@ class SequentialRelay:
         )
 
 
+class SessionProvisioningTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.path = Path(temporary.name) / "private" / "sessions.sqlite3"
+        self.jobs = JobRepository(self.path)
+        self.sessions = SessionRepository(self.path)
+        self.capture = capture_with_seed(21)
+        self.jobs.save_capture(self.capture, created_at=100.0)
+        self.artifact = local_artifact("terminal-input.jpg", "d")
+        self.manifest = DependencyManifest(
+            schema_version=1,
+            protocol_version="1",
+            comfyui_core_version="0.29.0",
+            comfyui_frontend_version="1.47.10",
+            worker_version="a" * 40,
+            prompt_digest=self.capture.prompt_digest,
+            custom_nodes=(),
+            artifacts=(self.artifact,),
+            output_allowance_bytes=1024,
+            disk_gb=80,
+        )
+        self.jobs.save_manifest(
+            self.manifest.digest,
+            self.manifest.canonical_bytes().decode("utf-8"),
+            created_at=100.0,
+        )
+        session = CloudSession.new(
+            "terminal-session-key",
+            session_id="terminal-session",
+            manifest_digest=self.manifest.digest,
+            deadline_at=7_300.0,
+            deadline_mode="finite",
+            disk_gb=80,
+            now=100.0,
+            state=SessionState.PROVISIONING,
+        ).transition(
+            SessionState.PROVISIONING,
+            now=100.0,
+            instance_id="77",
+            worker_base_url="http://8.8.8.8:30000",
+            provider_token="provider-token",
+            session_secret_hex="e" * 64,
+        )
+        self.sessions.create_or_get(session)
+        self.worker = SequentialWorker()
+        self.service = SessionService(
+            job_repository=self.jobs,
+            session_repository=self.sessions,
+            resolver=FakeResolver(resolved_resolution()),
+            release=worker_release(),
+            worker_factory=lambda _session: self.worker,
+            clock=lambda: 100.0,
+        )
+
+    def response(self, *, state="ready", manifest=None, **changes):
+        selected = manifest or self.manifest
+        payload = {
+            "transaction_id": "provision-" + selected.digest,
+            "manifest_digest": selected.digest,
+            "state": state,
+            "planned_restarts": 0,
+            "repair_restarts": 0,
+            "missing_class_types": [],
+            "missing_artifacts": [],
+        }
+        payload.update(changes)
+        return payload
+
+    def assert_terminal(self, awaitable, message):
+        with self.assertRaises(TerminalProvisioningError) as caught:
+            asyncio.run(awaitable)
+        self.assertIs(type(caught.exception), TerminalProvisioningError)
+        self.assertEqual(str(caught.exception), message)
+
+    async def apply(self, worker, manifest=None):
+        selected = manifest or self.manifest
+        return await self.service._apply_manifest(
+            worker,
+            self.sessions.get("terminal-session"),
+            selected,
+            transfer_job_id="bootstrap:terminal-session",
+            capture=self.capture,
+        )
+
+    def test_invalid_response_shape_or_identity_is_terminal(self):
+        invalid = (
+            None,
+            {
+                **self.response(),
+                "transaction_id": "provision-" + "f" * 64,
+            },
+        )
+        for response in invalid:
+            with self.subTest(response=response):
+                worker = SequentialWorker()
+
+                async def apply_manifest(_payload, value=response):
+                    return value
+
+                worker.apply_manifest = apply_manifest
+                self.assert_terminal(
+                    self.apply(worker),
+                    "Remote provisioning response was invalid.",
+                )
+
+    def test_unknown_or_nonlocal_required_upload_is_terminal(self):
+        public_artifact = ArtifactSpec(
+            artifact_id="public-model",
+            kind="model",
+            logical_name="public.safetensors",
+            destination="models/diffusion_models/public.safetensors",
+            size_bytes=10,
+            sha256="f" * 64,
+            source=SourceSpec(
+                "huggingface",
+                (
+                    "https://huggingface.co/example/public/resolve/"
+                    + "f" * 40
+                    + "/public.safetensors"
+                ),
+                immutable_revision="f" * 40,
+            ),
+        )
+        public_manifest = DependencyManifest(
+            schema_version=1,
+            protocol_version="1",
+            comfyui_core_version="0.29.0",
+            comfyui_frontend_version="1.47.10",
+            worker_version="a" * 40,
+            prompt_digest=self.capture.prompt_digest,
+            custom_nodes=(),
+            artifacts=(public_artifact,),
+            output_allowance_bytes=1024,
+            disk_gb=80,
+        )
+        cases = (
+            (self.manifest, "unknown-artifact"),
+            (public_manifest, public_artifact.artifact_id),
+        )
+        for manifest, artifact_id in cases:
+            with self.subTest(artifact_id=artifact_id):
+                worker = SequentialWorker()
+
+                async def apply_manifest(_payload, selected=manifest):
+                    return self.response(
+                        state="awaiting_upload",
+                        manifest=selected,
+                        required_uploads=[artifact_id],
+                    )
+
+                worker.apply_manifest = apply_manifest
+                self.assert_terminal(
+                    self.apply(worker, manifest),
+                    "Remote provisioning requested an unknown upload.",
+                )
+
+    def test_invalid_progress_and_upload_receipt_identity_are_terminal(self):
+        worker = SequentialWorker()
+
+        async def apply_manifest(_payload):
+            return self.response(
+                progress={
+                    "phase": "model_transfer",
+                    "dependency_id": "https://example.com/model",
+                    "transferred_bytes": 1,
+                    "total_bytes": self.artifact.size_bytes,
+                }
+            )
+
+        worker.apply_manifest = apply_manifest
+        self.assert_terminal(
+            self.apply(worker),
+            "Remote provisioning response was invalid.",
+        )
+
+        content = b"terminal-upload"
+        path = self.path.parent / "terminal-upload.bin"
+        path.write_bytes(content)
+        digest = __import__("hashlib").sha256(content).hexdigest()
+        artifact = ArtifactSpec(
+            artifact_id="terminal-upload",
+            kind="input",
+            logical_name="terminal-upload.bin",
+            destination="input/terminal-upload.bin",
+            size_bytes=len(content),
+            sha256=digest,
+            source=SourceSpec(
+                "local-upload",
+                "local-upload:terminal-upload",
+            ),
+        )
+        self.jobs.register_local_artifact(
+            types.SimpleNamespace(
+                artifact_id=artifact.artifact_id,
+                private_path=str(path),
+                size_bytes=artifact.size_bytes,
+                sha256=artifact.sha256,
+            )
+        )
+        receipts = (
+            {"artifact_id": "other"},
+            {"size_bytes": artifact.size_bytes + 1},
+            {"sha256": "0" * 64},
+        )
+        for index, changed in enumerate(receipts):
+            with self.subTest(receipt=changed):
+                receipt = {
+                    "artifact_id": artifact.artifact_id,
+                    "state": "verified",
+                    "next_offset": artifact.size_bytes,
+                    "size_bytes": artifact.size_bytes,
+                    "sha256": artifact.sha256,
+                    **changed,
+                }
+
+                class ReceiptWorker:
+                    async def upload_artifact(inner_self, *_args, **_kwargs):
+                        return receipt
+
+                self.assert_terminal(
+                    self.service._upload_artifact(
+                        ReceiptWorker(),
+                        "terminal-upload-job-" + str(index),
+                        artifact,
+                    ),
+                    "Remote dependency upload was not verified.",
+                )
+
+    def test_failed_stalled_or_final_nonready_worker_state_is_terminal(self):
+        for state in ("failed", "stalled"):
+            with self.subTest(state=state):
+                worker = SequentialWorker()
+
+                async def apply_manifest(_payload, value=state):
+                    return self.response(
+                        state=value,
+                        repair_restarts=1,
+                    )
+
+                worker.apply_manifest = apply_manifest
+                self.assert_terminal(
+                    self.apply(worker),
+                    "Remote provisioning did not become ready.",
+                )
+
+        worker = SequentialWorker()
+
+        async def apply_manifest(_payload):
+            return self.response(state="applying")
+
+        async def transaction(_transaction_id):
+            return self.response(state="applying")
+
+        worker.apply_manifest = apply_manifest
+        worker.transaction = transaction
+        self.assert_terminal(
+            self.apply(worker),
+            "Remote provisioning is incomplete.",
+        )
+
+    def test_inconsistent_deadline_response_after_provisioning_is_terminal(self):
+        async def update_deadline(_policy):
+            return {"mode": "none", "acknowledged": True}
+
+        self.worker.update_deadline = update_deadline
+        self.assert_terminal(
+            self.service.bootstrap_session("terminal-session"),
+            "Remote deadline enforcement failed.",
+        )
+
+    def test_transport_unavailability_and_cancellation_are_not_terminal(self):
+        worker = SequentialWorker()
+
+        async def unavailable(_payload):
+            raise OSError("synthetic transport failure")
+
+        worker.apply_manifest = unavailable
+        with self.assertRaises(SessionExecutionError) as caught:
+            asyncio.run(self.apply(worker))
+        self.assertIs(type(caught.exception), SessionExecutionError)
+        self.assertEqual(str(caught.exception), "Remote provisioning failed.")
+
+        async def cancelled(_payload):
+            raise asyncio.CancelledError()
+
+        worker.apply_manifest = cancelled
+        with self.assertRaises(asyncio.CancelledError):
+            asyncio.run(self.apply(worker))
+
+        async def interrupted(_payload):
+            raise KeyboardInterrupt()
+
+        worker.apply_manifest = interrupted
+        with self.assertRaises(KeyboardInterrupt):
+            asyncio.run(self.apply(worker))
+
+
 class ReusableSessionTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -559,6 +1079,7 @@ class ReusableSessionTests(unittest.TestCase):
             output_allowance_bytes=1024,
             disk_gb=80,
         )
+        self.initial_manifest = initial
         self.jobs.save_manifest(
             initial.digest,
             initial.canonical_bytes().decode("utf-8"),
@@ -583,6 +1104,363 @@ class ReusableSessionTests(unittest.TestCase):
             session_secret_hex="d" * 64,
         )
         self.sessions.create_or_get(session)
+
+    def test_apply_manifest_polls_and_persists_only_sanitized_progress(self):
+        service = self.service
+        service.job_poll_interval_seconds = 0
+        manifest = self.initial_manifest
+        session = self.sessions.get("session-1")
+        total_bytes = sum(
+            artifact.size_bytes for artifact in manifest.artifacts
+        )
+
+        class PollingWorker:
+            def __init__(self):
+                self.release = asyncio.Event()
+                self.transaction_calls = []
+                self.polls = 0
+
+            async def apply_manifest(self, _payload):
+                await self.release.wait()
+                return {
+                    "transaction_id": "provision-" + manifest.digest,
+                    "manifest_digest": manifest.digest,
+                    "state": "ready",
+                    "planned_restarts": 0,
+                    "repair_restarts": 0,
+                    "missing_class_types": [],
+                    "missing_artifacts": [],
+                    "progress": {
+                        "phase": "ready",
+                        "dependency_id": None,
+                        "transferred_bytes": total_bytes,
+                        "total_bytes": total_bytes,
+                    },
+                }
+
+            async def transaction(self, transaction_id):
+                self.transaction_calls.append(transaction_id)
+                self.polls += 1
+                if self.polls == 1:
+                    return None
+                progress = {
+                    "phase": (
+                        "model_transfer"
+                        if self.polls == 2
+                        else "digest_verification"
+                    ),
+                    "dependency_id": self_outer.model.artifact_id,
+                    "transferred_bytes": (
+                        self_outer.model.size_bytes // 2
+                        if self.polls == 2
+                        else self_outer.model.size_bytes
+                    ),
+                    "total_bytes": total_bytes,
+                }
+                if self.polls == 3:
+                    self.release.set()
+                return {
+                    "transaction_id": transaction_id,
+                    "manifest_digest": manifest.digest,
+                    "state": "applying",
+                    "planned_restarts": 0,
+                    "repair_restarts": 0,
+                    "missing_class_types": [],
+                    "missing_artifacts": [],
+                    "progress": progress,
+                }
+
+        self_outer = self
+
+        async def exercise():
+            worker = PollingWorker()
+            result = await asyncio.wait_for(
+                service._apply_manifest(
+                    worker,
+                    session,
+                    manifest,
+                    transfer_job_id="bootstrap:session-1",
+                    capture=self.first_capture,
+                ),
+                timeout=0.2,
+            )
+            return worker, result
+
+        worker, result = asyncio.run(exercise())
+        latest = self.jobs.latest_provision_transaction("session-1")
+
+        self.assertEqual(result["state"], "ready")
+        self.assertGreaterEqual(worker.polls, 3)
+        self.assertEqual(
+            set(worker.transaction_calls),
+            {"provision-" + manifest.digest},
+        )
+        self.assertEqual(latest.phase, "ready")
+        self.assertIsNone(latest.current_dependency_id)
+        self.assertEqual(latest.transferred_bytes, total_bytes)
+        self.assertEqual(latest.total_bytes, total_bytes)
+        self.assertNotIn("huggingface.co", repr(latest))
+        self.assertNotIn("provider-token", repr(latest))
+
+    def test_provision_progress_identity_is_session_scoped_and_retry_idempotent(self):
+        manifest = self.initial_manifest
+        total_bytes = sum(
+            artifact.size_bytes for artifact in manifest.artifacts
+        )
+        response = {
+            "transaction_id": "provision-" + manifest.digest,
+            "manifest_digest": manifest.digest,
+            "state": "applying",
+            "planned_restarts": 0,
+            "repair_restarts": 0,
+            "missing_class_types": [],
+            "missing_artifacts": [],
+            "progress": {
+                "phase": "model_transfer",
+                "dependency_id": self.model.artifact_id,
+                "transferred_bytes": 1,
+                "total_bytes": total_bytes,
+            },
+        }
+        first_session = self.sessions.get("session-1")
+        second_session = CloudSession.new(
+            "session-key-2",
+            session_id="session-2",
+            manifest_digest=manifest.digest,
+            deadline_at=7300.0,
+            deadline_mode="finite",
+            disk_gb=80,
+            now=100.0,
+            state=SessionState.READY,
+        ).transition(
+            SessionState.READY,
+            now=100.0,
+            installed_manifest_digest=manifest.digest,
+            instance_id="88",
+            worker_base_url="http://8.8.4.4:30000",
+            provider_token="second-provider-token",
+            session_secret_hex="e" * 64,
+        )
+        self.sessions.create_or_get(second_session)
+
+        self.service._record_provision_progress(
+            response,
+            session=first_session,
+            manifest=manifest,
+            transfer_job_id="bootstrap:session-1",
+        )
+        first_identity = self.jobs.latest_provision_transaction(
+            "session-1"
+        ).transaction_id
+        self.service._record_provision_progress(
+            response,
+            session=first_session,
+            manifest=manifest,
+            transfer_job_id="bootstrap:session-1",
+        )
+        self.service._record_provision_progress(
+            response,
+            session=second_session,
+            manifest=manifest,
+            transfer_job_id="bootstrap:session-2",
+        )
+
+        first = self.jobs.latest_provision_transaction("session-1")
+        second = self.jobs.latest_provision_transaction("session-2")
+        self.assertEqual(first.transaction_id, first_identity)
+        self.assertNotEqual(first.transaction_id, second.transaction_id)
+        self.assertEqual(first.manifest_digest, manifest.digest)
+        self.assertEqual(second.manifest_digest, manifest.digest)
+        self.assertEqual(
+            response["transaction_id"],
+            "provision-" + manifest.digest,
+        )
+
+    def test_legacy_apply_response_without_progress_remains_accepted(self):
+        result = asyncio.run(
+            self.service._apply_manifest(
+                self.worker,
+                self.sessions.get("session-1"),
+                self.initial_manifest,
+                transfer_job_id="bootstrap:session-1",
+                capture=self.first_capture,
+            )
+        )
+
+        self.assertEqual(result["state"], "ready")
+        self.assertNotIn("progress", result)
+        self.assertIsNone(
+            self.jobs.latest_provision_transaction("session-1")
+        )
+
+    def test_hostile_worker_progress_is_rejected_without_persistence(self):
+        manifest = self.initial_manifest
+        total_bytes = sum(
+            artifact.size_bytes for artifact in manifest.artifacts
+        )
+        base_progress = {
+            "phase": "model_transfer",
+            "dependency_id": self.model.artifact_id,
+            "transferred_bytes": 1,
+            "total_bytes": total_bytes,
+        }
+        hostile = (
+            {**base_progress, "phase": "unknown"},
+            {**base_progress, "dependency_id": "https://example.com/model"},
+            {**base_progress, "transferred_bytes": total_bytes + 1},
+            {**base_progress, "total_bytes": total_bytes + 1},
+            {
+                **base_progress,
+                "source_url": "https://huggingface.co/private?token=secret",
+            },
+        )
+
+        for progress in hostile:
+            with self.subTest(progress=progress):
+                worker = SequentialWorker()
+
+                async def apply_manifest(_payload, value=progress):
+                    return {
+                        "transaction_id": "provision-" + manifest.digest,
+                        "manifest_digest": manifest.digest,
+                        "state": "ready",
+                        "planned_restarts": 0,
+                        "repair_restarts": 0,
+                        "missing_class_types": [],
+                        "missing_artifacts": [],
+                        "progress": value,
+                    }
+
+                worker.apply_manifest = apply_manifest
+                with self.assertRaises(SessionExecutionError):
+                    asyncio.run(
+                        self.service._apply_manifest(
+                            worker,
+                            self.sessions.get("session-1"),
+                            manifest,
+                            transfer_job_id="bootstrap:session-1",
+                            capture=self.first_capture,
+                        )
+                    )
+                self.assertIsNone(
+                    self.jobs.latest_provision_transaction("session-1")
+                )
+
+    def test_observed_ready_progress_cannot_replace_failed_apply_result(self):
+        self.service.job_poll_interval_seconds = 0
+        manifest = self.initial_manifest
+        total_bytes = sum(
+            artifact.size_bytes for artifact in manifest.artifacts
+        )
+
+        class FinalFailureWorker:
+            def __init__(self):
+                self.release = asyncio.Event()
+
+            async def apply_manifest(self, _payload):
+                await self.release.wait()
+                return {
+                    "transaction_id": "provision-" + manifest.digest,
+                    "manifest_digest": manifest.digest,
+                    "state": "failed",
+                    "planned_restarts": 0,
+                    "repair_restarts": 0,
+                    "missing_class_types": [],
+                    "missing_artifacts": [],
+                    "progress": {
+                        "phase": "environment_validation",
+                        "dependency_id": None,
+                        "transferred_bytes": total_bytes,
+                        "total_bytes": total_bytes,
+                    },
+                }
+
+            async def transaction(self, transaction_id):
+                self.release.set()
+                return {
+                    "transaction_id": transaction_id,
+                    "manifest_digest": manifest.digest,
+                    "state": "ready",
+                    "planned_restarts": 0,
+                    "repair_restarts": 0,
+                    "missing_class_types": [],
+                    "missing_artifacts": [],
+                    "progress": {
+                        "phase": "ready",
+                        "dependency_id": None,
+                        "transferred_bytes": total_bytes,
+                        "total_bytes": total_bytes,
+                    },
+                }
+
+        async def exercise():
+            await asyncio.wait_for(
+                self.service._apply_manifest(
+                    FinalFailureWorker(),
+                    self.sessions.get("session-1"),
+                    manifest,
+                    transfer_job_id="bootstrap:session-1",
+                    capture=self.first_capture,
+                ),
+                timeout=0.2,
+            )
+
+        with self.assertRaises(SessionExecutionError):
+            asyncio.run(exercise())
+
+        latest = self.jobs.latest_provision_transaction("session-1")
+        self.assertEqual(latest.state, "failed")
+        self.assertEqual(latest.phase, "environment_validation")
+
+    def test_invalid_polled_progress_cancels_and_consumes_active_apply(self):
+        self.service.job_poll_interval_seconds = 0
+        manifest = self.initial_manifest
+
+        class InvalidPollingWorker:
+            def __init__(self):
+                self.cancelled = False
+
+            async def apply_manifest(self, _payload):
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    self.cancelled = True
+                    raise
+
+            async def transaction(self, transaction_id):
+                return {
+                    "transaction_id": transaction_id,
+                    "manifest_digest": manifest.digest,
+                    "state": "applying",
+                    "planned_restarts": 0,
+                    "repair_restarts": 0,
+                    "missing_class_types": [],
+                    "missing_artifacts": [],
+                    "progress": {
+                        "phase": "model_transfer",
+                        "dependency_id": "https://example.com/model",
+                        "transferred_bytes": 1,
+                        "total_bytes": 20,
+                    },
+                }
+
+        async def exercise():
+            worker = InvalidPollingWorker()
+            with self.assertRaises(SessionExecutionError):
+                await self.service._apply_manifest(
+                    worker,
+                    self.sessions.get("session-1"),
+                    manifest,
+                    transfer_job_id="bootstrap:session-1",
+                    capture=self.first_capture,
+                )
+            return worker
+
+        worker = asyncio.run(exercise())
+        self.assertTrue(worker.cancelled)
+        self.assertIsNone(
+            self.jobs.latest_provision_transaction("session-1")
+        )
 
     def test_two_compatible_jobs_reuse_one_session_and_transfer_only_delta(self):
         first = asyncio.run(
@@ -761,6 +1639,112 @@ class ReusableSessionTests(unittest.TestCase):
             ],
         )
 
+    def test_ready_recovery_inconsistent_deadline_response_is_terminal(self):
+        self.worker.claimed = True
+
+        async def inconsistent_deadline(_policy):
+            return {"mode": "none", "acknowledged": True}
+
+        self.worker.update_deadline = inconsistent_deadline
+
+        with self.assertRaises(TerminalProvisioningError) as caught:
+            asyncio.run(self.service.recover_session("session-1"))
+
+        self.assertIs(type(caught.exception), TerminalProvisioningError)
+        self.assertEqual(
+            str(caught.exception),
+            "Remote deadline enforcement failed.",
+        )
+
+    def test_ready_recovery_rejects_incompatible_deadline_policy_fields(self):
+        self.worker.claimed = True
+        expected = {
+            "mode": "finite",
+            "deadline_at": 7300.0,
+            "retrieval_grace_seconds": 300,
+            "destroy_intent": False,
+            "destroy_requested": False,
+        }
+        incompatible = (
+            {**expected, "retrieval_grace_seconds": 0},
+            {**expected, "destroy_intent": True},
+        )
+
+        for response in incompatible:
+            with self.subTest(response=response):
+                async def incompatible_deadline(_policy, response=response):
+                    return response
+
+                self.worker.update_deadline = incompatible_deadline
+
+                with self.assertRaises(TerminalProvisioningError):
+                    asyncio.run(self.service.recover_session("session-1"))
+
+    def test_confirmed_terminal_destroy_abandons_active_session_work(self):
+        session = self.sessions.get("session-1")
+        session = self.sessions.save(
+            session.transition(SessionState.RUNNING, now=101.0)
+        )
+        running = CloudJob(
+            job_id="terminal-recovery-job",
+            session_id=session.session_id,
+            idempotency_key="terminal-recovery-key",
+            state=JobState.RUNNING,
+            prompt_digest=self.first_capture.prompt_digest,
+            capture_json=self.first_capture.canonical_payload(),
+            manifest_digest=session.installed_manifest_digest,
+            remote_prompt_id=(
+                "11111111-1111-1111-1111-111111111111"
+            ),
+            sanitized_error=None,
+            created_at=100.0,
+            updated_at=101.0,
+            version=1,
+        )
+        self.jobs.create_job(running)
+        self.jobs.save_transfer(
+            job_id=running.job_id,
+            artifact_id="unfinished-output",
+            direction="download",
+            expected_size=20,
+            sha256="f" * 64,
+            offset=10,
+            state=TransferState.TRANSFERRING,
+            private_path=str(self.path.parent / "unfinished-output.part"),
+        )
+        for state in (
+            SessionState.FAILED,
+            SessionState.DESTROY_REQUESTED,
+            SessionState.DESTROYING,
+            SessionState.DESTROYED,
+        ):
+            session = self.sessions.transition(
+                session.session_id,
+                state,
+                now=session.updated_at + 1,
+                destroy_requested=(
+                    state
+                    in {
+                        SessionState.DESTROY_REQUESTED,
+                        SessionState.DESTROYING,
+                    }
+                ),
+            )
+
+        self.service.confirmed_terminal_destroy(session.session_id)
+
+        failed = self.jobs.get_job(running.job_id)
+        transfer = self.jobs.get_transfer(
+            running.job_id,
+            "unfinished-output",
+        )
+        self.assertEqual(failed.state, JobState.FAILED)
+        self.assertEqual(
+            failed.sanitized_error,
+            "Remote execution was interrupted by GPU destruction.",
+        )
+        self.assertEqual(transfer.state, TransferState.ABANDONED)
+
     def test_running_recovery_idempotently_resumes_remote_job_and_harvest(self):
         session = self.sessions.get("session-1")
         session = self.sessions.save(
@@ -802,6 +1786,13 @@ class ReusableSessionTests(unittest.TestCase):
         self.assertEqual(self.worker.manifest_calls, [])
 
     def test_execution_failure_returns_the_healthy_session_to_ready(self):
+        lifecycle_calls = []
+
+        class RecordingLifecycle:
+            async def destroy_session(inner_self, *args, **kwargs):
+                lifecycle_calls.append((args, kwargs))
+
+        self.service.lifecycle = RecordingLifecycle()
         self.worker.terminal_state = "failed"
         self.worker.error = {
             "code": "out_of_memory",
@@ -825,6 +1816,40 @@ class ReusableSessionTests(unittest.TestCase):
             self.sessions.get("session-1").state,
             SessionState.READY,
         )
+        self.assertEqual(lifecycle_calls, [])
+
+    def test_terminal_job_delta_requests_verified_destruction(self):
+        calls = []
+        diagnostic = "Remote provisioning response was invalid."
+
+        class RecordingLifecycle:
+            async def destroy_session(
+                inner_self,
+                session_id,
+                *,
+                terminal_error=None,
+            ):
+                calls.append((session_id, terminal_error))
+                return self_outer.sessions.get(session_id)
+
+        self_outer = self
+        self.service.lifecycle = RecordingLifecycle()
+
+        async def terminal_apply(_payload):
+            raise TerminalProvisioningError(diagnostic)
+
+        self.worker.apply_manifest = terminal_apply
+
+        with self.assertRaises(TerminalProvisioningError):
+            asyncio.run(
+                self.service.submit_job(
+                    "session-1",
+                    capture_id=self.second_capture.capture_id,
+                    idempotency_key="terminal-delta-key",
+                )
+            )
+
+        self.assertEqual(calls, [("session-1", diagnostic)])
 
     def test_running_remote_job_returns_immediately_then_finishes_in_background(self):
         async def scenario():
@@ -967,6 +1992,12 @@ class ReusableSessionTests(unittest.TestCase):
                 return {
                     "mode": payload["mode"],
                     "deadline_at": payload.get("deadline_at"),
+                    "retrieval_grace_seconds": payload.get(
+                        "retrieval_grace_seconds",
+                        0,
+                    ),
+                    "destroy_intent": False,
+                    "destroy_requested": False,
                 }
 
             self.worker.update_deadline = blocked_update

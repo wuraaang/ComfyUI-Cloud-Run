@@ -5,10 +5,11 @@ import unittest
 from pathlib import Path
 
 from cloud_run.lifecycle import CloudRunLifecycle
-from cloud_run.models import AttemptState
+from cloud_run.models import AttemptState, CloudSession, SessionState
 from cloud_run.offers import HostBlacklist
-from cloud_run.repository import AttemptRepository
+from cloud_run.repository import AttemptRepository, SessionRepository
 from cloud_run.service import CloudRunService
+from cloud_run.session_service import TerminalProvisioningError
 from cloud_run.settings import SettingsStore
 from cloud_run.worker_release import WorkerRelease
 
@@ -214,6 +215,93 @@ class FullOfflineLifecycleTests(unittest.TestCase):
             ).recover()
             self.assertEqual(recovered, [])
             self.assertEqual(provider.create_count, 1)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            asyncio.run(scenario(Path(temporary_directory) / "private"))
+
+    def test_terminal_session_provisioning_destroys_fake_inventory_once(self):
+        async def scenario(data_directory):
+            settings = SettingsStore(data_directory)
+            settings.update(
+                {
+                    "api_key": "synthetic-offline-only-value",
+                    "max_price_per_hour": 0.55,
+                    "min_vram_gb": 24,
+                }
+            )
+            attempts = AttemptRepository(
+                data_directory / "attempts.sqlite3"
+            )
+            sessions = SessionRepository(
+                data_directory / "attempts.sqlite3"
+            )
+            provider = OfflineVast()
+            session = CloudSession.new(
+                "terminal-offline-key",
+                session_id="terminal-offline-session",
+                manifest_digest="c" * 64,
+                deadline_at=7_300.0,
+                deadline_mode="finite",
+                disk_gb=80,
+                now=100.0,
+                state=SessionState.BOOTSTRAPPING,
+            ).transition(
+                SessionState.BOOTSTRAPPING,
+                now=100.0,
+                instance_id="900",
+                session_secret_hex="d" * 64,
+            )
+            sessions.create_or_get(session)
+            provider.instances = [
+                {
+                    "instance_id": "900",
+                    "label": session.label,
+                    "actual_status": "running",
+                    "public_ipaddr": "8.8.8.8",
+                    "ports": {"8765/tcp": [{"HostPort": "32100"}]},
+                    "jupyter_token": "offline-boundary-token",
+                }
+            ]
+            sleeps = []
+
+            class TerminalService:
+                async def bootstrap_session(inner_self, _session_id):
+                    raise TerminalProvisioningError(
+                        "Remote provisioning response was invalid."
+                    )
+
+            async def sleep(seconds):
+                sleeps.append(seconds)
+
+            lifecycle = CloudRunLifecycle(
+                settings,
+                attempts,
+                provider=provider,
+                blacklist=HostBlacklist(
+                    data_directory / "host-blacklist.json"
+                ),
+                clock=lambda: 101.0,
+                sleep=sleep,
+                release=worker_release(),
+                session_repository=sessions,
+                session_service=TerminalService(),
+            )
+
+            destroyed = await lifecycle.wait_until_session_ready(
+                session.session_id
+            )
+
+            self.assertEqual(destroyed.state, SessionState.DESTROYED)
+            self.assertEqual(provider.destroy_count, 1)
+            self.assertEqual(provider.instances, [])
+            self.assertEqual(sleeps, [])
+            self.assertEqual(
+                destroyed.sanitized_error,
+                "Remote provisioning response was invalid.",
+            )
+            self.assertFalse(
+                destroyed.public_payload()["billing_may_continue"]
+            )
 
         with tempfile.TemporaryDirectory() as temporary_directory:
             asyncio.run(scenario(Path(temporary_directory) / "private"))

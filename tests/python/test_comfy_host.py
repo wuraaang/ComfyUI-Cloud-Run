@@ -229,6 +229,161 @@ class ComfyHostTests(unittest.TestCase):
             },
         )
 
+    def test_absent_model_category_comes_from_exact_native_annotation(self):
+        host = ComfyHost(
+            comfy_root=Path("/safe/ComfyUI"),
+            custom_nodes_root=Path("/safe/ComfyUI/custom_nodes"),
+            node_records={
+                "UNETLoader": NodeRecord(
+                    "/safe/ComfyUI/nodes.py",
+                    "nodes",
+                    input_types={
+                        "required": {
+                            "model_name": ([], {}),
+                        }
+                    },
+                ),
+            },
+            version_reader=lambda: ("0.29.0", "1.47.10", "3.13.12"),
+        )
+        capture = types.SimpleNamespace(
+            output={
+                "1": {
+                    "class_type": "UNETLoader",
+                    "inputs": {
+                        "model_name": "missing.safetensors",
+                    },
+                },
+            },
+            workflow={
+                "nodes": [
+                    {
+                        "id": 1,
+                        "type": "UNETLoader",
+                        "mode": 0,
+                        "properties": {
+                            "models": [
+                                {
+                                    "name": "missing.safetensors",
+                                    "url": (
+                                        "https://huggingface.co/example/"
+                                        "public-model/resolve/main/"
+                                        "missing.safetensors"
+                                    ),
+                                    "directory": "diffusion_models",
+                                }
+                            ]
+                        },
+                        "widgets_values": ["missing.safetensors"],
+                    }
+                ]
+            },
+        )
+
+        metadata = host.file_input_metadata(
+            capture,
+            model_filenames={"diffusion_models": set()},
+        )
+
+        self.assertEqual(
+            metadata,
+            {
+                "UNETLoader": {
+                    "model_name": FileInputMetadata(
+                        kind="model",
+                        category="diffusion_models",
+                    )
+                }
+            },
+        )
+
+    def test_schema_combo_model_uses_exact_native_annotation(self):
+        host = ComfyHost(
+            comfy_root=Path("/safe/ComfyUI"),
+            custom_nodes_root=Path("/safe/ComfyUI/custom_nodes"),
+            node_records={
+                "UpscaleModelLoader": NodeRecord(
+                    "/safe/ComfyUI/comfy_extras/nodes_upscale_model.py",
+                    "comfy_extras.nodes_upscale_model",
+                    input_types={
+                        "required": {
+                            "model_name": (
+                                "COMBO",
+                                {"options": []},
+                            ),
+                        }
+                    },
+                ),
+                "TextNode": NodeRecord(
+                    "/safe/ComfyUI/nodes.py",
+                    "nodes",
+                    input_types={
+                        "required": {"text": ("STRING", {})},
+                    },
+                ),
+            },
+            version_reader=lambda: ("0.29.0", "1.47.10", "3.13.12"),
+        )
+        capture = types.SimpleNamespace(
+            output={
+                "61": {
+                    "class_type": "UpscaleModelLoader",
+                    "inputs": {"model_name": "missing-upscaler.pth"},
+                },
+                "62": {
+                    "class_type": "TextNode",
+                    "inputs": {"text": ""},
+                },
+            },
+            workflow={
+                "nodes": [
+                    {
+                        "id": 61,
+                        "type": "UpscaleModelLoader",
+                        "mode": 0,
+                        "properties": {
+                            "models": [
+                                {
+                                    "name": "missing-upscaler.pth",
+                                    "url": (
+                                        "https://huggingface.co/example/"
+                                        "public-model/resolve/main/"
+                                        "missing-upscaler.pth"
+                                    ),
+                                    "directory": "upscale_models",
+                                }
+                            ]
+                        },
+                        "widgets_values": ["missing-upscaler.pth"],
+                    },
+                    {
+                        "id": 62,
+                        "type": "TextNode",
+                        "mode": 0,
+                        "properties": {},
+                        "widgets_values": [""],
+                    },
+                ]
+            },
+        )
+
+        metadata = host.file_input_metadata(
+            capture,
+            model_filenames={"upscale_models": set()},
+        )
+
+        self.assertEqual(
+            metadata,
+            {
+                "UpscaleModelLoader": {
+                    "model_name": FileInputMetadata(
+                        kind="model",
+                        category="upscale_models",
+                    )
+                }
+            },
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

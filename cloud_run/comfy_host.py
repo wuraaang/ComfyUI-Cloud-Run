@@ -13,6 +13,7 @@ import subprocess
 
 from .artifacts import FileInputMetadata
 from .manifest import ManifestValidationError, normalize_github_repository
+from .model_metadata import EmbeddedModelIndex, ModelMetadataError
 
 
 PINNED_HOST_VERSIONS = ("0.29.0", "1.47.10", "3.13.12")
@@ -300,10 +301,17 @@ class ComfyHost:
             raise HostCompatibilityError(
                 "Compiled prompt metadata is unavailable."
             )
+        try:
+            embedded_models = EmbeddedModelIndex.from_workflow(
+                getattr(capture, "workflow", None)
+            )
+        except ModelMetadataError:
+            embedded_models = None
         metadata = {}
-        for node in output.values():
+        for raw_node_id, node in output.items():
             if not isinstance(node, dict):
                 continue
+            node_id = str(raw_node_id)
             class_type = str(node.get("class_type") or "")
             inputs = node.get("inputs")
             record = (self.node_records or {}).get(class_type)
@@ -350,22 +358,42 @@ class ComfyHost:
                         kind="input"
                     )
                     continue
-                if not isinstance(input_type, (tuple, list)):
+                matching_categories = set()
+                if embedded_models is not None and value:
+                    matching_categories.update(
+                        category
+                        for category in embedded_models.directories_for(
+                            node_id=node_id,
+                            name=value,
+                        )
+                        if category in model_filenames
+                    )
+                if (
+                    not isinstance(input_type, (tuple, list))
+                    and not matching_categories
+                ):
                     continue
-                matching_categories = sorted(
+                matching_categories.update(
                     category
                     for category, filenames in model_filenames.items()
                     if value in filenames
                 )
+                matching_categories = sorted(matching_categories)
                 if len(matching_categories) > 1:
                     raise HostCompatibilityError(
                         "ComfyUI model filename category is ambiguous."
                     )
                 if len(matching_categories) == 1:
-                    class_metadata[input_name] = FileInputMetadata(
+                    resolved_metadata = FileInputMetadata(
                         kind="model",
                         category=matching_categories[0],
                     )
+                    existing = class_metadata.get(input_name)
+                    if existing is not None and existing != resolved_metadata:
+                        raise HostCompatibilityError(
+                            "ComfyUI model filename category is ambiguous."
+                        )
+                    class_metadata[input_name] = resolved_metadata
             if not class_metadata:
                 metadata.pop(class_type, None)
         return metadata

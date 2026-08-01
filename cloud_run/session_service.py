@@ -20,12 +20,16 @@ from .capture import CompiledCapture
 from .manifest import (
     DependencyManifest,
     ManifestDelta,
+    ManifestValidationError,
     MANIFEST_SCHEMA_VERSION,
     PINNED_COMFYUI_CORE_VERSION,
     PINNED_COMFYUI_FRONTEND_VERSION,
     PROTOCOL_VERSION,
+    SourceSpec,
+    validate_dependency,
 )
 from .models import CloudJob, JobState, SessionState, TransferState
+from .offers import estimated_transfer_seconds
 from .relay import RelaySyncResult
 from .repository import ConcurrentSessionUpdate, SessionRepository
 from .worker_release import WorkerRelease
@@ -35,6 +39,19 @@ _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}")
 _HEX_40 = re.compile(r"[0-9a-f]{40}")
 _HEX_64 = re.compile(r"[0-9a-f]{64}")
 _STATUSES = {"resolved", "mapping_required", "unsupported"}
+_PROVISION_PHASES = {
+    "dependency_transfer",
+    "model_transfer",
+    "digest_verification",
+    "comfyui_startup",
+    "environment_validation",
+    "ready",
+}
+_ARTIFACT_PROVISION_PHASES = {
+    "dependency_transfer",
+    "model_transfer",
+    "digest_verification",
+}
 _SOURCE_KINDS = {
     "agent",
     "approved",
@@ -93,6 +110,10 @@ class IncompatibleSession(SessionServiceError):
 
 class SessionExecutionError(SessionServiceError):
     pass
+
+
+class TerminalProvisioningError(SessionExecutionError):
+    """A sanitized deterministic failure after bounded recovery is exhausted."""
 
 
 class DeadlineValidationError(SessionServiceError):
@@ -170,6 +191,7 @@ class PreflightRow:
     destination: str | None
     reason: str | None
     mapping_candidate: dict | None = None
+    source_locator: str | None = None
 
     def __post_init__(self):
         _identifier(self.dependency_id, "dependency ID")
@@ -210,6 +232,27 @@ class PreflightRow:
             ):
                 raise SessionServiceError("Invalid dependency destination.")
         _safe_text(self.reason, "dependency reason", optional=True)
+        if self.source_locator is not None:
+            if (
+                self.status != "resolved"
+                or self.source_kind != "huggingface"
+                or self.immutable_revision is None
+            ):
+                raise SessionServiceError(
+                    "Invalid dependency source locator."
+                )
+            try:
+                validate_dependency(
+                    SourceSpec(
+                        kind="huggingface",
+                        locator=self.source_locator,
+                        immutable_revision=self.immutable_revision,
+                    )
+                )
+            except ManifestValidationError:
+                raise SessionServiceError(
+                    "Invalid dependency source locator."
+                ) from None
         candidate = self.mapping_candidate
         if candidate is not None:
             if (
@@ -270,6 +313,7 @@ class PreflightRow:
             "sha256": self.sha256,
             "destination": self.destination,
             "reason": self.reason,
+            "source_locator": self.source_locator,
             "mapping_candidate": (
                 dict(self.mapping_candidate)
                 if self.mapping_candidate is not None
@@ -291,16 +335,21 @@ class PreflightRow:
             "destination",
             "reason",
         }
-        if (
-            not isinstance(payload, dict)
-            or frozenset(payload) not in {
-                frozenset(fields),
-                frozenset(fields | {"mapping_candidate"}),
-            }
-        ):
+        optional_fields = {"mapping_candidate", "source_locator"}
+        allowed = {
+            frozenset(fields | subset)
+            for subset in (
+                set(),
+                {"mapping_candidate"},
+                {"source_locator"},
+                optional_fields,
+            )
+        }
+        if not isinstance(payload, dict) or frozenset(payload) not in allowed:
             raise SessionServiceError("Stored preflight row is invalid.")
         values = dict(payload)
         values.setdefault("mapping_candidate", None)
+        values.setdefault("source_locator", None)
         return cls(**values)
 
 
@@ -508,6 +557,14 @@ def _preflight_rows(resolution, mapping_repository):
                 sha256=artifact_row.sha256,
                 destination=artifact_row.destination,
                 reason=artifact_row.reason,
+                source_locator=(
+                    artifact.source.locator
+                    if (
+                        artifact is not None
+                        and artifact.source.kind == "huggingface"
+                    )
+                    else None
+                ),
             )
         )
     return tuple(rows)
@@ -684,7 +741,102 @@ def _safe_remote_error(error):
     return message if message in allowed else "Remote execution failed."
 
 
-def _provision_payload_valid(payload, manifest_digest):
+def _deadline_response_matches(response, request):
+    fields = {
+        "mode",
+        "deadline_at",
+        "retrieval_grace_seconds",
+        "destroy_intent",
+        "destroy_requested",
+    }
+    if not isinstance(response, dict) or set(response) != fields:
+        return False
+    mode = request.get("mode") if isinstance(request, dict) else None
+    if mode == "finite":
+        expected_deadline = request.get("deadline_at")
+        expected_grace = request.get("retrieval_grace_seconds")
+        deadline_at = response.get("deadline_at")
+        if (
+            isinstance(deadline_at, bool)
+            or not isinstance(deadline_at, (int, float))
+            or not math.isfinite(deadline_at)
+            or deadline_at != expected_deadline
+        ):
+            return False
+    elif mode == "none":
+        expected_deadline = None
+        expected_grace = 0
+    else:
+        return False
+    return (
+        response.get("mode") == mode
+        and response.get("deadline_at") == expected_deadline
+        and type(response.get("retrieval_grace_seconds")) is int
+        and response.get("retrieval_grace_seconds") == expected_grace
+        and response.get("destroy_intent") is False
+        and response.get("destroy_requested") is False
+    )
+
+
+def _validated_provision_progress(payload, manifest):
+    progress = payload.get("progress")
+    if progress is None:
+        if "progress" in payload:
+            raise ValueError("Invalid provisioning progress.")
+        return None
+    fields = {
+        "phase",
+        "dependency_id",
+        "transferred_bytes",
+        "total_bytes",
+    }
+    if not isinstance(progress, dict) or set(progress) != fields:
+        raise ValueError("Invalid provisioning progress.")
+    phase = progress.get("phase")
+    dependency_id = progress.get("dependency_id")
+    transferred_bytes = progress.get("transferred_bytes")
+    total_bytes = progress.get("total_bytes")
+    catalog = _transfer_catalog(manifest)
+    expected_total = sum(
+        artifact.size_bytes for artifact in catalog.values()
+    )
+    artifact = (
+        catalog.get(dependency_id)
+        if isinstance(dependency_id, str)
+        else None
+    )
+    if (
+        phase not in _PROVISION_PHASES
+        or isinstance(transferred_bytes, bool)
+        or not isinstance(transferred_bytes, int)
+        or isinstance(total_bytes, bool)
+        or not isinstance(total_bytes, int)
+        or total_bytes != expected_total
+        or not 0 <= transferred_bytes <= total_bytes
+        or (
+            phase in _ARTIFACT_PROVISION_PHASES
+            and (
+                not isinstance(dependency_id, str)
+                or not _IDENTIFIER.fullmatch(dependency_id)
+                or artifact is None
+            )
+        )
+        or (
+            phase not in _ARTIFACT_PROVISION_PHASES
+            and dependency_id is not None
+        )
+        or (phase == "model_transfer" and artifact.kind != "model")
+        or (
+            phase == "dependency_transfer"
+            and artifact.kind == "model"
+        )
+        or (phase == "ready" and transferred_bytes != total_bytes)
+    ):
+        raise ValueError("Invalid provisioning progress.")
+    return dict(progress)
+
+
+def _provision_payload_valid(payload, manifest):
     required = {
         "transaction_id",
         "manifest_digest",
@@ -694,15 +846,23 @@ def _provision_payload_valid(payload, manifest_digest):
         "missing_class_types",
         "missing_artifacts",
     }
-    if not isinstance(payload, dict) or frozenset(payload) not in {
-        frozenset(required),
-        frozenset(required | {"required_uploads"}),
-    }:
+    optional = {"required_uploads", "progress"}
+    allowed = {
+        frozenset(required | subset)
+        for subset in (
+            set(),
+            {"required_uploads"},
+            {"progress"},
+            optional,
+        )
+    }
+    if not isinstance(payload, dict) or frozenset(payload) not in allowed:
         return False
     if (
         not isinstance(payload.get("transaction_id"), str)
         or not _IDENTIFIER.fullmatch(payload["transaction_id"])
-        or payload.get("manifest_digest") != manifest_digest
+        or payload["transaction_id"] != "provision-" + manifest.digest
+        or payload.get("manifest_digest") != manifest.digest
         or payload.get("state")
         not in {"applying", "awaiting_upload", "ready", "failed", "stalled"}
         or payload.get("planned_restarts") not in {0, 1}
@@ -727,7 +887,30 @@ def _provision_payload_valid(payload, manifest_digest):
             or len(set(values)) != len(values)
         ):
             return False
+    try:
+        progress = _validated_provision_progress(payload, manifest)
+    except (SessionExecutionError, TypeError, ValueError):
+        return False
+    if progress is not None and (
+        (progress["phase"] == "ready")
+        != (payload["state"] == "ready")
+    ):
+        return False
     return True
+
+
+def _stored_provision_transaction_id(session_id, manifest_digest):
+    if (
+        not isinstance(session_id, str)
+        or not _IDENTIFIER.fullmatch(session_id)
+        or not isinstance(manifest_digest, str)
+        or not _HEX_64.fullmatch(manifest_digest)
+    ):
+        raise ValueError("Invalid provisioning transaction identity.")
+    identity = hashlib.sha256(
+        (session_id + "\0" + manifest_digest).encode("ascii")
+    ).hexdigest()
+    return "provision-session-" + identity
 
 
 class SessionService:
@@ -948,10 +1131,21 @@ class SessionService:
         if self.offer_search is None:
             raise PreflightBlocked("Vast offer search is unavailable.")
         if callable(self.offer_search):
-            return await self.offer_search(disk_gb=result.disk_gb)
-        if callable(getattr(self.offer_search, "search", None)):
-            return await self.offer_search.search(disk_gb=result.disk_gb)
-        raise PreflightBlocked("Vast offer search is unavailable.")
+            offers = await self.offer_search(disk_gb=result.disk_gb)
+        elif callable(getattr(self.offer_search, "search", None)):
+            offers = await self.offer_search.search(disk_gb=result.disk_gb)
+        else:
+            raise PreflightBlocked("Vast offer search is unavailable.")
+        return [
+            {
+                **offer,
+                "estimated_transfer_seconds": estimated_transfer_seconds(
+                    result.transfer_bytes,
+                    offer.get("inet_down_mbps"),
+                ),
+            }
+            for offer in offers
+        ]
 
     def approve_mapping(self, mapping_id, candidate_digest):
         if self.mapping_repository is None:
@@ -1159,11 +1353,7 @@ class SessionService:
                 response = None
         else:
             response = None
-        valid = (
-            isinstance(response, dict)
-            and response.get("mode") == mode
-            and response.get("deadline_at") == deadline_at
-        )
+        valid = _deadline_response_matches(response, request)
         if not valid:
             self._sessions().update(
                 session.session_id,
@@ -1287,6 +1477,14 @@ class SessionService:
             )
         self._abandon_session_work(session.session_id)
 
+    def confirmed_terminal_destroy(self, session_id):
+        session = self.session(session_id)
+        if session.state != SessionState.DESTROYED:
+            raise SessionExecutionError(
+                "Terminal destruction is not inventory verified."
+            )
+        self._abandon_session_work(session.session_id)
+
     async def prepare_deadline_destroy(self, session_id):
         session = self.session(session_id)
         active = [
@@ -1392,6 +1590,20 @@ class SessionService:
         if result.state == SessionState.DESTROYED:
             self._abandon_session_work(session.session_id)
         return result
+
+    async def _request_terminal_destruction(self, session_id, diagnostic):
+        destroy = getattr(self.lifecycle, "destroy_session", None)
+        if not callable(destroy):
+            return None
+        try:
+            return await destroy(
+                session_id,
+                terminal_error=diagnostic,
+            )
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            raise
+        except Exception:
+            return None
 
     def _worker(self, session):
         if not callable(self.worker_factory):
@@ -1573,7 +1785,7 @@ class SessionService:
             or existing.expected_size != artifact.size_bytes
             or existing.sha256 != artifact.sha256
         ):
-            raise SessionExecutionError(
+            raise TerminalProvisioningError(
                 "Stored dependency upload identity changed."
             )
         offset = existing.offset if existing is not None else 0
@@ -1621,7 +1833,7 @@ class SessionService:
                         >= artifact.size_bytes
                     )
                 ):
-                    raise SessionExecutionError(
+                    raise TerminalProvisioningError(
                         "Remote dependency upload identity changed."
                     )
                 remote_offset = remote_status["next_offset"]
@@ -1663,7 +1875,7 @@ class SessionService:
                 or not isinstance(next_offset, int)
                 or not offset <= next_offset <= artifact.size_bytes
             ):
-                raise SessionExecutionError(
+                raise TerminalProvisioningError(
                     "Remote dependency upload made invalid progress."
                 )
             self.job_repository.save_transfer(
@@ -1727,10 +1939,105 @@ class SessionService:
             or receipt.get("size_bytes") != artifact.size_bytes
             or receipt.get("sha256") != artifact.sha256
         ):
-            raise SessionExecutionError(
+            raise TerminalProvisioningError(
                 "Remote dependency upload was not verified."
             )
         await progress(artifact.size_bytes)
+
+    def _record_provision_progress(
+        self,
+        response,
+        *,
+        session,
+        manifest,
+        transfer_job_id,
+    ):
+        try:
+            progress = _validated_provision_progress(response, manifest)
+            if progress is None:
+                return
+            sanitized_error = {
+                "failed": "Remote provisioning failed.",
+                "stalled": "Remote provisioning stalled.",
+            }.get(response["state"])
+            self.job_repository.record_provision_progress(
+                transaction_id=_stored_provision_transaction_id(
+                    session.session_id,
+                    manifest.digest,
+                ),
+                session_id=session.session_id,
+                job_id=transfer_job_id,
+                manifest_digest=manifest.digest,
+                state=response["state"],
+                phase=progress["phase"],
+                current_dependency_id=progress["dependency_id"],
+                transferred_bytes=progress["transferred_bytes"],
+                total_bytes=progress["total_bytes"],
+                last_progress_at=self._now(),
+                sanitized_error=sanitized_error,
+            )
+        except (KeyError, TypeError, ValueError):
+            raise TerminalProvisioningError(
+                "Remote provisioning response was invalid."
+            ) from None
+
+    async def _apply_with_progress_polling(
+        self,
+        worker,
+        request,
+        *,
+        session,
+        manifest,
+        transfer_job_id,
+    ):
+        apply_task = asyncio.ensure_future(worker.apply_manifest(request))
+        transaction = getattr(worker, "transaction", None)
+        transaction_id = "provision-" + manifest.digest
+        try:
+            while True:
+                done, _pending = await asyncio.wait(
+                    {apply_task},
+                    timeout=self.job_poll_interval_seconds,
+                )
+                if apply_task in done:
+                    response = apply_task.result()
+                    break
+                if not callable(transaction):
+                    continue
+                try:
+                    observed = await transaction(transaction_id)
+                except (asyncio.CancelledError, KeyboardInterrupt):
+                    raise
+                except Exception:
+                    continue
+                if observed is None:
+                    continue
+                if not _provision_payload_valid(observed, manifest):
+                    raise TerminalProvisioningError(
+                        "Remote provisioning response was invalid."
+                    )
+                self._record_provision_progress(
+                    observed,
+                    session=session,
+                    manifest=manifest,
+                    transfer_job_id=transfer_job_id,
+                )
+            if not _provision_payload_valid(response, manifest):
+                raise TerminalProvisioningError(
+                    "Remote provisioning response was invalid."
+                )
+            self._record_provision_progress(
+                response,
+                session=session,
+                manifest=manifest,
+                transfer_job_id=transfer_job_id,
+            )
+            return response
+        except BaseException:
+            if not apply_task.done():
+                apply_task.cancel()
+            await asyncio.gather(apply_task, return_exceptions=True)
+            raise
 
     async def _apply_manifest(
         self,
@@ -1752,15 +2059,23 @@ class SessionService:
         catalog = _transfer_catalog(manifest)
         for _attempt in range(3):
             try:
-                response = await worker.apply_manifest(request)
+                response = await self._apply_with_progress_polling(
+                    worker,
+                    request,
+                    session=session,
+                    manifest=manifest,
+                    transfer_job_id=transfer_job_id,
+                )
             except (asyncio.CancelledError, KeyboardInterrupt):
+                raise
+            except SessionExecutionError:
                 raise
             except Exception:
                 raise SessionExecutionError(
                     "Remote provisioning failed."
                 ) from None
-            if not _provision_payload_valid(response, manifest.digest):
-                raise SessionExecutionError(
+            if not _provision_payload_valid(response, manifest):
+                raise TerminalProvisioningError(
                     "Remote provisioning response was invalid."
                 )
             required_uploads = response.get("required_uploads", [])
@@ -1771,7 +2086,7 @@ class SessionService:
                         artifact is None
                         or artifact.source.kind != "local-upload"
                     ):
-                        raise SessionExecutionError(
+                        raise TerminalProvisioningError(
                             "Remote provisioning requested an unknown upload."
                         )
                     await self._upload_artifact(
@@ -1783,7 +2098,7 @@ class SessionService:
             if response["state"] == "ready":
                 return response
             if response["state"] in {"failed", "stalled"}:
-                raise SessionExecutionError(
+                raise TerminalProvisioningError(
                     "Remote provisioning did not become ready."
                 )
             transaction = getattr(worker, "transaction", None)
@@ -1798,14 +2113,20 @@ class SessionService:
                     "Remote provisioning status is unavailable."
                 ) from None
             if (
-                not _provision_payload_valid(response, manifest.digest)
+                not _provision_payload_valid(response, manifest)
                 or response["state"] != "ready"
             ):
-                raise SessionExecutionError(
+                raise TerminalProvisioningError(
                     "Remote provisioning is incomplete."
                 )
+            self._record_provision_progress(
+                response,
+                session=session,
+                manifest=manifest,
+                transfer_job_id=transfer_job_id,
+            )
             return response
-        raise SessionExecutionError(
+        raise TerminalProvisioningError(
             "Remote provisioning did not accept required uploads."
         )
 
@@ -1889,16 +2210,8 @@ class SessionService:
             raise SessionExecutionError(
                 "Remote deadline enforcement failed."
             ) from None
-        if (
-            not isinstance(deadline_result, dict)
-            or deadline_result.get("mode") != session.deadline_mode
-            or (
-                session.deadline_mode == "finite"
-                and deadline_result.get("deadline_at")
-                != session.deadline_at
-            )
-        ):
-            raise SessionExecutionError(
+        if not _deadline_response_matches(deadline_result, policy):
+            raise TerminalProvisioningError(
                 "Remote deadline enforcement failed."
             )
         self.job_repository.replace_installed_set(
@@ -1983,16 +2296,8 @@ class SessionService:
             raise SessionExecutionError(
                 "Remote deadline enforcement failed."
             ) from None
-        if (
-            not isinstance(deadline_result, dict)
-            or deadline_result.get("mode") != session.deadline_mode
-            or (
-                session.deadline_mode == "finite"
-                and deadline_result.get("deadline_at")
-                != session.deadline_at
-            )
-        ):
-            raise SessionExecutionError(
+        if not _deadline_response_matches(deadline_result, policy):
+            raise TerminalProvisioningError(
                 "Remote deadline enforcement failed."
             )
         self.job_repository.replace_installed_set(
@@ -2184,6 +2489,24 @@ class SessionService:
                     transfer_job_id=job.job_id,
                     capture=capture,
                 )
+            except TerminalProvisioningError as error:
+                diagnostic = str(error)
+                self._transition_job(
+                    job,
+                    JobState.FAILED,
+                    sanitized_error=diagnostic,
+                )
+                self._sessions().transition(
+                    session.session_id,
+                    SessionState.FAILED,
+                    now=self._now(),
+                    sanitized_error=diagnostic,
+                )
+                await self._request_terminal_destruction(
+                    session.session_id,
+                    diagnostic,
+                )
+                raise
             except Exception:
                 self._transition_job(
                     job,
@@ -2229,6 +2552,24 @@ class SessionService:
                     transfer_job_id=job.job_id,
                     capture=capture,
                 )
+            except TerminalProvisioningError as error:
+                diagnostic = str(error)
+                self._transition_job(
+                    job,
+                    JobState.FAILED,
+                    sanitized_error=diagnostic,
+                )
+                self._sessions().transition(
+                    session.session_id,
+                    SessionState.FAILED,
+                    now=self._now(),
+                    sanitized_error=diagnostic,
+                )
+                await self._request_terminal_destruction(
+                    session.session_id,
+                    diagnostic,
+                )
+                raise
             except Exception:
                 self._transition_job(
                     job,

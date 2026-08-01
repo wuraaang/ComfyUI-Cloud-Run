@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import replace
 import hashlib
 import json
 import os
@@ -9,8 +10,17 @@ import types
 import unittest
 from unittest import mock
 
+from cloud_run.artifacts import FileInputMetadata
 from cloud_run.capture import CompiledCapture
-from cloud_run.routes import build_service, register_routes
+from cloud_run.dependency_repository import DependencyRepository
+from cloud_run.manifest import ArtifactSpec, DependencyManifest, SourceSpec
+from cloud_run.model_sources import ModelSourceResolution
+from cloud_run.routes import (
+    _RuntimeResolver,
+    _runtime_resolution_context,
+    build_service,
+    register_routes,
+)
 from cloud_run.models import (
     AttemptState,
     CloudAttempt,
@@ -19,6 +29,7 @@ from cloud_run.models import (
     JobState,
     OfferQuote,
     SessionState,
+    TransferState,
 )
 from cloud_run.vast import OfferSearchError
 
@@ -293,6 +304,140 @@ class ServiceConstructionTests(unittest.TestCase):
 
         self.assertIsNone(service.release)
         self.assertIsNone(service.session_service.release)
+
+
+class RuntimeResolverTests(unittest.TestCase):
+    def test_runtime_context_keeps_category_when_local_listing_fails(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            model_root = root / "models"
+            input_root = root / "input"
+            model_root.mkdir()
+            input_root.mkdir()
+
+            class FakeHost:
+                def file_input_metadata(self, capture, *, model_filenames):
+                    self.model_filenames = model_filenames
+                    return {}
+
+            host = FakeHost()
+            folder_paths = types.ModuleType("folder_paths")
+            folder_paths.folder_names_and_paths = {
+                "upscale_models": ((str(model_root),), {".pth"})
+            }
+
+            def unavailable_listing(_category):
+                raise OSError("model directory is unavailable")
+
+            folder_paths.get_filename_list = unavailable_listing
+            folder_paths.get_input_directory = lambda: str(input_root)
+
+            with mock.patch.dict(
+                sys.modules,
+                {"folder_paths": folder_paths},
+            ):
+                context = _runtime_resolution_context(host)(
+                    types.SimpleNamespace()
+                )
+
+        self.assertEqual(host.model_filenames, {"upscale_models": set()})
+        self.assertEqual(
+            context["model_roots"],
+            {"upscale_models": (model_root,)},
+        )
+
+    def test_injected_model_source_resolver_keeps_route_tests_offline(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            model_root = root / "models"
+            input_root = root / "input"
+            model_root.mkdir()
+            input_root.mkdir()
+            repository = DependencyRepository(
+                root / "private" / "sessions.sqlite3"
+            )
+            revision = "a" * 40
+            digest = "c" * 64
+            model_source_resolver = types.SimpleNamespace(
+                resolve=mock.AsyncMock(
+                    return_value={
+                        ("1", "model_name"): ModelSourceResolution(
+                            status="resolved",
+                            source=SourceSpec(
+                                kind="huggingface",
+                                locator=(
+                                    "https://huggingface.co/example/model/"
+                                    "resolve/"
+                                    + revision
+                                    + "/files/example.safetensors"
+                                ),
+                                immutable_revision=revision,
+                            ),
+                            size_bytes=4096,
+                            sha256=digest,
+                            reason=None,
+                        )
+                    }
+                )
+            )
+
+            class FakeHost:
+                def assert_compatible(self):
+                    return None
+
+                def describe_node(self, class_type):
+                    return types.SimpleNamespace(kind="core")
+
+                def file_input_metadata(self, capture, *, model_filenames):
+                    self.model_filenames = model_filenames
+                    return {
+                        "UNETLoader": {
+                            "model_name": FileInputMetadata(
+                                kind="model",
+                                category="diffusion_models",
+                            )
+                        }
+                    }
+
+            host = FakeHost()
+            folder_paths = types.ModuleType("folder_paths")
+            folder_paths.folder_names_and_paths = {
+                "diffusion_models": ((str(model_root),), {".safetensors"})
+            }
+            folder_paths.get_filename_list = lambda _category: []
+            folder_paths.get_input_directory = lambda: str(input_root)
+            capture = types.SimpleNamespace(
+                executable_class_types=("UNETLoader",),
+                output={
+                    "1": {
+                        "class_type": "UNETLoader",
+                        "inputs": {"model_name": "example.safetensors"},
+                    }
+                },
+                workflow={"nodes": []},
+            )
+            resolver = _RuntimeResolver(
+                repository,
+                model_source_resolver=model_source_resolver,
+            )
+
+            with mock.patch.dict(
+                sys.modules,
+                {"folder_paths": folder_paths},
+            ), mock.patch(
+                "cloud_run.routes.ComfyHost.from_running_host",
+                return_value=host,
+            ):
+                result = asyncio.run(
+                    resolver.resolve_preflight(
+                        capture,
+                        explicit_output_allowance_bytes=1024,
+                    )
+                )
+
+        self.assertTrue(result.rentable)
+        self.assertEqual(result.artifacts[0].source.kind, "huggingface")
+        model_source_resolver.resolve.assert_awaited_once()
 
 
 class OffersRouteTests(unittest.TestCase):
@@ -608,6 +753,7 @@ def attempt(state=AttemptState.OFFER_SELECTED):
             worker_archive_sha256="b" * 64,
             protocol_version="1",
             manifest_digest="c" * 64,
+            max_instance_creates=1,
         ),
     )
 
@@ -659,6 +805,7 @@ class PaidSessionRouteTests(unittest.TestCase):
                 "mode": "finite",
                 "duration_seconds": 7200,
             },
+            "max_instance_creates": 1,
         }
 
         quote_response = asyncio.run(
@@ -688,6 +835,13 @@ class PaidSessionRouteTests(unittest.TestCase):
                 FakeRequest({**request_payload, "unexpected": True})
             )
         )
+        missing_limit = dict(request_payload)
+        del missing_limit["max_instance_creates"]
+        missing = asyncio.run(
+            handlers[("POST", "/cloud-run/api/sessions")](
+                FakeRequest(missing_limit)
+            )
+        )
 
         service.preview_session.assert_awaited_once_with(
             preflight_id="preflight-1",
@@ -697,6 +851,7 @@ class PaidSessionRouteTests(unittest.TestCase):
                 "mode": "finite",
                 "duration_seconds": 7200,
             },
+            max_instance_creates=1,
         )
         service.confirm_session.assert_awaited_once_with(
             "session-1",
@@ -707,6 +862,7 @@ class PaidSessionRouteTests(unittest.TestCase):
         self.assertEqual(confirm_response.payload["status"], "bootstrapping")
         self.assertEqual(confirm_response.payload["instance_id"], "77")
         self.assertEqual(rejected.status, 400)
+        self.assertEqual(missing.status, 400)
         for response in (quote_response, confirm_response):
             encoded = repr(response.payload)
             self.assertNotIn("private-session-idempotency-key", encoded)
@@ -1208,6 +1364,155 @@ class RelayMediaRouteTests(unittest.TestCase):
             ["job-1"],
         )
         self.assertNotIn(str(self.root), repr(response.payload))
+
+    def test_session_status_maps_bounded_progress_to_safe_current_model(self):
+        repository = self.service.job_repository
+        revision = "a" * 40
+        model = ArtifactSpec(
+            artifact_id="model-" + "b" * 64,
+            kind="model",
+            logical_name="Gold-model.safetensors",
+            destination="models/diffusion_models/gold.safetensors",
+            size_bytes=10,
+            sha256="b" * 64,
+            source=SourceSpec(
+                "huggingface",
+                (
+                    "https://huggingface.co/example/public-model/resolve/"
+                    + revision
+                    + "/gold.safetensors"
+                ),
+                immutable_revision=revision,
+            ),
+        )
+        input_artifact = ArtifactSpec(
+            artifact_id="input-private",
+            kind="input",
+            logical_name="private-input.png",
+            destination="input/private-input.png",
+            size_bytes=5,
+            sha256="c" * 64,
+            source=SourceSpec(
+                "local-upload",
+                "local-upload:input-private",
+            ),
+        )
+        manifest = DependencyManifest(
+            schema_version=1,
+            protocol_version="1",
+            comfyui_core_version="0.29.0",
+            comfyui_frontend_version="1.47.10",
+            worker_version="a" * 40,
+            prompt_digest="d" * 64,
+            custom_nodes=(),
+            artifacts=(model, input_artifact),
+            output_allowance_bytes=1024,
+            disk_gb=80,
+        )
+        repository.save_manifest(
+            manifest.digest,
+            manifest.canonical_bytes().decode("utf-8"),
+            created_at=100.0,
+        )
+        repository.record_provision_progress(
+            transaction_id="provision-" + manifest.digest,
+            session_id="session-1",
+            job_id="bootstrap:session-1",
+            manifest_digest=manifest.digest,
+            state="applying",
+            phase="model_transfer",
+            current_dependency_id=model.artifact_id,
+            transferred_bytes=4,
+            total_bytes=15,
+            last_progress_at=6_995.0,
+        )
+        repository.save_transfer(
+            job_id="bootstrap:session-1",
+            artifact_id=input_artifact.artifact_id,
+            direction="upload",
+            expected_size=input_artifact.size_bytes,
+            sha256=input_artifact.sha256,
+            offset=3,
+            state=TransferState.TRANSFERRING,
+            private_path=str(self.root / "private" / "input.part"),
+        )
+        provisioning = CloudSession.new(
+            "session-key-progress",
+            session_id="session-1",
+            quote=replace(
+                attempt().quote,
+                manifest_digest=manifest.digest,
+                transfer_bytes=15,
+                output_allowance_bytes=1024,
+                disk_gb=80,
+            ),
+            manifest_digest=manifest.digest,
+            deadline_at=7_300.0,
+            deadline_mode="finite",
+            disk_gb=80,
+            now=100.0,
+            state=SessionState.PROVISIONING,
+        ).transition(
+            SessionState.PROVISIONING,
+            now=6_990.0,
+            instance_id="77",
+        )
+        self.service.refresh_session = mock.AsyncMock(
+            return_value=provisioning
+        )
+        handler = self.handlers[
+            ("GET", "/cloud-run/api/sessions/{session_id}")
+        ]
+
+        response = asyncio.run(
+            handler(FakeRequest(match_info={"session_id": "session-1"}))
+        )
+
+        self.assertEqual(
+            response.payload["provisioning"],
+            {
+                "phase": "model_transfer",
+                "current_model": "Gold-model.safetensors",
+                "transferred_bytes": 7,
+                "total_bytes": 15,
+                "installed_units": 0,
+                "validated_units": 0,
+                "seconds_without_progress": 5.0,
+                "stall_budget_seconds": 600,
+            },
+        )
+        self.assertNotIn("huggingface.co", repr(response.payload))
+        self.assertNotIn("local-upload", repr(response.payload))
+        self.assertNotIn(str(self.root), repr(response.payload))
+
+        with repository._connect() as connection:
+            connection.execute(
+                """
+                UPDATE provision_transactions
+                SET phase = 'unknown', transferred_bytes = 999
+                WHERE transaction_id = ?
+                """,
+                ("provision-" + manifest.digest,),
+            )
+            connection.commit()
+        hostile = asyncio.run(
+            handler(FakeRequest(match_info={"session_id": "session-1"}))
+        )
+        self.assertEqual(
+            hostile.payload["provisioning"]["phase"],
+            "provisioning",
+        )
+        self.assertIsNone(
+            hostile.payload["provisioning"]["current_model"]
+        )
+        self.assertEqual(
+            hostile.payload["provisioning"]["transferred_bytes"],
+            3,
+        )
+        self.assertEqual(
+            hostile.payload["provisioning"]["total_bytes"],
+            15,
+        )
 
     def test_wrong_session_cannot_read_an_existing_job(self):
         response = asyncio.run(

@@ -90,6 +90,14 @@ Offer confirmation revalidates identity and price. Session confirmation and job
 submission are idempotent. Restart recovery adopts matching managed inventory
 instead of blindly creating another instance.
 
+The paid review includes **Maximum total instance creates**, limited to `1` or
+`2` and persisted in the immutable quote. The conservative default, including
+legacy restored quotes, is `1`. A reviewed value of `2` authorizes at most one
+replacement after verified destruction and fresh inventory absence. The
+backend counts the initial create plus the durable retry count and enforces the
+limit at confirmation and before any replacement offer search or create; a
+duplicate or ambiguous request cannot replenish the budget.
+
 A session accepts one job at a time but can run multiple jobs sequentially.
 When the next job needs nothing new, execution starts immediately. A compatible
 model or input causes only its transfer delta. A compatible new custom node
@@ -197,6 +205,87 @@ mutation, publication, or GPU rental.
 The deterministic worker artifact is review material governed by a worker
 release lock. See `docs/remote-worker-bootstrap-review.md`. There is deliberately
 no live release lock in this repository.
+
+The offline publication tools bind one immutable GitHub Release asset to the
+repository, a 40-character lowercase commit, deterministic asset name, exact
+byte size, SHA-256, protocol, and pinned runtime versions. Bootstrap accepts a
+direct identity-encoded `200`, or exactly one manually validated `302` to the
+fixed GitHub release-assets host. The temporary signed target is neither part
+of the lock nor retained, persisted, logged, or returned.
+
+`remote_worker/gateway.py` starts one fixed Caddy binary and the loopback Python
+worker without a shell. Only Caddy receives the validated Jupyter token. The
+worker receives an explicit runtime allowlist plus Vast's own-instance ID and
+API key required by its independent deadline watchdog, never the Jupyter token
+or a provider-account key. The supervisor terminates, then boundedly reaps or
+kills, the sibling when either process exits. Caddy exposes `:8765`, strips
+inbound authorization and boundary headers, and proxies only to
+`127.0.0.1:8766`.
+
+Every Vast offer must carry complete verified, rentable, one-GPU, on-demand
+evidence, reliability of at least `0.99`, and finite provider-advertised
+download bandwidth of at least `500` Mbps. A default search uses disjoint
+target (`>= 1,000` Mbps) and fallback (`500–999` Mbps) queries, never relaxes
+either floor, and ranks with download speed saturated at `1,000` Mbps before
+reliability, disk bandwidth, price, and offer ID. Offer and paid-review views
+show the advertised network/disk metrics and
+`ceil(bytes * 8 / (Mbps * 1_000_000))` as a theoretical transfer lower bound,
+not measured startup time. Exact-offer confirmation reapplies the hard policy
+and rejects a drop below `min(reviewed Mbps, 1,000)` before any initial create.
+Both replacement paths independently reapply the `0.99`/`500` floors before
+selecting or creating from a fresh search result.
+
+The deterministic commands are:
+
+```sh
+python3 scripts/build_worker_release_bundle.py \
+  --repository-root <repository-root> \
+  --output-directory <owner-private-output-directory> \
+  --worker-commit <40-lowercase-hex-commit>
+
+python3 scripts/render_worker_template.py \
+  --repository-root <repository-root> \
+  --output-directory <owner-private-output-directory> \
+  --release-metadata <owner-private-release-metadata> \
+  --base-template-audit <owner-private-base-template-audit>
+
+python3 scripts/publish_worker_template.py \
+  audit-base \
+  --output-directory <owner-private-output-directory>
+
+python3 scripts/publish_worker_template.py \
+  publish \
+  --request-file <owner-private-template-request> \
+  --output-directory <owner-private-output-directory>
+
+python3 scripts/write_worker_release_lock.py \
+  --output <owner-private-data-directory>/worker-release.json \
+  --template-hash-id <32-lowercase-hex-template-id> \
+  --release-metadata <owner-private-release-metadata>
+```
+
+All generation inputs and outputs stay outside the repository in existing
+owner-private directories. Generated files use mode `0600`. The final local
+lock is created atomically without overwrite and must round-trip through the
+runtime loader before it is accepted.
+
+The template publisher is a single-purpose client for the fixed Vast template
+endpoint. It exposes only exact base audit and one-create publication actions,
+disables ambient proxies and redirects, reads the existing owner-private API
+key without accepting it on argv, never prints payloads or credentials, and
+never offers update, delete, arbitrary URL/method, offer, instance, or volume
+operations. Audit, render, and publish accept only
+`docker.io/vastai/base-image@sha256:<lowercase-64-hex>`; publication also
+requires the encoded bootstrap bytes to equal the reviewed repository file and
+the remote lock to be the exact canonical release contract. The separate
+pre-POST Task 8 gate still verifies the digest-scoped OCI manifest/config and
+required source/revision labels. Automated coverage injects only fake
+transports and synthetic keys.
+
+No immutable Remote Worker release has been published. No private
+project-specific Vast template has been created. No local live
+`worker-release.json` exists. No Vast offer search has been performed. No paid
+Vast instance has been created. No live workflow run has occurred.
 
 Before a paid Gold run, a new human GO must state the maximum instance count,
 maximum hourly price, and absolute duration or cost. The private Gold image and

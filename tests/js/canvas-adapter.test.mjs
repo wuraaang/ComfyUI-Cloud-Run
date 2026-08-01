@@ -1,9 +1,34 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import {
   captureOfficialQueuePayload,
 } from "../../web/js/canvas-adapter.js";
+
+
+function canonicalize(value) {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.keys(value)
+        .sort()
+        .map((key) => [key, canonicalize(value[key])]),
+    );
+  }
+  return value;
+}
+
+
+function executionDigest(capture) {
+  return createHash("sha256")
+    .update(JSON.stringify(canonicalize({
+      output: capture.output,
+      queue_options: capture.queue_options,
+    })))
+    .digest("hex");
+}
 
 
 test("captures through official queue preparation and never calls local prompt", async () => {
@@ -161,4 +186,92 @@ test("captures queue number and clones mutable official payloads", async () => {
 
   assert.equal(captured.output["1"].inputs.value, 3);
   assert.deepEqual(captured.queue_options, { number: 7 });
+});
+
+
+test("preserves native model metadata at every workflow scope", async () => {
+  const fixture = JSON.parse(
+    await readFile(
+      new URL(
+        "../fixtures/native-model-metadata-workflow.json",
+        import.meta.url,
+      ),
+      "utf8",
+    ),
+  );
+  const nestedRecord = {
+    name: "nested.safetensors",
+    url: (
+      "https://huggingface.co/example/nested/resolve/main/"
+      + "models/nested.safetensors"
+    ),
+    directory: "vae",
+    hash: "c".repeat(64),
+    hash_type: "sha256",
+  };
+  const workflow = structuredClone(fixture);
+  workflow.models = [{ ...nestedRecord }];
+  workflow.definitions = {
+    subgraphs: [
+      {
+        id: "inner",
+        nodes: [
+          {
+            id: 4,
+            type: "VAELoader",
+            mode: 0,
+            widgets_values: ["nested.safetensors"],
+            properties: { models: [{ ...nestedRecord }] },
+          },
+        ],
+      },
+    ],
+  };
+  const expectedWorkflow = structuredClone(workflow);
+  const output = {
+    "1": {
+      class_type: "UNETLoader",
+      inputs: { unet_name: "cloud-run-native-proof.safetensors" },
+    },
+  };
+  const api = {
+    async queuePrompt() {
+      throw new Error("local prompt execution is forbidden");
+    },
+  };
+  const app = {
+    async queuePrompt() {
+      await api.queuePrompt(0, { workflow, output }, {});
+      workflow.nodes[0].properties.models.length = 0;
+      workflow.models.length = 0;
+      workflow.definitions.subgraphs.length = 0;
+      return true;
+    },
+  };
+
+  const captured = await captureOfficialQueuePayload({ app, api });
+
+  assert.deepEqual(Object.keys(captured).sort(), [
+    "output",
+    "queue_options",
+    "workflow",
+  ]);
+  assert.deepEqual(captured.workflow, expectedWorkflow);
+  assert.deepEqual(
+    captured.workflow.nodes[0].properties.models,
+    fixture.nodes[0].properties.models,
+  );
+  assert.deepEqual(
+    captured.workflow.definitions.subgraphs[0].nodes[0].properties.models,
+    [nestedRecord],
+  );
+  assert.deepEqual(captured.output, output);
+  assert.deepEqual(captured.queue_options, {});
+  assert.equal(
+    executionDigest(captured),
+    executionDigest({
+      ...captured,
+      workflow: { nodes: [], models: [] },
+    }),
+  );
 });

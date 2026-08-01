@@ -12,6 +12,7 @@ from cloud_run.models import (
 )
 from cloud_run.offers import HostBlacklist
 from cloud_run.repository import AttemptRepository, SessionRepository
+from cloud_run.session_service import TerminalProvisioningError
 from cloud_run.vast import VastError
 from cloud_run.worker_release import WorkerRelease
 
@@ -45,6 +46,7 @@ def quote(
     machine_id="machine-7",
     host_id="host-3",
     public_ipaddr="8.8.8.8",
+    max_instance_creates=1,
 ):
     return OfferQuote(
         offer_id=offer_id,
@@ -70,6 +72,7 @@ def quote(
         machine_id=machine_id,
         host_id=host_id,
         public_ipaddr=public_ipaddr,
+        max_instance_creates=max_instance_creates,
     )
 
 
@@ -344,6 +347,8 @@ class CancellationAndReadinessTests(LifecycleTestCase):
                     "gpu_ram_gb": 24.0,
                     "dph_total": 0.42,
                     "reliability": 0.99,
+                    "inet_down_mbps": 500.0,
+                    "disk_bw_mbps": 600.0,
                     "machine_id": "machine-7",
                     "host_id": "host-3",
                     "public_ipaddr": "8.8.8.8",
@@ -597,6 +602,7 @@ class RecoveryAndReplacementTests(LifecycleTestCase):
         attempt = self.save_attempt(
             AttemptState.STARTING,
             instance_id="instance-1",
+            selected_quote=quote(max_instance_creates=2),
         )
         self.provider.instances = [
             provider_instance("instance-1", attempt.label)
@@ -621,6 +627,8 @@ class RecoveryAndReplacementTests(LifecycleTestCase):
                 "machine_id": "machine-8",
                 "host_id": "host-4",
                 "public_ipaddr": "1.1.1.1",
+                "inet_down_mbps": 1200.0,
+                "disk_bw_mbps": 700.0,
             },
         ]
 
@@ -635,6 +643,10 @@ class RecoveryAndReplacementTests(LifecycleTestCase):
         self.assertEqual(replacement.retry_count, 1)
         self.assertEqual(replacement.instance_id, "instance-2")
         self.assertEqual(replacement.quote.offer_id, "43")
+        self.assertIn("inet_down_mbps", replacement.quote.to_record())
+        self.assertEqual(replacement.quote.inet_down_mbps, 1200.0)
+        self.assertEqual(replacement.quote.disk_bw_mbps, 700.0)
+        self.assertEqual(replacement.quote.max_instance_creates, 2)
         actions = [call[0] for call in self.provider.calls]
         self.assertLess(actions.index("destroy"), actions.index("search"))
         self.assertLess(actions.index("list"), actions.index("create"))
@@ -660,14 +672,100 @@ class RecoveryAndReplacementTests(LifecycleTestCase):
         )
         self.assertEqual(second_failure.state, AttemptState.FAILED)
         self.assertEqual(
+            second_failure.sanitized_error,
+            "The authorized total instance-create limit was reached.",
+        )
+        self.assertEqual(
             len([call for call in self.provider.calls if call[0] == "create"]),
             1,
+        )
+
+    def test_replacement_reapplies_connection_floors_before_create(self):
+        attempt = self.save_attempt(
+            AttemptState.STARTING,
+            instance_id="instance-1",
+            selected_quote=quote(max_instance_creates=2),
+        )
+        self.provider.instances = [
+            provider_instance("instance-1", attempt.label)
+        ]
+        self.provider.search_results = [
+            {
+                "offer_id": 43,
+                "gpu_name": "RTX 4090",
+                "gpu_ram_gb": 24.0,
+                "dph_total": 0.44,
+                "reliability": 0.999,
+                "inet_down_mbps": 400.0,
+                "disk_bw_mbps": 700.0,
+            }
+        ]
+
+        failed = asyncio.run(
+            self.lifecycle().handle_start_failure(
+                attempt.attempt_id,
+                failure_code="boot_timeout",
+            )
+        )
+
+        self.assertEqual(failed.state, AttemptState.FAILED)
+        self.assertEqual(
+            failed.sanitized_error,
+            "No safe replacement offer is currently available.",
+        )
+        self.assertEqual(
+            [call for call in self.provider.calls if call[0] == "create"],
+            [],
+        )
+
+    def test_legacy_limit_one_stops_before_blacklist_and_replacement_search(self):
+        attempt = self.save_attempt(
+            AttemptState.STARTING,
+            instance_id="instance-1",
+            selected_quote=quote(max_instance_creates=1),
+        )
+        self.provider.instances = [
+            provider_instance("instance-1", attempt.label)
+        ]
+
+        failed = asyncio.run(
+            self.lifecycle().handle_start_failure(
+                attempt.attempt_id,
+                failure_code="boot_timeout",
+            )
+        )
+
+        self.assertEqual(failed.state, AttemptState.FAILED)
+        self.assertIsNone(failed.instance_id)
+        self.assertEqual(failed.retry_count, 0)
+        self.assertEqual(
+            failed.sanitized_error,
+            "The authorized total instance-create limit was reached.",
+        )
+        self.assertEqual(
+            [call for call in self.provider.calls if call[0] == "search"],
+            [],
+        )
+        self.assertEqual(
+            [call for call in self.provider.calls if call[0] == "create"],
+            [],
+        )
+        self.assertFalse(
+            self.blacklist.contains(
+                {
+                    "machine_id": "machine-7",
+                    "host_id": "host-3",
+                    "public_ipaddr": "8.8.8.8",
+                },
+                now=self.clock(),
+            )
         )
 
     def test_replacement_never_uses_a_release_different_from_the_quote(self):
         attempt = self.save_attempt(
             AttemptState.STARTING,
             instance_id="instance-1",
+            selected_quote=quote(max_instance_creates=2),
         )
         self.provider.instances = [
             provider_instance("instance-1", attempt.label)
@@ -788,6 +886,8 @@ class RecoveringSessionService:
         self.recovery_calls = []
         self.deadline_destroy_calls = []
         self.deadline_prepare_calls = []
+        self.terminal_destroy_calls = []
+        self.active_work = {}
 
     async def bootstrap_session(self, session_id):
         session = self.repository.get(session_id)
@@ -801,6 +901,12 @@ class RecoveringSessionService:
 
     def confirmed_deadline_destroy(self, session_id):
         self.deadline_destroy_calls.append(session_id)
+
+    def confirmed_terminal_destroy(self, session_id):
+        state = self.repository.get(session_id).state
+        self.terminal_destroy_calls.append((session_id, state))
+        if state == SessionState.DESTROYED:
+            self.active_work[session_id] = "failed"
 
     async def prepare_deadline_destroy(self, session_id):
         self.deadline_prepare_calls.append(session_id)
@@ -829,6 +935,24 @@ class ReadySessionService(RecoveringSessionService):
                 installed_manifest_digest=session.manifest_digest,
             )
         return session
+
+
+class TerminalSessionService(RecoveringSessionService):
+    diagnostic = "Remote provisioning response was invalid."
+
+    async def bootstrap_session(self, session_id):
+        session = self.repository.get(session_id)
+        self.bootstrap_calls.append(session)
+        raise TerminalProvisioningError(self.diagnostic)
+
+
+class TerminalRecoverySessionService(RecoveringSessionService):
+    diagnostic = "Remote deadline enforcement failed."
+
+    async def recover_session(self, session_id):
+        session = self.repository.get(session_id)
+        self.recovery_calls.append(session)
+        raise TerminalProvisioningError(self.diagnostic)
 
 
 class SessionLifecycleTests(LifecycleTestCase):
@@ -862,8 +986,9 @@ class SessionLifecycleTests(LifecycleTestCase):
         session_id="session-1",
         instance_id="instance-1",
         retry_count=0,
+        max_instance_creates=1,
     ):
-        selected = quote()
+        selected = quote(max_instance_creates=max_instance_creates)
         session = CloudSession.new(
             "key-" + session_id,
             session_id=session_id,
@@ -945,8 +1070,132 @@ class SessionLifecycleTests(LifecycleTestCase):
         )
         self.assertEqual(len(self.session_service.bootstrap_calls), 1)
 
-    def test_recovery_lists_once_and_fails_closed_on_duplicate_label(self):
+    def test_terminal_provisioning_failure_destroys_and_verifies_immediately(self):
+        self.session_service = TerminalSessionService(self.sessions)
         session = self.save_session()
+        self.provider.instances = [
+            self.worker_instance("instance-1", session.label)
+        ]
+        lifecycle = self.session_lifecycle()
+        lifecycle.boot_deadline_seconds = 3
+        lifecycle.poll_interval_seconds = 1
+
+        destroyed = asyncio.run(
+            lifecycle.wait_until_session_ready(session.session_id)
+        )
+
+        self.assertEqual(destroyed.state, SessionState.DESTROYED)
+        self.assertIsNone(destroyed.instance_id)
+        self.assertFalse(destroyed.public_payload()["billing_may_continue"])
+        self.assertEqual(
+            destroyed.sanitized_error,
+            TerminalSessionService.diagnostic,
+        )
+        self.assertEqual(self.clock.sleeps, [])
+        self.assertEqual(
+            [call[0] for call in self.provider.calls],
+            ["get", "destroy", "list"],
+        )
+
+    def test_terminal_destroy_exception_keeps_residual_billing_warning(self):
+        self.session_service = TerminalSessionService(self.sessions)
+        session = self.save_session()
+        self.provider.instances = [
+            self.worker_instance("instance-1", session.label)
+        ]
+
+        async def failing_destroy(api_key, instance_id):
+            self.provider.calls.append(("destroy", instance_id, api_key))
+            raise RuntimeError("synthetic destroy failure")
+
+        self.provider.destroy_instance = failing_destroy
+        lifecycle = self.session_lifecycle()
+        lifecycle.boot_deadline_seconds = 3
+        lifecycle.poll_interval_seconds = 1
+
+        failed = asyncio.run(
+            lifecycle.wait_until_session_ready(session.session_id)
+        )
+
+        self.assertEqual(failed.state, SessionState.FAILED)
+        self.assertEqual(failed.instance_id, "instance-1")
+        self.assertEqual(failed.residual_inventory, ("instance-1",))
+        self.assertTrue(failed.public_payload()["billing_may_continue"])
+        self.assertEqual(
+            failed.sanitized_error,
+            "The Vast instance is still present; destroy it in "
+            "the Vast console immediately.",
+        )
+        self.assertEqual(self.clock.sleeps, [])
+        self.assertEqual(
+            [call[0] for call in self.provider.calls],
+            ["get", "destroy", "list"],
+        )
+
+    def test_terminal_destroy_unverifiable_inventory_keeps_warning(self):
+        self.session_service = TerminalSessionService(self.sessions)
+        session = self.save_session()
+        self.provider.instances = [
+            self.worker_instance("instance-1", session.label)
+        ]
+        self.provider.list_error = RuntimeError("synthetic inventory failure")
+        lifecycle = self.session_lifecycle()
+        lifecycle.boot_deadline_seconds = 3
+        lifecycle.poll_interval_seconds = 1
+
+        failed = asyncio.run(
+            lifecycle.wait_until_session_ready(session.session_id)
+        )
+
+        self.assertEqual(failed.state, SessionState.FAILED)
+        self.assertEqual(failed.instance_id, "instance-1")
+        self.assertEqual(failed.residual_inventory, ("instance-1",))
+        self.assertTrue(failed.public_payload()["billing_may_continue"])
+        self.assertEqual(
+            failed.sanitized_error,
+            "Destruction could not be verified because Vast inventory is unavailable.",
+        )
+        self.assertEqual(self.clock.sleeps, [])
+        self.assertEqual(
+            [call[0] for call in self.provider.calls],
+            ["get", "destroy", "list"],
+        )
+
+    def test_terminal_destroy_residual_label_keeps_warning(self):
+        self.session_service = TerminalSessionService(self.sessions)
+        session = self.save_session()
+        self.provider.instances = [
+            self.worker_instance("instance-1", session.label)
+        ]
+        self.provider.destroy_removes = False
+        lifecycle = self.session_lifecycle()
+        lifecycle.boot_deadline_seconds = 3
+        lifecycle.poll_interval_seconds = 1
+
+        failed = asyncio.run(
+            lifecycle.wait_until_session_ready(session.session_id)
+        )
+
+        self.assertEqual(failed.state, SessionState.FAILED)
+        self.assertEqual(failed.instance_id, "instance-1")
+        self.assertEqual(failed.residual_inventory, ("instance-1",))
+        self.assertTrue(failed.public_payload()["billing_may_continue"])
+        self.assertEqual(
+            failed.sanitized_error,
+            "The Vast instance is still present; destroy it in "
+            "the Vast console immediately.",
+        )
+        self.assertEqual(self.clock.sleeps, [])
+        self.assertEqual(
+            [call[0] for call in self.provider.calls],
+            ["get", "destroy", "list"],
+        )
+
+    def test_recovery_lists_once_and_fails_closed_on_duplicate_label(self):
+        session = self.save_session(
+            retry_count=1,
+            max_instance_creates=2,
+        )
         self.provider.instances = [
             self.worker_instance("instance-1", session.label),
             self.worker_instance("instance-2", session.label),
@@ -962,6 +1211,8 @@ class SessionLifecycleTests(LifecycleTestCase):
             failed.residual_inventory,
             ("instance-1", "instance-2"),
         )
+        self.assertEqual(failed.retry_count, 1)
+        self.assertEqual(failed.quote.max_instance_creates, 2)
         self.assertEqual(
             [call[0] for call in self.provider.calls],
             ["list"],
@@ -970,7 +1221,11 @@ class SessionLifecycleTests(LifecycleTestCase):
         self.assertEqual(self.session_service.bootstrap_calls, [])
 
     def test_restart_adopts_one_instance_and_reenforces_session_recovery(self):
-        session = self.save_session(state=SessionState.READY)
+        session = self.save_session(
+            state=SessionState.READY,
+            retry_count=1,
+            max_instance_creates=2,
+        )
         self.provider.instances = [
             self.worker_instance("instance-1", session.label)
         ]
@@ -980,6 +1235,8 @@ class SessionLifecycleTests(LifecycleTestCase):
         )
 
         self.assertEqual(len(recovered), 1)
+        self.assertEqual(recovered[0].retry_count, 1)
+        self.assertEqual(recovered[0].quote.max_instance_creates, 2)
         self.assertEqual(
             self.sessions.get(session.session_id).worker_base_url,
             "http://8.8.8.8:32100",
@@ -988,6 +1245,56 @@ class SessionLifecycleTests(LifecycleTestCase):
         self.assertEqual(
             [call[0] for call in self.provider.calls],
             ["list"],
+        )
+
+    def test_terminal_recovery_failure_destroys_and_verifies_immediately(self):
+        self.session_service = TerminalRecoverySessionService(self.sessions)
+        session = self.save_session(state=SessionState.READY)
+        self.provider.instances = [
+            self.worker_instance("instance-1", session.label)
+        ]
+
+        recovered = asyncio.run(
+            self.session_lifecycle().recover_sessions()
+        )
+
+        destroyed = self.sessions.get(session.session_id)
+        self.assertEqual(recovered, [destroyed])
+        self.assertEqual(destroyed.state, SessionState.DESTROYED)
+        self.assertIsNone(destroyed.instance_id)
+        self.assertFalse(destroyed.public_payload()["billing_may_continue"])
+        self.assertEqual(
+            destroyed.sanitized_error,
+            TerminalRecoverySessionService.diagnostic,
+        )
+        self.assertEqual(self.clock.sleeps, [])
+        self.assertEqual(
+            [call[0] for call in self.provider.calls],
+            ["list", "destroy", "list"],
+        )
+
+    def test_terminal_running_recovery_abandons_work_after_verified_destroy(self):
+        self.session_service = TerminalRecoverySessionService(self.sessions)
+        session = self.save_session(state=SessionState.RUNNING)
+        self.session_service.active_work[session.session_id] = "running"
+        self.provider.instances = [
+            self.worker_instance("instance-1", session.label)
+        ]
+
+        recovered = asyncio.run(
+            self.session_lifecycle().recover_sessions()
+        )
+
+        destroyed = self.sessions.get(session.session_id)
+        self.assertEqual(recovered, [destroyed])
+        self.assertEqual(destroyed.state, SessionState.DESTROYED)
+        self.assertEqual(
+            self.session_service.terminal_destroy_calls,
+            [(session.session_id, SessionState.DESTROYED)],
+        )
+        self.assertEqual(
+            self.session_service.active_work[session.session_id],
+            "failed",
         )
 
     def test_expired_session_absence_is_recorded_as_deadline_destruction(self):
@@ -1074,7 +1381,7 @@ class SessionLifecycleTests(LifecycleTestCase):
         )
 
     def test_only_boot_failure_replaces_once_after_inventory_absence(self):
-        session = self.save_session()
+        session = self.save_session(max_instance_creates=2)
         self.provider.instances = [
             self.worker_instance("instance-1", session.label)
         ]
@@ -1088,6 +1395,8 @@ class SessionLifecycleTests(LifecycleTestCase):
                 "machine_id": "machine-8",
                 "host_id": "host-4",
                 "public_ipaddr": "1.1.1.1",
+                "inet_down_mbps": 1000.0,
+                "disk_bw_mbps": 750.0,
             }
         ]
 
@@ -1102,12 +1411,19 @@ class SessionLifecycleTests(LifecycleTestCase):
         self.assertEqual(replacement.retry_count, 1)
         self.assertEqual(replacement.instance_id, "instance-2")
         self.assertEqual(replacement.quote.offer_id, "43")
+        self.assertIn("inet_down_mbps", replacement.quote.to_record())
+        self.assertEqual(replacement.quote.inet_down_mbps, 1000.0)
+        self.assertEqual(replacement.quote.disk_bw_mbps, 750.0)
+        self.assertEqual(replacement.quote.max_instance_creates, 2)
         actions = [call[0] for call in self.provider.calls]
         self.assertEqual(actions, ["destroy", "list", "search", "create"])
 
         self.provider.instances = [
             self.worker_instance("instance-2", replacement.label)
         ]
+        search_count = len(
+            [call for call in self.provider.calls if call[0] == "search"]
+        )
         exhausted = asyncio.run(
             self.session_lifecycle().handle_session_boot_failure(
                 session.session_id,
@@ -1116,12 +1432,106 @@ class SessionLifecycleTests(LifecycleTestCase):
         )
         self.assertEqual(exhausted.state, SessionState.FAILED)
         self.assertEqual(
+            exhausted.sanitized_error,
+            "The authorized total instance-create limit was reached.",
+        )
+        self.assertEqual(
+            len([call for call in self.provider.calls if call[0] == "search"]),
+            search_count,
+        )
+        self.assertEqual(
             len([call for call in self.provider.calls if call[0] == "create"]),
             1,
         )
 
+    def test_session_replacement_reapplies_connection_floors_before_create(self):
+        session = self.save_session(max_instance_creates=2)
+        self.provider.instances = [
+            self.worker_instance("instance-1", session.label)
+        ]
+        self.provider.search_results = [
+            {
+                "offer_id": 43,
+                "gpu_name": "RTX 4090",
+                "gpu_ram_gb": 24.0,
+                "dph_total": 0.44,
+                "reliability": 0.999,
+                "inet_down_mbps": 400.0,
+                "disk_bw_mbps": 750.0,
+            }
+        ]
+
+        failed = asyncio.run(
+            self.session_lifecycle().handle_session_boot_failure(
+                session.session_id,
+                failure_code="boot_timeout",
+            )
+        )
+
+        self.assertEqual(failed.state, SessionState.FAILED)
+        self.assertEqual(
+            failed.sanitized_error,
+            "No safe replacement offer is currently available.",
+        )
+        self.assertEqual(
+            [call for call in self.provider.calls if call[0] == "create"],
+            [],
+        )
+
+    def test_limit_one_destroys_failed_boot_without_replacement_search(self):
+        session = self.save_session(max_instance_creates=1)
+        self.provider.instances = [
+            self.worker_instance("instance-1", session.label)
+        ]
+        asyncio.run(
+            self.provider.create_instance(
+                "synthetic-value",
+                offer_id=session.quote.offer_id,
+                disk_gb=session.disk_gb,
+                label=session.label,
+                release=worker_release(),
+            )
+        )
+        initial_create_count = len(
+            [call for call in self.provider.calls if call[0] == "create"]
+        )
+
+        result = asyncio.run(
+            self.session_lifecycle().handle_session_boot_failure(
+                session.session_id,
+                failure_code="boot_timeout",
+            )
+        )
+
+        self.assertEqual(result.state, SessionState.FAILED)
+        self.assertIsNone(result.instance_id)
+        self.assertEqual(result.retry_count, 0)
+        self.assertEqual(
+            [call for call in self.provider.calls if call[0] == "search"],
+            [],
+        )
+        self.assertEqual(
+            len([call for call in self.provider.calls if call[0] == "create"]),
+            initial_create_count,
+        )
+        self.assertEqual(initial_create_count, 1)
+        self.assertFalse(
+            self.blacklist.contains(
+                {
+                    "machine_id": "machine-7",
+                    "host_id": "host-3",
+                    "public_ipaddr": "8.8.8.8",
+                },
+                now=self.clock(),
+            )
+        )
+        self.assertEqual(
+            result.sanitized_error,
+            "The authorized total instance-create limit was reached.",
+        )
+
     def test_ambiguous_replacement_create_adopts_inventory_without_second_create(self):
-        session = self.save_session()
+        session = self.save_session(max_instance_creates=2)
         self.provider.instances = [
             self.worker_instance("instance-1", session.label)
         ]
@@ -1135,6 +1545,8 @@ class SessionLifecycleTests(LifecycleTestCase):
                 "machine_id": "machine-8",
                 "host_id": "host-4",
                 "public_ipaddr": "1.1.1.1",
+                "inet_down_mbps": 1000.0,
+                "disk_bw_mbps": 750.0,
             }
         ]
         original_create = self.provider.create_instance
@@ -1164,6 +1576,7 @@ class SessionLifecycleTests(LifecycleTestCase):
         self.assertEqual(replacement.state, SessionState.BOOTSTRAPPING)
         self.assertEqual(replacement.instance_id, "instance-2")
         self.assertEqual(replacement.retry_count, 1)
+        self.assertEqual(replacement.quote.max_instance_creates, 2)
         self.assertEqual(
             [call[0] for call in self.provider.calls],
             ["destroy", "list", "search", "create", "list"],

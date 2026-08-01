@@ -56,6 +56,90 @@ function safeMappingCandidate(value) {
 }
 
 
+function safeHuggingFaceProvenance(item) {
+  const locator = item?.source_locator;
+  const revision = item?.immutable_revision;
+  if (
+    item?.status !== "resolved"
+    || item?.source_kind !== "huggingface"
+    || typeof locator !== "string"
+    || !locator
+    || locator.length > 8192
+    || locator.includes("%")
+    || locator.includes("\\")
+    || typeof revision !== "string"
+    || !/^[0-9a-f]{40}$/.test(revision)
+  ) {
+    return null;
+  }
+  for (let index = 0; index < locator.length; index += 1) {
+    const code = locator.charCodeAt(index);
+    if (code < 33 || code > 126) return null;
+  }
+
+  let parsed;
+  try {
+    parsed = new URL(locator);
+  } catch {
+    return null;
+  }
+  if (
+    parsed.protocol !== "https:"
+    || parsed.hostname !== "huggingface.co"
+    || parsed.username
+    || parsed.password
+    || parsed.port
+    || parsed.hash
+    || parsed.search
+    || parsed.href !== locator
+  ) {
+    return null;
+  }
+
+  const parts = parsed.pathname.split("/");
+  const repositoryPart = /^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/;
+  const pathPart = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,199}$/;
+  if (
+    parts.length < 6
+    || parts[0] !== ""
+    || !repositoryPart.test(parts[1])
+    || !repositoryPart.test(parts[2])
+    || parts[3] !== "resolve"
+    || parts[4] !== revision
+    || !parts.slice(5).every((part) => pathPart.test(part))
+  ) {
+    return null;
+  }
+
+  const destination = item?.destination;
+  const destinationParts = typeof destination === "string"
+    ? destination.split("/")
+    : [];
+  if (
+    !destination
+    || destination.startsWith("/")
+    || destination.includes("\\")
+    || destinationParts.some((part) => !part || part === "." || part === "..")
+  ) {
+    return null;
+  }
+  const digest = typeof item?.sha256 === "string"
+    && /^[0-9a-f]{64}$/.test(item.sha256)
+    ? item.sha256.slice(0, 12)
+    : null;
+  if (digest === null) return null;
+
+  const repository = `${parts[1]}/${parts[2]}`;
+  return {
+    repository,
+    filePath: parts.slice(5).join("/"),
+    repositoryUrl: `${parsed.origin}/${repository}`,
+    destination,
+    digest,
+  };
+}
+
+
 function money(value) {
   const number = finiteNumber(value);
   return number !== null && number >= 0 ? `$${number.toFixed(2)}` : "unknown";
@@ -63,10 +147,63 @@ function money(value) {
 
 
 function bandwidthPrice(value) {
-  const number = finiteNumber(value);
+  const number = strictNonnegativeNumber(value);
   return number !== null && number >= 0
     ? `$${number.toFixed(3)}/GB`
     : "unavailable";
+}
+
+
+function strictNonnegativeNumber(value) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? value
+    : null;
+}
+
+
+function metricText(value, unit) {
+  const number = strictNonnegativeNumber(value);
+  return number === null
+    ? "unavailable"
+    : `${number.toFixed(1).replace(/\.0$/, "")} ${unit}`;
+}
+
+
+function downloadClassText(value) {
+  const downloadMbps = strictNonnegativeNumber(value);
+  if (downloadMbps === null || downloadMbps < 500) return "unavailable";
+  return downloadMbps >= 1000
+    ? "target (1000 Mbps or faster)"
+    : "fallback (500–999 Mbps)";
+}
+
+
+function theoreticalTransferText(value) {
+  if (
+    typeof value !== "number"
+    || !Number.isSafeInteger(value)
+    || value < 0
+  ) {
+    return "unavailable";
+  }
+  if (value < 60) return `${value} second${value === 1 ? "" : "s"}`;
+  const minutes = Math.ceil(value / 60);
+  return `${minutes} minute${minutes === 1 ? "" : "s"}`;
+}
+
+
+function estimatedTransferSeconds(transferBytes, inetDownMbps) {
+  const speed = strictNonnegativeNumber(inetDownMbps);
+  if (
+    !Number.isSafeInteger(transferBytes)
+    || transferBytes < 0
+    || speed === null
+    || speed <= 0
+  ) {
+    return null;
+  }
+  const estimate = Math.ceil(transferBytes * 8 / (speed * 1_000_000));
+  return Number.isSafeInteger(estimate) && estimate >= 0 ? estimate : null;
 }
 
 
@@ -521,6 +658,25 @@ export function createSessionConsole(document, api = {}, options = {}) {
         `${revision ? ` @ ${revision}` : ""}` +
         `${size === null ? "" : ` — ${bytesText(size)}`}` +
         reason;
+      const provenance = safeHuggingFaceProvenance(item);
+      if (provenance) {
+        const details = element(document, "div", {
+          className: "cloud-run-model-provenance",
+        });
+        const repositoryLink = element(document, "a", {
+          text: provenance.repository,
+        });
+        repositoryLink.setAttribute("href", provenance.repositoryUrl);
+        repositoryLink.setAttribute("target", "_blank");
+        repositoryLink.setAttribute("rel", "noopener noreferrer");
+        details.append(
+          "Verified model: ",
+          repositoryLink,
+          `/${provenance.filePath} — destination ${provenance.destination}`,
+          ` — SHA-256 ${provenance.digest}`,
+        );
+        row.appendChild(details);
+      }
       const candidate = safeMappingCandidate(item?.mapping_candidate);
       if (
         state === "mapping_required"
@@ -633,12 +789,24 @@ export function createSessionConsole(document, api = {}, options = {}) {
           ? "unavailable"
           : `${(Number(quote.reliability) * 100).toFixed(1)}%`
       }`,
+      `Download: ${metricText(quote.inet_down_mbps, "Mbps")}`,
+      `Disk speed: ${metricText(quote.disk_bw_mbps, "MB/s")}`,
+      `Download class: ${downloadClassText(quote.inet_down_mbps)}`,
       `Bandwidth: ${bandwidthPrice(quote.inet_down_cost)} down; ` +
         `${bandwidthPrice(quote.inet_up_cost)} up`,
+      `theoretical transfer ≈ ${theoreticalTransferText(
+        estimatedTransferSeconds(
+          quote.transfer_bytes,
+          quote.inet_down_mbps,
+        ),
+      )}; actual startup can be longer`,
       `${positiveInteger(quote.disk_gb) ?? "unknown"} GB ephemeral disk`,
       `${bytesText(quote.transfer_bytes)} dependencies and inputs`,
       `${bytesText(quote.output_allowance_bytes)} output allowance`,
       durationText(quote.duration_seconds),
+      `Maximum total instance creates: ${
+        positiveInteger(quote.max_instance_creates) ?? "unknown"
+      }`,
       `approximately ${money(quote.approximate_max_active_charge)} ` +
         "active/storage",
       `template ${safeText(quote.template_hash_id, "unavailable")}`,
@@ -676,18 +844,53 @@ export function createSessionConsole(document, api = {}, options = {}) {
       provisioningStatus.textContent = "";
       return;
     }
-    const phase = {
+    const sessionPhase = {
       bootstrapping: "Worker authentication",
       provisioning: "Verified transfer/install",
       validating: "Remote /object_info validation",
       repairing: "One approved repair",
     }[statusValue];
-    const transferred = finiteNumber(progress?.transferred_bytes);
-    const total = finiteNumber(progress?.total_bytes);
+    const workerPhases = {
+      dependency_transfer: "Dependency transfer",
+      model_transfer: "Model transfer",
+      digest_verification: "Digest verification",
+      comfyui_startup: "ComfyUI startup",
+      environment_validation: "Environment validation",
+      ready: "Provisioning ready",
+    };
+    const workerPhase = typeof progress?.phase === "string"
+      && Object.hasOwn(workerPhases, progress.phase)
+      ? progress.phase
+      : null;
+    const phase = workerPhase === null
+      ? sessionPhase
+      : workerPhases[workerPhase];
+    const transferred = Number.isSafeInteger(progress?.transferred_bytes)
+      && progress.transferred_bytes >= 0
+      ? progress.transferred_bytes
+      : null;
+    const total = Number.isSafeInteger(progress?.total_bytes)
+      && progress.total_bytes >= 0
+      && transferred !== null
+      && transferred <= progress.total_bytes
+      ? progress.total_bytes
+      : null;
     const bytes =
       transferred !== null && total !== null
         ? ` — ${bytesText(transferred)} of ${bytesText(total)}`
         : "";
+    const currentModel = (
+      workerPhase !== null
+      && ["model_transfer", "digest_verification"].includes(workerPhase)
+      && typeof progress?.current_model === "string"
+      && progress.current_model
+      && progress.current_model.length <= 500
+      && !Array.from(progress.current_model).some(
+        (character) => character.charCodeAt(0) < 32,
+      )
+    )
+      ? progress.current_model
+      : null;
     const installs = positiveInteger(progress?.installed_units);
     const validation = positiveInteger(progress?.validated_units);
     const secondsWithoutProgress = Number(progress?.seconds_without_progress);
@@ -704,6 +907,7 @@ export function createSessionConsole(document, api = {}, options = {}) {
       : "cloud-run-provisioning-status";
     provisioningStatus.textContent =
       `${phase}${bytes}` +
+      `${currentModel === null ? "" : ` — model ${currentModel}`}` +
       `${installs === null ? "" : ` — ${installs} install units`}` +
       `${validation === null ? "" : ` — ${validation} validations`}` +
       (

@@ -1,11 +1,14 @@
 import ast
+import asyncio
 import inspect
 import unittest
 from pathlib import Path
 
 from cloud_run import vast
+from cloud_run.session_service import PreflightBlocked
 from remote_worker import deadline
 from remote_worker.server import worker_route_set
+from tests.python.test_fake_session_integration import FakeCloudRunSystem
 from tests.python.test_routes import captured_handlers
 
 
@@ -13,6 +16,40 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 
 class ProviderMutationSurfaceTests(unittest.TestCase):
+    def test_blocked_source_first_preflight_is_read_only_and_transfer_free(self):
+        system = FakeCloudRunSystem()
+        self.addCleanup(system.close)
+        payload = system.source_first_capture_payload()
+        system.huggingface.gated = True
+
+        capture = system.capture(payload)
+        preflight = system.preflight(
+            capture,
+            explicit_output_allowance_bytes=4_096,
+        )
+
+        self.assertFalse(preflight.rentable)
+        self.assertTrue(
+            any(row.status == "unsupported" for row in preflight.rows)
+        )
+        with self.assertRaises(PreflightBlocked):
+            asyncio.run(system.service.search(preflight.preflight_id))
+        self.assertEqual(system.huggingface.metadata_calls, 2)
+        self.assertTrue(
+            all(
+                request.startswith("https://huggingface.co/api/models/")
+                for request in system.huggingface.requests
+            )
+        )
+        self.assertEqual(system.vast.search_count, 0)
+        self.assertEqual(system.vast.get_offer_count, 0)
+        self.assertEqual(system.vast.create_count, 0)
+        self.assertEqual(system.vast.destroy_count, 0)
+        self.assertEqual(system.vast.mutations, [])
+        self.assertEqual(system.worker.model_byte_calls, 0)
+        self.assertEqual(system.worker.upload_offsets, {})
+        self.assertEqual(system.cache_mutations, [])
+
     def test_repository_contract_authorizes_only_human_gated_sessions(self):
         agents = (REPOSITORY_ROOT / "AGENTS.md").read_text(encoding="utf-8")
         project_state = (REPOSITORY_ROOT / "docs" / "project-state.md").read_text(

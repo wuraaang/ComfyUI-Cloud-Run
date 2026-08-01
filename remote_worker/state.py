@@ -38,6 +38,49 @@ _JOB_RECORD_FIELDS = {
     "error",
     "updated_at",
 }
+_PROVISION_STATES = {
+    "applying",
+    "awaiting_upload",
+    "ready",
+    "failed",
+    "stalled",
+}
+_PROVISION_PHASES = {
+    "dependency_transfer",
+    "model_transfer",
+    "digest_verification",
+    "comfyui_startup",
+    "environment_validation",
+    "ready",
+}
+_ARTIFACT_PROVISION_PHASES = {
+    "dependency_transfer",
+    "model_transfer",
+    "digest_verification",
+}
+_PROVISION_RECORD_FIELDS = {
+    "kind",
+    "transaction_id",
+    "manifest_digest",
+    "manifest",
+    "required_class_types",
+    "state",
+    "planned_restarts",
+    "repair_restarts",
+    "repair_used",
+    "missing_class_types",
+    "missing_artifacts",
+    "failure_code",
+    "updated_at",
+    "last_progress_at",
+    "progress",
+}
+_PROGRESS_FIELDS = {
+    "phase",
+    "dependency_id",
+    "transferred_bytes",
+    "total_bytes",
+}
 _STATE_FIELDS = {
     "schema_version",
     "protocol_version",
@@ -142,6 +185,86 @@ def _validate_job_record(job_id, record):
             or not isinstance(output.get("private_path"), str)
         ):
             raise WorkerStateError("Worker job state is invalid.")
+    return record
+
+
+def _validate_identifier_list(value):
+    return (
+        isinstance(value, list)
+        and len(value) <= 100_000
+        and all(_identifier(item) for item in value)
+        and len(value) == len(set(value))
+    )
+
+
+def _validate_provision_progress(value):
+    if value is None:
+        return
+    if not isinstance(value, dict) or set(value) != _PROGRESS_FIELDS:
+        raise WorkerStateError("Worker provisioning state is invalid.")
+    phase = value.get("phase")
+    dependency_id = value.get("dependency_id")
+    transferred_bytes = value.get("transferred_bytes")
+    total_bytes = value.get("total_bytes")
+    if (
+        not isinstance(phase, str)
+        or phase not in _PROVISION_PHASES
+        or isinstance(transferred_bytes, bool)
+        or not isinstance(transferred_bytes, int)
+        or isinstance(total_bytes, bool)
+        or not isinstance(total_bytes, int)
+        or not 0 <= transferred_bytes <= total_bytes
+        or (
+            phase in _ARTIFACT_PROVISION_PHASES
+            and not _identifier(dependency_id)
+        )
+        or (
+            phase not in _ARTIFACT_PROVISION_PHASES
+            and dependency_id is not None
+        )
+        or (phase == "ready" and transferred_bytes != total_bytes)
+    ):
+        raise WorkerStateError("Worker provisioning state is invalid.")
+
+
+def _validate_provision_record(transaction_id, record):
+    if (
+        not _identifier(transaction_id)
+        or not isinstance(record, dict)
+        or set(record) != _PROVISION_RECORD_FIELDS
+        or record.get("kind") != "provision"
+        or record.get("transaction_id") != transaction_id
+        or not isinstance(record.get("manifest_digest"), str)
+        or not _HEX_64.fullmatch(record["manifest_digest"])
+        or record.get("manifest") is not None
+        or not _validate_identifier_list(
+            record.get("required_class_types")
+        )
+        or record.get("state") not in _PROVISION_STATES
+        or record.get("planned_restarts") not in {0, 1}
+        or isinstance(record.get("planned_restarts"), bool)
+        or record.get("repair_restarts") not in {0, 1}
+        or isinstance(record.get("repair_restarts"), bool)
+        or not isinstance(record.get("repair_used"), bool)
+        or not _validate_identifier_list(
+            record.get("missing_class_types")
+        )
+        or not _validate_identifier_list(record.get("missing_artifacts"))
+        or (
+            record.get("failure_code") is not None
+            and not _identifier(record["failure_code"])
+        )
+        or not _finite_number(record.get("updated_at"))
+        or not _finite_number(record.get("last_progress_at"))
+    ):
+        raise WorkerStateError("Worker provisioning state is invalid.")
+    _validate_provision_progress(record.get("progress"))
+    if (
+        record["progress"] is not None
+        and (record["progress"]["phase"] == "ready")
+        != (record["state"] == "ready")
+    ):
+        raise WorkerStateError("Worker provisioning state is invalid.")
     return record
 
 
@@ -409,6 +532,8 @@ class WorkerStateStore:
             )
         ):
             raise WorkerStateError("Worker transaction state is invalid.")
+        if record["kind"] == "provision":
+            _validate_provision_record(transaction_id, record)
         state = self.load()
         if not state["claimed"]:
             raise WorkerStateError("Worker is not claimed.")

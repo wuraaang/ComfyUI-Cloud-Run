@@ -114,6 +114,15 @@ class FileInputMetadata:
 
 
 @dataclass(frozen=True)
+class StaticFileRequirement:
+    node_id: str
+    class_type: str
+    input_name: str
+    metadata: FileInputMetadata
+    value: object
+
+
+@dataclass(frozen=True)
 class ArtifactResolution:
     node_id: str
     class_type: str
@@ -455,6 +464,33 @@ def _metadata_for(metadata, class_type):
     return result
 
 
+def static_file_requirements(capture, metadata):
+    output = getattr(capture, "output", None)
+    if not isinstance(output, dict):
+        raise ArtifactResolutionError("Compiled prompt is invalid.")
+    requirements = []
+    for raw_node_id, node in output.items():
+        node_id = str(raw_node_id)
+        if not isinstance(node, dict):
+            raise ArtifactResolutionError("Compiled prompt node is invalid.")
+        class_type = str(node.get("class_type") or "")
+        inputs = node.get("inputs")
+        if not class_type or not isinstance(inputs, dict):
+            raise ArtifactResolutionError("Compiled prompt node is invalid.")
+        rules = _metadata_for(metadata, class_type)
+        for input_name, rule in rules.items():
+            requirements.append(
+                StaticFileRequirement(
+                    node_id=node_id,
+                    class_type=class_type,
+                    input_name=input_name,
+                    metadata=rule,
+                    value=inputs.get(input_name),
+                )
+            )
+    return tuple(requirements)
+
+
 def _roots_for_model(model_roots, category):
     configured = model_roots.get(category, ())
     if isinstance(configured, (str, os.PathLike)):
@@ -484,6 +520,59 @@ def _artifact_id(kind, digest):
     return f"{kind}-{digest}"
 
 
+def _normalized_model_sources(model_sources):
+    if model_sources is None:
+        return {}
+    if not isinstance(model_sources, dict):
+        raise ArtifactResolutionError("Workflow model sources are invalid.")
+    from .model_sources import ModelSourceResolution
+
+    allowed_reasons = {
+        "Native model metadata is missing or ambiguous.",
+        "Native model metadata is invalid.",
+        "The public Hugging Face file could not be verified.",
+    }
+    normalized = {}
+    for key, resolution in model_sources.items():
+        if (
+            not isinstance(key, tuple)
+            or len(key) != 2
+            or not all(isinstance(part, str) and part for part in key)
+            or not isinstance(resolution, ModelSourceResolution)
+        ):
+            raise ArtifactResolutionError("Workflow model source is invalid.")
+        if resolution.status == "resolved":
+            if (
+                not isinstance(resolution.source, SourceSpec)
+                or resolution.source.kind != "huggingface"
+                or resolution.source.secret_handle is not None
+                or not isinstance(resolution.size_bytes, int)
+                or isinstance(resolution.size_bytes, bool)
+                or resolution.size_bytes <= 0
+                or not isinstance(resolution.sha256, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", resolution.sha256)
+                or resolution.reason is not None
+            ):
+                raise ArtifactResolutionError(
+                    "Resolved workflow model source is invalid."
+                )
+            validate_dependency(resolution.source)
+        elif resolution.status in {"mapping_required", "unsupported"}:
+            if (
+                resolution.source is not None
+                or resolution.size_bytes is not None
+                or resolution.sha256 is not None
+                or resolution.reason not in allowed_reasons
+            ):
+                raise ArtifactResolutionError(
+                    "Unresolved workflow model source is invalid."
+                )
+        else:
+            raise ArtifactResolutionError("Workflow model source is invalid.")
+        normalized[key] = resolution
+    return normalized
+
+
 def resolve_artifacts(
     capture,
     *,
@@ -491,7 +580,10 @@ def resolve_artifacts(
     model_roots,
     input_root,
     source_mappings,
+    model_sources=None,
+    requirements=None,
 ):
+    model_sources = _normalized_model_sources(model_sources)
     if not isinstance(source_mappings, dict):
         raise ArtifactResolutionError("Artifact source mappings are invalid.")
     normalized_sources = {}
@@ -511,23 +603,142 @@ def resolve_artifacts(
     rows = []
     artifacts = []
     local_artifacts = {}
-    output = getattr(capture, "output", None)
-    if not isinstance(output, dict):
-        raise ArtifactResolutionError("Compiled prompt is invalid.")
-    for raw_node_id, node in output.items():
-        node_id = str(raw_node_id)
-        if not isinstance(node, dict):
-            raise ArtifactResolutionError("Compiled prompt node is invalid.")
-        class_type = str(node.get("class_type") or "")
-        inputs = node.get("inputs")
-        if not class_type or not isinstance(inputs, dict):
-            raise ArtifactResolutionError("Compiled prompt node is invalid.")
-        rules = _metadata_for(metadata, class_type)
-        for input_name, rule in rules.items():
-            value = inputs.get(input_name)
-            if not isinstance(value, str):
-                if value is None:
+    if requirements is None:
+        requirements = static_file_requirements(capture, metadata)
+    elif not isinstance(requirements, tuple) or not all(
+        isinstance(requirement, StaticFileRequirement)
+        for requirement in requirements
+    ):
+        raise ArtifactResolutionError("Static file requirements are invalid.")
+    for requirement in requirements:
+        node_id = requirement.node_id
+        class_type = requirement.class_type
+        input_name = requirement.input_name
+        rule = requirement.metadata
+        value = requirement.value
+        if not isinstance(value, str):
+            if value is None:
+                continue
+            rows.append(
+                ArtifactResolution(
+                    node_id,
+                    class_type,
+                    input_name,
+                    rule.kind,
+                    "unsupported",
+                    None,
+                    reason="File-backed input is not a static filename.",
+                )
+            )
+            continue
+        try:
+            relative = _safe_relative(value)
+        except ArtifactPathError:
+            rows.append(
+                ArtifactResolution(
+                    node_id,
+                    class_type,
+                    input_name,
+                    rule.kind,
+                    "unsupported",
+                    None,
+                    reason="File-backed input cannot be resolved safely.",
+                )
+            )
+            continue
+
+        model_resolution = None
+        local_path = None
+        if rule.kind == "model":
+            destination = (
+                PurePosixPath("models")
+                / str(rule.category)
+                / relative
+            ).as_posix()
+            model_resolution = model_sources.get((node_id, input_name))
+            if (
+                model_resolution is not None
+                and model_resolution.status != "resolved"
+            ):
+                rows.append(
+                    ArtifactResolution(
+                        node_id,
+                        class_type,
+                        input_name,
+                        rule.kind,
+                        model_resolution.status,
+                        destination,
+                        reason=model_resolution.reason,
+                    )
+                )
+                continue
+            try:
+                roots = _roots_for_model(model_roots, rule.category)
+                _, local_path = _find_asset(relative, roots)
+            except FileNotFoundError:
+                local_path = None
+            except ArtifactPathError:
+                if model_resolution is not None:
+                    local_path = None
+                else:
+                    rows.append(
+                        ArtifactResolution(
+                            node_id,
+                            class_type,
+                            input_name,
+                            rule.kind,
+                            "unsupported",
+                            destination,
+                            reason=(
+                                "File-backed input cannot be resolved safely."
+                            ),
+                        )
+                    )
                     continue
+            if model_resolution is not None:
+                file_digest = FileDigest(
+                    size_bytes=model_resolution.size_bytes,
+                    sha256=model_resolution.sha256,
+                )
+                source = model_resolution.source
+                if local_path is not None:
+                    try:
+                        local_digest = hash_file(
+                            local_path,
+                            allowed_root=local_path.parent,
+                        )
+                    except ArtifactPathError:
+                        rows.append(
+                            ArtifactResolution(
+                                node_id,
+                                class_type,
+                                input_name,
+                                rule.kind,
+                                "unsupported",
+                                destination,
+                                reason=(
+                                    "File-backed input cannot be resolved safely."
+                                ),
+                            )
+                        )
+                        continue
+                    if local_digest != file_digest:
+                        rows.append(
+                            ArtifactResolution(
+                                node_id,
+                                class_type,
+                                input_name,
+                                rule.kind,
+                                "unsupported",
+                                destination,
+                                reason=(
+                                    "Local model content conflicts with the "
+                                    "verified workflow source."
+                                ),
+                            )
+                        )
+                        continue
+            elif local_path is None:
                 rows.append(
                     ArtifactResolution(
                         node_id,
@@ -536,35 +747,44 @@ def resolve_artifacts(
                         rule.kind,
                         "unsupported",
                         None,
-                        reason="File-backed input is not a static filename.",
+                        reason="File-backed input cannot be resolved safely.",
                     )
                 )
                 continue
-            try:
-                relative = _safe_relative(value)
-                if rule.kind == "model":
-                    roots = _roots_for_model(model_roots, rule.category)
-                    _, local_path = _find_asset(relative, roots)
-                    destination = (
-                        PurePosixPath("models")
-                        / str(rule.category)
-                        / relative
-                    ).as_posix()
-                else:
-                    _, local_path = _find_asset(
-                        relative,
-                        (resolved_input_root,),
+            else:
+                try:
+                    file_digest = hash_file(
+                        local_path,
+                        allowed_root=local_path.parent,
                     )
-                    destination = (
-                        PurePosixPath("input") / relative
-                    ).as_posix()
+                except ArtifactPathError:
+                    rows.append(
+                        ArtifactResolution(
+                            node_id,
+                            class_type,
+                            input_name,
+                            rule.kind,
+                            "unsupported",
+                            None,
+                            reason=(
+                                "File-backed input cannot be resolved safely."
+                            ),
+                        )
+                    )
+                    continue
+                source = normalized_sources.get(file_digest.sha256)
+        else:
+            try:
+                _, local_path = _find_asset(
+                    relative,
+                    (resolved_input_root,),
+                )
+                destination = (
+                    PurePosixPath("input") / relative
+                ).as_posix()
                 file_digest = hash_file(
                     local_path,
-                    allowed_root=(
-                        resolved_input_root
-                        if rule.kind == "input"
-                        else local_path.parent
-                    ),
+                    allowed_root=resolved_input_root,
                 )
             except (ArtifactPathError, FileNotFoundError):
                 rows.append(
@@ -579,9 +799,15 @@ def resolve_artifacts(
                     )
                 )
                 continue
-
             source = normalized_sources.get(file_digest.sha256)
-            artifact_id = _artifact_id(rule.kind, file_digest.sha256)
+
+        artifact_id = _artifact_id(rule.kind, file_digest.sha256)
+        if source is None and rule.kind == "input":
+            source = SourceSpec(
+                kind="local-upload",
+                locator="local-upload:" + artifact_id,
+            )
+        if local_path is not None:
             local_artifacts.setdefault(
                 artifact_id,
                 ResolvedLocalArtifact(
@@ -591,46 +817,46 @@ def resolve_artifacts(
                     sha256=file_digest.sha256,
                 ),
             )
-            if source is None:
-                rows.append(
-                    ArtifactResolution(
-                        node_id,
-                        class_type,
-                        input_name,
-                        rule.kind,
-                        "mapping_required",
-                        destination,
-                        file_digest.size_bytes,
-                        file_digest.sha256,
-                        "Exact artifact source requires approval.",
-                        artifact_id,
-                    )
-                )
-                continue
-            artifact = ArtifactSpec(
-                artifact_id=artifact_id,
-                kind=rule.kind,
-                logical_name=relative.name,
-                destination=destination,
-                size_bytes=file_digest.size_bytes,
-                sha256=file_digest.sha256,
-                source=source,
-            )
-            validate_dependency(artifact)
-            artifacts.append(artifact)
+        if source is None:
             rows.append(
                 ArtifactResolution(
                     node_id,
                     class_type,
                     input_name,
                     rule.kind,
-                    "resolved",
+                    "mapping_required",
                     destination,
                     file_digest.size_bytes,
                     file_digest.sha256,
-                    artifact_id=artifact_id,
+                    "Exact artifact source requires approval.",
+                    artifact_id,
                 )
             )
+            continue
+        artifact = ArtifactSpec(
+            artifact_id=artifact_id,
+            kind=rule.kind,
+            logical_name=relative.name,
+            destination=destination,
+            size_bytes=file_digest.size_bytes,
+            sha256=file_digest.sha256,
+            source=source,
+        )
+        validate_dependency(artifact)
+        artifacts.append(artifact)
+        rows.append(
+            ArtifactResolution(
+                node_id,
+                class_type,
+                input_name,
+                rule.kind,
+                "resolved",
+                destination,
+                file_digest.size_bytes,
+                file_digest.sha256,
+                artifact_id=artifact_id,
+            )
+        )
 
     unique_artifacts = reject_destination_collisions(artifacts)
     immutable_rows = tuple(rows)

@@ -35,8 +35,13 @@ class RepositoryContractTests(unittest.TestCase):
             ".gitignore",
             "scripts/check.sh",
             "scripts/build_worker_artifact.py",
+            "scripts/build_worker_release_bundle.py",
+            "scripts/publish_worker_template.py",
+            "scripts/render_worker_template.py",
             "scripts/validate_gold_output.py",
+            "scripts/write_worker_release_lock.py",
             "remote_worker/bootstrap.py",
+            "remote_worker/gateway.py",
             "docs/remote-worker-bootstrap-review.md",
         ):
             with self.subTest(path=relative_path):
@@ -119,6 +124,7 @@ class RepositoryContractTests(unittest.TestCase):
         for required_text in (
             "[check] fake reusable session",
             "[check] worker protocol and artifact",
+            "[check] immutable worker release bundle",
             "[check] secret, origin, route, state, subprocess, and provider boundary scan",
             "[check] public artifact scan",
             "allowed_cloud_run_routes",
@@ -127,10 +133,20 @@ class RepositoryContractTests(unittest.TestCase):
             "expected_job_states",
             "expected_transfer_states",
             "allowed_provider_actions",
+            "reviewed_release_tool_paths",
+            "build_worker_release_bundle",
+            "publish_worker_template.py",
+            "test_worker_template_api.py",
+            '("remote_worker/gateway.py", "subprocess.Popen")',
             "secret_patterns",
+            'Path("tests/fixtures/native-model-metadata-workflow.json")',
         ):
             with self.subTest(text=required_text):
                 self.assertIn(required_text, gate)
+        self.assertGreaterEqual(
+            gate.count('"release-assets.githubusercontent.com"'),
+            2,
+        )
 
     def test_publication_docs_name_only_the_correct_source_origin(self):
         paths = (
@@ -161,15 +177,27 @@ class RepositoryContractTests(unittest.TestCase):
             / "docs"
             / "remote-worker-bootstrap-review.md"
         ).read_text(encoding="utf-8")
+        normalized = " ".join(review.split())
         for required_text in (
+            "immutable GitHub Release asset",
+            "direct `200` response or exactly one HTTP `302` redirect",
+            "release-assets.githubusercontent.com",
+            "never retained, persisted, logged, or returned",
+            "scripts/build_worker_release_bundle.py",
+            "scripts/render_worker_template.py",
+            "scripts/write_worker_release_lock.py",
+            "owner-private directory",
+            "mode `0600`",
             "scripts/build_worker_artifact.py",
             "remote_worker/Caddyfile",
+            "remote_worker/gateway.py",
             "cloud_run/manifest.py",
             "cloud_run/worker_protocol.py",
             "SHA-256",
             "own-instance DELETE",
-            "No dedicated Remote Worker release artifact or "
-            "project-specific Vast template has been published",
+            "No immutable Remote Worker release has been published",
+            "No private project-specific Vast template has been created",
+            "No local live `worker-release.json` exists",
             "ComfyRelay",
             "Public source repository:",
             "Published source commit:",
@@ -177,13 +205,37 @@ class RepositoryContractTests(unittest.TestCase):
             "Fetched archive size:",
             "Fetched archive SHA-256:",
             "Observed redirect boundary:",
-            "Current bootstrap result:",
-            "No project-specific Vast template has been created",
-            "No live worker-release.json has been created",
-            "No paid Gold run has occurred",
+            "Historical full-repository source-archive result: `FAIL`",
+            "No Vast offer search has been performed",
+            "No paid Vast instance has been created",
+            "No live workflow run has occurred",
         ):
             with self.subTest(text=required_text):
-                self.assertIn(required_text, review)
+                self.assertIn(required_text, normalized)
+
+    def test_offline_docs_record_total_create_and_release_boundaries(self):
+        paths = (
+            REPOSITORY_ROOT / "README.md",
+            REPOSITORY_ROOT / "docs" / "project-state.md",
+            REPOSITORY_ROOT / "docs" / "remote-worker-bootstrap-review.md",
+        )
+        combined = "\n".join(
+            path.read_text(encoding="utf-8") for path in paths
+        )
+        normalized = " ".join(combined.split())
+        for required_text in (
+            "Maximum total instance creates",
+            "limited to `1` or `2`",
+            "before any replacement offer search or create",
+            "No immutable Remote Worker release has been published",
+            "No private project-specific Vast template has been created",
+            "No local live `worker-release.json` exists",
+            "No Vast offer search has been performed",
+            "No paid Vast instance has been created",
+            "No live workflow run has occurred",
+        ):
+            with self.subTest(text=required_text):
+                self.assertIn(required_text, normalized)
 
     def test_gate_is_executable(self):
         gate = REPOSITORY_ROOT / "scripts" / "check.sh"

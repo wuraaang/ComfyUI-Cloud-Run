@@ -19,6 +19,8 @@ function fullQuote(overrides = {}) {
       gpu_ram_gb: 24,
       dph_total: 0.50,
       reliability: 0.99,
+      inet_down_mbps: 1000,
+      disk_bw_mbps: 900,
       max_price_per_hour: 0.55,
       expires_at: 1_060,
       disk_gb: 96,
@@ -34,6 +36,7 @@ function fullQuote(overrides = {}) {
       worker_archive_sha256: "b".repeat(64),
       protocol_version: "1",
       manifest_digest: "c".repeat(64),
+      max_instance_creates: 1,
     },
     ...overrides,
   };
@@ -130,6 +133,7 @@ test("session API uses only the exact same-origin lifecycle routes", async () =>
     offer_id: "42",
     idempotency_key: "session-key",
     deadline: { mode: "finite", duration_seconds: 7_200 },
+    max_instance_creates: 1,
   });
   await api.approveMapping("FancyNode", "d".repeat(64));
   await api.confirmSession("session-1", "session-key");
@@ -229,6 +233,106 @@ test("renders dependency states as inert text and gates offer search", () => {
   });
   assert.equal(consoleView.searchButton.disabled, false);
   assert.match(consoleView.root.textContent, /80 GiB/);
+});
+
+
+test("renders only validated immutable Hugging Face provenance as a safe link", () => {
+  const document = new FakeDocument();
+  const view = createSessionConsole(document, {});
+  document.body.appendChild(view.root);
+  const revision = "a".repeat(40);
+  const digest = "b".repeat(64);
+  const repository = "black-forest-labs/FLUX.1-Fill-dev";
+  const filename = "flux1-fill-dev.safetensors";
+  const destination = `models/diffusion_models/${filename}`;
+
+  view.renderPreflight({
+    preflight_id: "preflight-provenance",
+    capture_id: "capture-1",
+    rentable: true,
+    manifest_digest: "c".repeat(64),
+    transfer_bytes: 4_096,
+    output_allowance_bytes: 4_096,
+    disk_gb: 80,
+    rows: [{
+      dependency_id: "artifact:model-flux-fill",
+      kind: "model",
+      display_name: filename,
+      status: "resolved",
+      source_kind: "huggingface",
+      source_locator:
+        `https://huggingface.co/${repository}/resolve/${revision}/${filename}`,
+      immutable_revision: revision,
+      size_bytes: 4_096,
+      sha256: digest,
+      destination,
+      reason: null,
+    }],
+  });
+
+  const text = view.root.textContent;
+  assert.ok(text.includes(destination));
+  assert.ok(text.includes(`${repository}/${filename}`));
+  assert.ok(text.includes(digest.slice(0, 12)));
+  assert.ok(text.includes(revision));
+  assert.ok(text.includes("4 KB"));
+  const links = view.root.querySelectorAll("a");
+  assert.equal(links.length, 1);
+  assert.equal(
+    links[0].getAttribute("href"),
+    `https://huggingface.co/${repository}`,
+  );
+  assert.equal(links[0].getAttribute("target"), "_blank");
+  assert.equal(links[0].getAttribute("rel"), "noopener noreferrer");
+});
+
+
+test("keeps hostile model provenance inert and creates no link", () => {
+  const document = new FakeDocument();
+  const view = createSessionConsole(document, {});
+  document.body.appendChild(view.root);
+  const revision = "a".repeat(40);
+  const pinned =
+    `https://huggingface.co/owner/repository/resolve/${revision}/model.safetensors`;
+  const hostileLocators = [
+    pinned.replace("huggingface.co", "example.com"),
+    pinned.replace("huggingface.co", "user@huggingface.co"),
+    pinned.replace("huggingface.co", "huggingface.co:443"),
+    `${pinned}#fragment`,
+    pinned.replace("/resolve/", "/blob/"),
+    pinned.replace("model.safetensors", "%6dodel.safetensors"),
+    "<a href=\"https://huggingface.co/owner/repository\">model</a>",
+    "javascript:alert(1)",
+  ];
+
+  view.renderPreflight({
+    preflight_id: "preflight-hostile",
+    capture_id: "capture-1",
+    rentable: false,
+    manifest_digest: null,
+    transfer_bytes: 0,
+    output_allowance_bytes: null,
+    disk_gb: null,
+    rows: hostileLocators.map((locator, index) => ({
+      dependency_id: `artifact:hostile-${index}`,
+      kind: "model",
+      display_name: locator,
+      status: "resolved",
+      source_kind: "huggingface",
+      source_locator: locator,
+      immutable_revision: revision,
+      size_bytes: 4_096,
+      sha256: "b".repeat(64),
+      destination: "models/diffusion_models/model.safetensors",
+      reason: null,
+    })),
+  });
+
+  for (const locator of hostileLocators) {
+    assert.ok(view.root.textContent.includes(locator));
+  }
+  assert.equal(view.root.querySelectorAll("a").length, 0);
+  assert.equal(view.root.querySelector("script"), null);
 });
 
 
@@ -346,10 +450,15 @@ test("paid review shows every bounded cost and immutable identity", () => {
     "24 GB",
     "$0.50/h",
     "Reliability: 99.0%",
+    "Download: 1000 Mbps",
+    "Disk speed: 900 MB/s",
+    "Download class: target (1000 Mbps or faster)",
     "Bandwidth: $0.010/GB down; $0.020/GB up",
+    "theoretical transfer ≈ 1 second; actual startup can be longer",
     "96 GB ephemeral disk",
     "12 KB dependencies and inputs",
     "2 hour automatic limit",
+    "Maximum total instance creates: 1",
     "approximately $1.00 active/storage",
     `template ${"1".repeat(32)}`,
     `worker ${"a".repeat(40)}`,
@@ -357,6 +466,35 @@ test("paid review shows every bounded cost and immutable identity", () => {
   ]) {
     assert.ok(text.includes(expected), expected);
   }
+});
+
+
+test("paid review renders unavailable connection metrics without non-finite text", () => {
+  const document = new FakeDocument();
+  const view = createSessionConsole(document, fakeApi());
+  document.body.appendChild(view.root);
+
+  view.renderQuote(fullQuote({
+    offer: {
+      ...fullQuote().offer,
+      inet_down_mbps: Infinity,
+      disk_bw_mbps: NaN,
+      inet_down_cost: Infinity,
+      inet_up_cost: NaN,
+    },
+  }));
+
+  const text = view.root.textContent;
+  for (const expected of [
+    "Download: unavailable",
+    "Disk speed: unavailable",
+    "Download class: unavailable",
+    "Bandwidth: unavailable down; unavailable up",
+    "theoretical transfer ≈ unavailable; actual startup can be longer",
+  ]) {
+    assert.ok(text.includes(expected), expected);
+  }
+  assert.doesNotMatch(text, /NaN|Infinity/);
 });
 
 
@@ -437,6 +575,55 @@ test("provisioning shows the meaningful-progress clock and ten-minute stall", ()
 
   assert.match(view.root.textContent, /STALL DETECTED/);
   assert.match(view.provisioningStatus.className, /cloud-run-danger/);
+});
+
+
+test("provisioning renders only bounded worker phase and inert model text", () => {
+  const document = new FakeDocument();
+  const view = createSessionConsole(document, fakeApi());
+  document.body.appendChild(view.root);
+  const hostileModel = "<script>Gold model</script>.safetensors";
+
+  view.renderSession(sessionPayload({
+    status: "provisioning",
+    provisioning: {
+      phase: "model_transfer",
+      current_model: hostileModel,
+      transferred_bytes: 4_096,
+      total_bytes: 8_192,
+      installed_units: 0,
+      validated_units: 0,
+      seconds_without_progress: 5,
+      stall_budget_seconds: 600,
+      source_url: "https://huggingface.co/private?token=secret",
+    },
+  }));
+
+  assert.match(view.root.textContent, /Model transfer/);
+  assert.ok(view.root.textContent.includes(hostileModel));
+  assert.match(view.root.textContent, /4 KB of 8 KB/);
+  assert.doesNotMatch(view.root.textContent, /huggingface\.co/);
+  assert.doesNotMatch(view.root.textContent, /token=secret/);
+  assert.equal(view.root.querySelector("script"), null);
+  assert.equal(view.root.querySelector("a"), null);
+
+  view.renderSession(sessionPayload({
+    status: "provisioning",
+    provisioning: {
+      phase: "unknown_phase",
+      current_model: "https://example.com/private-model",
+      transferred_bytes: 9_999,
+      total_bytes: 10,
+      installed_units: 0,
+      validated_units: 0,
+      seconds_without_progress: 5,
+      stall_budget_seconds: 600,
+    },
+  }));
+
+  assert.match(view.root.textContent, /Verified transfer\/install/);
+  assert.doesNotMatch(view.root.textContent, /9\.8 KB of 10 bytes/);
+  assert.doesNotMatch(view.root.textContent, /example\.com/);
 });
 
 

@@ -4,10 +4,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from cloud_run.artifacts import FileInputMetadata, GIB
+from cloud_run.artifacts import FileInputMetadata, GIB, StaticFileRequirement
 from cloud_run.comfy_host import NodeDescription, NodeNotFound
 from cloud_run.dependency_repository import DependencyRepository
 from cloud_run.manifest import SourceSpec
+from cloud_run.model_sources import ModelSourceResolution
 from cloud_run.registry import RegistryCandidate
 from cloud_run.resolver import DependencyResolver
 
@@ -38,9 +39,10 @@ def pending_candidate(revision="a" * 40):
 
 
 class FakeCapture:
-    def __init__(self, *class_types, output=None):
+    def __init__(self, *class_types, output=None, workflow=None):
         self.executable_class_types = tuple(class_types)
         self.output = output or {}
+        self.workflow = workflow or {"nodes": []}
 
 
 class FakeHost:
@@ -78,6 +80,16 @@ class FakeCacheCatalog:
 
     def register_local_artifact(self, artifact):
         self.registered.append(artifact)
+
+
+class FakeModelSourceResolver:
+    def __init__(self, result):
+        self.result = result
+        self.calls = []
+
+    async def resolve(self, capture, *, requirements):
+        self.calls.append((capture, requirements))
+        return self.result
 
 
 def core(class_type):
@@ -356,6 +368,88 @@ class DependencyResolverTests(unittest.TestCase):
             result.artifacts[0].artifact_id,
         )
         self.assertEqual(cache_catalog.external_calls, [])
+
+    def test_model_sources_resolve_before_artifact_assembly(self):
+        model_root = Path(self.temporary_directory.name) / "empty-models"
+        input_root = Path(self.temporary_directory.name) / "input"
+        model_root.mkdir()
+        input_root.mkdir()
+        digest = "c" * 64
+        revision = "a" * 40
+        capture = FakeCapture(
+            "UNETLoader",
+            output={
+                "1": {
+                    "class_type": "UNETLoader",
+                    "inputs": {"model_name": "example.safetensors"},
+                }
+            },
+        )
+        metadata = {
+            "UNETLoader": {
+                "model_name": FileInputMetadata(
+                    kind="model",
+                    category="diffusion_models",
+                )
+            }
+        }
+        model_source_resolver = FakeModelSourceResolver(
+            {
+                ("1", "model_name"): ModelSourceResolution(
+                    status="resolved",
+                    source=SourceSpec(
+                        kind="huggingface",
+                        locator=(
+                            "https://huggingface.co/example/public-model/"
+                            "resolve/"
+                            + revision
+                            + "/files/example.safetensors"
+                        ),
+                        immutable_revision=revision,
+                    ),
+                    size_bytes=4096,
+                    sha256=digest,
+                    reason=None,
+                )
+            }
+        )
+        resolver = DependencyResolver(
+            host=FakeHost({"UNETLoader": core("UNETLoader")}),
+            repository=self.repository,
+            registry=FakeRegistry({}),
+            model_source_resolver=model_source_resolver,
+        )
+
+        result = asyncio.run(
+            resolver.resolve_dependencies(
+                capture,
+                metadata=metadata,
+                model_roots={"diffusion_models": (model_root,)},
+                input_root=input_root,
+                source_mappings={},
+                base_bytes=40 * GIB,
+                explicit_output_allowance_bytes=1024,
+            )
+        )
+
+        self.assertTrue(result.rentable)
+        self.assertEqual(len(result.artifacts), 1)
+        self.assertEqual(result.artifacts[0].source.kind, "huggingface")
+        self.assertEqual(len(model_source_resolver.calls), 1)
+        called_capture, requirements = model_source_resolver.calls[0]
+        self.assertIs(called_capture, capture)
+        self.assertEqual(
+            requirements,
+            (
+                StaticFileRequirement(
+                    node_id="1",
+                    class_type="UNETLoader",
+                    input_name="model_name",
+                    metadata=metadata["UNETLoader"]["model_name"],
+                    value="example.safetensors",
+                ),
+            ),
+        )
 
 
 if __name__ == "__main__":

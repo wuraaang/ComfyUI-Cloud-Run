@@ -3,9 +3,13 @@
 This document is the offline review handoff and public source-publication
 record. It is not a release lock, Vast template, or permission to spend.
 
-No dedicated Remote Worker release artifact or project-specific Vast template has been published.
+No immutable Remote Worker release has been published. No private
+project-specific Vast template has been created. No local live
+`worker-release.json` exists. No Vast offer search has been performed. No paid
+Vast instance has been created. No live workflow run has occurred.
+
 Publishing source alone does not create a worker release lock, authorize Vast
-activity, or convert the deterministic review artifact below into a live
+activity, or convert deterministic offline review material into a live
 release.
 
 ## Public source publication evidence — 2026-07-31
@@ -30,8 +34,10 @@ Fetched archive size: `356149 bytes`
 Fetched archive SHA-256:
 `bf7727f35e2ec32103cf7eeaf329e0e094406a2503fdec1241328b3322aa681b`
 
-Observed redirect boundary: HTTP `302` from the requested `github.com` URL to
-`https://codeload.github.com/wuraaang/ComfyUI-Cloud-Run/tar.gz/4627ffcd504cd3cbfdaa280921a9d09eba63f488`.
+Observed redirect boundary: HTTP `302` from the requested `github.com` source
+archive URL. The target is intentionally omitted. This historical source
+archive used a host that is not accepted by the immutable GitHub Release asset
+contract below.
 
 The fetched archive had one complete gzip member with no trailing or
 unconsumed bytes. Its tar contained 116 members under the single root
@@ -47,7 +53,7 @@ The deterministic review artifact remained `51590 bytes` with SHA-256
 It is not byte-identical to the fetched full-repository archive and its digest
 must not be copied into a live lock for those GitHub bytes.
 
-Current bootstrap result: `FAIL`.
+Historical full-repository source-archive result: `FAIL`.
 
 - `observed_final_url=FAIL`: the injected-stream audit observed the exact
   returned-URL check reject the codeload final URL. The production HTTPS
@@ -65,9 +71,6 @@ fail the installed-tree allowlist after extraction.
 These failures are release-blocking evidence. They do not authorize weakening
 redirect, archive, extraction, allowlist, digest, or shell restrictions.
 
-No project-specific Vast template has been created.
-No live worker-release.json has been created.
-No paid Gold run has occurred.
 No Vast provider mutation, worker release, tag, Registry publication, or GPU
 rental occurred during this source-publication audit.
 
@@ -80,12 +83,9 @@ python3 scripts/build_worker_artifact.py \
   /absolute/review/path/comfyui-cloud-run-worker.tar.gz
 ```
 
-For the Task 18 source state, two consecutive builds produced byte-identical
-51,590-byte archives with:
-
-```text
-SHA-256  783a8f180365f6401af69679ba7681401aa123c50d050ead47c4f6faeb8df06f
-```
+Two consecutive complete gates must produce byte-identical archives and print
+the same current size and SHA-256. Those gate values are offline review
+evidence, not a published immutable release identity.
 
 The builder normalizes member order, UID/GID, owner/group names, modes, mtime,
 tar format, and gzip mtime. It rejects a missing or unknown file, symlink,
@@ -103,6 +103,7 @@ remote_worker/__init__.py
 remote_worker/bootstrap.py
 remote_worker/comfy.py
 remote_worker/deadline.py
+remote_worker/gateway.py
 remote_worker/install.py
 remote_worker/jobs.py
 remote_worker/main.py
@@ -134,36 +135,104 @@ python_version
 destination
 ```
 
-The worker commit is exactly 40 lowercase hex characters. The only accepted URL
-shape is:
+The worker commit is exactly 40 lowercase hex characters. The immutable GitHub
+Release asset URL is bound to the fixed repository, that commit, and the exact
+archive SHA-256. Its only accepted shape is:
 
 ```text
-https://github.com/{owner}/{repository}/archive/{same_commit}.tar.gz
+https://github.com/wuraaang/ComfyUI-Cloud-Run/releases/download/worker-v1-{commit}/comfyui-cloud-run-worker-{same-commit}-{same-sha256}.tar.gz
 ```
 
-The transport disables proxies and redirects, requests identity encoding,
-streams into a private `.part`, and requires the final URL, exact byte size, and
-SHA-256 to match the reviewed lock. Extraction accepts one gzip member and
-bounded regular tar files/directories only; it rejects absolute/traversal
-paths, duplicates, symlinks, devices, sparse/PAX metadata, unsafe modes, excess
-members, and expansion beyond the fixed limit.
+The transport disables proxies and automatic redirects, requests identity
+encoding, and accepts a direct `200` response or exactly one HTTP `302`
+redirect to host `release-assets.githubusercontent.com`. Every other status,
+host, redirect count, encoding, user-information, explicit port, or fragment
+fails closed. The signed target exists only while making that second request
+and is never retained, persisted, logged, or returned. The reviewed source URL,
+redirect count of zero or one, exact byte size, and SHA-256 must match before
+installation.
+
+Extraction accepts one gzip member and bounded regular tar files/directories
+only; it rejects absolute/traversal paths, duplicates, symlinks, devices,
+sparse/PAX metadata, unsafe modes, excess members, and expansion beyond the
+fixed limit.
 
 The installed tree is atomically placed at `/opt/comfyui-cloud-run`. Bootstrap
 then uses `os.execv` with only:
 
 ```text
-<current-python> -m remote_worker.main \
+<current-python> -m remote_worker.gateway \
   --state-directory /var/lib/comfyui-cloud-run
 ```
 
 No environment, workflow, manifest, Agent Panel suggestion, or dependency
 record can provide an alternate command or shell fragment.
 
-The publication reviewer must verify how the exact immutable GitHub archive
-bytes map to the reviewed source-only member set and record that archive's
-actual size and digest in the template bootstrap lock. The offline digest above
-must not be copied into a live lock unless the fetched bytes are exactly the
-same artifact.
+The publication reviewer must verify that the exact immutable GitHub Release
+asset bytes are the reviewed source-only member set and record those bytes'
+actual size and digest in the private template bootstrap lock. An offline gate
+digest must not be copied into a live lock unless the published bytes are
+exactly the same artifact.
+
+## Deterministic private publication inputs
+
+Run these commands only with existing paths in an owner-private directory:
+
+```sh
+python3 scripts/build_worker_release_bundle.py \
+  --repository-root <repository-root> \
+  --output-directory <owner-private-output-directory> \
+  --worker-commit <40-lowercase-hex-commit>
+
+python3 scripts/render_worker_template.py \
+  --repository-root <repository-root> \
+  --output-directory <owner-private-output-directory> \
+  --release-metadata <owner-private-release-metadata> \
+  --base-template-audit <owner-private-base-template-audit>
+
+python3 scripts/publish_worker_template.py \
+  audit-base \
+  --output-directory <owner-private-output-directory>
+
+python3 scripts/publish_worker_template.py \
+  publish \
+  --request-file <owner-private-template-request> \
+  --output-directory <owner-private-output-directory>
+
+python3 scripts/write_worker_release_lock.py \
+  --output <owner-private-data-directory>/worker-release.json \
+  --template-hash-id <32-lowercase-hex-template-id> \
+  --release-metadata <owner-private-release-metadata>
+```
+
+The release builder produces a deterministic archive and sanitized metadata
+whose tag, asset name, URL, commit, byte size, SHA-256, protocol, runtime
+versions, and destination agree exactly. The renderer accepts only the fixed
+audited base-template schema and deterministically creates the remote lock,
+fixed bootstrap program, and template request with no embedded token, session,
+workflow, model locator, signed target, or caller command.
+
+The template publisher fixes the Vast template HTTPS endpoint and exposes only
+base audit plus one private-template publication. It validates exact lookup and
+request schemas, disables redirects and ambient proxies, bounds time and
+response bytes, obtains the API key through a no-follow owner-private settings
+read instead of argv, performs at most one POST, and reconciles ambiguity only
+with one exact-name GET. It has no update, delete, arbitrary URL/method,
+offer, instance, or volume capability, and never prints a request, response,
+authorization header, key, `onstart`, or base64 body.
+Audit, render, and publish require the exact image repository form
+`docker.io/vastai/base-image@sha256:<lowercase-64-hex>`. Before any HTTP,
+publication decodes `onstart`, compares its bootstrap bytes with the reviewed
+`remote_worker/bootstrap.py`, and validates the remote lock as the one
+canonical immutable release contract. This structural lock does not replace
+Task 8's separate pre-POST verification of the digest-scoped OCI
+manifest/config bytes and exact source/revision labels.
+
+Every input and output remains outside the repository. The output directory
+must be owner-private and every generated file has mode `0600`. The local lock
+writer accepts only a nonexistent target beneath an owner-private directory,
+publishes by no-overwrite atomic hard link, synchronizes the directory, and
+round-trips every field through `load_worker_release()` before success.
 
 ## Caddy and inbound boundary
 
@@ -171,6 +240,29 @@ same artifact.
 the Vast-provided Jupyter bearer token, strips `Authorization`, discards any
 caller-supplied `X-Cloud-Run-Boundary`, adds the authenticated boundary marker,
 and proxies only to `127.0.0.1:8766`.
+
+At official Vast base-image source commit
+`46e032d852ece6edb2a2a477c5b9557cba6645bf`, `Dockerfile.runtime` inherits its
+stock base image, `caddy.conf` invokes `/opt/supervisor-scripts/caddy.sh`, and
+that script directly executes `/opt/portal-aio/caddy_manager/caddy`. This
+source review proves the launch path, not the live filesystem or the inherited
+layer that installed the binary.
+
+Reviewed public permalinks:
+
+- `Dockerfile.runtime`: https://github.com/vast-ai/base-image/blob/46e032d852ece6edb2a2a477c5b9557cba6645bf/Dockerfile.runtime
+- `caddy.sh`: https://github.com/vast-ai/base-image/blob/46e032d852ece6edb2a2a477c5b9557cba6645bf/ROOT/opt/supervisor-scripts/caddy.sh
+- `caddy.conf`: https://github.com/vast-ai/base-image/blob/46e032d852ece6edb2a2a477c5b9557cba6645bf/ROOT/etc/supervisor/conf.d/caddy.conf
+
+`remote_worker/gateway.py` requires exactly that one executable regular Caddy
+binary, rejects symlinks and generic system paths, validates the token without
+disclosing it, and starts Caddy plus the worker with fixed argv and no shell.
+Only Caddy's minimal environment receives the token. The worker receives only
+an explicit runtime allowlist plus Vast's own-instance `CONTAINER_ID` and
+`CONTAINER_API_KEY` required by its deadline watchdog; it receives neither the
+Jupyter token nor a provider-account key. When either child exits, the
+supervisor terminates the sibling, waits for the fixed bound, kills only after
+timeout, and reaps both processes or fails with one static error.
 
 The Python worker itself binds only to `127.0.0.1:8766`. Its route allowlist is:
 
@@ -195,7 +287,8 @@ nonce, body digest, and HMAC signature. Nonces and clock skew are bounded.
 
 The reviewed worker can make only these outbound connections:
 
-- bootstrap GET to the exact immutable `github.com` archive in the lock;
+- bootstrap GET to the exact immutable GitHub Release asset in the lock, with
+  at most the one reviewed release-assets redirect;
 - ranged dependency GETs to the immutable manifest origin, or the exact
   backend-signed R2 URL, with redirect confinement to the original origin;
 - loopback HTTP/WebSocket calls to its own ComfyUI on `127.0.0.1:8188`;
@@ -228,3 +321,14 @@ A publication review must record all of the following:
     absolute duration or cost.
 
 Publishing an artifact or template is not itself authorization to rent a GPU.
+
+## Total instance-create authorization
+
+The paid review's **Maximum total instance creates** is an immutable integer
+limited to `1` or `2`. Legacy records default to `1`; no recovery path infers a
+larger value. The initial create consumes one, and the durable retry count
+represents any consumed replacement. Confirmation checks the persisted value,
+and boot-failure handling checks it after verified destruction and absence but
+before any replacement offer search or create. Duplicate confirmation,
+ambiguous-create reconciliation, and restart recovery do not replenish the
+budget. The current offline tests use fake providers only.

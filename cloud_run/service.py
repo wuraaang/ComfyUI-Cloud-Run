@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import math
 import secrets
 import time
 
 from .capture import CompiledCapture
-from .constants import DEFAULT_DISK_GB
+from .constants import (
+    DEFAULT_DISK_GB,
+    MIN_VAST_INET_DOWN_MBPS,
+    PREFERRED_VAST_INET_DOWN_MBPS,
+)
 from .models import (
     AttemptState,
     CloudAttempt,
@@ -14,7 +19,10 @@ from .models import (
     OfferQuote,
     SessionState,
 )
-from .offers import apply_offer_policy
+from .offers import (
+    apply_offer_policy,
+    offer_meets_connection_quality_policy,
+)
 from .repository import ConcurrentAttemptUpdate, ConcurrentSessionUpdate
 from .worker_release import WorkerRelease, WorkerReleaseUnavailable
 from . import vast
@@ -121,6 +129,14 @@ def _offer_id(value):
     if not normalized.isdigit() or len(normalized) > 32:
         raise CloudRunValidationError("A valid offer ID is required.")
     return normalized
+
+
+def _max_instance_creates(value):
+    if type(value) is not int or value not in {1, 2}:
+        raise CloudRunValidationError(
+            "Maximum total instance creates must be 1 or 2."
+        )
+    return value
 
 
 class CloudRunService:
@@ -360,6 +376,7 @@ class CloudRunService:
         offer_id,
         idempotency_key,
         deadline,
+        max_instance_creates,
     ):
         release = self._reviewed_release()
         repository = self._session_repository()
@@ -382,6 +399,7 @@ class CloudRunService:
             return existing
         identifier = _offer_id(offer_id)
         mode, duration = self._deadline_contract(deadline)
+        create_limit = _max_instance_creates(max_instance_creates)
         preflight = self.session_service.require_rentable_preflight(
             preflight_id
         )
@@ -406,6 +424,8 @@ class CloudRunService:
                 if selected.get("reliability") is not None
                 else None
             ),
+            inet_down_mbps=selected.get("inet_down_mbps"),
+            disk_bw_mbps=selected.get("disk_bw_mbps"),
             max_price_per_hour=float(settings["max_price_per_hour"]),
             expires_at=now + self.quote_ttl_seconds,
             disk_gb=int(preflight.disk_gb),
@@ -430,6 +450,7 @@ class CloudRunService:
             machine_id=selected.get("machine_id"),
             host_id=selected.get("host_id"),
             public_ipaddr=selected.get("public_ipaddr"),
+            max_instance_creates=create_limit,
         )
         candidate = CloudSession.new(
             key,
@@ -460,6 +481,33 @@ class CloudRunService:
             return current is None
         return current is not None and float(current) <= float(quoted)
 
+    @staticmethod
+    def _finite_metric(value):
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+        ):
+            return None
+        return float(value)
+
+    @classmethod
+    def _connection_quality_is_eligible(cls, offer):
+        return offer_meets_connection_quality_policy(offer)
+
+    @classmethod
+    def _connection_speed_matches_quote(cls, current, quoted):
+        current_speed = cls._finite_metric(current)
+        quoted_speed = cls._finite_metric(quoted)
+        return (
+            current_speed is not None
+            and quoted_speed is not None
+            and quoted_speed >= MIN_VAST_INET_DOWN_MBPS
+            and current_speed >= MIN_VAST_INET_DOWN_MBPS
+            and current_speed
+            >= min(quoted_speed, PREFERRED_VAST_INET_DOWN_MBPS)
+        )
+
     async def _revalidated_session_offer(self, session, settings):
         selected = await self._eligible_offer(
             session.quote.offer_id,
@@ -469,7 +517,12 @@ class CloudRunService:
         if selected is None:
             return None
         if (
-            str(selected.get("gpu_name")) == session.quote.gpu_name
+            self._connection_quality_is_eligible(selected)
+            and self._connection_speed_matches_quote(
+                selected.get("inet_down_mbps"),
+                session.quote.inet_down_mbps,
+            )
+            and str(selected.get("gpu_name")) == session.quote.gpu_name
             and float(selected.get("gpu_ram_gb", 0))
             >= session.quote.gpu_ram_gb
             and float(selected.get("dph_total", float("inf")))
@@ -542,8 +595,17 @@ class CloudRunService:
         }:
             return session
         repository = self._session_repository()
-        release = self._reviewed_release()
         now = float(self.clock())
+        if 1 + session.retry_count > session.quote.max_instance_creates:
+            return repository.transition(
+                session.session_id,
+                SessionState.FAILED,
+                now=now,
+                sanitized_error=(
+                    "The authorized total instance-create limit was reached."
+                ),
+            )
+        release = self._reviewed_release()
         if now >= session.quote.expires_at:
             repository.transition(
                 session.session_id,
@@ -688,7 +750,7 @@ class CloudRunService:
             blacklist=self.blacklist,
             now=float(self.clock()),
         )
-        return next(
+        selected = next(
             (
                 offer
                 for offer in eligible
@@ -696,6 +758,11 @@ class CloudRunService:
             ),
             None,
         )
+        if selected is None or not self._connection_quality_is_eligible(
+            selected
+        ):
+            return None
+        return selected
 
     async def preview_offer(self, *, offer_id, idempotency_key):
         release = self._reviewed_release()
@@ -723,6 +790,8 @@ class CloudRunService:
                 if selected.get("reliability") is not None
                 else None
             ),
+            inet_down_mbps=selected.get("inet_down_mbps"),
+            disk_bw_mbps=selected.get("disk_bw_mbps"),
             max_price_per_hour=float(settings["max_price_per_hour"]),
             expires_at=now + self.quote_ttl_seconds,
             disk_gb=self.disk_gb,
@@ -774,7 +843,12 @@ class CloudRunService:
         if selected is None:
             return None
         if (
-            str(selected.get("gpu_name")) == attempt.quote.gpu_name
+            self._connection_quality_is_eligible(selected)
+            and self._connection_speed_matches_quote(
+                selected.get("inet_down_mbps"),
+                attempt.quote.inet_down_mbps,
+            )
+            and str(selected.get("gpu_name")) == attempt.quote.gpu_name
             and float(selected.get("gpu_ram_gb", 0))
             >= attempt.quote.gpu_ram_gb
             and float(selected.get("dph_total", float("inf")))
