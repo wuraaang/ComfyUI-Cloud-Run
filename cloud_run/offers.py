@@ -10,9 +10,14 @@ import statistics
 import tempfile
 import time
 
+from .constants import (
+    MIN_VAST_INET_DOWN_MBPS,
+    MIN_VAST_RELIABILITY,
+    PREFERRED_VAST_INET_DOWN_MBPS,
+)
+
 
 PRICE_BAIT_RATIO = 0.60
-SIMILAR_PRICE_WINDOW = 1.10
 DEFAULT_BLACKLIST_TTL_SECONDS = 3 * 24 * 60 * 60
 _IDENTITY_FIELDS = ("machine_id", "host_id", "public_ipaddr")
 _SAFE_REASONS = {
@@ -56,6 +61,37 @@ def _offer_id_key(offer):
     if isinstance(value, int) and not isinstance(value, bool):
         return (0, value)
     return (1, str(value or ""))
+
+
+def offer_quality_key(offer):
+    down = _finite(offer.get("inet_down_mbps"), default=-math.inf)
+    return (
+        -min(down, PREFERRED_VAST_INET_DOWN_MBPS),
+        -_finite(offer.get("reliability")),
+        -_finite(offer.get("disk_bw_mbps")),
+        _finite(offer.get("dph_total"), default=math.inf),
+        _offer_id_key(offer),
+    )
+
+
+def offer_meets_connection_quality_policy(offer):
+    if not isinstance(offer, dict):
+        return False
+    return (
+        _finite(offer.get("reliability"), default=-math.inf)
+        >= MIN_VAST_RELIABILITY
+        and _finite(offer.get("inet_down_mbps"), default=-math.inf)
+        >= MIN_VAST_INET_DOWN_MBPS
+    )
+
+
+def estimated_transfer_seconds(transfer_bytes, inet_down_mbps):
+    if type(transfer_bytes) is not int or transfer_bytes < 0:
+        return None
+    speed = _finite(inet_down_mbps, default=-1)
+    if speed <= 0:
+        return None
+    return math.ceil(transfer_bytes * 8 / (speed * 1_000_000))
 
 
 class HostBlacklist:
@@ -233,18 +269,11 @@ def apply_offer_policy(offers, *, blacklist=None, now=None):
             if not blacklist.contains(offer, now=now)
         ]
     candidates = _remove_bait_prices(candidates)
-    return sorted(
-        candidates,
-        key=lambda offer: (
-            _finite(offer.get("dph_total"), default=math.inf),
-            str(offer.get("gpu_name") or "").casefold(),
-            _offer_id_key(offer),
-        ),
-    )
+    return sorted(candidates, key=offer_quality_key)
 
 
 def select_best_offer(offers, *, requested_gpu=None):
-    """Select reliability first among offers within 10% of the cheapest."""
+    """Select the highest-quality eligible offer deterministically."""
     candidates = [offer for offer in offers if isinstance(offer, dict)]
     if requested_gpu is not None:
         requested = str(requested_gpu).strip()
@@ -261,26 +290,4 @@ def select_best_offer(offers, *, requested_gpu=None):
         )
         raise OfferSelectionError("There is no eligible offer" + suffix + ".")
 
-    priced = [
-        offer
-        for offer in candidates
-        if _finite(offer.get("dph_total"), default=-1) >= 0
-    ]
-    if priced:
-        cheapest = min(_finite(offer["dph_total"]) for offer in priced)
-        candidates = [
-            offer
-            for offer in priced
-            if _finite(offer["dph_total"]) <= cheapest * SIMILAR_PRICE_WINDOW
-        ]
-
-    return min(
-        candidates,
-        key=lambda offer: (
-            -_finite(offer.get("reliability")),
-            -_finite(offer.get("inet_down_mbps")),
-            -_finite(offer.get("disk_bw_mbps")),
-            _finite(offer.get("dph_total"), default=math.inf),
-            _offer_id_key(offer),
-        ),
-    )
+    return min(candidates, key=offer_quality_key)

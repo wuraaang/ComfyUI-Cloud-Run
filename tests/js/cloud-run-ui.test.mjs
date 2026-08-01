@@ -322,8 +322,11 @@ test("capture preflight offer and paid review enforce instance creates", async (
           gpu_ram_gb: 24,
           dph_total: 0.5,
           reliability: 0.99,
+          inet_down_mbps: 1000,
+          disk_bw_mbps: 900,
           inet_down_cost: 0.01,
           inet_up_cost: 0.02,
+          estimated_transfer_seconds: 235,
         }],
       });
     }
@@ -390,6 +393,18 @@ test("capture preflight offer and paid review enforce instance creates", async (
     document.getElementById("cloud-run-offers").textContent,
     /<RTX 4090>/,
   );
+  for (const expected of [
+    "1000 Mbps download",
+    "900 MB/s disk",
+    "target download class",
+    "theoretical transfer ≈ 4 minutes",
+    "actual startup can be longer",
+  ]) {
+    assert.ok(
+      document.getElementById("cloud-run-offers").textContent.includes(expected),
+      expected,
+    );
+  }
   assert.equal(document.querySelector("script"), null);
 
   createLimit.value = "2";
@@ -568,6 +583,32 @@ test("offer rendering treats provider strings as inert text", async () => {
   assert.equal(container.querySelector("script"), null);
   await container.querySelector("input").click();
   assert.equal(selected.offer_id, "42");
+});
+
+
+test("offer rendering marks missing connection metrics unavailable", () => {
+  const document = new FakeDocument();
+  const container = document.createElement("div");
+  document.body.appendChild(container);
+
+  renderOffers(document, container, [{
+    offer_id: "42",
+    gpu_name: "RTX 4090",
+    gpu_ram_gb: 24,
+    dph_total: 0.5,
+    reliability: 0.99,
+    inet_down_mbps: Infinity,
+    disk_bw_mbps: NaN,
+    inet_down_cost: Infinity,
+    inet_up_cost: NaN,
+    estimated_transfer_seconds: Infinity,
+  }], () => {});
+
+  assert.match(container.textContent, /download unavailable/);
+  assert.match(container.textContent, /disk speed unavailable/);
+  assert.match(container.textContent, /download class unavailable/);
+  assert.match(container.textContent, /theoretical transfer ≈ unavailable/);
+  assert.doesNotMatch(container.textContent, /NaN|Infinity/);
 });
 
 

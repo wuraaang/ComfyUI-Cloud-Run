@@ -19,6 +19,8 @@ function fullQuote(overrides = {}) {
       gpu_ram_gb: 24,
       dph_total: 0.50,
       reliability: 0.99,
+      inet_down_mbps: 1000,
+      disk_bw_mbps: 900,
       max_price_per_hour: 0.55,
       expires_at: 1_060,
       disk_gb: 96,
@@ -448,7 +450,11 @@ test("paid review shows every bounded cost and immutable identity", () => {
     "24 GB",
     "$0.50/h",
     "Reliability: 99.0%",
+    "Download: 1000 Mbps",
+    "Disk speed: 900 MB/s",
+    "Download class: target (1000 Mbps or faster)",
     "Bandwidth: $0.010/GB down; $0.020/GB up",
+    "theoretical transfer ≈ 1 second; actual startup can be longer",
     "96 GB ephemeral disk",
     "12 KB dependencies and inputs",
     "2 hour automatic limit",
@@ -460,6 +466,35 @@ test("paid review shows every bounded cost and immutable identity", () => {
   ]) {
     assert.ok(text.includes(expected), expected);
   }
+});
+
+
+test("paid review renders unavailable connection metrics without non-finite text", () => {
+  const document = new FakeDocument();
+  const view = createSessionConsole(document, fakeApi());
+  document.body.appendChild(view.root);
+
+  view.renderQuote(fullQuote({
+    offer: {
+      ...fullQuote().offer,
+      inet_down_mbps: Infinity,
+      disk_bw_mbps: NaN,
+      inet_down_cost: Infinity,
+      inet_up_cost: NaN,
+    },
+  }));
+
+  const text = view.root.textContent;
+  for (const expected of [
+    "Download: unavailable",
+    "Disk speed: unavailable",
+    "Download class: unavailable",
+    "Bandwidth: unavailable down; unavailable up",
+    "theoretical transfer ≈ unavailable; actual startup can be longer",
+  ]) {
+    assert.ok(text.includes(expected), expected);
+  }
+  assert.doesNotMatch(text, /NaN|Infinity/);
 });
 
 

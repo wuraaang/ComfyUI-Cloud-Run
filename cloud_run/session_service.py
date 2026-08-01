@@ -29,6 +29,7 @@ from .manifest import (
     validate_dependency,
 )
 from .models import CloudJob, JobState, SessionState, TransferState
+from .offers import estimated_transfer_seconds
 from .relay import RelaySyncResult
 from .repository import ConcurrentSessionUpdate, SessionRepository
 from .worker_release import WorkerRelease
@@ -1130,10 +1131,21 @@ class SessionService:
         if self.offer_search is None:
             raise PreflightBlocked("Vast offer search is unavailable.")
         if callable(self.offer_search):
-            return await self.offer_search(disk_gb=result.disk_gb)
-        if callable(getattr(self.offer_search, "search", None)):
-            return await self.offer_search.search(disk_gb=result.disk_gb)
-        raise PreflightBlocked("Vast offer search is unavailable.")
+            offers = await self.offer_search(disk_gb=result.disk_gb)
+        elif callable(getattr(self.offer_search, "search", None)):
+            offers = await self.offer_search.search(disk_gb=result.disk_gb)
+        else:
+            raise PreflightBlocked("Vast offer search is unavailable.")
+        return [
+            {
+                **offer,
+                "estimated_transfer_seconds": estimated_transfer_seconds(
+                    result.transfer_bytes,
+                    offer.get("inet_down_mbps"),
+                ),
+            }
+            for offer in offers
+        ]
 
     def approve_mapping(self, mapping_id, candidate_digest):
         if self.mapping_repository is None:

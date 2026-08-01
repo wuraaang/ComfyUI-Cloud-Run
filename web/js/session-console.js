@@ -147,10 +147,63 @@ function money(value) {
 
 
 function bandwidthPrice(value) {
-  const number = finiteNumber(value);
+  const number = strictNonnegativeNumber(value);
   return number !== null && number >= 0
     ? `$${number.toFixed(3)}/GB`
     : "unavailable";
+}
+
+
+function strictNonnegativeNumber(value) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? value
+    : null;
+}
+
+
+function metricText(value, unit) {
+  const number = strictNonnegativeNumber(value);
+  return number === null
+    ? "unavailable"
+    : `${number.toFixed(1).replace(/\.0$/, "")} ${unit}`;
+}
+
+
+function downloadClassText(value) {
+  const downloadMbps = strictNonnegativeNumber(value);
+  if (downloadMbps === null || downloadMbps < 500) return "unavailable";
+  return downloadMbps >= 1000
+    ? "target (1000 Mbps or faster)"
+    : "fallback (500–999 Mbps)";
+}
+
+
+function theoreticalTransferText(value) {
+  if (
+    typeof value !== "number"
+    || !Number.isSafeInteger(value)
+    || value < 0
+  ) {
+    return "unavailable";
+  }
+  if (value < 60) return `${value} second${value === 1 ? "" : "s"}`;
+  const minutes = Math.ceil(value / 60);
+  return `${minutes} minute${minutes === 1 ? "" : "s"}`;
+}
+
+
+function estimatedTransferSeconds(transferBytes, inetDownMbps) {
+  const speed = strictNonnegativeNumber(inetDownMbps);
+  if (
+    !Number.isSafeInteger(transferBytes)
+    || transferBytes < 0
+    || speed === null
+    || speed <= 0
+  ) {
+    return null;
+  }
+  const estimate = Math.ceil(transferBytes * 8 / (speed * 1_000_000));
+  return Number.isSafeInteger(estimate) && estimate >= 0 ? estimate : null;
 }
 
 
@@ -736,8 +789,17 @@ export function createSessionConsole(document, api = {}, options = {}) {
           ? "unavailable"
           : `${(Number(quote.reliability) * 100).toFixed(1)}%`
       }`,
+      `Download: ${metricText(quote.inet_down_mbps, "Mbps")}`,
+      `Disk speed: ${metricText(quote.disk_bw_mbps, "MB/s")}`,
+      `Download class: ${downloadClassText(quote.inet_down_mbps)}`,
       `Bandwidth: ${bandwidthPrice(quote.inet_down_cost)} down; ` +
         `${bandwidthPrice(quote.inet_up_cost)} up`,
+      `theoretical transfer ≈ ${theoreticalTransferText(
+        estimatedTransferSeconds(
+          quote.transfer_bytes,
+          quote.inet_down_mbps,
+        ),
+      )}; actual startup can be longer`,
       `${positiveInteger(quote.disk_gb) ?? "unknown"} GB ephemeral disk`,
       `${bytesText(quote.transfer_bytes)} dependencies and inputs`,
       `${bytesText(quote.output_allowance_bytes)} output allowance`,

@@ -9,7 +9,11 @@ from .constants import (
     DEFAULT_DISK_GB,
     MAX_SESSION_DISK_GB,
     MIN_SESSION_DISK_GB,
+    MIN_VAST_INET_DOWN_MBPS,
+    MIN_VAST_RELIABILITY,
+    PREFERRED_VAST_INET_DOWN_MBPS,
 )
+from .offers import offer_quality_key
 from .worker_release import WorkerRelease, WorkerReleaseError
 
 
@@ -18,7 +22,6 @@ VAST_API_V1 = "https://console.vast.ai/api/v1"
 OFFER_SEARCH_URL = VAST_API_V0 + "/bundles/"
 OFFER_SEARCH_LIMIT = 20
 OFFER_TIMEOUT_SECONDS = 30
-MIN_RELIABILITY = 0.95
 
 
 class VastError(RuntimeError):
@@ -81,6 +84,17 @@ def _require_key(api_key):
     return api_key.strip()
 
 
+def _validated_minimum(value, fixed_floor, message, *, maximum=None):
+    normalized = _finite_number(value)
+    if (
+        normalized is None
+        or normalized < fixed_floor
+        or (maximum is not None and normalized > maximum)
+    ):
+        raise VastConfigurationError(message)
+    return int(normalized) if normalized.is_integer() else normalized
+
+
 def _headers(api_key):
     return {
         "Authorization": "Bearer " + _require_key(api_key),
@@ -93,17 +107,43 @@ def build_search_payload(
     min_vram_gb,
     *,
     disk_gb=DEFAULT_DISK_GB,
-    min_inet_down_mbps=0,
+    min_inet_down_mbps=MIN_VAST_INET_DOWN_MBPS,
+    max_inet_down_mbps=None,
     min_disk_bw_mbps=0,
-    min_reliability=MIN_RELIABILITY,
+    min_reliability=MIN_VAST_RELIABILITY,
     verified_only=True,
     secure_cloud_only=False,
+    order=None,
 ):
     """Build the on-demand, one-GPU search query."""
     disk = _validate_disk_gb(disk_gb)
+    reliability_floor = _validated_minimum(
+        min_reliability,
+        MIN_VAST_RELIABILITY,
+        "Vast reliability cannot be below the fixed safety floor.",
+        maximum=1,
+    )
+    download_floor = _validated_minimum(
+        min_inet_down_mbps,
+        MIN_VAST_INET_DOWN_MBPS,
+        "Vast download speed cannot be below the fixed safety floor.",
+    )
+    if max_inet_down_mbps is not None:
+        download_ceiling = _finite_number(max_inet_down_mbps)
+        if download_ceiling is None or download_ceiling <= download_floor:
+            raise VastConfigurationError(
+                "Vast download speed interval is invalid."
+            )
+        download_ceiling = (
+            int(download_ceiling)
+            if download_ceiling.is_integer()
+            else download_ceiling
+        )
+    else:
+        download_ceiling = None
     payload = {
         "gpu_ram": {"gte": int(min_vram_gb) * 1024},
-        "reliability": {"gte": float(min_reliability)},
+        "reliability": {"gte": reliability_floor},
         "rentable": {"eq": True},
         "dph_total": {"lte": float(max_price_per_hour)},
         "disk_space": {"gte": disk},
@@ -111,14 +151,15 @@ def build_search_payload(
         "num_gpus": {"eq": 1},
         "type": "ondemand",
         "limit": OFFER_SEARCH_LIMIT,
-        "order": [["dph_total", "asc"]],
+        "inet_down": {"gte": download_floor},
+        "order": order or [["dph_total", "asc"]],
     }
     if verified_only:
         payload["verified"] = {"eq": True}
     if secure_cloud_only:
         payload["datacenter"] = {"eq": True}
-    if min_inet_down_mbps:
-        payload["inet_down"] = {"gte": int(min_inet_down_mbps)}
+    if download_ceiling is not None:
+        payload["inet_down"]["lt"] = download_ceiling
     if min_disk_bw_mbps:
         payload["disk_bw"] = {"gte": int(min_disk_bw_mbps)}
     return payload
@@ -130,13 +171,24 @@ def normalize_offers(
     min_vram_gb,
     *,
     disk_gb=DEFAULT_DISK_GB,
-    min_inet_down_mbps=0,
+    min_inet_down_mbps=MIN_VAST_INET_DOWN_MBPS,
     min_disk_bw_mbps=0,
-    min_reliability=MIN_RELIABILITY,
+    min_reliability=MIN_VAST_RELIABILITY,
     verified_only=True,
     secure_cloud_only=False,
 ):
     disk_required = _validate_disk_gb(disk_gb)
+    reliability_floor = _validated_minimum(
+        min_reliability,
+        MIN_VAST_RELIABILITY,
+        "Vast reliability cannot be below the fixed safety floor.",
+        maximum=1,
+    )
+    download_floor = _validated_minimum(
+        min_inet_down_mbps,
+        MIN_VAST_INET_DOWN_MBPS,
+        "Vast download speed cannot be below the fixed safety floor.",
+    )
     if not isinstance(payload, dict):
         raise OfferSearchError("Vast returned an invalid offer response.")
     raw_offers = payload.get("offers")
@@ -165,7 +217,21 @@ def normalize_offers(
         num_gpus = raw.get("num_gpus")
         rentable = raw.get("rentable")
         verified = raw.get("verified")
+        verification = raw.get("verification")
         datacenter = raw.get("datacenter")
+        has_verified = "verified" in raw and verified is not None
+        has_verification = "verification" in raw and verification is not None
+        verification_is_valid = (
+            (has_verified or has_verification)
+            and (not has_verified or verified is True)
+            and (
+                not has_verification
+                or (
+                    isinstance(verification, str)
+                    and verification.casefold() == "verified"
+                )
+            )
+        )
         if (
             isinstance(offer_id, bool)
             or not isinstance(offer_id, int)
@@ -178,41 +244,23 @@ def normalize_offers(
             or price < 0
             or price > float(max_price_per_hour)
             or reliability is None
-            or not float(min_reliability) <= reliability <= 1
-            or (
-                rental_type is not None
-                and (
-                    not isinstance(rental_type, str)
-                    or rental_type.casefold() != "ondemand"
-                )
-            )
-            or (
-                num_gpus is not None
-                and (
-                    isinstance(num_gpus, bool)
-                    or not isinstance(num_gpus, (int, float))
-                    or float(num_gpus) != 1
-                )
-            )
-            or (rentable is not None and rentable is not True)
-            or (verified_only and verified is not None and verified is not True)
-            or (
-                secure_cloud_only
-                and datacenter is not None
-                and datacenter is not True
-            )
-            or (
-                min_inet_down_mbps
-                and (inet_down is None or inet_down < float(min_inet_down_mbps))
-            )
+            or not reliability_floor <= reliability <= 1
+            or not isinstance(rental_type, str)
+            or rental_type.casefold() != "ondemand"
+            or isinstance(num_gpus, bool)
+            or not isinstance(num_gpus, (int, float))
+            or float(num_gpus) != 1
+            or rentable is not True
+            or (verified_only and not verification_is_valid)
+            or (secure_cloud_only and datacenter is not True)
+            or inet_down is None
+            or inet_down < download_floor
             or (
                 min_disk_bw_mbps
                 and (disk_bw is None or disk_bw < float(min_disk_bw_mbps))
             )
-            or (
-                disk_space is not None
-                and disk_space < disk_required
-            )
+            or disk_space is None
+            or disk_space < disk_required
         ):
             continue
         offers.append(
@@ -247,12 +295,16 @@ async def _search_with_session(
     search_options,
     *,
     offer_id=None,
+    max_inet_down_mbps=None,
+    order=None,
 ):
     try:
         request_payload = build_search_payload(
             max_price_per_hour,
             min_vram_gb,
             **search_options,
+            max_inet_down_mbps=max_inet_down_mbps,
+            order=order,
         )
         if offer_id is not None:
             request_payload["ask_contract_id"] = {"eq": int(offer_id)}
@@ -323,31 +375,83 @@ async def search_offers(
     session=None,
     *,
     disk_gb=DEFAULT_DISK_GB,
-    min_inet_down_mbps=0,
+    min_inet_down_mbps=MIN_VAST_INET_DOWN_MBPS,
     min_disk_bw_mbps=0,
-    min_reliability=MIN_RELIABILITY,
+    min_reliability=MIN_VAST_RELIABILITY,
     verified_only=True,
     secure_cloud_only=False,
 ):
     if not isinstance(api_key, str) or not api_key.strip():
         raise OfferSearchConfigurationError("Vast API key is not configured.")
+    try:
+        reliability_floor = _validated_minimum(
+            min_reliability,
+            MIN_VAST_RELIABILITY,
+            "Vast reliability cannot be below the fixed safety floor.",
+            maximum=1,
+        )
+        download_floor = _validated_minimum(
+            min_inet_down_mbps,
+            MIN_VAST_INET_DOWN_MBPS,
+            "Vast download speed cannot be below the fixed safety floor.",
+        )
+    except VastConfigurationError as error:
+        raise OfferSearchConfigurationError(str(error)) from None
     options = {
         "disk_gb": disk_gb,
-        "min_inet_down_mbps": min_inet_down_mbps,
+        "min_inet_down_mbps": download_floor,
         "min_disk_bw_mbps": min_disk_bw_mbps,
-        "min_reliability": min_reliability,
+        "min_reliability": reliability_floor,
         "verified_only": verified_only,
         "secure_cloud_only": secure_cloud_only,
     }
 
     async def operation(client):
-        return await _search_with_session(
+        target_options = {
+            **options,
+            "min_inet_down_mbps": max(
+                PREFERRED_VAST_INET_DOWN_MBPS,
+                download_floor,
+            ),
+        }
+        target = await _search_with_session(
             client,
             api_key.strip(),
             max_price_per_hour,
             min_vram_gb,
-            options,
+            target_options,
+            order=[
+                ["reliability", "desc"],
+                ["disk_bw", "desc"],
+                ["dph_total", "asc"],
+                ["id", "asc"],
+            ],
         )
+        result_sets = [target]
+        if download_floor < PREFERRED_VAST_INET_DOWN_MBPS:
+            fallback = await _search_with_session(
+                client,
+                api_key.strip(),
+                max_price_per_hour,
+                min_vram_gb,
+                options,
+                max_inet_down_mbps=PREFERRED_VAST_INET_DOWN_MBPS,
+                order=[
+                    ["inet_down", "desc"],
+                    ["reliability", "desc"],
+                    ["disk_bw", "desc"],
+                    ["dph_total", "asc"],
+                    ["id", "asc"],
+                ],
+            )
+            result_sets.append(fallback)
+        unique = {}
+        for result_set in result_sets:
+            for offer in result_set:
+                unique.setdefault(offer["offer_id"], offer)
+        return sorted(unique.values(), key=offer_quality_key)[
+            : 2 * OFFER_SEARCH_LIMIT
+        ]
 
     try:
         return await _run_with_session(operation, session)
@@ -381,20 +485,34 @@ async def get_offer(
     session=None,
     *,
     disk_gb=DEFAULT_DISK_GB,
-    min_inet_down_mbps=0,
+    min_inet_down_mbps=MIN_VAST_INET_DOWN_MBPS,
     min_disk_bw_mbps=0,
-    min_reliability=MIN_RELIABILITY,
+    min_reliability=MIN_VAST_RELIABILITY,
     verified_only=True,
     secure_cloud_only=False,
 ):
     if not isinstance(api_key, str) or not api_key.strip():
         raise OfferSearchConfigurationError("Vast API key is not configured.")
     identifier = _validate_offer_id(offer_id)
+    try:
+        reliability_floor = _validated_minimum(
+            min_reliability,
+            MIN_VAST_RELIABILITY,
+            "Vast reliability cannot be below the fixed safety floor.",
+            maximum=1,
+        )
+        download_floor = _validated_minimum(
+            min_inet_down_mbps,
+            MIN_VAST_INET_DOWN_MBPS,
+            "Vast download speed cannot be below the fixed safety floor.",
+        )
+    except VastConfigurationError as error:
+        raise OfferSearchConfigurationError(str(error)) from None
     options = {
         "disk_gb": disk_gb,
-        "min_inet_down_mbps": min_inet_down_mbps,
+        "min_inet_down_mbps": download_floor,
         "min_disk_bw_mbps": min_disk_bw_mbps,
-        "min_reliability": min_reliability,
+        "min_reliability": reliability_floor,
         "verified_only": verified_only,
         "secure_cloud_only": secure_cloud_only,
     }

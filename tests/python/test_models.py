@@ -42,6 +42,8 @@ def quote(OfferQuote):
         host_id="host-3",
         public_ipaddr="203.0.113.7",
         max_instance_creates=1,
+        inet_down_mbps=1200.0,
+        disk_bw_mbps=600.0,
     )
 
 
@@ -55,6 +57,12 @@ class LifecycleModelTests(unittest.TestCase):
         paid_quote = OfferQuote.from_record(values)
         public = paid_quote.public_payload()
 
+        self.assertIn("inet_down_mbps", values)
+        self.assertIn("disk_bw_mbps", values)
+        self.assertEqual(paid_quote.inet_down_mbps, 1200.0)
+        self.assertEqual(paid_quote.disk_bw_mbps, 600.0)
+        self.assertEqual(public["inet_down_mbps"], 1200.0)
+        self.assertEqual(public["disk_bw_mbps"], 600.0)
         self.assertEqual(paid_quote.max_instance_creates, 1)
         self.assertEqual(paid_quote.to_record()["max_instance_creates"], 1)
         self.assertEqual(public["max_instance_creates"], 1)
@@ -69,6 +77,35 @@ class LifecycleModelTests(unittest.TestCase):
         self.assertEqual(public["protocol_version"], "1")
         self.assertEqual(public["manifest_digest"], "c" * 64)
         self.assertNotIn("session_secret_hex", public)
+
+    def test_quote_quality_metrics_are_optional_finite_nonnegative_numbers(self):
+        from cloud_run.models import OfferQuote
+
+        values = quote(OfferQuote).to_record()
+        values.update(inet_down_mbps=1200, disk_bw_mbps=600.5)
+        restored = OfferQuote.from_record(values)
+
+        self.assertEqual(restored.inet_down_mbps, 1200)
+        self.assertEqual(restored.disk_bw_mbps, 600.5)
+        for field in ("inet_down_mbps", "disk_bw_mbps"):
+            for malformed in (True, -1, float("inf"), float("nan"), "500"):
+                with self.subTest(field=field, malformed=malformed):
+                    with self.assertRaises(ValueError):
+                        OfferQuote.from_record({**values, field: malformed})
+
+    def test_quote_without_quality_metrics_is_legacy_inspection_only(self):
+        from cloud_run.models import OfferQuote
+
+        values = quote(OfferQuote).to_record()
+        values.pop("inet_down_mbps", None)
+        values.pop("disk_bw_mbps", None)
+
+        restored = OfferQuote.from_record(values)
+
+        self.assertIsNone(restored.inet_down_mbps)
+        self.assertIsNone(restored.disk_bw_mbps)
+        self.assertIsNone(restored.public_payload()["inet_down_mbps"])
+        self.assertIsNone(restored.public_payload()["disk_bw_mbps"])
 
     def test_quote_rejects_invalid_total_instance_create_limits(self):
         from cloud_run.models import OfferQuote

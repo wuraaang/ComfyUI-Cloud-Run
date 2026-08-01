@@ -276,6 +276,8 @@ class OfferQuote:
     host_id: str | None = None
     public_ipaddr: str | None = None
     max_instance_creates: int = 1
+    inet_down_mbps: float | None = None
+    disk_bw_mbps: float | None = None
 
     def __post_init__(self):
         finite_numbers = (
@@ -336,6 +338,14 @@ class OfferQuote:
                 or not isinstance(cost, (int, float))
                 or not math.isfinite(cost)
                 or cost < 0
+            ):
+                raise ValueError("Invalid paid offer quote.")
+        for metric in (self.inet_down_mbps, self.disk_bw_mbps):
+            if metric is not None and (
+                isinstance(metric, bool)
+                or not isinstance(metric, (int, float))
+                or not math.isfinite(metric)
+                or metric < 0
             ):
                 raise ValueError("Invalid paid offer quote.")
         if self.deadline_mode == "finite":
@@ -402,6 +412,8 @@ class OfferQuote:
                 "protocol_version": "1",
                 "manifest_digest": _UNBOUND_SHA256,
                 "max_instance_creates": 1,
+                "inet_down_mbps": None,
+                "disk_bw_mbps": None,
             }
         try:
             return cls(**payload)
@@ -425,6 +437,10 @@ class OfferQuote:
             "gpu_ram_gb": self.gpu_ram_gb,
             "dph_total": self.dph_total,
             "reliability": self.reliability,
+            "inet_down_mbps": (
+                self.inet_down_mbps if reviewed else None
+            ),
+            "disk_bw_mbps": self.disk_bw_mbps if reviewed else None,
             "max_price_per_hour": self.max_price_per_hour,
             "expires_at": self.expires_at,
             "disk_gb": self.disk_gb if reviewed else None,

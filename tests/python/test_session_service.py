@@ -107,11 +107,16 @@ class FakeOfferSearch:
     def __init__(self):
         self.calls = 0
         self.mutations = []
+        self.provider_offer = {
+            "offer_id": 42,
+            "inet_down_mbps": 500.0,
+            "private_provider_identity": "must-not-leak-through-preflight",
+        }
 
     async def __call__(self, *, disk_gb):
         self.calls += 1
         self.disk_gb = disk_gb
-        return [{"offer_id": 42}]
+        return [self.provider_offer]
 
 
 def blocked_resolution():
@@ -423,7 +428,23 @@ class SessionServiceTests(unittest.TestCase):
         self.assertIsNotNone(
             self.repository.get_manifest(result.manifest_digest)
         )
-        self.assertEqual(offers, [{"offer_id": 42}])
+        self.assertEqual(
+            offers,
+            [
+                {
+                    "offer_id": 42,
+                    "inet_down_mbps": 500.0,
+                    "private_provider_identity": (
+                        "must-not-leak-through-preflight"
+                    ),
+                    "estimated_transfer_seconds": 1,
+                }
+            ],
+        )
+        self.assertNotIn(
+            "estimated_transfer_seconds",
+            self.offer_search.provider_offer,
+        )
         self.assertEqual(self.offer_search.calls, 1)
         self.assertEqual(self.offer_search.disk_gb, 80)
         self.assertEqual(self.offer_search.mutations, [])
@@ -451,7 +472,16 @@ class SessionServiceTests(unittest.TestCase):
         self.assertTrue(result.rentable)
         self.assertEqual(
             asyncio.run(service.search_offers(result.preflight_id)),
-            [{"offer_id": 42}],
+            [
+                {
+                    "offer_id": 42,
+                    "inet_down_mbps": 500.0,
+                    "private_provider_identity": (
+                        "must-not-leak-through-preflight"
+                    ),
+                    "estimated_transfer_seconds": 1,
+                }
+            ],
         )
 
     def test_non_huggingface_row_does_not_expose_locator(self):

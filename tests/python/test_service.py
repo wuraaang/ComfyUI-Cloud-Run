@@ -218,6 +218,9 @@ class CloudRunServiceTests(unittest.TestCase):
         self.assertEqual(reopened.quote.disk_gb, 96)
         self.assertEqual(reopened.quote.transfer_bytes, 12_000)
         self.assertEqual(reopened.quote.output_allowance_bytes, 4_000)
+        self.assertIn("inet_down_mbps", reopened.quote.to_record())
+        self.assertEqual(reopened.quote.inet_down_mbps, 500.0)
+        self.assertEqual(reopened.quote.disk_bw_mbps, 600.0)
         self.assertEqual(reopened.quote.duration_seconds, 7_200)
         self.assertEqual(reopened.quote.max_instance_creates, 1)
         self.assertEqual(
@@ -676,7 +679,141 @@ class CloudRunServiceTests(unittest.TestCase):
         self.assertEqual(reopened.quote.dph_total, 0.42)
         self.assertEqual(reopened.quote.max_price_per_hour, 0.55)
         self.assertEqual(reopened.quote.expires_at, 160.0)
+        self.assertIn("inet_down_mbps", reopened.quote.to_record())
+        self.assertEqual(reopened.quote.inet_down_mbps, 500.0)
+        self.assertEqual(reopened.quote.disk_bw_mbps, 600.0)
         self.assertEqual(provider.create_calls, [])
+
+    def test_exact_offer_revalidation_enforces_quality_and_speed_floor(self):
+        from cloud_run.service import QuoteUnavailable
+
+        cases = (
+            (1200.0, 1000.0, True),
+            (1200.0, 999.0, False),
+            (850.0, 850.0, True),
+            (850.0, 849.0, False),
+            (850.0, 499.0, False),
+        )
+        for session_path in (False, True):
+            for quoted_speed, current_speed, accepted in cases:
+                with self.subTest(
+                    session_path=session_path,
+                    quoted_speed=quoted_speed,
+                    current_speed=current_speed,
+                ):
+                    quoted_offer = {
+                        **offer(),
+                        "inet_down_mbps": quoted_speed,
+                    }
+                    current_offer = {
+                        **offer(),
+                        "inet_down_mbps": current_speed,
+                    }
+                    provider = FakeProvider(
+                        lookups=[quoted_offer, current_offer]
+                    )
+                    service = self.service(
+                        provider,
+                        session_service=(
+                            FakePreflightService() if session_path else None
+                        ),
+                    )
+                    key = (
+                        f"quality-{'session' if session_path else 'legacy'}-"
+                        f"{quoted_speed}-{current_speed}"
+                    )
+                    if session_path:
+                        preview = asyncio.run(
+                            service.preview_session(
+                                preflight_id="preflight-1",
+                                offer_id="42",
+                                idempotency_key=key,
+                                deadline={
+                                    "mode": "finite",
+                                    "duration_seconds": 7_200,
+                                },
+                                max_instance_creates=1,
+                            )
+                        )
+                        confirm = service.confirm_session
+                        identifier = preview.session_id
+                    else:
+                        preview = asyncio.run(
+                            service.preview_offer(
+                                offer_id="42",
+                                idempotency_key=key,
+                            )
+                        )
+                        confirm = service.confirm
+                        identifier = preview.attempt_id
+                    if accepted:
+                        result = asyncio.run(
+                            confirm(identifier, idempotency_key=key)
+                        )
+                        self.assertEqual(result.instance_id, "instance-9")
+                        self.assertEqual(len(provider.create_calls), 1)
+                    else:
+                        with self.assertRaises(QuoteUnavailable):
+                            asyncio.run(
+                                confirm(identifier, idempotency_key=key)
+                            )
+                        self.assertEqual(provider.create_calls, [])
+
+    def test_exact_offer_revalidation_rejects_hard_policy_failure(self):
+        from cloud_run.service import QuoteUnavailable
+
+        for session_path in (False, True):
+            with self.subTest(session_path=session_path):
+                provider = FakeProvider(
+                    lookups=[
+                        {**offer(), "inet_down_mbps": 850.0},
+                        {
+                            **offer(),
+                            "inet_down_mbps": 850.0,
+                            "reliability": 0.98,
+                        },
+                    ]
+                )
+                service = self.service(
+                    provider,
+                    session_service=(
+                        FakePreflightService() if session_path else None
+                    ),
+                )
+                key = "hard-policy-" + (
+                    "session" if session_path else "legacy"
+                )
+                if session_path:
+                    preview = asyncio.run(
+                        service.preview_session(
+                            preflight_id="preflight-1",
+                            offer_id="42",
+                            idempotency_key=key,
+                            deadline={
+                                "mode": "finite",
+                                "duration_seconds": 7_200,
+                            },
+                            max_instance_creates=1,
+                        )
+                    )
+                    operation = service.confirm_session(
+                        preview.session_id,
+                        idempotency_key=key,
+                    )
+                else:
+                    preview = asyncio.run(
+                        service.preview_offer(
+                            offer_id="42",
+                            idempotency_key=key,
+                        )
+                    )
+                    operation = service.confirm(
+                        preview.attempt_id,
+                        idempotency_key=key,
+                    )
+                with self.assertRaises(QuoteUnavailable):
+                    asyncio.run(operation)
+                self.assertEqual(provider.create_calls, [])
 
     def test_preview_uses_exact_lookup_when_offer_is_absent_from_broad_results(self):
         provider = FakeProvider(searches=[[]], lookups=[offer()])

@@ -9,6 +9,7 @@ from .constants import COMFYUI_CONTAINER_PORT, DEFAULT_DISK_GB
 from .models import AttemptState, OfferQuote, SessionState
 from .offers import (
     apply_offer_policy,
+    offer_meets_connection_quality_policy,
     select_best_offer,
 )
 from .session_service import TerminalProvisioningError
@@ -551,6 +552,7 @@ class CloudRunLifecycle:
                     for offer in offers
                     if float(offer.get("dph_total", float("inf")))
                     <= attempt.quote.max_price_per_hour
+                    and offer_meets_connection_quality_policy(offer)
                 ],
                 blacklist=self.blacklist,
                 now=float(self.clock()),
@@ -579,6 +581,8 @@ class CloudRunLifecycle:
                 if selected.get("reliability") is not None
                 else None
             ),
+            inet_down_mbps=selected.get("inet_down_mbps"),
+            disk_bw_mbps=selected.get("disk_bw_mbps"),
             max_price_per_hour=attempt.quote.max_price_per_hour,
             expires_at=float(self.clock()) + 120,
             disk_gb=attempt.quote.disk_gb,
@@ -1356,6 +1360,7 @@ class CloudRunLifecycle:
                     for offer in offers
                     if float(offer.get("dph_total", float("inf")))
                     <= session.quote.max_price_per_hour
+                    and offer_meets_connection_quality_policy(offer)
                 ],
                 blacklist=self.blacklist,
                 now=float(self.clock()),
@@ -1384,6 +1389,8 @@ class CloudRunLifecycle:
                 if selected.get("reliability") is not None
                 else None
             ),
+            inet_down_mbps=selected.get("inet_down_mbps"),
+            disk_bw_mbps=selected.get("disk_bw_mbps"),
             max_price_per_hour=session.quote.max_price_per_hour,
             expires_at=float(self.clock()) + 120,
             disk_gb=session.quote.disk_gb,

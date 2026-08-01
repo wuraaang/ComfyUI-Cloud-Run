@@ -347,6 +347,8 @@ class CancellationAndReadinessTests(LifecycleTestCase):
                     "gpu_ram_gb": 24.0,
                     "dph_total": 0.42,
                     "reliability": 0.99,
+                    "inet_down_mbps": 500.0,
+                    "disk_bw_mbps": 600.0,
                     "machine_id": "machine-7",
                     "host_id": "host-3",
                     "public_ipaddr": "8.8.8.8",
@@ -625,6 +627,8 @@ class RecoveryAndReplacementTests(LifecycleTestCase):
                 "machine_id": "machine-8",
                 "host_id": "host-4",
                 "public_ipaddr": "1.1.1.1",
+                "inet_down_mbps": 1200.0,
+                "disk_bw_mbps": 700.0,
             },
         ]
 
@@ -639,6 +643,9 @@ class RecoveryAndReplacementTests(LifecycleTestCase):
         self.assertEqual(replacement.retry_count, 1)
         self.assertEqual(replacement.instance_id, "instance-2")
         self.assertEqual(replacement.quote.offer_id, "43")
+        self.assertIn("inet_down_mbps", replacement.quote.to_record())
+        self.assertEqual(replacement.quote.inet_down_mbps, 1200.0)
+        self.assertEqual(replacement.quote.disk_bw_mbps, 700.0)
         self.assertEqual(replacement.quote.max_instance_creates, 2)
         actions = [call[0] for call in self.provider.calls]
         self.assertLess(actions.index("destroy"), actions.index("search"))
@@ -671,6 +678,44 @@ class RecoveryAndReplacementTests(LifecycleTestCase):
         self.assertEqual(
             len([call for call in self.provider.calls if call[0] == "create"]),
             1,
+        )
+
+    def test_replacement_reapplies_connection_floors_before_create(self):
+        attempt = self.save_attempt(
+            AttemptState.STARTING,
+            instance_id="instance-1",
+            selected_quote=quote(max_instance_creates=2),
+        )
+        self.provider.instances = [
+            provider_instance("instance-1", attempt.label)
+        ]
+        self.provider.search_results = [
+            {
+                "offer_id": 43,
+                "gpu_name": "RTX 4090",
+                "gpu_ram_gb": 24.0,
+                "dph_total": 0.44,
+                "reliability": 0.999,
+                "inet_down_mbps": 400.0,
+                "disk_bw_mbps": 700.0,
+            }
+        ]
+
+        failed = asyncio.run(
+            self.lifecycle().handle_start_failure(
+                attempt.attempt_id,
+                failure_code="boot_timeout",
+            )
+        )
+
+        self.assertEqual(failed.state, AttemptState.FAILED)
+        self.assertEqual(
+            failed.sanitized_error,
+            "No safe replacement offer is currently available.",
+        )
+        self.assertEqual(
+            [call for call in self.provider.calls if call[0] == "create"],
+            [],
         )
 
     def test_legacy_limit_one_stops_before_blacklist_and_replacement_search(self):
@@ -1350,6 +1395,8 @@ class SessionLifecycleTests(LifecycleTestCase):
                 "machine_id": "machine-8",
                 "host_id": "host-4",
                 "public_ipaddr": "1.1.1.1",
+                "inet_down_mbps": 1000.0,
+                "disk_bw_mbps": 750.0,
             }
         ]
 
@@ -1364,6 +1411,9 @@ class SessionLifecycleTests(LifecycleTestCase):
         self.assertEqual(replacement.retry_count, 1)
         self.assertEqual(replacement.instance_id, "instance-2")
         self.assertEqual(replacement.quote.offer_id, "43")
+        self.assertIn("inet_down_mbps", replacement.quote.to_record())
+        self.assertEqual(replacement.quote.inet_down_mbps, 1000.0)
+        self.assertEqual(replacement.quote.disk_bw_mbps, 750.0)
         self.assertEqual(replacement.quote.max_instance_creates, 2)
         actions = [call[0] for call in self.provider.calls]
         self.assertEqual(actions, ["destroy", "list", "search", "create"])
@@ -1392,6 +1442,40 @@ class SessionLifecycleTests(LifecycleTestCase):
         self.assertEqual(
             len([call for call in self.provider.calls if call[0] == "create"]),
             1,
+        )
+
+    def test_session_replacement_reapplies_connection_floors_before_create(self):
+        session = self.save_session(max_instance_creates=2)
+        self.provider.instances = [
+            self.worker_instance("instance-1", session.label)
+        ]
+        self.provider.search_results = [
+            {
+                "offer_id": 43,
+                "gpu_name": "RTX 4090",
+                "gpu_ram_gb": 24.0,
+                "dph_total": 0.44,
+                "reliability": 0.999,
+                "inet_down_mbps": 400.0,
+                "disk_bw_mbps": 750.0,
+            }
+        ]
+
+        failed = asyncio.run(
+            self.session_lifecycle().handle_session_boot_failure(
+                session.session_id,
+                failure_code="boot_timeout",
+            )
+        )
+
+        self.assertEqual(failed.state, SessionState.FAILED)
+        self.assertEqual(
+            failed.sanitized_error,
+            "No safe replacement offer is currently available.",
+        )
+        self.assertEqual(
+            [call for call in self.provider.calls if call[0] == "create"],
+            [],
         )
 
     def test_limit_one_destroys_failed_boot_without_replacement_search(self):
@@ -1461,6 +1545,8 @@ class SessionLifecycleTests(LifecycleTestCase):
                 "machine_id": "machine-8",
                 "host_id": "host-4",
                 "public_ipaddr": "1.1.1.1",
+                "inet_down_mbps": 1000.0,
+                "disk_bw_mbps": 750.0,
             }
         ]
         original_create = self.provider.create_instance
