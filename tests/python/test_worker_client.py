@@ -40,6 +40,60 @@ class RecordingTransport:
 
 
 class WorkerClientTests(unittest.TestCase):
+    def test_boundary_401_is_typed_and_never_echoes_response(self):
+        from cloud_run.worker_client import (
+            WorkerBoundaryAuthenticationError,
+            WorkerClient,
+            WorkerTransportResponse,
+        )
+
+        private_marker = "private-boundary-response-marker"
+
+        class RejectingTransport:
+            requests = []
+
+            async def request(self, request, *, max_bytes):
+                self.requests.append(request)
+                return WorkerTransportResponse(
+                    status=401,
+                    headers={
+                        "Content-Type": "text/html",
+                        "Content-Encoding": "gzip",
+                        "X-Private-Marker": private_marker,
+                    },
+                    body=private_marker.encode("utf-8") + b"\xffnot-json",
+                )
+
+        transport = RejectingTransport()
+        client = WorkerClient(
+            base_url="http://8.8.8.8:30000",
+            provider_token="a" * 64,
+            session_id="session-1",
+            session_secret=b"s" * 32,
+            transport=transport,
+            clock=lambda: 1000,
+            nonce=lambda: "n-1",
+        )
+
+        with self.assertRaises(
+            WorkerBoundaryAuthenticationError
+        ) as raised:
+            asyncio.run(client.health())
+
+        self.assertIs(
+            type(raised.exception),
+            WorkerBoundaryAuthenticationError,
+        )
+        self.assertEqual(
+            str(raised.exception),
+            "Remote worker boundary authentication failed.",
+        )
+        self.assertNotIn(private_marker, str(raised.exception))
+        self.assertNotIn(private_marker, repr(raised.exception))
+        self.assertNotIn("a" * 64, str(raised.exception))
+        self.assertNotIn("a" * 64, repr(raised.exception))
+        self.assertEqual(len(transport.requests), 1)
+
     def test_client_rejects_invalid_boundary_tokens_before_transport(self):
         from cloud_run.worker_client import WorkerClient, WorkerClientError
 

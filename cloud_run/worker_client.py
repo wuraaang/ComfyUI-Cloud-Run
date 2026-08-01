@@ -42,6 +42,10 @@ class WorkerClientError(RuntimeError):
     """A sanitized worker transport or protocol failure."""
 
 
+class WorkerBoundaryAuthenticationError(WorkerClientError):
+    """The worker boundary rejected its controller-owned token."""
+
+
 @dataclass(frozen=True, repr=False)
 class WorkerRequest:
     method: str
@@ -129,6 +133,10 @@ def _parse_json_response(response, *, maximum=MAX_WORKER_JSON_BYTES):
         or len(response.body) > maximum
     ):
         raise _client_error()
+    if response.status == 401:
+        raise WorkerBoundaryAuthenticationError(
+            "Remote worker boundary authentication failed."
+        )
     headers = _response_headers(response.headers)
     if headers.get("content-encoding", "identity").casefold() != "identity":
         raise _client_error()

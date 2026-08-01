@@ -32,6 +32,7 @@ from .models import CloudJob, JobState, SessionState, TransferState
 from .offers import estimated_transfer_seconds
 from .relay import RelaySyncResult
 from .repository import ConcurrentSessionUpdate, SessionRepository
+from .worker_client import WorkerBoundaryAuthenticationError
 from .worker_release import WorkerRelease
 
 
@@ -2158,6 +2159,10 @@ class SessionService:
                 await claim()
         except (asyncio.CancelledError, KeyboardInterrupt):
             raise
+        except WorkerBoundaryAuthenticationError:
+            raise TerminalProvisioningError(
+                "Remote worker boundary authentication failed."
+            ) from None
         except Exception:
             raise SessionExecutionError(
                 "Remote worker authentication failed."
@@ -2256,6 +2261,10 @@ class SessionService:
                 await claim()
         except (asyncio.CancelledError, KeyboardInterrupt):
             raise
+        except WorkerBoundaryAuthenticationError:
+            raise TerminalProvisioningError(
+                "Remote worker boundary authentication failed."
+            ) from None
         except Exception:
             raise SessionExecutionError(
                 "Remote worker authentication failed."

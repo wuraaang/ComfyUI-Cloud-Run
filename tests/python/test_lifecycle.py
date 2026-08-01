@@ -1162,13 +1162,23 @@ class SessionLifecycleTests(LifecycleTestCase):
 
     def test_terminal_provisioning_failure_destroys_and_verifies_immediately(self):
         self.session_service = TerminalSessionService(self.sessions)
-        session = self.save_session()
+        session = self.save_session(max_instance_creates=1)
         self.provider.instances = [
             self.worker_instance("instance-1", session.label)
         ]
+        asyncio.run(
+            self.provider.create_instance(
+                "synthetic-value",
+                offer_id=session.quote.offer_id,
+                disk_gb=session.disk_gb,
+                label=session.label,
+                release=worker_release(),
+                boundary_token="a" * 64,
+                session_id=session.session_id,
+            )
+        )
         lifecycle = self.session_lifecycle()
-        lifecycle.boot_deadline_seconds = 3
-        lifecycle.poll_interval_seconds = 1
+        self.assertEqual(lifecycle.boot_deadline_seconds, 15 * 60)
 
         destroyed = asyncio.run(
             lifecycle.wait_until_session_ready(session.session_id)
@@ -1184,7 +1194,45 @@ class SessionLifecycleTests(LifecycleTestCase):
         self.assertEqual(self.clock.sleeps, [])
         self.assertEqual(
             [call[0] for call in self.provider.calls],
-            ["get", "destroy", "list"],
+            ["create", "get", "destroy", "list"],
+        )
+        self.assertEqual(
+            len(
+                [
+                    call
+                    for call in self.provider.calls
+                    if call[0] == "create"
+                ]
+            ),
+            1,
+        )
+        self.assertEqual(
+            len(
+                [
+                    call
+                    for call in self.provider.calls
+                    if call[0] == "destroy"
+                ]
+            ),
+            1,
+        )
+        self.assertEqual(
+            len(
+                [
+                    call
+                    for call in self.provider.calls
+                    if call[0] == "list"
+                ]
+            ),
+            1,
+        )
+        self.assertEqual(
+            [
+                call
+                for call in self.provider.calls
+                if call[0] == "search"
+            ],
+            [],
         )
 
     def test_terminal_destroy_exception_keeps_residual_billing_warning(self):

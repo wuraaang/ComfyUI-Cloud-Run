@@ -1105,6 +1105,26 @@ class ReusableSessionTests(unittest.TestCase):
         )
         self.sessions.create_or_get(session)
 
+    def _save_bootstrapping_session(self):
+        session = CloudSession.new(
+            "boot-key",
+            session_id="session-boot",
+            manifest_digest=self.initial_manifest.digest,
+            deadline_at=7300.0,
+            deadline_mode="finite",
+            disk_gb=80,
+            now=100.0,
+            state=SessionState.BOOTSTRAPPING,
+        ).transition(
+            SessionState.BOOTSTRAPPING,
+            now=100.0,
+            instance_id="88",
+            worker_base_url="http://8.8.8.8:30001",
+            provider_token="c" * 64,
+            session_secret_hex="e" * 64,
+        )
+        return self.sessions.create_or_get(session)[0]
+
     def test_apply_manifest_polls_and_persists_only_sanitized_progress(self):
         service = self.service
         service.job_poll_interval_seconds = 0
@@ -1570,27 +1590,8 @@ class ReusableSessionTests(unittest.TestCase):
         )
 
     def test_boot_claims_provisions_deadline_and_records_verified_installed_set(self):
-        initial_digest = self.sessions.get(
-            "session-1"
-        ).installed_manifest_digest
-        boot = CloudSession.new(
-            "boot-key",
-            session_id="session-boot",
-            manifest_digest=initial_digest,
-            deadline_at=7300.0,
-            deadline_mode="finite",
-            disk_gb=80,
-            now=100.0,
-            state=SessionState.BOOTSTRAPPING,
-        ).transition(
-            SessionState.BOOTSTRAPPING,
-            now=100.0,
-            instance_id="88",
-            worker_base_url="http://8.8.8.8:30001",
-            provider_token="c" * 64,
-            session_secret_hex="e" * 64,
-        )
-        self.sessions.create_or_get(boot)
+        initial_digest = self.initial_manifest.digest
+        self._save_bootstrapping_session()
 
         ready = asyncio.run(
             self.service.bootstrap_session("session-boot")
@@ -1617,6 +1618,93 @@ class ReusableSessionTests(unittest.TestCase):
             ],
             ["input-a.jpg", "model-a.safetensors"],
         )
+
+    def test_bootstrap_boundary_401_is_terminal(self):
+        from cloud_run.worker_client import (
+            WorkerBoundaryAuthenticationError,
+        )
+
+        self._save_bootstrapping_session()
+
+        async def rejected_health():
+            raise WorkerBoundaryAuthenticationError(
+                "Remote worker boundary authentication failed."
+            )
+
+        self.worker.health = rejected_health
+
+        with self.assertRaises(TerminalProvisioningError) as raised:
+            asyncio.run(
+                self.service.bootstrap_session("session-boot")
+            )
+
+        self.assertIs(type(raised.exception), TerminalProvisioningError)
+        self.assertEqual(
+            str(raised.exception),
+            "Remote worker boundary authentication failed.",
+        )
+        self.assertIsNone(raised.exception.__cause__)
+
+    def test_recovery_boundary_401_is_terminal(self):
+        from cloud_run.worker_client import (
+            WorkerBoundaryAuthenticationError,
+        )
+
+        async def rejected_health():
+            raise WorkerBoundaryAuthenticationError(
+                "Remote worker boundary authentication failed."
+            )
+
+        self.worker.health = rejected_health
+
+        with self.assertRaises(TerminalProvisioningError) as raised:
+            asyncio.run(self.service.recover_session("session-1"))
+
+        self.assertIs(type(raised.exception), TerminalProvisioningError)
+        self.assertEqual(
+            str(raised.exception),
+            "Remote worker boundary authentication failed.",
+        )
+        self.assertIsNone(raised.exception.__cause__)
+
+    def test_worker_transport_failures_remain_retryable(self):
+        from cloud_run.worker_client import WorkerClientError
+
+        failures = (
+            ConnectionRefusedError("private refusal detail"),
+            TimeoutError("private timeout detail"),
+            WorkerClientError("Remote worker request failed."),
+        )
+        for operation in ("bootstrap", "recovery"):
+            for failure in failures:
+                with self.subTest(
+                    operation=operation,
+                    failure=type(failure).__name__,
+                ):
+                    if operation == "bootstrap":
+                        self._save_bootstrapping_session()
+                        session_id = "session-boot"
+                        invoke = self.service.bootstrap_session
+                    else:
+                        session_id = "session-1"
+                        invoke = self.service.recover_session
+
+                    async def failed_health(failure=failure):
+                        raise failure
+
+                    self.worker.health = failed_health
+
+                    with self.assertRaises(SessionExecutionError) as raised:
+                        asyncio.run(invoke(session_id))
+
+                    self.assertIs(
+                        type(raised.exception),
+                        SessionExecutionError,
+                    )
+                    self.assertEqual(
+                        str(raised.exception),
+                        "Remote worker authentication failed.",
+                    )
 
     def test_ready_recovery_reauthenticates_manifest_and_deadline_without_create(self):
         self.worker.claimed = True
