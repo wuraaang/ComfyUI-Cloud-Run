@@ -13,7 +13,9 @@ import time
 from typing import Mapping
 
 
-CADDY_CANDIDATES = (Path("/usr/bin/caddy"), Path("/usr/local/bin/caddy"))
+CADDY_CANDIDATES = (
+    Path("/opt/portal-aio/caddy_manager/caddy"),
+)
 STATE_DIRECTORY = Path("/var/lib/comfyui-cloud-run")
 MAX_TOKEN_BYTES = 4096
 SHUTDOWN_TIMEOUT_SECONDS = 10

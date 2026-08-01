@@ -175,6 +175,12 @@ class GatewayTokenTests(unittest.TestCase):
 
 
 class CaddySelectionTests(unittest.TestCase):
+    def test_candidate_is_the_exact_official_vast_portal_binary(self):
+        self.assertEqual(
+            CADDY_CANDIDATES,
+            (Path("/opt/portal-aio/caddy_manager/caddy"),),
+        )
+
     def test_selects_the_only_regular_owned_executable_candidate(self):
         selected = CADDY_CANDIDATES[0]
         filesystem = FakeFilesystem(
@@ -187,25 +193,38 @@ class CaddySelectionTests(unittest.TestCase):
             access_fn=filesystem.access,
         )
 
-        self.assertEqual(result, Path("/usr/bin/caddy"))
+        self.assertEqual(
+            result,
+            Path("/opt/portal-aio/caddy_manager/caddy"),
+        )
         self.assertEqual(filesystem.lstat_calls, list(CADDY_CANDIDATES))
         self.assertEqual(filesystem.access_calls, [(selected, os.X_OK)])
 
-    def test_zero_or_two_matching_candidates_fail_closed(self):
-        cases = {
-            "zero": FakeFilesystem({}, set()),
-            "two": FakeFilesystem(
-                {candidate: file_metadata() for candidate in CADDY_CANDIDATES},
-                CADDY_CANDIDATES,
-            ),
-        }
-        for label, filesystem in cases.items():
-            with self.subTest(label=label):
-                with self.assertRaisesRegex(GatewayError, "^" + STATIC_ERROR + "$"):
-                    select_caddy_binary(
-                        lstat_fn=filesystem.lstat,
-                        access_fn=filesystem.access,
-                    )
+    def test_missing_official_candidate_fails_closed_without_trying_generic_paths(self):
+        filesystem = FakeFilesystem(
+            {
+                Path("/usr/bin/caddy"): file_metadata(),
+                Path("/usr/local/bin/caddy"): file_metadata(),
+                Path("/opt/instance-tools/bin/caddy"): file_metadata(),
+            },
+            {
+                Path("/usr/bin/caddy"),
+                Path("/usr/local/bin/caddy"),
+                Path("/opt/instance-tools/bin/caddy"),
+            },
+        )
+
+        with self.assertRaisesRegex(GatewayError, "^" + STATIC_ERROR + "$"):
+            select_caddy_binary(
+                lstat_fn=filesystem.lstat,
+                access_fn=filesystem.access,
+            )
+
+        self.assertEqual(
+            filesystem.lstat_calls,
+            [Path("/opt/portal-aio/caddy_manager/caddy")],
+        )
+        self.assertEqual(filesystem.access_calls, [])
 
     def test_rejects_symlinks_non_files_unowned_and_non_executable_files(self):
         candidate = CADDY_CANDIDATES[0]
