@@ -4,7 +4,7 @@
 }
 
 :8765 {
-	@unauthorized not header Authorization "Bearer {$JUPYTER_TOKEN}"
+	@unauthorized not header Authorization "Bearer {$CLOUD_RUN_BOUNDARY_TOKEN}"
 	respond @unauthorized 401
 
 	request_header -Authorization

@@ -13,6 +13,10 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+from cloud_run.worker_protocol import (
+    BOUNDARY_TOKEN_ENVIRONMENT,
+    SESSION_ID_ENVIRONMENT,
+)
 from remote_worker.gateway import (
     CADDY_CANDIDATES,
     GatewayError,
@@ -129,27 +133,32 @@ class RecordingPopen:
 
 
 class GatewayTokenTests(unittest.TestCase):
-    def test_accepts_only_the_bounded_inert_utf8_token_alphabet(self):
-        accepted = "Az09._~+/=-"
+    def test_accepts_only_the_project_boundary_token(self):
+        accepted = "a" * 64
         self.assertEqual(
-            validated_gateway_token({"JUPYTER_TOKEN": accepted}),
+            validated_gateway_token({BOUNDARY_TOKEN_ENVIRONMENT: accepted}),
             accepted,
         )
-        self.assertEqual(
-            validated_gateway_token({"JUPYTER_TOKEN": "a" * 4096}),
-            "a" * 4096,
-        )
 
-        for token in ("", "a" * 4097, "has space", "line\nbreak", "café"):
+        for token in ("", "A" * 64, "a" * 63, "a" * 65, "has space"):
             with self.subTest(token_length=len(token)):
                 with self.assertRaisesRegex(GatewayError, "^" + STATIC_ERROR + "$"):
-                    validated_gateway_token({"JUPYTER_TOKEN": token})
+                    validated_gateway_token({BOUNDARY_TOKEN_ENVIRONMENT: token})
+
+    def test_provider_owned_tokens_never_substitute_for_project_boundary(self):
+        provider_tokens = {
+            "JUPYTER_TOKEN": "a" * 64,
+            "OPEN_BUTTON_TOKEN": "b" * 64,
+        }
+
+        with self.assertRaisesRegex(GatewayError, "^" + STATIC_ERROR + "$"):
+            validated_gateway_token(provider_tokens)
 
     def test_rejections_disclose_only_the_static_gateway_error(self):
         token = "not allowed secret"
         caught = None
         try:
-            validated_gateway_token({"JUPYTER_TOKEN": token})
+            validated_gateway_token({BOUNDARY_TOKEN_ENVIRONMENT: token})
         except GatewayError as error:
             caught = error
         self.assertIsNotNone(caught)
@@ -247,10 +256,12 @@ class CaddySelectionTests(unittest.TestCase):
 
 class GatewayProcessTests(unittest.TestCase):
     def setUp(self):
-        self.token = "opaque-token+/="
+        self.token = "a" * 64
         self.runtime_environment = {
-            "JUPYTER_TOKEN": self.token,
-            "CLOUD_RUN_SESSION_ID": "session-1",
+            BOUNDARY_TOKEN_ENVIRONMENT: self.token,
+            "JUPYTER_TOKEN": "b" * 64,
+            "OPEN_BUTTON_TOKEN": "c" * 64,
+            SESSION_ID_ENVIRONMENT: "session-1",
             "CLOUD_RUN_COMFY_ROOT": "/opt/ComfyUI",
             "CLOUD_RUN_WORKER_VERSION": "a" * 40,
             "CONTAINER_ID": "77",
@@ -334,7 +345,7 @@ class GatewayProcessTests(unittest.TestCase):
         self.assertEqual(
             factory.calls[0][1]["env"],
             {
-                "JUPYTER_TOKEN": self.token,
+                BOUNDARY_TOKEN_ENVIRONMENT: self.token,
                 "HOME": "/var/lib/comfyui-cloud-run",
                 "XDG_CONFIG_HOME": str(self.config_directory),
                 "XDG_DATA_HOME": str(self.data_directory),
@@ -342,7 +353,7 @@ class GatewayProcessTests(unittest.TestCase):
         )
         worker_environment = factory.calls[1][1]["env"]
         expected_names = {
-            "CLOUD_RUN_SESSION_ID",
+            SESSION_ID_ENVIRONMENT,
             "CLOUD_RUN_COMFY_ROOT",
             "CLOUD_RUN_WORKER_VERSION",
             "CONTAINER_ID",
@@ -368,7 +379,13 @@ class GatewayProcessTests(unittest.TestCase):
             ),
             msg="worker instance credential was not preserved",
         )
+        self.assertEqual(
+            worker_environment[SESSION_ID_ENVIRONMENT],
+            self.runtime_environment[SESSION_ID_ENVIRONMENT],
+        )
+        self.assertNotIn(BOUNDARY_TOKEN_ENVIRONMENT, worker_environment)
         self.assertNotIn("JUPYTER_TOKEN", worker_environment)
+        self.assertNotIn("OPEN_BUTTON_TOKEN", worker_environment)
 
     def test_filtered_environment_builds_real_deadline_armed_worker_runtime(self):
         from remote_worker.deadline import (
@@ -496,7 +513,7 @@ class GatewayConfigurationTests(unittest.TestCase):
         self.assertIn("auto_https off", text)
         self.assertEqual(text.count(":8765 {"), 1)
         self.assertIn(
-            '@unauthorized not header Authorization "Bearer {$JUPYTER_TOKEN}"',
+            '@unauthorized not header Authorization "Bearer {$CLOUD_RUN_BOUNDARY_TOKEN}"',
             text,
         )
         self.assertIn("request_header -Authorization", text)

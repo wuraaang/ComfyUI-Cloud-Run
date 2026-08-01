@@ -447,7 +447,7 @@ class WorkerApplicationTests(unittest.TestCase):
                 "\n"
                 ":8765 {\n"
                 '\t@unauthorized not header Authorization "Bearer '
-                '{$JUPYTER_TOKEN}"\n'
+                '{$CLOUD_RUN_BOUNDARY_TOKEN}"\n'
                 "\trespond @unauthorized 401\n"
                 "\n"
                 "\trequest_header -Authorization\n"

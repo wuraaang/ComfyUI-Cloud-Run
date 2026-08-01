@@ -9,6 +9,8 @@ import re
 import stat
 import sys
 
+from cloud_run.worker_protocol import SESSION_ID_ENVIRONMENT
+
 from .comfy import ComfyProcess
 from .deadline import deadline_watchdog
 from .install import CustomNodeInstaller
@@ -257,7 +259,7 @@ def main(argv=None):
         raise RuntimeError("aiohttp is required by the Remote Worker.") from None
     arguments = parse_worker_arguments(argv)
     session_id = (
-        os.environ.get("CLOUD_RUN_SESSION_ID", "").strip() or None
+        os.environ.get(SESSION_ID_ENVIRONMENT, "").strip() or None
     )
     data_root = arguments.state_directory
     state_path = data_root / "worker-state.json"
