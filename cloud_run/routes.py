@@ -56,6 +56,7 @@ from .vast import (
     VastError,
 )
 from .worker_release import (
+    WorkerRelease,
     WorkerReleaseUnavailable,
     load_worker_release,
 )
@@ -748,6 +749,12 @@ def register_routes(service_factory=None):
             service = make_service()
         except Exception:
             service = None
+        release = getattr(service, "release", None)
+        payload["worker_release"] = (
+            release.to_record()
+            if isinstance(release, WorkerRelease)
+            else None
+        )
         payload["active_sessions"] = (
             _active_session_payloads(service)
             if service is not None

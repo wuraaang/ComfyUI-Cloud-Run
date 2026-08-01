@@ -32,6 +32,7 @@ from cloud_run.models import (
     TransferState,
 )
 from cloud_run.vast import OfferSearchError
+from cloud_run.worker_release import WorkerRelease
 
 
 class FakeResponse:
@@ -154,9 +155,69 @@ class SettingsRouteTests(unittest.TestCase):
                 "official_template_id": "027fba7753c024be019030fb42aed900",
                 "official_template_name": "Official ComfyUI",
                 "lifecycle_enabled": True,
+                "worker_release": None,
                 "active_sessions": [],
             },
         )
+
+    def test_get_returns_only_the_loaded_worker_release_record(self):
+        release = WorkerRelease.from_payload(
+            {
+                "schema_version": 1,
+                "template_hash_id": "1" * 32,
+                "worker_commit": "a" * 40,
+                "worker_archive_sha256": "b" * 64,
+                "protocol_version": "1",
+                "comfyui_core_version": "0.29.0",
+                "comfyui_frontend_version": "1.47.10",
+                "python_version": "3.12",
+                "worker_port": 8765,
+            }
+        )
+        private_markers = (
+            "/private/worker-release.json",
+            "https://signed.example/private-worker.tar.gz",
+            "credential-marker",
+            "provider-token-marker",
+            "session-secret-marker",
+            "private-workflow-marker",
+            "private-model-marker",
+            "private-template-payload-marker",
+        )
+        service = types.SimpleNamespace(
+            release=release,
+            lock_path=private_markers[0],
+            archive_url=private_markers[1],
+            api_key=private_markers[2],
+            provider_token=private_markers[3],
+            session_secret=private_markers[4],
+            workflow=private_markers[5],
+            model=private_markers[6],
+            template_request=private_markers[7],
+        )
+        handlers = captured_handlers(service_factory=lambda: service)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            with mock.patch.dict(
+                os.environ,
+                {"COMFYUI_CLOUD_RUN_DATA_DIR": temporary_directory},
+                clear=False,
+            ):
+                response = asyncio.run(
+                    handlers[("GET", "/cloud-run/api/settings")](
+                        FakeRequest()
+                    )
+                )
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(
+            response.payload["worker_release"],
+            release.to_record(),
+        )
+        rendered = repr(response.payload)
+        for marker in private_markers:
+            with self.subTest(marker=marker):
+                self.assertNotIn(marker, rendered)
 
     def test_get_rediscovers_recovered_sessions_without_browser_storage(self):
         from cloud_run.job_repository import JobRepository
@@ -249,6 +310,7 @@ class SettingsRouteTests(unittest.TestCase):
             "official_template_id": "027fba7753c024be019030fb42aed900",
             "official_template_name": "Official ComfyUI",
             "lifecycle_enabled": True,
+            "worker_release": None,
             "active_sessions": [],
         }
         self.assertEqual(put_response.status, 200)
