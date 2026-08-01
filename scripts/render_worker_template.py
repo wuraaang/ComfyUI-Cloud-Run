@@ -43,10 +43,8 @@ _EXTRA_FILTERS = {
 _BASE_FIELDS = {
     "schema_version",
     "hash_id",
-    "runtype",
     "use_ssh",
     "ssh_direct",
-    "jupyter_dir",
 }
 _POLICY = {
     "schema_version": 1,
@@ -122,21 +120,17 @@ def _validated_base_template(base_template):
         type(schema_version) is not int
         or schema_version != 1
         or base_template.get("hash_id") != BASE_TEMPLATE_HASH_ID
-        or base_template.get("runtype") != "jupyter_direc ssh_direc"
         or type(base_template.get("use_ssh")) is not bool
         or base_template.get("use_ssh") is not True
         or type(base_template.get("ssh_direct")) is not bool
         or base_template.get("ssh_direct") is not True
-        or base_template.get("jupyter_dir") is not None
     ):
         raise TemplateRenderError("Base template audit is invalid.")
     return {
         "schema_version": 1,
         "hash_id": BASE_TEMPLATE_HASH_ID,
-        "runtype": "jupyter_direc ssh_direc",
         "use_ssh": True,
         "ssh_direct": True,
-        "jupyter_dir": None,
     }
 
 

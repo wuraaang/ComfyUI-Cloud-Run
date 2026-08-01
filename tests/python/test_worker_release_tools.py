@@ -80,10 +80,8 @@ def base_template_audit():
     return {
         "schema_version": 1,
         "hash_id": "027fba7753c024be019030fb42aed900",
-        "runtype": "jupyter_direc ssh_direc",
         "use_ssh": True,
         "ssh_direct": True,
-        "jupyter_dir": None,
     }
 
 
@@ -507,14 +505,14 @@ class TemplateRendererTests(unittest.TestCase):
     def test_renderer_rejects_non_exact_base_template_audits(self):
         invalid = []
         missing = base_template_audit()
-        missing.pop("jupyter_dir")
+        missing.pop("ssh_direct")
         invalid.append(missing)
         invalid.append({**base_template_audit(), "env": "SECRET=value"})
         invalid.append({**base_template_audit(), "image": OFFICIAL_IMAGE})
         invalid.append({**base_template_audit(), "tag": OFFICIAL_TAG})
         invalid.append({**base_template_audit(), "hash_id": "e" * 32})
         invalid.append({**base_template_audit(), "schema_version": 1.0})
-        invalid.append({**base_template_audit(), "runtype": "ssh_direc"})
+        invalid.append({**base_template_audit(), "runtype": "jupyter"})
         invalid.append({**base_template_audit(), "use_ssh": False})
         invalid.append({**base_template_audit(), "jupyter_dir": "/tmp"})
 

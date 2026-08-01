@@ -61,10 +61,8 @@ LOOKUP_COLUMNS = [
 ]
 BASE_LOOKUP_COLUMNS = [
     "hash_id",
-    "runtype",
     "use_ssh",
     "ssh_direct",
-    "jupyter_dir",
 ]
 HTTP_TIMEOUT_SECONDS = 15
 MAX_RESPONSE_BYTES = 256 * 1024
@@ -297,10 +295,8 @@ def _normalize_base_row(row):
     if (
         not isinstance(row.get("hash_id"), str)
         or _HASH.fullmatch(row["hash_id"]) is None
-        or not isinstance(row.get("runtype"), str)
         or type(row.get("use_ssh")) is not bool
         or type(row.get("ssh_direct")) is not bool
-        or row.get("jupyter_dir") is not None
     ):
         _fail()
     return {column: row[column] for column in BASE_LOOKUP_COLUMNS}
@@ -648,19 +644,15 @@ def audit_base_template(
         row = matches[0]
         if (
             row["hash_id"] != BASE_TEMPLATE_HASH_ID
-            or row["runtype"] != "jupyter_direc ssh_direc"
             or row["use_ssh"] is not True
             or row["ssh_direct"] is not True
-            or row["jupyter_dir"] is not None
         ):
             _fail()
         record = {
             "schema_version": 1,
             "hash_id": row["hash_id"],
-            "runtype": row["runtype"],
             "use_ssh": row["use_ssh"],
             "ssh_direct": row["ssh_direct"],
-            "jupyter_dir": row["jupyter_dir"],
         }
         _write_private_record(
             output_directory,

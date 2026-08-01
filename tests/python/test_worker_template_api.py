@@ -187,10 +187,8 @@ def template_row(request=None, *, template_id=17, hash_id=HASH_ID):
 def base_template_row(**overrides):
     row = {
         "hash_id": BASE_TEMPLATE_HASH_ID,
-        "runtype": "jupyter_direc ssh_direc",
         "use_ssh": True,
         "ssh_direct": True,
-        "jupyter_dir": None,
     }
     row.update(overrides)
     return row
@@ -348,10 +346,8 @@ class WorkerTemplateApiTests(unittest.TestCase):
                 columns,
                 [
                     "hash_id",
-                    "runtype",
                     "use_ssh",
                     "ssh_direct",
-                    "jupyter_dir",
                 ],
             )
             self.assertEqual(request.method, "GET")
@@ -390,10 +386,8 @@ class WorkerTemplateApiTests(unittest.TestCase):
             {
                 "schema_version",
                 "hash_id",
-                "runtype",
                 "use_ssh",
                 "ssh_direct",
-                "jupyter_dir",
             },
         )
         self.assertNotIn(provider_marker, json.dumps(record))
@@ -422,7 +416,7 @@ class WorkerTemplateApiTests(unittest.TestCase):
                 "success": True,
                 "templates_found": 1,
                 "templates": [
-                    {**base_template_row(), "jupyter_dir": "/workspace"}
+                    {**base_template_row(), "ssh_direct": 1}
                 ],
             },
         )
@@ -443,20 +437,31 @@ class WorkerTemplateApiTests(unittest.TestCase):
                 self.assertNotIn(KEY, str(caught.exception))
                 self.assertEqual([call[0].method for call in opener.calls], ["GET"])
 
-    def test_audit_rejects_altered_base_security_contract(self):
-        row = base_template_row(runtype="ssh")
+    def test_audit_ignores_mutable_base_runtime_fields(self):
+        row = base_template_row(
+            runtype="jupyter",
+            jupyter_dir=None,
+        )
         opener = FakeOpener(
             [FakeResponse({"success": True, "templates_found": 1, "templates": [row]})]
         )
         with tempfile.TemporaryDirectory() as root:
             settings, output, _request = self._private_inputs(root)
-            with self.assertRaises(TemplatePublicationError):
-                audit_base_template(
-                    output,
-                    settings_path_resolver=lambda: settings,
-                    transport=VastTemplateTransport(opener=opener),
-                )
-            self.assertEqual(tuple(output.iterdir()), ())
+            record = audit_base_template(
+                output,
+                settings_path_resolver=lambda: settings,
+                transport=VastTemplateTransport(opener=opener),
+            )
+
+        self.assertEqual(
+            record,
+            {
+                "schema_version": 1,
+                "hash_id": BASE_TEMPLATE_HASH_ID,
+                "use_ssh": True,
+                "ssh_direct": True,
+            },
+        )
 
     def test_audit_never_uses_or_records_the_base_image_and_tag(self):
         provider_marker = "untrusted-provider-image-marker"
