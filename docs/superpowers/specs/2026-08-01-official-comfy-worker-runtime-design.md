@@ -41,6 +41,32 @@ The deterministic `onstart`:
 3. exports `CLOUD_RUN_COMFY_ROOT=/opt/workspace-internal/ComfyUI`;
 4. executes `/venv/main/bin/python` on the bootstrap.
 
+### Live Vast `onstart` size contract
+
+The authorized live publication exposed a provider limit that was not present in
+the create-template schema: Vast's read-only
+`GET /api/v0/template/params/` reports a maximum `onstart` length of `16384`
+characters. The rejected request contained `31872` ASCII characters, principally
+the raw base64 form of the reviewed bootstrap. Publication must enforce the live
+limit locally before its first HTTP request.
+
+The renderer therefore gzip-compresses only the exact reviewed
+`remote_worker/bootstrap.py` bytes with deterministic metadata before base64
+encoding them. The small canonical release lock remains raw base64. The fixed
+POSIX `onstart` decodes and inflates the bootstrap into its private file, decodes
+the lock as before, applies the same modes and exports, and directly executes the
+same `/venv/main/bin/python` command. It introduces no downloaded script, mutable
+URL, alternate executable, image entrypoint, Supervisor process, or additional
+provider action.
+
+Publisher validation must recompute and require the exact deterministic gzip
+member for the reviewed bootstrap, retain the existing exact canonical lock
+round-trip, and reject any `onstart` longer than `16384` characters before a
+credential lookup or HTTP request. Tests cover deterministic rendering, exact
+inflate-to-source equality, tampered or non-canonical compressed bytes, and the
+pre-HTTP size rejection. The image, tag, hardware filters, single-POST budget,
+durable intent, private receipt, and launch command remain unchanged.
+
 The worker launches exactly one native ComfyUI process on loopback port `8188`. Its gateway launches the already reviewed Caddy executable on external port `8765`. It neither starts Supervisor nor copies the baked ComfyUI tree to `/workspace`, avoiding a duplicate GPU process and an avoidable startup copy.
 
 ## Runtime identity
