@@ -997,22 +997,28 @@ def _wheel_identity(path):
     if len(prefix) != 2 or not all(prefix):
         raise UnpinnedRequirementsError("Python wheel filename is invalid.")
     python_tags = set(python_tag.split("."))
+    abi_tags = set(abi_tag.split("."))
     platform_tags = set(platform_tag.split("."))
-    if not python_tags.intersection({"cp313", "py3"}):
+    if not (
+        (
+            "cp312" in python_tags
+            and abi_tags.intersection({"abi3", "cp312", "none"})
+        )
+        or ("py3" in python_tags and "none" in abi_tags)
+    ):
         raise UnpinnedRequirementsError(
-            "Python wheel is incompatible with Python 3.13."
+            "Python wheel is incompatible with Python 3.12."
         )
     if "any" not in platform_tags and not any(
-        "linux" in tag for tag in platform_tags
+        tag == "linux_x86_64"
+        or (
+            tag.startswith(("manylinux", "musllinux"))
+            and tag.endswith("_x86_64")
+        )
+        for tag in platform_tags
     ):
         raise UnpinnedRequirementsError(
             "Python wheel is incompatible with Linux."
-        )
-    if "cp313" in python_tags and not set(abi_tag.split(".")).intersection(
-        {"abi3", "cp313", "none"}
-    ):
-        raise UnpinnedRequirementsError(
-            "Python wheel ABI is incompatible with Python 3.13."
         )
     return filename, prefix[0].replace("_", "-").casefold()
 

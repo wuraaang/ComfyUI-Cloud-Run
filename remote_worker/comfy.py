@@ -22,7 +22,7 @@ from cloud_run.manifest import (
     PINNED_COMFYUI_FRONTEND_VERSION,
 )
 
-PINNED_PYTHON_VERSION = "3.13.12"
+PINNED_PYTHON_VERSION = "3.12"
 COMFY_BIND_HOST = "127.0.0.1"
 COMFY_BIND_PORT = 8188
 DEFAULT_STARTUP_TIMEOUT_SECONDS = 180
@@ -158,7 +158,7 @@ def _validated_system_stats(stats):
         != PINNED_COMFYUI_FRONTEND_VERSION
         or not isinstance(system.get("python_version"), str)
         or not system["python_version"].startswith(
-            PINNED_PYTHON_VERSION + " "
+            PINNED_PYTHON_VERSION + "."
         )
         or not isinstance(devices, list)
         or not any(

@@ -59,7 +59,7 @@ def release_metadata():
         protocol_version="1",
         comfyui_core_version="0.29.0",
         comfyui_frontend_version="1.47.10",
-        python_version="3.13.12",
+        python_version="3.12",
         destination="/opt/comfyui-cloud-run",
     )
 

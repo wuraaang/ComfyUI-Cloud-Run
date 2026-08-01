@@ -1003,7 +1003,7 @@ class FakeComfyHttp:
                 "system": {
                     "comfyui_version": "0.29.0",
                     "required_frontend_version": "1.47.10",
-                    "python_version": "3.13.12 (main)",
+                    "python_version": "3.12.7 (main)",
                     "comfy_package_versions": [
                         {
                             "name": "comfyui-frontend-package",
@@ -1023,7 +1023,43 @@ async def no_sleep(_seconds):
     return None
 
 
+def comfy_system_stats(python_version):
+    return {
+        "system": {
+            "comfyui_version": "0.29.0",
+            "required_frontend_version": "1.47.10",
+            "python_version": python_version,
+            "comfy_package_versions": [
+                {
+                    "name": "comfyui-frontend-package",
+                    "installed": "1.47.10",
+                    "required": "1.47.10",
+                }
+            ],
+        },
+        "devices": [{"type": "cuda"}],
+    }
+
+
 class ComfyProcessTests(unittest.TestCase):
+    def test_remote_health_accepts_qualified_python_312_report(self):
+        from remote_worker.comfy import _validated_system_stats
+
+        stats = comfy_system_stats("3.12.7 (main)")
+
+        self.assertIs(_validated_system_stats(stats), stats)
+
+    def test_remote_health_rejects_wrong_or_unqualified_python_series(self):
+        from remote_worker.comfy import (
+            ComfyIdentityError,
+            _validated_system_stats,
+        )
+
+        for version in ("3.11.9 (main)", "3.13.12 (main)", "3.12"):
+            with self.subTest(version=version):
+                with self.assertRaises(ComfyIdentityError):
+                    _validated_system_stats(comfy_system_stats(version))
+
     def test_fixed_loopback_argv_private_workdir_and_sanitized_environment(self):
         from remote_worker.comfy import ComfyProcess
 
@@ -1106,7 +1142,7 @@ class ComfyProcessTests(unittest.TestCase):
                     "system": {
                         "comfyui_version": "0.30.0",
                         "required_frontend_version": "1.47.10",
-                        "python_version": "3.13.12 (main)",
+                        "python_version": "3.12.7 (main)",
                         "comfy_package_versions": [],
                     },
                     "devices": [{"type": "cpu"}],

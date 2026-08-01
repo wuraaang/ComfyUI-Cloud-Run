@@ -893,8 +893,16 @@ class ArtifactTests(unittest.TestCase):
         package = self.root / "package"
         package.mkdir()
         (package / "node.py").write_text("NODE = True\n", encoding="utf-8")
-        wheel = self.root / "dependency-1.0-py3-none-any.whl"
-        wheel.write_bytes(b"wheel")
+        cp312_wheel = (
+            self.root / "dependency-1.0-cp312-cp312-linux_x86_64.whl"
+        )
+        abi3_wheel = (
+            self.root / "abi_dependency-1.0-cp312-abi3-manylinux_2_28_x86_64.whl"
+        )
+        py3_wheel = self.root / "universal_dependency-1.0-py3-none-any.whl"
+        cp312_wheel.write_bytes(b"cp312 wheel")
+        abi3_wheel.write_bytes(b"abi3 wheel")
+        py3_wheel.write_bytes(b"py3 wheel")
 
         node = build_custom_node_dependency(
             package_id="acme.nodes",
@@ -903,7 +911,7 @@ class ArtifactTests(unittest.TestCase):
             provided_class_types=("AcmeNode",),
             package_root=package,
             archive_path=self.root / "acme-nodes.tar",
-            wheel_paths=(wheel,),
+            wheel_paths=(cp312_wheel, abi3_wheel, py3_wheel),
         )
 
         self.assertGreater(node.archive.size_bytes, 0)
@@ -913,7 +921,11 @@ class ArtifactTests(unittest.TestCase):
         )
         self.assertEqual(
             [item.filename for item in node.wheels],
-            ["dependency-1.0-py3-none-any.whl"],
+            [
+                "abi_dependency-1.0-cp312-abi3-manylinux_2_28_x86_64.whl",
+                "dependency-1.0-cp312-cp312-linux_x86_64.whl",
+                "universal_dependency-1.0-py3-none-any.whl",
+            ],
         )
         (package / "requirements.txt").write_text(
             "floating-dependency>=1\n",
@@ -927,21 +939,35 @@ class ArtifactTests(unittest.TestCase):
                 provided_class_types=("AcmeNode",),
                 package_root=package,
                 archive_path=self.root / "rejected.tar",
-                wheel_paths=(wheel,),
+                wheel_paths=(cp312_wheel, abi3_wheel, py3_wheel),
             )
-        incompatible = self.root / "dependency-1.0-cp312-cp312-linux_x86_64.whl"
-        incompatible.write_bytes(b"wheel")
-        (package / "requirements.txt").unlink()
-        with self.assertRaises(UnpinnedRequirementsError):
-            build_custom_node_dependency(
-                package_id="acme.nodes",
-                repository_url="https://github.com/acme/nodes",
-                revision="a" * 40,
-                provided_class_types=("AcmeNode",),
-                package_root=package,
-                archive_path=self.root / "rejected-abi.tar",
-                wheel_paths=(incompatible,),
-            )
+
+    def test_custom_node_archive_rejects_incompatible_wheel_tags(self):
+        package = self.root / "package"
+        package.mkdir()
+        (package / "node.py").write_text("NODE = True\n", encoding="utf-8")
+        incompatible_names = (
+            "dependency-1.0-cp313-cp313-linux_x86_64.whl",
+            "dependency-1.0-cp312-cp313-linux_x86_64.whl",
+            "dependency-1.0-cp312-cp312-win_amd64.whl",
+            "dependency-1.0-cp312-cp312-manylinux_2_28_aarch64.whl",
+            "dependency-1.0-cp312-cp312-linux_armv7l.whl",
+        )
+
+        for index, name in enumerate(incompatible_names):
+            incompatible = self.root / name
+            incompatible.write_bytes(b"wheel")
+            with self.subTest(name=name):
+                with self.assertRaises(UnpinnedRequirementsError):
+                    build_custom_node_dependency(
+                        package_id="acme.nodes",
+                        repository_url="https://github.com/acme/nodes",
+                        revision="a" * 40,
+                        provided_class_types=("AcmeNode",),
+                        package_root=package,
+                        archive_path=self.root / f"rejected-wheel-{index}.tar",
+                        wheel_paths=(incompatible,),
+                    )
 
 
 if __name__ == "__main__":

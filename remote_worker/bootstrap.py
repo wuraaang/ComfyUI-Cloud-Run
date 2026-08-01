@@ -281,7 +281,7 @@ def _validated_lock(payload, allowed_destination):
         or payload.get("protocol_version") != "1"
         or payload.get("comfyui_core_version") != "0.29.0"
         or payload.get("comfyui_frontend_version") != "1.47.10"
-        or payload.get("python_version") != "3.13.12"
+        or payload.get("python_version") != "3.12"
         or payload.get("destination") != str(allowed_destination)
     ):
         raise _bootstrap_error()
