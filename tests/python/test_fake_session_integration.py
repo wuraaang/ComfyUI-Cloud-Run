@@ -255,7 +255,7 @@ class FakeVastProvider:
                 "public_ipaddr": offer["public_ipaddr"],
                 "machine_id": offer["machine_id"],
                 "host_id": offer["host_id"],
-                "jupyter_token": "intentionally-wrong-provider-token",
+                "jupyter_token": "f" * 64,
                 "ports": {
                     "8765/tcp": [
                         {"HostPort": str(32_100 + self.create_count)}
@@ -1208,7 +1208,7 @@ class FakeReusableSessionIntegrationTests(unittest.TestCase):
         self.assertEqual(session.provider_token, boundary.boundary_token)
         self.assertNotEqual(
             session.provider_token,
-            "intentionally-wrong-provider-token",
+            "f" * 64,
         )
 
         job = system.run_job(session, capture, "controller-boundary-job-key")

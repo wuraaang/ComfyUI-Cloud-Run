@@ -1107,7 +1107,7 @@ class SessionLifecycleTests(LifecycleTestCase):
             "public_ipaddr": "8.8.8.8",
             "ports": {"8765/tcp": [{"HostPort": "32100"}]},
             "status_msg": None,
-            "jupyter_token": "intentionally-wrong-provider-token",
+            "jupyter_token": "f" * 64,
         }
 
     def test_boot_adopts_exact_worker_mapping_and_private_boundary_token(self):

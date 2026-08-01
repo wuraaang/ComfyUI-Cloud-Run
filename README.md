@@ -257,13 +257,15 @@ below Vast's live `16384`-character limit, exports
 separately encoded. It adds no download and does not invoke the image entrypoint,
 Supervisor, portal/serverless tooling, or an official wrapper.
 `remote_worker/gateway.py` then starts one fixed Caddy binary and the loopback
-Python worker without a shell. Only Caddy receives the validated Jupyter
-token. The worker receives an explicit runtime allowlist plus Vast's
-own-instance ID and API key required by its independent deadline watchdog,
-never the Jupyter token or a provider-account key. The supervisor terminates,
-then boundedly reaps or kills, the sibling when either process exits. Caddy
-exposes `:8765`, strips inbound authorization and boundary headers, and proxies
-only to `127.0.0.1:8766`.
+Python worker without a shell. The controller generates a per-instance boundary
+token, injects it at create time, and Caddy alone receives that token. The
+Python worker receives only the session ID plus its existing allowlisted runtime
+variables, including Vast's own-instance ID and API key required by its
+independent deadline watchdog. `JUPYTER_TOKEN` and `OPEN_BUTTON_TOKEN` are not
+fallback credentials. The worker never receives the boundary token or a
+provider-account key. The supervisor terminates, then boundedly reaps or kills,
+the sibling when either process exits. Caddy exposes `:8765`, strips inbound
+authorization and boundary headers, and proxies only to `127.0.0.1:8766`.
 
 Every Vast offer must carry complete verified, rentable, one-GPU, on-demand
 evidence, reliability of at least `0.99`, and finite provider-advertised

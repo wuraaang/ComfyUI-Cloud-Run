@@ -277,7 +277,7 @@ class FullOfflineLifecycleTests(unittest.TestCase):
                     "actual_status": "running",
                     "public_ipaddr": "8.8.8.8",
                     "ports": {"8765/tcp": [{"HostPort": "32100"}]},
-                    "jupyter_token": "intentionally-wrong-provider-token",
+                    "jupyter_token": "f" * 64,
                 }
             ]
             sleeps = []

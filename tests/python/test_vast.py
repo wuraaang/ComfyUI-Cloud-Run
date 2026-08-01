@@ -875,7 +875,7 @@ class VastLifecycleRequestTests(unittest.TestCase):
             "label": "comfy-cloud-run-attempt-1",
             "dph_total": 0.42,
             "status_msg": "ready",
-            "jupyter_token": "provider-secret",
+            "jupyter_token": "f" * 64,
         }
         list_session = FakeSession(
             FakeResponse(200, {"instances": [raw_instance]})

@@ -442,6 +442,22 @@ production_paths = [
     *sorted(Path("remote_worker").glob("*.py")),
     *reviewed_release_tool_paths,
 ]
+provider_boundary_paths = [
+    Path("cloud_run/vast.py"),
+    Path("cloud_run/lifecycle.py"),
+    Path("remote_worker/gateway.py"),
+    Path("remote_worker/Caddyfile"),
+]
+provider_credential_literals = (
+    "JUPYTER_TOKEN",
+    "OPEN_BUTTON_TOKEN",
+    "jupyter_token",
+)
+for path in provider_boundary_paths:
+    source = path.read_text(encoding="utf-8")
+    for literal in provider_credential_literals:
+        if literal in source:
+            fail("provider credential literal in " + str(path))
 frontend_paths = sorted(Path("web/js").glob("*.js"))
 for path in production_paths:
     source = path.read_text(encoding="utf-8")

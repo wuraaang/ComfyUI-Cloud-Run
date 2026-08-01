@@ -106,6 +106,25 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertNotIn("/cloud-run/api/attempts/", readme)
         self.assertNotIn("Workflow transfer", readme)
 
+    def test_readme_documents_controller_owned_worker_boundary(self):
+        readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
+        normalized = " ".join(readme.split())
+
+        self.assertIn(
+            "controller generates a per-instance boundary token",
+            normalized,
+        )
+        self.assertIn("injects it at create time", normalized)
+        self.assertIn("Caddy alone receives", normalized)
+        self.assertIn(
+            "session ID plus its existing allowlisted runtime variables",
+            normalized,
+        )
+        self.assertIn(
+            "`JUPYTER_TOKEN` and `OPEN_BUTTON_TOKEN` are not fallback credentials",
+            normalized,
+        )
+
     def test_notice_records_behavioral_reference_without_vendored_source(self):
         notice = (REPOSITORY_ROOT / "NOTICE").read_text(encoding="utf-8")
         self.assertIn("LoRA Dataset Studio", notice)
@@ -147,6 +166,22 @@ class RepositoryContractTests(unittest.TestCase):
             gate.count('"release-assets.githubusercontent.com"'),
             2,
         )
+
+    def test_gate_rejects_provider_credentials_in_boundary_production_files(self):
+        gate = (REPOSITORY_ROOT / "scripts" / "check.sh").read_text(
+            encoding="utf-8"
+        )
+        for required_text in (
+            'Path("cloud_run/vast.py")',
+            'Path("cloud_run/lifecycle.py")',
+            'Path("remote_worker/gateway.py")',
+            'Path("remote_worker/Caddyfile")',
+            '"JUPYTER_TOKEN"',
+            '"OPEN_BUTTON_TOKEN"',
+            '"jupyter_token"',
+        ):
+            with self.subTest(text=required_text):
+                self.assertIn(required_text, gate)
 
     def test_publication_docs_name_only_the_correct_source_origin(self):
         paths = (
