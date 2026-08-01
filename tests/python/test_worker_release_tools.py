@@ -68,7 +68,7 @@ def base_template_audit():
     return {
         "schema_version": 1,
         "hash_id": "027fba7753c024be019030fb42aed900",
-        "image": "reviewed-image.example/comfyui@sha256:" + "d" * 64,
+        "image": "docker.io/vastai/base-image@sha256:" + "d" * 64,
         "tag": "reviewed-pinned-tag",
         "runtype": "jupyter_direc ssh_direc",
         "use_ssh": True,
@@ -348,16 +348,30 @@ class TemplateRendererTests(unittest.TestCase):
                 "runtype",
                 "use_ssh",
                 "ssh_direct",
+                "jup_direct",
                 "jupyter_dir",
+                "use_jupyter_lab",
+                "docker_login_repo",
+                "docker_login_user",
+                "docker_login_pass",
                 "onstart",
-                "ports",
                 "env",
                 "recommended_disk_space",
+                "private",
             },
         )
-        self.assertEqual(rendered.request["ports"], ["8765/tcp"])
-        self.assertEqual(rendered.request["env"], "")
+        self.assertEqual(rendered.request["runtype"], "ssh")
+        self.assertIs(rendered.request["use_ssh"], True)
+        self.assertIs(rendered.request["ssh_direct"], True)
+        self.assertIs(rendered.request["jup_direct"], False)
+        self.assertIs(rendered.request["use_jupyter_lab"], False)
+        self.assertEqual(rendered.request["docker_login_repo"], "")
+        self.assertEqual(rendered.request["docker_login_user"], "")
+        self.assertEqual(rendered.request["docker_login_pass"], "")
+        self.assertEqual(rendered.request["env"], "-p 8765:8765")
         self.assertEqual(rendered.request["recommended_disk_space"], 80)
+        self.assertIs(rendered.request["private"], True)
+        self.assertNotIn("ports", rendered.request)
         self.assertEqual(
             rendered.request["name"],
             "cloud-run-worker-" + WORKER_COMMIT,
@@ -455,6 +469,13 @@ class TemplateRendererTests(unittest.TestCase):
         invalid.append({**base_template_audit(), "tag": "reviewed\ntag"})
         invalid.append({**base_template_audit(), "tag": "reviewed;shutdown"})
         invalid.append({**base_template_audit(), "image": "image.example/latest"})
+        invalid.append(
+            {
+                **base_template_audit(),
+                "image": "registry.example/vastai/base-image@sha256:"
+                + "d" * 64,
+            }
+        )
         invalid.append({**base_template_audit(), "hash_id": "e" * 32})
         invalid.append({**base_template_audit(), "schema_version": 1.0})
         invalid.append({**base_template_audit(), "runtype": "ssh_direc"})

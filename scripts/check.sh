@@ -416,15 +416,23 @@ if (
 
 reviewed_release_tool_paths = [
     Path("scripts/build_worker_release_bundle.py"),
+    Path("scripts/publish_worker_template.py"),
     Path("scripts/render_worker_template.py"),
     Path("scripts/write_worker_release_lock.py"),
+]
+reviewed_release_test_paths = [
+    Path("tests/python/test_worker_template_api.py"),
 ]
 reviewed_worker_tool_paths = [
     Path("remote_worker/gateway.py"),
 ]
 if not all(
     path.is_file()
-    for path in [*reviewed_release_tool_paths, *reviewed_worker_tool_paths]
+    for path in [
+        *reviewed_release_tool_paths,
+        *reviewed_release_test_paths,
+        *reviewed_worker_tool_paths,
+    ]
 ):
     fail("reviewed worker tooling is unavailable")
 

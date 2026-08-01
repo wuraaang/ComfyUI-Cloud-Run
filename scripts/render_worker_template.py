@@ -49,7 +49,7 @@ _POLICY = {
     "worker_port": 8765,
 }
 _IMAGE_DIGEST = re.compile(
-    r"[A-Za-z0-9][A-Za-z0-9._/-]*@sha256:[0-9a-f]{64}"
+    r"docker\.io/vastai/base-image@sha256:[0-9a-f]{64}"
 )
 _PINNED_TAG = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _MUTABLE_TAGS = {"edge", "latest", "main", "master", "nightly", "stable"}
@@ -288,14 +288,19 @@ def render_worker_template(
         "name": "cloud-run-worker-" + validated_metadata.worker_commit,
         "image": validated_base["image"],
         "tag": validated_base["tag"],
-        "runtype": validated_base["runtype"],
+        "runtype": "ssh",
         "use_ssh": validated_base["use_ssh"],
         "ssh_direct": validated_base["ssh_direct"],
+        "jup_direct": False,
         "jupyter_dir": validated_base["jupyter_dir"],
+        "use_jupyter_lab": False,
+        "docker_login_repo": "",
+        "docker_login_user": "",
+        "docker_login_pass": "",
         "onstart": onstart,
-        "ports": ["8765/tcp"],
-        "env": "",
+        "env": "-p 8765:8765",
         "recommended_disk_space": 80,
+        "private": True,
     }
     outputs = (
         (output / REMOTE_LOCK_NAME, remote_lock_bytes),
