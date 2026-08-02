@@ -547,7 +547,7 @@ def _numeric_identifier(value):
         or (isinstance(value, str) and value != value.strip())
     ):
         return None
-    return text
+    return str(int(text, 10))
 
 
 def _validate_instance_id(instance_id):

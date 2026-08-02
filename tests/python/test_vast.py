@@ -1295,6 +1295,29 @@ class VastLifecycleRequestTests(unittest.TestCase):
                 self.assertNotIn(marker, str(raised.exception))
                 self.assertNotIn(marker, repr(raised.exception))
 
+    def test_create_returns_the_canonical_numeric_contract_id(self):
+        from cloud_run.vast import create_instance
+
+        instance_id = asyncio.run(
+            create_instance(
+                "synthetic-value",
+                offer_id="00042",
+                disk_gb=80,
+                label="comfy-cloud-run-attempt-1",
+                release=worker_release(),
+                boundary_token="a" * 64,
+                session_id="attempt-1",
+                session=FakeSession(
+                    FakeResponse(
+                        200,
+                        {"success": True, "new_contract": "000987"},
+                    )
+                ),
+            )
+        )
+
+        self.assertEqual(instance_id, "987")
+
     def test_create_error_repr_never_exposes_provider_or_boundary_markers(self):
         from cloud_run.vast import VastError, create_instance
 
@@ -1654,6 +1677,32 @@ class VastLifecycleRequestTests(unittest.TestCase):
                 ),
             ]
         )
+        with self.assertRaises(VastError):
+            asyncio.run(list_instances("synthetic-value", session=session))
+
+    def test_list_instances_rejects_duplicate_numeric_id_spellings(self):
+        from cloud_run.vast import VastError, list_instances
+
+        session = FakeSession(
+            [
+                FakeResponse(
+                    200,
+                    self._inventory_page(
+                        [self._inventory_instance(101)],
+                        total=2,
+                        next_token="page-2",
+                    ),
+                ),
+                FakeResponse(
+                    200,
+                    self._inventory_page(
+                        [self._inventory_instance("00101")],
+                        total=2,
+                    ),
+                ),
+            ]
+        )
+
         with self.assertRaises(VastError):
             asyncio.run(list_instances("synthetic-value", session=session))
 
