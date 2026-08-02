@@ -53,6 +53,8 @@ export async function postCapture(fetchImpl, capture) {
 
 
 export const SETTINGS_ENDPOINT = "/cloud-run/api/settings";
+export const VERIFY_VAST_ACCESS_ENDPOINT =
+  "/cloud-run/api/settings/verify-vast-access";
 export const CAPTURES_ENDPOINT = "/cloud-run/api/captures";
 export const PREFLIGHTS_ENDPOINT = "/cloud-run/api/preflights";
 export const OFFERS_ENDPOINT = "/cloud-run/api/offers";
@@ -102,6 +104,12 @@ export function createCloudRunApi(fetchImpl) {
         SETTINGS_ENDPOINT,
         jsonOptions("PUT", payload),
       );
+    },
+
+    verifyVastAccess() {
+      return fetchJson(fetchImpl, VERIFY_VAST_ACCESS_ENDPOINT, {
+        method: "POST",
+      });
     },
 
     capture(capture) {

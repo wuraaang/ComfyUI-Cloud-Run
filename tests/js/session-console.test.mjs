@@ -10,6 +10,11 @@ function fullQuote(overrides = {}) {
   return {
     session_id: "session-1",
     status: "offer_selected",
+    rental_outcome: "not_started",
+    can_search_offers: true,
+    can_destroy: false,
+    can_verify_vast_access: false,
+    billing_may_continue: false,
     deadline_at: 8_200,
     deadline_mode: "finite",
     disk_gb: 96,
@@ -47,14 +52,33 @@ function sessionPayload(overrides = {}) {
   return {
     ...fullQuote(),
     status: "ready",
+    rental_outcome: "active",
+    can_search_offers: false,
+    can_destroy: true,
+    can_verify_vast_access: false,
     instance_id: "77",
     created_at: 1_000,
     updated_at: 1_020,
     deadline_at: 8_200,
     deadline_mode: "finite",
     deadline_alerts: [],
-    billing_may_continue: false,
+    billing_may_continue: true,
     emergency_action: null,
+    ...overrides,
+  };
+}
+
+
+function rentablePreflight(overrides = {}) {
+  return {
+    preflight_id: "preflight-1",
+    capture_id: "capture-1",
+    rentable: true,
+    manifest_digest: "a".repeat(64),
+    transfer_bytes: 0,
+    output_allowance_bytes: 1024,
+    disk_gb: 80,
+    rows: [],
     ...overrides,
   };
 }
@@ -433,6 +457,318 @@ test("preflight button uses only the persisted capture identity", async () => {
   assert.deepEqual(calls, [["capture-1", 1024]]);
   assert.equal(consoleView.preflightId, "preflight-1");
   assert.equal(consoleView.searchButton.disabled, false);
+  assert.equal(
+    consoleView.status.textContent,
+    "Preflight complete. Offer search is unlocked.",
+  );
+});
+
+
+test("output allowance has byte guidance and sends the exact positive integer", async () => {
+  const document = new FakeDocument();
+  const calls = [];
+  const view = createSessionConsole(document, {
+    async preflight(captureId, explicitOutputAllowanceBytes) {
+      calls.push([captureId, explicitOutputAllowanceBytes]);
+      return rentablePreflight({
+        output_allowance_bytes: explicitOutputAllowanceBytes,
+      });
+    },
+  });
+  document.body.appendChild(view.root);
+
+  const label = document.querySelectorAll("label").find(
+    (candidate) => candidate.getAttribute("for") === "cloud-run-output-allowance",
+  );
+  assert.ok(label);
+  assert.match(label.textContent, /output allowance/i);
+  assert.equal(view.outputAllowanceInput.inputMode, "numeric");
+  assert.equal(view.outputAllowanceInput.getAttribute("min"), "1");
+  assert.equal(view.outputAllowanceInput.getAttribute("step"), "1");
+  assert.match(view.root.textContent, /16 MiB = 16777216/);
+  assert.match(view.root.textContent, /1 GiB = 1073741824/);
+
+  view.setCapture("capture-1");
+  view.outputAllowanceInput.value = "1073741824";
+  await view.preflightButton.click();
+
+  assert.deepEqual(calls, [["capture-1", 1_073_741_824]]);
+});
+
+
+test("ambiguous rental is red, polls, blocks paid controls, and permits destroy", () => {
+  const document = new FakeDocument();
+  const timers = [];
+  const api = fakeApi();
+  api.getSession = async () => sessionPayload({
+    status: "reconciling_create",
+    rental_outcome: "unknown",
+    can_search_offers: false,
+    can_destroy: true,
+    billing_may_continue: true,
+  });
+  const view = createSessionConsole(document, api, {
+    setTimeout(callback) {
+      timers.push(callback);
+      return timers.length;
+    },
+    clearTimeout() {},
+  });
+  document.body.appendChild(view.root);
+  view.renderPreflight(rentablePreflight());
+  view.renderQuote(fullQuote(), { idempotencyKey: "session-key" });
+
+  view.renderSession(sessionPayload({
+    status: "reconciling_create",
+    rental_outcome: "unknown",
+    instance_id: null,
+    can_search_offers: false,
+    can_destroy: true,
+    billing_may_continue: true,
+    error: "Vast inventory is temporarily unavailable.",
+  }));
+
+  assert.match(
+    view.root.textContent,
+    /GPU rental could not be confirmed\. Cloud Run is checking Vast inventory\./,
+  );
+  assert.match(view.root.textContent, /Do not start another rental yet\./);
+  assert.match(
+    view.root.textContent,
+    /Billing status is not yet known; Vast may have created an instance\./,
+  );
+  assert.ok(view.sessionError);
+  assert.match(view.sessionError.className, /cloud-run-danger/);
+  assert.equal(view.canSearchOffers, false);
+  assert.equal(view.searchButton.disabled, true);
+  assert.equal(view.confirmButton.disabled, true);
+  assert.equal(view.confirmButton.hidden, true);
+  assert.equal(view.destroyButton.hidden, false);
+  assert.equal(view.destroyButton.disabled, false);
+  assert.ok(timers.length >= 1);
+  assert.doesNotMatch(view.root.textContent, /No Vast billing is active/);
+});
+
+
+test("verified absence clears paid review and unlocks only fresh offer search", async () => {
+  const document = new FakeDocument();
+  const api = fakeApi();
+  let confirmCalls = 0;
+  api.confirmSession = async () => {
+    confirmCalls += 1;
+    return sessionPayload({ status: "creating" });
+  };
+  const view = createSessionConsole(document, api);
+  document.body.appendChild(view.root);
+  view.renderPreflight(rentablePreflight());
+  view.renderQuote(fullQuote(), { idempotencyKey: "stale-session-key" });
+  view.renderSession(sessionPayload());
+  await view.destroyButton.click();
+  assert.equal(view.destroyReview.hidden, false);
+
+  view.renderSession(sessionPayload({
+    status: "failed",
+    rental_outcome: "absent",
+    instance_id: null,
+    can_search_offers: true,
+    can_destroy: false,
+    billing_may_continue: false,
+    error: "No active instance was detected for this session.",
+  }));
+
+  assert.match(
+    view.root.textContent,
+    /GPU rental failed\. Vast inventory confirms that no instance is active for this session\./,
+  );
+  assert.match(
+    view.root.textContent,
+    /No Vast billing is active\. Search again and choose another GPU\./,
+  );
+  assert.equal(view.quotePanel.hidden, true);
+  assert.equal(view.confirmButton.hidden, true);
+  assert.equal(view.confirmButton.disabled, true);
+  assert.equal(view.destroyReview.hidden, true);
+  assert.equal(view.destroyButton.hidden, true);
+  assert.equal(view.canSearchOffers, true);
+  assert.equal(view.searchButton.disabled, false);
+  await view.confirmButton.click();
+  assert.equal(confirmCalls, 0);
+});
+
+
+test("fresh rentable preflight never bypasses a configuration or API gate", () => {
+  for (const failureCode of ["configuration_rejected", "api_key_rejected"]) {
+    const document = new FakeDocument();
+    const view = createSessionConsole(document, fakeApi());
+    document.body.appendChild(view.root);
+    view.setCapture("capture-1");
+    view.renderSession(sessionPayload({
+      status: "failed",
+      rental_outcome: "absent",
+      instance_id: null,
+      failure_code: failureCode,
+      can_search_offers: false,
+      can_destroy: false,
+      can_verify_vast_access: failureCode === "api_key_rejected",
+      billing_may_continue: false,
+    }));
+
+    view.renderPreflight(rentablePreflight());
+    view.renderPreflight(rentablePreflight({ preflight_id: "preflight-2" }));
+
+    assert.equal(view.session?.failure_code, failureCode);
+    assert.equal(view.canSearchOffers, false);
+    assert.equal(view.searchButton.disabled, true);
+  }
+});
+
+
+test("API-key recovery uses only typed Verify Vast access and reloads state", async () => {
+  const document = new FakeDocument();
+  const calls = [];
+  const remediated = sessionPayload({
+    status: "failed",
+    rental_outcome: "absent",
+    instance_id: null,
+    failure_code: "api_key_rejected",
+    can_search_offers: true,
+    can_destroy: false,
+    can_verify_vast_access: false,
+    billing_may_continue: false,
+  });
+  const api = {
+    async verifyVastAccess() {
+      calls.push("verify");
+      return { verified: true, instance_count: 0 };
+    },
+    async getSettings() {
+      calls.push("settings");
+      return { configured: true };
+    },
+    async getSession(sessionId) {
+      calls.push(["session", sessionId]);
+      return remediated;
+    },
+  };
+  const view = createSessionConsole(document, api);
+  document.body.appendChild(view.root);
+  view.renderPreflight(rentablePreflight());
+  view.renderSession(sessionPayload({
+    status: "failed",
+    rental_outcome: "absent",
+    instance_id: null,
+    failure_code: "api_key_rejected",
+    can_search_offers: false,
+    can_destroy: false,
+    can_verify_vast_access: true,
+    billing_may_continue: false,
+  }));
+
+  const verifyButton = document.getElementById("cloud-run-verify-vast-access");
+  assert.ok(verifyButton);
+  assert.equal(verifyButton.hidden, false);
+  assert.equal(view.searchButton.disabled, true);
+  await verifyButton.click();
+
+  assert.deepEqual(calls, ["verify", "settings", ["session", "session-1"]]);
+  assert.equal(view.session, null);
+  assert.equal(view.canSearchOffers, true);
+  assert.equal(view.searchButton.disabled, false);
+  assert.equal(verifyButton.hidden, true);
+});
+
+
+test("failed Vast access verification preserves the typed gate", async () => {
+  const document = new FakeDocument();
+  const calls = [];
+  const api = {
+    async verifyVastAccess() {
+      calls.push("verify");
+      throw new Error("rate limited");
+    },
+    async getSettings() {
+      calls.push("settings");
+      return {};
+    },
+    async getSession() {
+      calls.push("session");
+      return {};
+    },
+  };
+  const view = createSessionConsole(document, api);
+  document.body.appendChild(view.root);
+  view.renderPreflight(rentablePreflight());
+  const rejected = sessionPayload({
+    status: "failed",
+    rental_outcome: "absent",
+    instance_id: null,
+    failure_code: "api_key_rejected",
+    can_search_offers: false,
+    can_destroy: false,
+    can_verify_vast_access: true,
+    billing_may_continue: false,
+  });
+  view.renderSession(rejected);
+
+  const verifyButton = document.getElementById("cloud-run-verify-vast-access");
+  assert.ok(verifyButton);
+  await verifyButton.click();
+
+  assert.deepEqual(calls, ["verify"]);
+  assert.equal(view.session, rejected);
+  assert.equal(view.canSearchOffers, false);
+  assert.equal(view.searchButton.disabled, true);
+  assert.equal(verifyButton.hidden, false);
+});
+
+
+test("Verify Vast access visibility follows only its typed capability", () => {
+  const cases = [
+    ["configuration_rejected", "absent", false],
+    ["offer_unavailable", "absent", false],
+    ["api_key_rejected", "unknown", false],
+    ["api_key_rejected", "active", false],
+    ["api_key_rejected", "absent", false],
+  ];
+  for (const [failureCode, outcome, capability] of cases) {
+    const document = new FakeDocument();
+    const view = createSessionConsole(document, fakeApi());
+    document.body.appendChild(view.root);
+    view.renderSession(sessionPayload({
+      status: "failed",
+      rental_outcome: outcome,
+      failure_code: failureCode,
+      can_search_offers: false,
+      can_destroy: outcome !== "absent",
+      can_verify_vast_access: capability,
+      billing_may_continue: outcome !== "absent",
+    }));
+    const button = document.getElementById("cloud-run-verify-vast-access");
+    assert.ok(button);
+    assert.equal(button.hidden, true);
+  }
+});
+
+
+test("normal active session shows billing without an emergency warning", () => {
+  const document = new FakeDocument();
+  const view = createSessionConsole(document, fakeApi());
+  document.body.appendChild(view.root);
+
+  view.renderSession(sessionPayload({
+    status: "ready",
+    rental_outcome: "active",
+    billing_may_continue: true,
+    can_destroy: true,
+    residual_inventory: [],
+    emergency_action: null,
+  }));
+
+  assert.ok(view.sessionError);
+  assert.doesNotMatch(view.sessionError.className, /cloud-run-danger/);
+  assert.doesNotMatch(view.root.textContent, /Use the Vast console immediately/);
+  assert.doesNotMatch(view.root.textContent, /Billing status is not yet known/);
+  assert.equal(view.destroyButton.hidden, false);
 });
 
 
