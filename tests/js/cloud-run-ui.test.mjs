@@ -30,15 +30,26 @@ function settingsPayload(overrides = {}) {
     r2_configured: false,
     huggingface_configured: false,
     civitai_configured: false,
+    active_sessions: [],
+    recent_sessions: [],
     ...overrides,
   };
 }
 
 
 function quoteSession(status = "offer_selected", overrides = {}) {
+  const rentalOutcome = status === "offer_selected"
+    ? "not_started"
+    : ["creating", "reconciling_create"].includes(status)
+      ? "unknown"
+      : "active";
   return {
     session_id: "session-1",
     status,
+    rental_outcome: rentalOutcome,
+    can_search_offers: rentalOutcome === "not_started",
+    can_destroy: rentalOutcome !== "not_started",
+    can_verify_vast_access: false,
     offer: {
       offer_id: "42",
       gpu_name: "RTX 4090",
@@ -76,7 +87,7 @@ function quoteSession(status = "offer_selected", overrides = {}) {
     error: null,
     created_at: 1_000,
     updated_at: 1_020,
-    billing_may_continue: false,
+    billing_may_continue: rentalOutcome !== "not_started",
     emergency_action: null,
     ...overrides,
   };
@@ -300,7 +311,7 @@ test("registers through the pinned ComfyUI extension API", async () => {
 });
 
 
-test("capture preflight offer and paid review enforce instance creates", async () => {
+test("paid review fixes one create and sends the selected bounded duration", async () => {
   const document = new FakeDocument();
   mountLocalRunButton(document);
   const { api, app, localSubmissions } = captureHost();
@@ -361,14 +372,23 @@ test("capture preflight offer and paid review enforce instance creates", async (
   assert.equal(document.getElementById("cloud-run-search").disabled, false);
   await document.getElementById("cloud-run-search").click();
   await document.getElementById("cloud-run-offer-0").click();
-  const createLimit = document.getElementById(
-    "cloud-run-max-instance-creates",
+  assert.equal(
+    document.getElementById("cloud-run-max-instance-creates"),
+    null,
   );
+  assert.equal(
+    document.getElementById("cloud-run-create-limit-review").textContent,
+    "Maximum provider creates for this review: 1. " +
+      "Cloud Run never rents a replacement automatically.",
+  );
+  const duration = document.getElementById("cloud-run-session-duration");
+  assert.ok(duration);
   assert.deepEqual(
-    createLimit.children.map((option) => option.value),
-    ["1", "2"],
+    duration.children.map((option) => option.value),
+    ["1800", "3600", "5400", "7200"],
   );
-  assert.equal(createLimit.value, "1");
+  assert.equal(duration.value, "7200");
+  duration.value = "5400";
   await document.getElementById("cloud-run-review-session").click();
 
   const sessionRequest = calls.find(
@@ -378,7 +398,7 @@ test("capture preflight offer and paid review enforce instance creates", async (
     preflight_id: "preflight-1",
     offer_id: "42",
     idempotency_key: "session-key",
-    deadline: { mode: "finite", duration_seconds: 7_200 },
+    deadline: { mode: "finite", duration_seconds: 5_400 },
     max_instance_creates: 1,
   });
   assert.match(
@@ -407,16 +427,6 @@ test("capture preflight offer and paid review enforce instance creates", async (
   }
   assert.equal(document.querySelector("script"), null);
 
-  createLimit.value = "2";
-  await document.getElementById("cloud-run-review-session").click();
-  const selectedLimitRequest = calls.filter(
-    ([endpoint]) => endpoint === "/cloud-run/api/sessions",
-  )[1];
-  assert.equal(
-    JSON.parse(selectedLimitRequest[1].body).max_instance_creates,
-    2,
-  );
-
   await document.getElementById("cloud-run-confirm-session").click();
 
   assert.equal(localSubmissions.length, 0);
@@ -429,6 +439,369 @@ test("capture preflight offer and paid review enforce instance creates", async (
   assert.ok(calls.every(([endpoint]) => !endpoint.includes("/quotes")));
   assert.ok(calls.every(([endpoint]) => !endpoint.includes("/attempts/")));
   assert.ok(timers.length >= 1);
+});
+
+
+test("forged session duration is rejected instead of using a fallback", async () => {
+  const document = new FakeDocument();
+  mountLocalRunButton(document);
+  const { api, app } = captureHost();
+  const calls = [];
+  mountCloudRun(document, async (endpoint, options = {}) => {
+    calls.push([endpoint, options]);
+    if (endpoint === "/cloud-run/api/settings") {
+      return jsonResponse(settingsPayload({ configured: true }));
+    }
+    if (endpoint === "/cloud-run/api/preflights") {
+      return jsonResponse(preflightPayload());
+    }
+    if (endpoint === "/cloud-run/api/offers") {
+      return jsonResponse({
+        offers: [{
+          offer_id: "42",
+          gpu_name: "RTX 4090",
+          gpu_ram_gb: 24,
+          dph_total: 0.5,
+          reliability: 0.99,
+        }],
+      });
+    }
+    if (endpoint === "/cloud-run/api/sessions") {
+      return jsonResponse(quoteSession());
+    }
+    throw new Error(`unexpected endpoint: ${endpoint}`);
+  }, {
+    crypto: { randomUUID: () => "session-key" },
+  }, {
+    app,
+    api,
+    async onCapture() {
+      return { capture_id: "capture-1" };
+    },
+  });
+
+  await document.getElementById("cloud-run-button").click();
+  await document.getElementById("cloud-run-preflight").click();
+  await document.getElementById("cloud-run-search").click();
+  await document.getElementById("cloud-run-offer-0").click();
+  const duration = document.getElementById("cloud-run-session-duration");
+  assert.ok(duration);
+  duration.value = "1801";
+  await document.getElementById("cloud-run-review-session").click();
+
+  assert.equal(
+    calls.filter(([endpoint]) => endpoint === "/cloud-run/api/sessions").length,
+    0,
+  );
+  assert.match(
+    document.getElementById("cloud-run-status").textContent,
+    /Choose one of the listed finite session durations/,
+  );
+});
+
+
+test("ambiguous active session blocks search review and confirm after preflight", async () => {
+  const document = new FakeDocument();
+  mountLocalRunButton(document);
+  const { api, app } = captureHost();
+  const calls = [];
+  const ambiguous = quoteSession("reconciling_create", {
+    session_id: "session-ambiguous",
+    rental_outcome: "unknown",
+    instance_id: null,
+    can_search_offers: false,
+    can_destroy: true,
+    billing_may_continue: true,
+  });
+  mountCloudRun(document, async (endpoint, options = {}) => {
+    calls.push([endpoint, options]);
+    if (endpoint === "/cloud-run/api/settings") {
+      return jsonResponse(settingsPayload({
+        configured: true,
+        active_sessions: [ambiguous],
+      }));
+    }
+    if (endpoint === "/cloud-run/api/preflights") {
+      return jsonResponse(preflightPayload());
+    }
+    if (endpoint === "/cloud-run/api/offers") {
+      return jsonResponse({ offers: [] });
+    }
+    throw new Error(`unexpected endpoint: ${endpoint}`);
+  }, {
+    setTimeout() {
+      return 1;
+    },
+    clearTimeout() {},
+  }, {
+    app,
+    api,
+    async onCapture() {
+      return { capture_id: "capture-1" };
+    },
+  });
+
+  await document.getElementById("cloud-run-button").click();
+  await document.getElementById("cloud-run-preflight").click();
+
+  assert.equal(document.getElementById("cloud-run-search").disabled, true);
+  assert.equal(document.getElementById("cloud-run-review-session").disabled, true);
+  assert.equal(document.getElementById("cloud-run-confirm-session").disabled, true);
+  assert.equal(document.getElementById("cloud-run-confirm-session").hidden, true);
+  assert.match(
+    document.getElementById("cloud-run-preview-banner").className,
+    /cloud-run-danger/,
+  );
+  await document.getElementById("cloud-run-search").click();
+  assert.equal(
+    calls.filter(([endpoint]) => endpoint === "/cloud-run/api/offers").length,
+    0,
+  );
+});
+
+
+test("reload chooses active or unknown state before recent absent history", async () => {
+  const document = new FakeDocument();
+  mountLocalRunButton(document);
+  const oldActive = quoteSession("ready", {
+    session_id: "session-old-active",
+    rental_outcome: "active",
+    can_search_offers: false,
+    can_destroy: true,
+    billing_may_continue: true,
+    updated_at: 1_100,
+  });
+  const newestUnknown = quoteSession("reconciling_create", {
+    session_id: "session-newest-unknown",
+    rental_outcome: "unknown",
+    instance_id: null,
+    can_search_offers: false,
+    can_destroy: true,
+    billing_may_continue: true,
+    updated_at: 1_200,
+  });
+  const recentAbsent = quoteSession("failed", {
+    session_id: "session-recent-absent",
+    rental_outcome: "absent",
+    instance_id: null,
+    can_search_offers: true,
+    can_destroy: false,
+    billing_may_continue: false,
+    updated_at: 1_300,
+  });
+  mountCloudRun(document, async () => jsonResponse(settingsPayload({
+    active_sessions: [oldActive, newestUnknown],
+    recent_sessions: [recentAbsent],
+  })), {
+    setTimeout() {
+      return 1;
+    },
+    clearTimeout() {},
+  });
+
+  await document.getElementById("cloud-run-button").click();
+
+  const text = document.getElementById("cloud-run-dependency-console").textContent;
+  assert.match(text, /session-newest-unknown/);
+  assert.doesNotMatch(text, /session-recent-absent/);
+});
+
+
+test("reload renders the newest failed absent session without active billing banner", async () => {
+  const document = new FakeDocument();
+  mountLocalRunButton(document);
+  const oldAbsent = quoteSession("failed", {
+    session_id: "session-old-absent",
+    rental_outcome: "absent",
+    instance_id: null,
+    can_search_offers: true,
+    can_destroy: false,
+    billing_may_continue: false,
+    updated_at: 1_100,
+  });
+  const newestAbsent = quoteSession("failed", {
+    session_id: "session-newest-absent",
+    rental_outcome: "absent",
+    instance_id: null,
+    can_search_offers: true,
+    can_destroy: false,
+    billing_may_continue: false,
+    updated_at: 1_200,
+  });
+  mountCloudRun(document, async () => jsonResponse(settingsPayload({
+    active_sessions: [],
+    recent_sessions: [oldAbsent, newestAbsent],
+  })));
+
+  await document.getElementById("cloud-run-button").click();
+
+  const text = document.getElementById("cloud-run-dependency-console").textContent;
+  const banner = document.getElementById("cloud-run-preview-banner");
+  assert.match(text, /session-newest-absent/);
+  assert.doesNotMatch(text, /session-old-absent/);
+  assert.doesNotMatch(banner.className, /cloud-run-danger/);
+  assert.match(banner.textContent, /no longer bills|No Vast billing is active/i);
+  assert.doesNotMatch(banner.textContent, /billing ends only after/);
+});
+
+
+test("verified absence requires a fresh manual offer review and idempotency key", async () => {
+  const document = new FakeDocument();
+  mountLocalRunButton(document);
+  const { api, app } = captureHost();
+  const calls = [];
+  let sessionReviews = 0;
+  let offerSearches = 0;
+  let uuidCount = 0;
+  mountCloudRun(document, async (endpoint, options = {}) => {
+    calls.push([endpoint, options]);
+    if (endpoint === "/cloud-run/api/settings") {
+      return jsonResponse(settingsPayload({ configured: true }));
+    }
+    if (endpoint === "/cloud-run/api/preflights") {
+      return jsonResponse(preflightPayload());
+    }
+    if (endpoint === "/cloud-run/api/offers") {
+      offerSearches += 1;
+      return jsonResponse({
+        offers: [{
+          offer_id: String(40 + offerSearches),
+          gpu_name: "RTX 4090",
+          gpu_ram_gb: 24,
+          dph_total: 0.5,
+          reliability: 0.99,
+        }],
+      });
+    }
+    if (endpoint === "/cloud-run/api/sessions") {
+      sessionReviews += 1;
+      return jsonResponse(quoteSession("offer_selected", {
+        session_id: `session-${sessionReviews}`,
+        offer: {
+          ...quoteSession().offer,
+          offer_id: String(40 + sessionReviews),
+        },
+      }));
+    }
+    if (endpoint === "/cloud-run/api/sessions/session-1/confirm") {
+      return jsonResponse(quoteSession("failed", {
+        session_id: "session-1",
+        rental_outcome: "absent",
+        instance_id: null,
+        can_search_offers: true,
+        can_destroy: false,
+        billing_may_continue: false,
+      }));
+    }
+    if (endpoint === "/cloud-run/api/sessions/session-2/confirm") {
+      return jsonResponse(quoteSession("creating", {
+        session_id: "session-2",
+      }));
+    }
+    throw new Error(`unexpected endpoint: ${endpoint}`);
+  }, {
+    crypto: {
+      randomUUID() {
+        uuidCount += 1;
+        return `session-key-${uuidCount}`;
+      },
+    },
+    setTimeout() {
+      return 1;
+    },
+    clearTimeout() {},
+  }, {
+    app,
+    api,
+    async onCapture() {
+      return { capture_id: "capture-1" };
+    },
+  });
+
+  await document.getElementById("cloud-run-button").click();
+  await document.getElementById("cloud-run-preflight").click();
+  await document.getElementById("cloud-run-search").click();
+  await document.getElementById("cloud-run-offer-0").click();
+  await document.getElementById("cloud-run-review-session").click();
+  await document.getElementById("cloud-run-confirm-session").click();
+
+  assert.equal(offerSearches, 1);
+  assert.equal(sessionReviews, 1);
+  assert.equal(uuidCount, 1);
+  assert.equal(document.getElementById("cloud-run-offers").children.length, 0);
+  assert.equal(document.getElementById("cloud-run-review-session").disabled, true);
+  assert.equal(document.getElementById("cloud-run-search").disabled, false);
+
+  await document.getElementById("cloud-run-search").click();
+  await document.getElementById("cloud-run-offer-0").click();
+  await document.getElementById("cloud-run-review-session").click();
+  await document.getElementById("cloud-run-confirm-session").click();
+
+  const reviewBodies = calls
+    .filter(([endpoint]) => endpoint === "/cloud-run/api/sessions")
+    .map(([, options]) => JSON.parse(options.body));
+  assert.deepEqual(
+    reviewBodies.map((body) => body.idempotency_key),
+    ["session-key-1", "session-key-2"],
+  );
+  assert.equal(offerSearches, 2);
+  assert.equal(sessionReviews, 2);
+  assert.equal(uuidCount, 2);
+});
+
+
+test("billing banner is normal for ready active and red only for unknown or residual failure", async () => {
+  const cases = [
+    {
+      session: quoteSession("ready", {
+        rental_outcome: "active",
+        can_search_offers: false,
+        can_destroy: true,
+        billing_may_continue: true,
+      }),
+      red: false,
+    },
+    {
+      session: quoteSession("reconciling_create", {
+        rental_outcome: "unknown",
+        instance_id: null,
+        can_search_offers: false,
+        can_destroy: true,
+        billing_may_continue: true,
+      }),
+      red: true,
+    },
+    {
+      session: quoteSession("failed", {
+        rental_outcome: "active",
+        can_search_offers: false,
+        can_destroy: true,
+        billing_may_continue: true,
+        residual_inventory: ["88"],
+      }),
+      red: true,
+    },
+  ];
+
+  for (const { session, red } of cases) {
+    const document = new FakeDocument();
+    mountLocalRunButton(document);
+    mountCloudRun(document, async () => jsonResponse(settingsPayload({
+      active_sessions: [session],
+    })), {
+      setTimeout() {
+        return 1;
+      },
+      clearTimeout() {},
+    });
+    await document.getElementById("cloud-run-button").click();
+    const banner = document.getElementById("cloud-run-preview-banner");
+    assert.equal(/cloud-run-danger/.test(banner.className), red);
+    if (!red) {
+      assert.match(banner.textContent, /Paid Vast\.ai session/);
+      assert.doesNotMatch(banner.textContent, /Warning/);
+    }
+  }
 });
 
 

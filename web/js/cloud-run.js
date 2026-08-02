@@ -12,6 +12,12 @@ import { createSessionConsole } from "./session-console.js";
 const OPEN_COMMAND_ID = "vast-cloud-run.open";
 const POLL_INTERVAL_MS = 1000;
 const DEFAULT_SESSION_SECONDS = 2 * 60 * 60;
+const SESSION_DURATION_SECONDS = new Map([
+  ["1800", 30 * 60],
+  ["3600", 60 * 60],
+  ["5400", 90 * 60],
+  ["7200", DEFAULT_SESSION_SECONDS],
+]);
 const mountedCloudRuns = new WeakMap();
 
 
@@ -400,18 +406,30 @@ export function mountCloudRun(
   vramInput.setAttribute("min", "1");
   vramInput.setAttribute("max", "1024");
   vramInput.setAttribute("step", "1");
-  const createLimitSelect = createElement(document, "select", {
-    id: "cloud-run-max-instance-creates",
-    testId: "cloud-run-max-instance-creates",
+  const durationSelect = createElement(document, "select", {
+    id: "cloud-run-session-duration",
+    testId: "cloud-run-session-duration",
   });
-  for (const value of [1, 2]) {
+  for (const [value, label] of [
+    ["1800", "30 minutes"],
+    ["3600", "60 minutes"],
+    ["5400", "90 minutes"],
+    ["7200", "120 minutes"],
+  ]) {
     const option = createElement(document, "option", {
-      text: String(value),
+      text: label,
     });
-    option.value = String(value);
-    createLimitSelect.appendChild(option);
+    option.value = value;
+    durationSelect.appendChild(option);
   }
-  createLimitSelect.value = "1";
+  durationSelect.value = String(DEFAULT_SESSION_SECONDS);
+  const createLimitReview = createElement(document, "div", {
+    id: "cloud-run-create-limit-review",
+    testId: "cloud-run-create-limit-review",
+    text:
+      "Maximum provider creates for this review: 1. " +
+      "Cloud Run never rents a replacement automatically.",
+  });
 
   const primaryActions = createElement(document, "div", {
     className: "cloud-run-actions",
@@ -454,6 +472,13 @@ export function mountCloudRun(
   let sessionIdempotencyKey = null;
   let busy = false;
 
+  function clearBrowserPaidReview() {
+    selectedOffer = null;
+    sessionIdempotencyKey = null;
+    offers.replaceChildren();
+    reviewButton.disabled = true;
+  }
+
   async function captureCurrentCanvas() {
     const context = record?.captureContext ?? captureContext;
     if (!context.app || !context.api) {
@@ -475,6 +500,7 @@ export function mountCloudRun(
     }
     record.currentCapture = capture;
     record.sessionConsole.setCapture(persisted.capture_id);
+    clearBrowserPaidReview();
     return persisted;
   }
 
@@ -496,15 +522,28 @@ export function mountCloudRun(
       pollIntervalMs: POLL_INTERVAL_MS,
       now: () => Date.now() / 1000,
       onSession(session) {
-        if (session?.billing_may_continue === true) {
-          banner.className = "cloud-run-banner cloud-run-danger";
-          banner.textContent =
-            "Warning — Vast billing may still be active. Use Destroy GPU.";
-        } else if (session?.status === "destroyed") {
+        if (session?.rental_outcome === "absent") {
+          clearBrowserPaidReview();
           banner.className = "cloud-run-banner";
           banner.textContent =
             "Vast inventory confirms that this session no longer bills.";
-        } else if (session?.status && session.status !== "offer_selected") {
+        } else if (
+          session?.rental_outcome === "unknown"
+          || (
+            session?.rental_outcome === "active"
+            && (
+              session?.status === "failed"
+              || (
+                Array.isArray(session?.residual_inventory)
+                && session.residual_inventory.length > 0
+              )
+            )
+          )
+        ) {
+          banner.className = "cloud-run-banner cloud-run-danger";
+          banner.textContent =
+            "Warning — Vast billing may still be active. Use Destroy GPU.";
+        } else if (session?.rental_outcome === "active") {
           banner.className = "cloud-run-banner";
           banner.textContent =
             "Paid Vast.ai session — billing ends only after verified destruction.";
@@ -517,12 +556,8 @@ export function mountCloudRun(
   appendField(document, card, "Vast API key", apiKeyInput);
   appendField(document, card, "Maximum hourly price ($/h)", priceInput);
   appendField(document, card, "Minimum VRAM (GB)", vramInput);
-  appendField(
-    document,
-    card,
-    "Maximum total instance creates",
-    createLimitSelect,
-  );
+  appendField(document, card, "Maximum session duration", durationSelect);
+  card.appendChild(createLimitReview);
   card.append(
     primaryActions,
     status,
@@ -534,7 +569,7 @@ export function mountCloudRun(
   function setBusy(value) {
     busy = Boolean(value);
     saveButton.disabled = busy;
-    searchButton.disabled = busy || !sessionConsole.preflightId;
+    searchButton.disabled = busy || !sessionConsole.canSearchOffers;
     reviewButton.disabled = busy || !selectedOffer;
   }
 
@@ -549,16 +584,23 @@ export function mountCloudRun(
       vramInput.value = String(payload.min_vram_gb);
       sessionConsole.renderSettings(payload);
       const active = Array.isArray(payload.active_sessions)
-        ? (
-          payload.active_sessions.find(
-            (session) => session?.billing_may_continue === true,
-          )
-          ?? [...payload.active_sessions].reverse().find(
-            (session) => session?.status !== "destroyed",
-          )
+        ? [...payload.active_sessions].reverse().find(
+          (session) => ["unknown", "active"].includes(
+            session?.rental_outcome,
+          ),
         )
         : null;
-      if (active) sessionConsole.renderSession(active);
+      const recentAbsent = !active && Array.isArray(payload.recent_sessions)
+        ? [...payload.recent_sessions].reverse().find(
+          (session) => (
+            session?.status === "failed"
+            && session?.rental_outcome === "absent"
+          ),
+        )
+        : null;
+      if (active || recentAbsent) {
+        sessionConsole.renderSession(active ?? recentAbsent);
+      }
       status.textContent = "";
     } catch {
       status.textContent = "Settings could not be loaded.";
@@ -639,14 +681,13 @@ export function mountCloudRun(
   });
 
   searchButton.addEventListener("click", async () => {
-    if (!sessionConsole.preflightId) {
+    if (!sessionConsole.canSearchOffers) {
       status.textContent =
         "Run and resolve the free dependency preflight first.";
       return;
     }
-    selectedOffer = null;
-    sessionIdempotencyKey = null;
-    offers.replaceChildren();
+    clearBrowserPaidReview();
+    sessionConsole.clearPaidReview();
     setBusy(true);
     status.textContent = "Searching eligible Vast GPUs…";
     try {
@@ -675,6 +716,14 @@ export function mountCloudRun(
 
   reviewButton.addEventListener("click", async () => {
     if (!selectedOffer || !sessionConsole.preflightId) return;
+    const durationSeconds = SESSION_DURATION_SECONDS.get(
+      String(durationSelect.value),
+    );
+    if (durationSeconds === undefined) {
+      status.textContent =
+        "Choose one of the listed finite session durations.";
+      return;
+    }
     try {
       if (!sessionIdempotencyKey) {
         sessionIdempotencyKey = createIdempotencyKey(browserWindow);
@@ -693,9 +742,9 @@ export function mountCloudRun(
         idempotency_key: sessionIdempotencyKey,
         deadline: {
           mode: "finite",
-          duration_seconds: DEFAULT_SESSION_SECONDS,
+          duration_seconds: durationSeconds,
         },
-        max_instance_creates: Number(createLimitSelect.value),
+        max_instance_creates: 1,
       });
       sessionConsole.renderQuote(session, {
         idempotencyKey: sessionIdempotencyKey,
