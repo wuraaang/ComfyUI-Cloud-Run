@@ -12,6 +12,12 @@ import { createSessionConsole } from "./session-console.js";
 const OPEN_COMMAND_ID = "vast-cloud-run.open";
 const POLL_INTERVAL_MS = 1000;
 const DEFAULT_SESSION_SECONDS = 2 * 60 * 60;
+const UNFILTERED_MAX_PRICE_PER_HOUR = 100;
+const UNFILTERED_MIN_VRAM_GB = 1;
+const INVALID_PRICE_MESSAGE =
+  "Price must be blank or a number such as 0.46 (0,46 also works).";
+const INVALID_VRAM_MESSAGE =
+  "VRAM must be blank or a whole number such as 16 or 24.";
 const SESSION_DURATION_SECONDS = new Map([
   ["none", null],
   ["1800", 30 * 60],
@@ -399,11 +405,10 @@ export function mountCloudRun(
   const priceInput = createElement(document, "input", {
     id: "cloud-run-max-price",
     testId: "cloud-run-max-price",
-    type: "number",
+    type: "text",
   });
-  priceInput.setAttribute("min", "0.01");
-  priceInput.setAttribute("max", "100");
-  priceInput.setAttribute("step", "0.01");
+  priceInput.setAttribute("inputmode", "decimal");
+  priceInput.setAttribute("placeholder", "No price filter");
   const vramInput = createElement(document, "input", {
     id: "cloud-run-min-vram",
     testId: "cloud-run-min-vram",
@@ -412,6 +417,7 @@ export function mountCloudRun(
   vramInput.setAttribute("min", "1");
   vramInput.setAttribute("max", "1024");
   vramInput.setAttribute("step", "1");
+  vramInput.setAttribute("placeholder", "No VRAM filter");
   const durationSelect = createElement(document, "select", {
     id: "cloud-run-session-duration",
     testId: "cloud-run-session-duration",
@@ -561,8 +567,13 @@ export function mountCloudRun(
 
   card.replaceChildren(header, banner, configured);
   appendField(document, card, "Vast API key", apiKeyInput);
-  appendField(document, card, "Maximum hourly price ($/h)", priceInput);
-  appendField(document, card, "Minimum VRAM (GB)", vramInput);
+  appendField(
+    document,
+    card,
+    "Maximum hourly price ($/h, optional)",
+    priceInput,
+  );
+  appendField(document, card, "Minimum VRAM (GB, optional)", vramInput);
   appendField(document, card, "Session duration", durationSelect);
   card.appendChild(createLimitReview);
   card.append(
@@ -581,17 +592,25 @@ export function mountCloudRun(
   }
 
   function visibleSettingsPayload() {
-    const maxPrice = Number(priceInput.value);
-    const minVram = Number(vramInput.value);
-    if (
-      !Number.isFinite(maxPrice)
-      || maxPrice < 0.01
-      || maxPrice > 100
-      || !Number.isInteger(minVram)
-      || minVram < 1
-      || minVram > 1024
-    ) {
-      return null;
+    const rawPrice = String(priceInput.value ?? "").trim();
+    let maxPrice = UNFILTERED_MAX_PRICE_PER_HOUR;
+    if (rawPrice !== "") {
+      if (!/^(?:\d+(?:[.,]\d+)?|[.,]\d+)$/.test(rawPrice)) {
+        return { payload: null, error: INVALID_PRICE_MESSAGE };
+      }
+      maxPrice = Number(rawPrice.replace(",", "."));
+      if (!Number.isFinite(maxPrice) || maxPrice < 0.01 || maxPrice > 100) {
+        return { payload: null, error: INVALID_PRICE_MESSAGE };
+      }
+    }
+
+    const rawVram = String(vramInput.value ?? "").trim();
+    let minVram = UNFILTERED_MIN_VRAM_GB;
+    if (rawVram !== "") {
+      minVram = Number(rawVram);
+      if (!Number.isInteger(minVram) || minVram < 1 || minVram > 1024) {
+        return { payload: null, error: INVALID_VRAM_MESSAGE };
+      }
     }
     const payload = {
       max_price_per_hour: maxPrice,
@@ -599,7 +618,7 @@ export function mountCloudRun(
     };
     const key = apiKeyInput.value.trim();
     if (key) payload.api_key = key;
-    return payload;
+    return { payload, error: null };
   }
 
   function renderSavedSettings(result) {
@@ -617,8 +636,14 @@ export function mountCloudRun(
       configured.textContent = payload.configured
         ? "Vast API key is configured."
         : "Vast API key is not configured.";
-      priceInput.value = String(payload.max_price_per_hour);
-      vramInput.value = String(payload.min_vram_gb);
+      priceInput.value =
+        Number(payload.max_price_per_hour) === UNFILTERED_MAX_PRICE_PER_HOUR
+          ? ""
+          : String(payload.max_price_per_hour);
+      vramInput.value =
+        Number(payload.min_vram_gb) === UNFILTERED_MIN_VRAM_GB
+          ? ""
+          : String(payload.min_vram_gb);
       sessionConsole.renderSettings(payload);
       const active = Array.isArray(payload.active_sessions)
         ? [...payload.active_sessions].reverse().find(
@@ -680,10 +705,9 @@ export function mountCloudRun(
   });
 
   saveButton.addEventListener("click", async () => {
-    const payload = visibleSettingsPayload();
-    if (!payload) {
-      status.textContent =
-        "Enter a valid price and whole-number VRAM value.";
+    const { payload, error } = visibleSettingsPayload();
+    if (error) {
+      status.textContent = error;
       return;
     }
     setBusy(true);
@@ -705,10 +729,12 @@ export function mountCloudRun(
         "Run and resolve the free dependency preflight first.";
       return;
     }
-    const settingsPayload = visibleSettingsPayload();
-    if (!settingsPayload) {
-      status.textContent =
-        "Enter a valid price and whole-number VRAM value.";
+    const {
+      payload: settingsPayload,
+      error: settingsError,
+    } = visibleSettingsPayload();
+    if (settingsError) {
+      status.textContent = settingsError;
       return;
     }
     clearBrowserPaidReview();
@@ -747,6 +773,15 @@ export function mountCloudRun(
       setBusy(false);
     }
   });
+
+  async function searchOnEnter(event) {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    await searchButton.click();
+  }
+
+  priceInput.addEventListener("keydown", searchOnEnter);
+  vramInput.addEventListener("keydown", searchOnEnter);
 
   reviewButton.addEventListener("click", async () => {
     if (!selectedOffer || !sessionConsole.preflightId) return;

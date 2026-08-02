@@ -328,6 +328,187 @@ test("registers through the pinned ComfyUI extension API", async () => {
 });
 
 
+async function optionalOfferFilterScenario(settingsOverrides = {}) {
+  const document = new FakeDocument();
+  mountLocalRunButton(document);
+  const { api, app } = captureHost();
+  const calls = [];
+  mountCloudRun(document, async (endpoint, options = {}) => {
+    calls.push([endpoint, options]);
+    if (endpoint === "/cloud-run/api/settings") {
+      const update = options.method === "PUT"
+        ? JSON.parse(options.body)
+        : {};
+      return jsonResponse(settingsPayload({
+        configured: true,
+        ...settingsOverrides,
+        ...update,
+      }));
+    }
+    if (endpoint === "/cloud-run/api/captures") {
+      return jsonResponse({
+        capture_id: "capture-1",
+        prompt_digest: "d".repeat(64),
+        status: "captured",
+      });
+    }
+    if (endpoint === "/cloud-run/api/preflights") {
+      return jsonResponse(preflightPayload());
+    }
+    if (endpoint === "/cloud-run/api/offers") {
+      return jsonResponse({ offers: [] });
+    }
+    throw new Error(`unexpected endpoint: ${endpoint}`);
+  }, {}, { app, api });
+
+  await document.getElementById("cloud-run-button").click();
+  await document.getElementById("cloud-run-preflight").click();
+  return { calls, document };
+}
+
+
+test("optional offer filters render and submit blank fields", async () => {
+  const { calls, document } = await optionalOfferFilterScenario({
+    max_price_per_hour: 100,
+    min_vram_gb: 1,
+  });
+  const priceInput = document.getElementById("cloud-run-max-price");
+  const vramInput = document.getElementById("cloud-run-min-vram");
+
+  assert.equal(priceInput.value, "");
+  assert.equal(vramInput.value, "");
+  await document.getElementById("cloud-run-search").click();
+
+  const settingsPut = calls.find(
+    ([endpoint, options]) => (
+      endpoint === "/cloud-run/api/settings" && options.method === "PUT"
+    ),
+  );
+  assert.ok(settingsPut, "blank filters must be persisted before search");
+  assert.deepEqual(JSON.parse(settingsPut[1].body), {
+    max_price_per_hour: 100,
+    min_vram_gb: 1,
+  });
+});
+
+
+test("optional offer filters allow VRAM-only and French-price-only search", async () => {
+  {
+    const { calls, document } = await optionalOfferFilterScenario();
+    document.getElementById("cloud-run-max-price").value = "";
+    document.getElementById("cloud-run-min-vram").value = "24";
+    await document.getElementById("cloud-run-search").click();
+
+    const settingsPut = calls.find(
+      ([endpoint, options]) => (
+        endpoint === "/cloud-run/api/settings" && options.method === "PUT"
+      ),
+    );
+    assert.ok(settingsPut, "VRAM-only filters must be persisted");
+    assert.deepEqual(JSON.parse(settingsPut[1].body), {
+      max_price_per_hour: 100,
+      min_vram_gb: 24,
+    });
+  }
+
+  {
+    const { calls, document } = await optionalOfferFilterScenario();
+    const priceInput = document.getElementById("cloud-run-max-price");
+    priceInput.value = "0,46";
+    document.getElementById("cloud-run-min-vram").value = "";
+    assert.equal(priceInput.type, "text");
+    assert.equal(priceInput.getAttribute("inputmode"), "decimal");
+    await document.getElementById("cloud-run-search").click();
+
+    const settingsPut = calls.find(
+      ([endpoint, options]) => (
+        endpoint === "/cloud-run/api/settings" && options.method === "PUT"
+      ),
+    );
+    assert.ok(settingsPut, "French-price-only filters must be persisted");
+    assert.deepEqual(JSON.parse(settingsPut[1].body), {
+      max_price_per_hour: 0.46,
+      min_vram_gb: 1,
+    });
+  }
+});
+
+
+test("filter validation identifies the invalid field", async () => {
+  {
+    const { calls, document } = await optionalOfferFilterScenario();
+    document.getElementById("cloud-run-max-price").value = "0,4.6";
+    document.getElementById("cloud-run-min-vram").value = "24";
+    await document.getElementById("cloud-run-search").click();
+
+    assert.equal(
+      calls.filter(([, options]) => options.method === "PUT").length,
+      0,
+    );
+    assert.match(
+      document.getElementById("cloud-run-status").textContent,
+      /^Price must be blank or a number such as 0\.46 \(0,46 also works\)\.$/,
+    );
+  }
+
+  {
+    const { calls, document } = await optionalOfferFilterScenario();
+    document.getElementById("cloud-run-max-price").value = "0.46";
+    document.getElementById("cloud-run-min-vram").value = "24.5";
+    await document.getElementById("cloud-run-search").click();
+
+    assert.equal(
+      calls.filter(([, options]) => options.method === "PUT").length,
+      0,
+    );
+    assert.match(
+      document.getElementById("cloud-run-status").textContent,
+      /^VRAM must be blank or a whole number such as 16 or 24\.$/,
+    );
+  }
+});
+
+
+test("Enter searches optional filters from price or VRAM", async () => {
+  for (const field of ["vram", "price"]) {
+    const { calls, document } = await optionalOfferFilterScenario();
+    const priceInput = document.getElementById("cloud-run-max-price");
+    const vramInput = document.getElementById("cloud-run-min-vram");
+    priceInput.value = field === "price" ? "0,46" : "";
+    vramInput.value = field === "vram" ? "24" : "";
+    const event = {
+      type: "keydown",
+      key: "Enter",
+      defaultPrevented: false,
+      preventDefault() {
+        this.defaultPrevented = true;
+      },
+    };
+
+    await (field === "price" ? priceInput : vramInput).dispatchEvent(event);
+
+    assert.equal(event.defaultPrevented, true, field);
+    const settingsPuts = calls.filter(
+      ([endpoint, options]) => (
+        endpoint === "/cloud-run/api/settings" && options.method === "PUT"
+      ),
+    );
+    const offerSearches = calls.filter(
+      ([endpoint]) => endpoint === "/cloud-run/api/offers",
+    );
+    assert.equal(settingsPuts.length, 1, field);
+    assert.equal(offerSearches.length, 1, field);
+    assert.deepEqual(JSON.parse(settingsPuts[0][1].body), field === "price"
+      ? { max_price_per_hour: 0.46, min_vram_gb: 1 }
+      : { max_price_per_hour: 100, min_vram_gb: 24 });
+    assert.ok(
+      calls.indexOf(settingsPuts[0]) < calls.indexOf(offerSearches[0]),
+      field,
+    );
+  }
+});
+
+
 test("Search persists visible settings before requesting offers", async () => {
   const document = new FakeDocument();
   mountLocalRunButton(document);
