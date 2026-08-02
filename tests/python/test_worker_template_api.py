@@ -2,6 +2,7 @@ import io
 import base64
 import contextlib
 import gzip
+import hashlib
 import inspect
 import json
 import os
@@ -202,6 +203,35 @@ def base_template_row(**overrides):
     return row
 
 
+def publication_intent_path(settings):
+    return settings.parent / (
+        ".template-publication-" + WORKER_COMMIT + ".intent"
+    )
+
+
+def write_publication_intent(settings, request=None, *, payload=None):
+    request = request or template_request()
+    if payload is None:
+        encoded_request = json.dumps(
+            request,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        payload = {
+            "schema_version": 1,
+            "name": request["name"],
+            "request_sha256": hashlib.sha256(encoded_request).hexdigest(),
+        }
+    intent = publication_intent_path(settings)
+    intent.write_text(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+    )
+    os.chmod(intent, 0o600)
+    return intent
+
+
 class FakeResponse:
     def __init__(self, payload, *, status=200, content_encoding="identity"):
         self.status = status
@@ -239,6 +269,21 @@ class FakeOpener:
         return response
 
 
+class ReadOnlyRecoveryTransport:
+    def __init__(self, name_rows, hash_rows=()):
+        self.name_rows = name_rows
+        self.hash_rows = hash_rows
+        self.calls = []
+
+    def lookup_name(self, api_key, name):
+        self.calls.append(("lookup_name", api_key, name))
+        return self.name_rows
+
+    def lookup_hash(self, api_key, hash_id):
+        self.calls.append(("lookup_hash", api_key, hash_id))
+        return self.hash_rows
+
+
 class WorkerTemplateApiTests(unittest.TestCase):
     def _private_inputs(self, root):
         settings_directory = Path(root) / "settings"
@@ -254,6 +299,13 @@ class WorkerTemplateApiTests(unittest.TestCase):
         request_path.write_text(json.dumps(template_request()))
         os.chmod(request_path, 0o600)
         return settings, output, request_path
+
+    def _reconcile_worker_template(self, *args, **kwargs):
+        publisher = __import__(
+            "scripts.publish_worker_template",
+            fromlist=["reconcile_worker_template"],
+        )
+        return publisher.reconcile_worker_template(*args, **kwargs)
 
     def test_transport_fixes_get_endpoint_query_headers_and_timeout(self):
         response = FakeResponse(
@@ -366,6 +418,72 @@ class WorkerTemplateApiTests(unittest.TestCase):
         self.assertNotIn(provider_marker, json.dumps(rows[0]))
         query = parse_qs(urlsplit(opener.calls[0][0].full_url).query)
         self.assertEqual(json.loads(query["select_cols"][0]), ["*"])
+
+    def test_worker_lookup_normalizes_exact_serialized_extra_filters(self):
+        row = template_row()
+        row["extra_filters"] = json.dumps(
+            EXTRA_FILTERS,
+            separators=(",", ":"),
+        )
+        response = FakeResponse(
+            {
+                "success": True,
+                "templates_found": 1,
+                "templates": [row],
+            }
+        )
+        opener = FakeOpener([response])
+
+        rows = VastTemplateTransport(opener=opener).lookup_name(KEY, NAME)
+
+        self.assertEqual(rows, [template_row()])
+        self.assertEqual([call[0].method for call in opener.calls], ["GET"])
+
+    def test_worker_lookup_rejects_non_exact_serialized_extra_filters(self):
+        compact = json.dumps(EXTRA_FILTERS, separators=(",", ":"))
+        duplicate = compact.replace(
+            '"gpu_arch":{"eq":"nvidia"}',
+            '"gpu_arch":{"eq":"nvidia","eq":"nvidia"}',
+        )
+        invalid_filters = [
+            "{",
+            duplicate,
+            "[]",
+            "null",
+            "[" * 1100 + "]" * 1100,
+        ]
+        invalid_filters.extend(
+            json.dumps(filters, separators=(",", ":"))
+            for filters in invalid_extra_filters()
+        )
+
+        for index, filters in enumerate(invalid_filters):
+            with self.subTest(index=index):
+                row = template_row()
+                row["extra_filters"] = filters
+                opener = FakeOpener(
+                    [
+                        FakeResponse(
+                            {
+                                "success": True,
+                                "templates_found": 1,
+                                "templates": [row],
+                            }
+                        )
+                    ]
+                )
+
+                with self.assertRaisesRegex(
+                    TemplatePublicationError,
+                    "^Private template publication failed\\.$",
+                ) as caught:
+                    VastTemplateTransport(opener=opener).lookup_name(KEY, NAME)
+
+                self.assertIsNone(caught.exception.__cause__)
+                self.assertEqual(
+                    [call[0].method for call in opener.calls],
+                    ["GET"],
+                )
 
     def test_audit_base_uses_exact_hash_and_writes_sanitized_private_record(self):
         base_row = base_template_row()
@@ -934,6 +1052,334 @@ class WorkerTemplateApiTests(unittest.TestCase):
         self.assertEqual(
             [call[0].method for call in first_opener.calls],
             ["GET", "POST", "GET"],
+        )
+
+    def test_reconcile_reads_exact_name_and_hash_without_mutation(self):
+        request = template_request()
+        row = template_row(request)
+        row["extra_filters"] = json.dumps(
+            EXTRA_FILTERS,
+            separators=(",", ":"),
+        )
+        transport = ReadOnlyRecoveryTransport(
+            [row],
+            [row],
+        )
+        self.assertFalse(hasattr(transport, "create_worker_template"))
+
+        with tempfile.TemporaryDirectory() as root:
+            settings, output, request_path = self._private_inputs(root)
+            intent = write_publication_intent(settings, request)
+
+            result = self._reconcile_worker_template(
+                request_path,
+                output,
+                settings_path_resolver=lambda: settings,
+                transport=transport,
+            )
+
+            artifact = output / "template-publication.json"
+            self.assertEqual(
+                result,
+                {"id": 17, "hash_id": HASH_ID, "verified": True},
+            )
+            self.assertEqual(json.loads(artifact.read_text()), result)
+            self.assertEqual(stat.S_IMODE(artifact.stat().st_mode), 0o600)
+            self.assertFalse(intent.exists())
+            self.assertNotIn(KEY, artifact.read_text())
+
+        self.assertEqual(
+            [(call[0], call[2]) for call in transport.calls],
+            [("lookup_name", NAME), ("lookup_hash", HASH_ID)],
+        )
+
+    def test_reconcile_retains_intent_when_intent_directory_fsync_fails(self):
+        request = template_request()
+        transport = ReadOnlyRecoveryTransport(
+            [template_row(request)],
+            [template_row(request)],
+        )
+        publisher = __import__(
+            "scripts.publish_worker_template",
+            fromlist=["_fsync_directory"],
+        )
+        real_fsync_directory = publisher._fsync_directory
+
+        with tempfile.TemporaryDirectory() as root:
+            settings, output, request_path = self._private_inputs(root)
+            intent = write_publication_intent(settings, request)
+            original = intent.read_bytes()
+            failed = False
+
+            def fail_intent_fsync_once(directory):
+                nonlocal failed
+                if Path(directory) == settings.parent and not failed:
+                    failed = True
+                    raise OSError("synthetic intent fsync failure")
+                return real_fsync_directory(directory)
+
+            with mock.patch(
+                "scripts.publish_worker_template._fsync_directory",
+                side_effect=fail_intent_fsync_once,
+            ):
+                with self.assertRaisesRegex(
+                    TemplatePublicationError,
+                    "^Private template publication failed\\.$",
+                ):
+                    self._reconcile_worker_template(
+                        request_path,
+                        output,
+                        settings_path_resolver=lambda: settings,
+                        transport=transport,
+                    )
+
+            self.assertTrue(failed)
+            self.assertEqual(intent.read_bytes(), original)
+            self.assertEqual(stat.S_IMODE(intent.stat().st_mode), 0o600)
+            self.assertEqual(intent.stat().st_nlink, 1)
+            self.assertEqual(tuple(output.iterdir()), ())
+
+    def test_reconcile_requires_exact_private_intent_before_lookup(self):
+        request = template_request()
+        encoded_request = json.dumps(
+            request,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        exact_hash = hashlib.sha256(encoded_request).hexdigest()
+        invalid_payloads = (
+            {"schema_version": 2, "name": NAME, "request_sha256": exact_hash},
+            {"schema_version": True, "name": NAME, "request_sha256": exact_hash},
+            {"schema_version": 1, "name": "wrong-name", "request_sha256": exact_hash},
+            {"schema_version": 1, "name": NAME, "request_sha256": "d" * 64},
+            {"schema_version": 1, "name": NAME, "request_sha256": True},
+            {
+                "schema_version": 1,
+                "name": NAME,
+                "request_sha256": exact_hash,
+                "extra": True,
+            },
+        )
+
+        for index, payload in enumerate(invalid_payloads):
+            with self.subTest(payload=index), tempfile.TemporaryDirectory() as root:
+                settings, output, request_path = self._private_inputs(root)
+                intent = write_publication_intent(
+                    settings,
+                    request,
+                    payload=payload,
+                )
+                original = intent.read_bytes()
+                transport = ReadOnlyRecoveryTransport([template_row(request)])
+
+                with self.assertRaisesRegex(
+                    TemplatePublicationError,
+                    "^Private template publication failed\\.$",
+                ):
+                    self._reconcile_worker_template(
+                        request_path,
+                        output,
+                        settings_path_resolver=lambda: settings,
+                        transport=transport,
+                    )
+
+                self.assertEqual(intent.read_bytes(), original)
+                self.assertEqual(transport.calls, [])
+                self.assertEqual(tuple(output.iterdir()), ())
+
+        with tempfile.TemporaryDirectory() as root:
+            settings, output, request_path = self._private_inputs(root)
+            transport = ReadOnlyRecoveryTransport([template_row(request)])
+
+            with self.assertRaises(TemplatePublicationError):
+                self._reconcile_worker_template(
+                    request_path,
+                    output,
+                    settings_path_resolver=lambda: settings,
+                    transport=transport,
+                )
+
+            self.assertEqual(transport.calls, [])
+            self.assertEqual(tuple(output.iterdir()), ())
+
+    def test_reconcile_rejects_unsafe_intent_metadata_before_lookup(self):
+        request = template_request()
+        cases = ("directory", "symlink", "hardlink", "public_mode")
+
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as root:
+                settings, output, request_path = self._private_inputs(root)
+                intent = publication_intent_path(settings)
+                if case == "directory":
+                    intent.mkdir(mode=0o700)
+                elif case == "symlink":
+                    target = settings.parent / "intent-target"
+                    write_publication_intent(settings, request)
+                    intent.rename(target)
+                    intent.symlink_to(target)
+                else:
+                    write_publication_intent(settings, request)
+                    if case == "hardlink":
+                        os.link(intent, settings.parent / "intent-peer")
+                    else:
+                        os.chmod(intent, 0o640)
+                transport = ReadOnlyRecoveryTransport([template_row(request)])
+
+                with self.assertRaises(TemplatePublicationError):
+                    self._reconcile_worker_template(
+                        request_path,
+                        output,
+                        settings_path_resolver=lambda: settings,
+                        transport=transport,
+                    )
+
+                self.assertTrue(intent.exists() or intent.is_symlink())
+                self.assertEqual(transport.calls, [])
+                self.assertEqual(tuple(output.iterdir()), ())
+
+    def test_reconcile_rejects_wrong_intent_owner_before_lookup(self):
+        request = template_request()
+        real_lstat = os.lstat
+        with tempfile.TemporaryDirectory() as root:
+            settings, output, request_path = self._private_inputs(root)
+            intent = write_publication_intent(settings, request)
+            transport = ReadOnlyRecoveryTransport([template_row(request)])
+
+            def wrong_owner(path):
+                metadata = real_lstat(path)
+                if Path(path) != intent:
+                    return metadata
+                values = list(metadata)
+                values[4] = metadata.st_uid + 1
+                return os.stat_result(values)
+
+            with mock.patch(
+                "scripts.publish_worker_template.os.lstat",
+                side_effect=wrong_owner,
+            ):
+                with self.assertRaises(TemplatePublicationError):
+                    self._reconcile_worker_template(
+                        request_path,
+                        output,
+                        settings_path_resolver=lambda: settings,
+                        transport=transport,
+                    )
+
+            self.assertTrue(intent.exists())
+            self.assertEqual(transport.calls, [])
+            self.assertEqual(tuple(output.iterdir()), ())
+
+    def test_reconcile_rejects_zero_multiple_or_mismatched_name_rows(self):
+        request = template_request()
+        invalid_rows = (
+            [],
+            [template_row(request), template_row(request)],
+            [{**template_row(request), "tag": "v0.29.0-cuda-12.8-py312"}],
+        )
+
+        for index, rows in enumerate(invalid_rows):
+            with self.subTest(index=index), tempfile.TemporaryDirectory() as root:
+                settings, output, request_path = self._private_inputs(root)
+                intent = write_publication_intent(settings, request)
+                transport = ReadOnlyRecoveryTransport(rows)
+
+                with self.assertRaises(TemplatePublicationError):
+                    self._reconcile_worker_template(
+                        request_path,
+                        output,
+                        settings_path_resolver=lambda: settings,
+                        transport=transport,
+                    )
+
+                self.assertTrue(intent.exists())
+                self.assertEqual(
+                    [call[0] for call in transport.calls],
+                    ["lookup_name"],
+                )
+                self.assertEqual(tuple(output.iterdir()), ())
+
+    def test_reconcile_rejects_non_exact_hash_readback(self):
+        request = template_request()
+        invalid_rows = (
+            [],
+            [template_row(request), template_row(request)],
+            [template_row(request, template_id=18)],
+            [template_row(request, hash_id="f" * 32)],
+            [{**template_row(request), "env": "-p 9999:9999"}],
+        )
+
+        for index, rows in enumerate(invalid_rows):
+            with self.subTest(index=index), tempfile.TemporaryDirectory() as root:
+                settings, output, request_path = self._private_inputs(root)
+                intent = write_publication_intent(settings, request)
+                transport = ReadOnlyRecoveryTransport(
+                    [template_row(request)],
+                    rows,
+                )
+
+                with self.assertRaises(TemplatePublicationError):
+                    self._reconcile_worker_template(
+                        request_path,
+                        output,
+                        settings_path_resolver=lambda: settings,
+                        transport=transport,
+                    )
+
+                self.assertTrue(intent.exists())
+                self.assertEqual(
+                    [call[0] for call in transport.calls],
+                    ["lookup_name", "lookup_hash"],
+                )
+                self.assertEqual(tuple(output.iterdir()), ())
+
+    def test_reconcile_cli_emits_only_safe_publication_fields(self):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        request_path = Path("/private/template-request.json")
+        output = Path("/private/output")
+        record = {"id": 17, "hash_id": HASH_ID, "verified": True}
+
+        with mock.patch(
+            "scripts.publish_worker_template.reconcile_worker_template",
+            return_value=record,
+        ) as reconcile, contextlib.redirect_stdout(
+            stdout
+        ), contextlib.redirect_stderr(stderr):
+            main(
+                [
+                    "reconcile",
+                    "--request-file",
+                    str(request_path),
+                    "--output-directory",
+                    str(output),
+                ]
+            )
+
+        reconcile.assert_called_once_with(request_path, output)
+        self.assertEqual(
+            stdout.getvalue().splitlines(),
+            [
+                "action=reconcile",
+                "id=17",
+                "hash_id=" + HASH_ID,
+                "verified=true",
+            ],
+        )
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_cli_help_describes_reconcile(self):
+        stdout = io.StringIO()
+
+        with contextlib.redirect_stdout(stdout):
+            with self.assertRaises(SystemExit) as caught:
+                main(["--help"])
+
+        self.assertEqual(caught.exception.code, 0)
+        self.assertIn(
+            "Audit, publish, or reconcile the fixed private Vast worker template.",
+            stdout.getvalue(),
         )
 
     def test_publish_rejects_legacy_schema_before_http(self):
