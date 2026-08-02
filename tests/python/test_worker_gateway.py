@@ -508,22 +508,24 @@ class GatewayConfigurationTests(unittest.TestCase):
         caddyfile = Path(__import__("remote_worker.gateway").gateway.__file__).with_name(
             "Caddyfile"
         )
-        text = caddyfile.read_text(encoding="utf-8")
-        self.assertIn("admin off", text)
-        self.assertIn("auto_https off", text)
-        self.assertEqual(text.count(":8765 {"), 1)
-        self.assertIn(
-            '@unauthorized not header Authorization "Bearer {$CLOUD_RUN_BOUNDARY_TOKEN}"',
-            text,
-        )
-        self.assertIn("request_header -Authorization", text)
-        self.assertIn("request_header -X-Cloud-Run-Boundary", text)
-        self.assertIn(
-            "request_header X-Cloud-Run-Boundary authenticated",
-            text,
-        )
-        self.assertIn("reverse_proxy 127.0.0.1:8766", text)
-        self.assertNotIn("0.0.0.0:8766", text)
+        expected = """{
+    admin off
+    auto_https off
+}
+
+:8765 {
+    route {
+        @unauthorized not header Authorization "Bearer {$CLOUD_RUN_BOUNDARY_TOKEN}"
+        respond @unauthorized 401
+
+        request_header -Authorization
+        request_header -X-Cloud-Run-Boundary
+        request_header X-Cloud-Run-Boundary authenticated
+        reverse_proxy 127.0.0.1:8766
+    }
+}
+"""
+        self.assertEqual(caddyfile.read_text(encoding="utf-8"), expected)
 
     def test_argument_parser_accepts_only_the_fixed_state_directory(self):
         arguments = parse_gateway_arguments(
