@@ -13,11 +13,18 @@ import stat
 from collections.abc import Mapping
 from urllib.parse import urljoin, urlsplit
 
-from cloud_run.manifest import (
-    ArtifactSpec,
-    PythonWheelSpec,
-    validate_dependency,
-)
+try:
+    from ..cloud_run.manifest import (
+        ArtifactSpec,
+        PythonWheelSpec,
+        validate_dependency,
+    )
+except ImportError:
+    from cloud_run.manifest import (
+        ArtifactSpec,
+        PythonWheelSpec,
+        validate_dependency,
+    )
 
 
 TRANSFER_CHUNK_BYTES = 8 * 1024 * 1024

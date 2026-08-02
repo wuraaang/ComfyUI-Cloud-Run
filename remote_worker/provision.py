@@ -14,19 +14,34 @@ import shutil
 import time
 from urllib.parse import urlsplit
 
-from cloud_run.manifest import (
-    MANIFEST_SCHEMA_VERSION,
-    PINNED_COMFYUI_CORE_VERSION,
-    PINNED_COMFYUI_FRONTEND_VERSION,
-    PROTOCOL_VERSION,
-    ArtifactSpec,
-    CustomNodeSpec,
-    DependencyManifest,
-    ManifestDelta,
-    PythonWheelSpec,
-    SourceSpec,
-    validate_dependency,
-)
+try:
+    from ..cloud_run.manifest import (
+        MANIFEST_SCHEMA_VERSION,
+        PINNED_COMFYUI_CORE_VERSION,
+        PINNED_COMFYUI_FRONTEND_VERSION,
+        PROTOCOL_VERSION,
+        ArtifactSpec,
+        CustomNodeSpec,
+        DependencyManifest,
+        ManifestDelta,
+        PythonWheelSpec,
+        SourceSpec,
+        validate_dependency,
+    )
+except ImportError:
+    from cloud_run.manifest import (
+        MANIFEST_SCHEMA_VERSION,
+        PINNED_COMFYUI_CORE_VERSION,
+        PINNED_COMFYUI_FRONTEND_VERSION,
+        PROTOCOL_VERSION,
+        ArtifactSpec,
+        CustomNodeSpec,
+        DependencyManifest,
+        ManifestDelta,
+        PythonWheelSpec,
+        SourceSpec,
+        validate_dependency,
+    )
 from .transfers import (
     ArtifactIntegrityError,
     TransferError,

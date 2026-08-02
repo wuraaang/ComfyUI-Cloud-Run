@@ -696,7 +696,12 @@ def _stored_manifest(repository, manifest_digest):
         )
     try:
         payload = json.loads(encoded)
-        from remote_worker.provision import dependency_manifest_from_record
+        try:
+            from ..remote_worker.provision import (
+                dependency_manifest_from_record,
+            )
+        except ImportError:
+            from remote_worker.provision import dependency_manifest_from_record
 
         manifest = dependency_manifest_from_record(payload)
     except Exception:
@@ -721,7 +726,10 @@ def _manifest_payload(manifest):
 
 def _transfer_catalog(manifest):
     try:
-        from remote_worker.transfers import wheel_artifact
+        try:
+            from ..remote_worker.transfers import wheel_artifact
+        except ImportError:
+            from remote_worker.transfers import wheel_artifact
 
         artifacts = [
             *manifest.artifacts,
@@ -2111,6 +2119,31 @@ class SessionService:
         transfer_job_id,
         capture,
     ):
+        transaction = getattr(worker, "transaction", None)
+        if callable(transaction):
+            try:
+                existing = await transaction(
+                    "provision-" + manifest.digest
+                )
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                raise
+            except WorkerBoundaryAuthenticationError:
+                raise
+            except Exception:
+                existing = None
+            if existing is not None:
+                if not _provision_payload_valid(existing, manifest):
+                    raise TerminalProvisioningError(
+                        "Remote provisioning response was invalid."
+                    )
+                if existing["state"] == "ready":
+                    self._record_provision_progress(
+                        existing,
+                        session=session,
+                        manifest=manifest,
+                        transfer_job_id=transfer_job_id,
+                    )
+                    return existing
         request = {
             "manifest": _manifest_payload(manifest),
             "manifest_digest": manifest.digest,
