@@ -15,6 +15,10 @@ from . import vast
 
 DEFAULT_POLL_INTERVAL_SECONDS = 5
 DEFAULT_BOOT_DEADLINE_SECONDS = 15 * 60
+BOUNDARY_AUTHENTICATION_GRACE_SECONDS = 60
+BOUNDARY_AUTHENTICATION_ERROR = (
+    "Remote worker boundary authentication failed."
+)
 _WATCHDOGS = {}
 _SESSION_WATCHDOGS = {}
 
@@ -390,6 +394,7 @@ class CloudRunLifecycle:
     async def wait_until_session_ready(self, session_id):
         initial = self._session(session_id)
         deadline = initial.updated_at + self.boot_deadline_seconds
+        boundary_authentication_started_at = None
         while True:
             try:
                 session = await self.reconcile_session_once(session_id)
@@ -397,6 +402,17 @@ class CloudRunLifecycle:
                 raise
             except TerminalProvisioningError as error:
                 diagnostic = str(error)
+                now = float(self.clock())
+                if diagnostic == BOUNDARY_AUTHENTICATION_ERROR:
+                    if boundary_authentication_started_at is None:
+                        boundary_authentication_started_at = now
+                    grace_deadline = (
+                        boundary_authentication_started_at
+                        + BOUNDARY_AUTHENTICATION_GRACE_SECONDS
+                    )
+                    if now < min(deadline, grace_deadline):
+                        await self.sleep(self.poll_interval_seconds)
+                        continue
                 session = self._session(session_id)
                 session = self.session_repository.transition(
                     session.session_id,
@@ -410,6 +426,8 @@ class CloudRunLifecycle:
                 )
             except Exception:
                 session = self._session(session_id)
+            else:
+                boundary_authentication_started_at = None
             if session.state in {
                 SessionState.READY,
                 SessionState.FAILED,

@@ -826,6 +826,26 @@ class TerminalSessionService(RecoveringSessionService):
         raise TerminalProvisioningError(self.diagnostic)
 
 
+class ImmediateTerminalSessionService(TerminalSessionService):
+    diagnostic = "Remote provisioning is incomplete."
+
+
+class TransientAuthenticationSessionService(ReadySessionService):
+    diagnostic = "Remote worker boundary authentication failed."
+
+    def __init__(self, repository):
+        super().__init__(repository)
+        self.authentication_failures = 1
+
+    async def bootstrap_session(self, session_id):
+        if self.authentication_failures:
+            self.authentication_failures -= 1
+            session = self.repository.get(session_id)
+            self.bootstrap_calls.append(session)
+            raise TerminalProvisioningError(self.diagnostic)
+        return await super().bootstrap_session(session_id)
+
+
 class TerminalRecoverySessionService(RecoveringSessionService):
     diagnostic = "Remote deadline enforcement failed."
 
@@ -951,7 +971,29 @@ class SessionLifecycleTests(LifecycleTestCase):
         )
         self.assertEqual(len(self.session_service.bootstrap_calls), 1)
 
-    def test_terminal_provisioning_failure_destroys_and_verifies_immediately(self):
+    def test_bootstrap_retries_one_early_boundary_authentication_response(self):
+        self.session_service = TransientAuthenticationSessionService(
+            self.sessions
+        )
+        session = self.save_session()
+        self.provider.instances = [
+            self.worker_instance("instance-1", session.label)
+        ]
+        lifecycle = self.session_lifecycle()
+
+        ready = asyncio.run(
+            lifecycle.wait_until_session_ready(session.session_id)
+        )
+
+        self.assertEqual(ready.state, SessionState.READY)
+        self.assertEqual(len(self.session_service.bootstrap_calls), 2)
+        self.assertEqual(self.clock.sleeps, [5])
+        self.assertNotIn(
+            "destroy",
+            [call[0] for call in self.provider.calls],
+        )
+
+    def test_persistent_boot_authentication_failure_destroys_after_grace(self):
         self.session_service = TerminalSessionService(self.sessions)
         session = self.save_session(max_instance_creates=1)
         self.provider.instances = [
@@ -982,10 +1024,10 @@ class SessionLifecycleTests(LifecycleTestCase):
             destroyed.sanitized_error,
             TerminalSessionService.diagnostic,
         )
-        self.assertEqual(self.clock.sleeps, [])
+        self.assertEqual(self.clock.sleeps, [5.0] * 12)
         self.assertEqual(
             [call[0] for call in self.provider.calls],
-            ["create", "get", "destroy", "list"],
+            ["create", *("get" for _ in range(13)), "destroy", "list"],
         )
         self.assertEqual(
             len(
@@ -1027,7 +1069,7 @@ class SessionLifecycleTests(LifecycleTestCase):
         )
 
     def test_terminal_destroy_exception_keeps_residual_billing_warning(self):
-        self.session_service = TerminalSessionService(self.sessions)
+        self.session_service = ImmediateTerminalSessionService(self.sessions)
         session = self.save_session()
         self.provider.instances = [
             self.worker_instance("instance-1", session.label)
@@ -1070,7 +1112,7 @@ class SessionLifecycleTests(LifecycleTestCase):
             self.assertNotIn(session.session_secret_hex, rendered)
 
     def test_terminal_destroy_unverifiable_inventory_keeps_warning(self):
-        self.session_service = TerminalSessionService(self.sessions)
+        self.session_service = ImmediateTerminalSessionService(self.sessions)
         session = self.save_session()
         self.provider.instances = [
             self.worker_instance("instance-1", session.label)
@@ -1104,7 +1146,7 @@ class SessionLifecycleTests(LifecycleTestCase):
         )
 
     def test_terminal_destroy_residual_label_keeps_warning(self):
-        self.session_service = TerminalSessionService(self.sessions)
+        self.session_service = ImmediateTerminalSessionService(self.sessions)
         session = self.save_session()
         self.provider.instances = [
             self.worker_instance("instance-1", session.label)
