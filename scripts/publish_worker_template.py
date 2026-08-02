@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import ctypes
 import fcntl
 import gzip
 import hashlib
@@ -12,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import stat
 import sys
 import tempfile
@@ -572,7 +574,7 @@ def _validate_onstart(value, worker_commit):
         )
         lock = base64.b64decode(match.group(2), validate=True)
         lock_payload = json.loads(lock.decode("utf-8"))
-    except (ValueError, UnicodeError, json.JSONDecodeError):
+    except (RecursionError, ValueError, UnicodeError, json.JSONDecodeError):
         _fail()
     if (
         not isinstance(lock_payload, dict)
@@ -702,6 +704,50 @@ def _fsync_directory(directory):
     finally:
         if descriptor is not None:
             os.close(descriptor)
+
+
+def _rename_no_replace(source, destination):
+    libc = ctypes.CDLL(None, use_errno=True)
+    source_bytes = os.fsencode(source)
+    destination_bytes = os.fsencode(destination)
+    try:
+        if sys.platform == "darwin":
+            rename = libc.renamex_np
+            rename.argtypes = [
+                ctypes.c_char_p,
+                ctypes.c_char_p,
+                ctypes.c_uint,
+            ]
+            rename.restype = ctypes.c_int
+            result = rename(
+                source_bytes,
+                destination_bytes,
+                0x00000004,
+            )
+        elif sys.platform.startswith("linux"):
+            rename = libc.renameat2
+            rename.argtypes = [
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_uint,
+            ]
+            rename.restype = ctypes.c_int
+            result = rename(
+                -100,
+                source_bytes,
+                -100,
+                destination_bytes,
+                0x00000001,
+            )
+        else:
+            _fail()
+    except AttributeError:
+        _fail()
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
 
 
 class _PublicationIntent:
@@ -838,6 +884,7 @@ class _ExistingPublicationIntent:
         self.recovery_descriptor = None
         self.recovery_path = None
         self.recovery_identity = None
+        self.retired_path = None
         self.preserve_recovery = False
         try:
             (
@@ -1004,24 +1051,37 @@ class _ExistingPublicationIntent:
             self._discard_recovery()
             _fail()
 
-    def _restore_prepared(self):
+    def _revalidate_retired(self):
         try:
-            self._revalidate_recovery()
-            os.replace(self.recovery_path, self.path)
-            self.recovery_path = None
-            metadata = os.lstat(self.path)
+            metadata = os.lstat(self.retired_path)
             if not self._exact_metadata(
                 metadata,
-                self.recovery_identity,
+                self.identity,
                 len(self.content),
             ):
                 _fail()
-            _fsync_directory(self.directory)
+            self._revalidate_descriptor(self.descriptor, self.identity)
         except TemplatePublicationError:
-            self.preserve_recovery = self.recovery_path is not None
             raise
         except OSError:
-            self.preserve_recovery = self.recovery_path is not None
+            _fail()
+
+    def _restore_retired(self):
+        try:
+            metadata = os.lstat(self.retired_path)
+            if not self._owned_metadata(metadata, self.identity):
+                _fail()
+            _rename_no_replace(self.retired_path, self.path)
+            self.retired_path = None
+            restored = os.lstat(self.path)
+            if not self._owned_metadata(restored, self.identity):
+                _fail()
+            _fsync_directory(self.directory)
+        except TemplatePublicationError:
+            self.preserve_recovery = True
+            raise
+        except OSError:
+            self.preserve_recovery = True
             _fail()
 
     def complete(self):
@@ -1032,13 +1092,34 @@ class _ExistingPublicationIntent:
         except TemplatePublicationError:
             self.preserve_recovery = True
             raise
+        self.retired_path = self.directory / (
+            ".template-publication-"
+            + self.worker_commit
+            + ".retired."
+            + secrets.token_hex(16)
+            + ".intent"
+        )
         try:
-            self.path.unlink()
+            _rename_no_replace(self.path, self.retired_path)
+        except TemplatePublicationError:
+            self.retired_path = None
+            self.preserve_recovery = True
+            raise
+        except OSError:
+            self.retired_path = None
+            self.preserve_recovery = True
+            _fail()
+        try:
+            self._revalidate_retired()
+        except TemplatePublicationError:
+            self.preserve_recovery = True
+            self._restore_retired()
+            _fail()
+        try:
             _fsync_directory(self.directory)
         except OSError:
-            if self.path.exists():
-                raise TemplatePublicationError(_FAILURE) from None
-            self._restore_prepared()
+            self.preserve_recovery = True
+            self._restore_retired()
             _fail()
         self._discard_recovery()
 

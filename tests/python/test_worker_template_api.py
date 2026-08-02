@@ -219,6 +219,35 @@ def publication_recovery_paths(settings):
     )
 
 
+def publication_retired_paths(settings):
+    return tuple(
+        settings.parent.glob(
+            ".template-publication-"
+            + WORKER_COMMIT
+            + ".retired.*.intent"
+        )
+    )
+
+
+def request_with_recursive_lock():
+    request = template_request()
+    nested = "[" * 1100 + json.dumps(KEY) + "]" * 1100
+    encoded = base64.b64encode(nested.encode("utf-8")).decode("ascii")
+    lines = request["onstart"].splitlines()
+    for index, line in enumerate(lines):
+        if line.endswith(
+            " > /opt/comfyui-cloud-run-bootstrap/release-lock.json"
+        ):
+            parts = line.split("'")
+            parts[3] = encoded
+            lines[index] = "'".join(parts)
+            break
+    else:
+        raise AssertionError("release lock line missing")
+    request["onstart"] = "\n".join(lines) + "\n"
+    return request
+
+
 def write_publication_intent(settings, request=None, *, payload=None):
     request = request or template_request()
     if payload is None:
@@ -838,6 +867,68 @@ class WorkerTemplateApiTests(unittest.TestCase):
                 self.assertNotIn("Traceback", combined)
                 self.assertEqual(tuple(output.iterdir()), ())
 
+    def test_recursive_embedded_lock_is_sanitized_before_lookup(self):
+        recursive_request = request_with_recursive_lock()
+        with tempfile.TemporaryDirectory() as root:
+            settings, output, request_path = self._private_inputs(root)
+            request_path.write_text(json.dumps(recursive_request))
+            os.chmod(request_path, 0o600)
+            transport = ReadOnlyRecoveryTransport([], [])
+
+            with self.assertRaisesRegex(
+                TemplatePublicationError,
+                "^Private template publication failed\\.$",
+            ) as caught:
+                self._reconcile_worker_template(
+                    request_path,
+                    output,
+                    settings_path_resolver=lambda: settings,
+                    transport=transport,
+                )
+
+            self.assertIsNone(caught.exception.__cause__)
+            self.assertNotIn(KEY, str(caught.exception))
+            self.assertEqual(transport.calls, [])
+            self.assertEqual(tuple(output.iterdir()), ())
+
+    def test_recursive_embedded_lock_cli_has_no_traceback_or_secret(self):
+        recursive_request = request_with_recursive_lock()
+        with tempfile.TemporaryDirectory() as root:
+            settings, output, request_path = self._private_inputs(root)
+            request_path.write_text(json.dumps(recursive_request))
+            os.chmod(request_path, 0o600)
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            store = mock.Mock()
+            store.path = settings
+
+            with mock.patch(
+                "scripts.publish_worker_template.SettingsStore",
+                return_value=store,
+            ), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(
+                stderr
+            ):
+                with self.assertRaises(SystemExit) as caught:
+                    main(
+                        [
+                            "reconcile",
+                            "--request-file",
+                            str(request_path),
+                            "--output-directory",
+                            str(output),
+                        ]
+                    )
+
+            combined = stdout.getvalue() + stderr.getvalue()
+            self.assertEqual(caught.exception.code, 1)
+            self.assertEqual(
+                combined,
+                "Private template publication failed.\n",
+            )
+            self.assertNotIn(KEY, combined)
+            self.assertNotIn("Traceback", combined)
+            self.assertEqual(tuple(output.iterdir()), ())
+
     def test_publish_checks_absence_posts_once_and_verifies_exact_hash(self):
         request = template_request()
         responses = [
@@ -1214,6 +1305,9 @@ class WorkerTemplateApiTests(unittest.TestCase):
             self.assertEqual(intent.read_bytes(), original)
             self.assertEqual(stat.S_IMODE(intent.stat().st_mode), 0o600)
             self.assertEqual(intent.stat().st_nlink, 1)
+            recovery = publication_recovery_paths(settings)
+            self.assertEqual(len(recovery), 1)
+            self.assertEqual(recovery[0].read_bytes(), original)
             self.assertEqual(tuple(output.iterdir()), ())
 
     def test_reconcile_prepares_recovery_before_unlinking_intent(self):
@@ -1341,7 +1435,9 @@ class WorkerTemplateApiTests(unittest.TestCase):
             self.assertEqual(intent.read_bytes(), original)
             self.assertEqual(stat.S_IMODE(intent.stat().st_mode), 0o600)
             self.assertEqual(intent.stat().st_nlink, 1)
-            self.assertEqual(publication_recovery_paths(settings), ())
+            recovery = publication_recovery_paths(settings)
+            self.assertEqual(len(recovery), 1)
+            self.assertEqual(recovery[0].read_bytes(), original)
             self.assertEqual(tuple(output.iterdir()), ())
 
     def test_reconcile_retains_prepared_copy_when_restore_rename_fails(self):
@@ -1351,9 +1447,13 @@ class WorkerTemplateApiTests(unittest.TestCase):
             fromlist=["_fsync_directory"],
         )
         real_fsync_directory = publisher._fsync_directory
-        real_replace = os.replace
         real_mkstemp = tempfile.mkstemp
         real_close = os.close
+        real_rename_no_replace = getattr(
+            publisher,
+            "_rename_no_replace",
+            None,
+        )
 
         with tempfile.TemporaryDirectory() as root:
             settings, output, request_path = self._private_inputs(root)
@@ -1382,15 +1482,17 @@ class WorkerTemplateApiTests(unittest.TestCase):
                         raise OSError("synthetic post-unlink fsync failure")
                 return real_fsync_directory(directory)
 
-            def fail_recovery_replace(source, destination):
+            def fail_retired_restore(source, destination):
                 nonlocal failed_restore
                 if (
                     Path(destination) == intent
-                    and ".recovery." in Path(source).name
+                    and ".retired." in Path(source).name
                 ):
                     failed_restore = True
                     raise OSError("synthetic recovery rename failure")
-                return real_replace(source, destination)
+                if real_rename_no_replace is None:
+                    raise AssertionError("no-replace rename missing")
+                return real_rename_no_replace(source, destination)
 
             transport = ReadOnlyRecoveryTransport(
                 [template_row(request)],
@@ -1399,9 +1501,11 @@ class WorkerTemplateApiTests(unittest.TestCase):
             with mock.patch(
                 "scripts.publish_worker_template._fsync_directory",
                 side_effect=fail_unlink_fsync_once,
-            ), mock.patch(
-                "scripts.publish_worker_template.os.replace",
-                side_effect=fail_recovery_replace,
+            ), mock.patch.object(
+                publisher,
+                "_rename_no_replace",
+                side_effect=fail_retired_restore,
+                create=True,
             ), mock.patch(
                 "scripts.publish_worker_template.tempfile.mkstemp",
                 side_effect=recording_mkstemp,
@@ -1426,6 +1530,9 @@ class WorkerTemplateApiTests(unittest.TestCase):
             self.assertEqual(recovery[0].stat().st_nlink, 1)
             self.assertFalse(recovery[0].is_symlink())
             self.assertFalse(intent.exists())
+            retired = publication_retired_paths(settings)
+            self.assertEqual(len(retired), 1)
+            self.assertEqual(retired[0].read_bytes(), original)
             self.assertTrue(recovery_descriptors)
             self.assertTrue(recovery_descriptors.issubset(closed_descriptors))
             self.assertEqual(tuple(output.iterdir()), ())
@@ -1481,6 +1588,166 @@ class WorkerTemplateApiTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(recovery[0].stat().st_mode), 0o600)
             self.assertEqual(recovery[0].stat().st_nlink, 1)
             self.assertFalse(recovery[0].is_symlink())
+            self.assertEqual(tuple(output.iterdir()), ())
+
+    def test_reconcile_detects_rewrite_after_final_validation(self):
+        request = template_request()
+        publisher = __import__(
+            "scripts.publish_worker_template",
+            fromlist=["_rename_no_replace"],
+        )
+        real_rename_no_replace = getattr(
+            publisher,
+            "_rename_no_replace",
+            None,
+        )
+
+        with tempfile.TemporaryDirectory() as root:
+            settings, output, request_path = self._private_inputs(root)
+            intent = write_publication_intent(settings, request)
+            original = intent.read_bytes()
+            original_inode = intent.stat().st_ino
+            mutated = bytearray(original)
+            marker = mutated.index(b'"request_sha256":"') + len(
+                b'"request_sha256":"'
+            )
+            mutated[marker] = (
+                ord("0") if mutated[marker] != ord("0") else ord("1")
+            )
+            mutated = bytes(mutated)
+            rewrote = False
+
+            def rewrite_immediately_before_move(source, destination):
+                nonlocal rewrote
+                if Path(source) == intent and ".retired." in Path(destination).name:
+                    rewrote = True
+                    with intent.open("r+b") as stream:
+                        stream.write(mutated)
+                        stream.truncate()
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                if real_rename_no_replace is None:
+                    raise AssertionError("no-replace rename missing")
+                return real_rename_no_replace(source, destination)
+
+            transport = ReadOnlyRecoveryTransport(
+                [template_row(request)],
+                [template_row(request)],
+            )
+            with mock.patch.object(
+                publisher,
+                "_rename_no_replace",
+                side_effect=rewrite_immediately_before_move,
+                create=True,
+            ):
+                with self.assertRaises(TemplatePublicationError):
+                    self._reconcile_worker_template(
+                        request_path,
+                        output,
+                        settings_path_resolver=lambda: settings,
+                        transport=transport,
+                    )
+
+            self.assertTrue(rewrote)
+            self.assertEqual(intent.read_bytes(), mutated)
+            self.assertEqual(intent.stat().st_ino, original_inode)
+            self.assertEqual(stat.S_IMODE(intent.stat().st_mode), 0o600)
+            self.assertEqual(intent.stat().st_nlink, 1)
+            recovery = publication_recovery_paths(settings)
+            self.assertEqual(len(recovery), 1)
+            self.assertEqual(recovery[0].read_bytes(), original)
+            self.assertEqual(stat.S_IMODE(recovery[0].stat().st_mode), 0o600)
+            self.assertEqual(recovery[0].stat().st_nlink, 1)
+            self.assertEqual(publication_retired_paths(settings), ())
+            self.assertEqual(tuple(output.iterdir()), ())
+
+    def test_reconcile_restore_never_overwrites_competing_intent(self):
+        request = template_request()
+        publisher = __import__(
+            "scripts.publish_worker_template",
+            fromlist=["_rename_no_replace"],
+        )
+        real_fsync_directory = publisher._fsync_directory
+        real_rename_no_replace = getattr(
+            publisher,
+            "_rename_no_replace",
+            None,
+        )
+
+        with tempfile.TemporaryDirectory() as root:
+            settings, output, request_path = self._private_inputs(root)
+            intent = write_publication_intent(settings, request)
+            original = intent.read_bytes()
+            competing = bytearray(original)
+            marker = competing.index(b'"request_sha256":"') + len(
+                b'"request_sha256":"'
+            )
+            competing[marker] = (
+                ord("0")
+                if competing[marker] != ord("0")
+                else ord("1")
+            )
+            competing = bytes(competing)
+            settings_fsync_calls = 0
+            competitor_created = False
+
+            def fail_post_move_fsync(directory):
+                nonlocal settings_fsync_calls
+                if Path(directory) == settings.parent:
+                    settings_fsync_calls += 1
+                    if settings_fsync_calls == 2:
+                        raise OSError("synthetic post-move fsync failure")
+                return real_fsync_directory(directory)
+
+            def create_competitor_before_restore(source, destination):
+                nonlocal competitor_created
+                if (
+                    Path(destination) == intent
+                    and ".retired." in Path(source).name
+                ):
+                    competitor_created = True
+                    intent.write_bytes(competing)
+                    os.chmod(intent, 0o600)
+                if real_rename_no_replace is None:
+                    raise AssertionError("no-replace rename missing")
+                return real_rename_no_replace(source, destination)
+
+            transport = ReadOnlyRecoveryTransport(
+                [template_row(request)],
+                [template_row(request)],
+            )
+            with mock.patch(
+                "scripts.publish_worker_template._fsync_directory",
+                side_effect=fail_post_move_fsync,
+            ), mock.patch.object(
+                publisher,
+                "_rename_no_replace",
+                side_effect=create_competitor_before_restore,
+                create=True,
+            ):
+                with self.assertRaises(TemplatePublicationError):
+                    self._reconcile_worker_template(
+                        request_path,
+                        output,
+                        settings_path_resolver=lambda: settings,
+                        transport=transport,
+                    )
+
+            self.assertGreaterEqual(settings_fsync_calls, 2)
+            self.assertTrue(competitor_created)
+            self.assertEqual(intent.read_bytes(), competing)
+            self.assertEqual(stat.S_IMODE(intent.stat().st_mode), 0o600)
+            self.assertEqual(intent.stat().st_nlink, 1)
+            recovery = publication_recovery_paths(settings)
+            retired = publication_retired_paths(settings)
+            self.assertEqual(len(recovery), 1)
+            self.assertEqual(recovery[0].read_bytes(), original)
+            self.assertEqual(stat.S_IMODE(recovery[0].stat().st_mode), 0o600)
+            self.assertEqual(recovery[0].stat().st_nlink, 1)
+            self.assertEqual(len(retired), 1)
+            self.assertEqual(retired[0].read_bytes(), original)
+            self.assertEqual(stat.S_IMODE(retired[0].stat().st_mode), 0o600)
+            self.assertEqual(retired[0].stat().st_nlink, 1)
             self.assertEqual(tuple(output.iterdir()), ())
 
     def test_reconcile_requires_exact_private_intent_before_lookup(self):
