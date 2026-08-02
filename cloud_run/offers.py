@@ -63,9 +63,22 @@ def _offer_id_key(offer):
     return (1, str(value or ""))
 
 
+def _dlperf_key(offer):
+    value = offer.get("dlperf") if isinstance(offer, dict) else None
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < 0
+    ):
+        return (1, 0.0)
+    return (0, -float(value))
+
+
 def offer_quality_key(offer):
     down = _finite(offer.get("inet_down_mbps"), default=-math.inf)
     return (
+        *_dlperf_key(offer),
         -min(down, PREFERRED_VAST_INET_DOWN_MBPS),
         -_finite(offer.get("reliability")),
         -_finite(offer.get("disk_bw_mbps")),

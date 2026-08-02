@@ -23,6 +23,7 @@ def normalized_offer(
     public_ipaddr=None,
     inet_down_mbps=1000,
     disk_bw_mbps=600,
+    dlperf=None,
 ):
     return {
         "offer_id": offer_id,
@@ -35,6 +36,7 @@ def normalized_offer(
         "public_ipaddr": public_ipaddr,
         "inet_down_mbps": inet_down_mbps,
         "disk_bw_mbps": disk_bw_mbps,
+        "dlperf": dlperf,
     }
 
 
@@ -204,6 +206,48 @@ class HostBlacklistTests(unittest.TestCase):
 
 
 class RankingPolicyTests(unittest.TestCase):
+    def test_higher_dlperf_beats_lower_dlperf_before_price(self):
+        from cloud_run.offers import select_best_offer
+
+        offers = [
+            normalized_offer(1, dlperf=40, price=0.40),
+            normalized_offer(2, dlperf=80, price=0.50),
+        ]
+
+        self.assertEqual(select_best_offer(offers)["offer_id"], 2)
+
+    def test_valid_zero_dlperf_beats_missing_or_invalid_dlperf(self):
+        from cloud_run.offers import select_best_offer
+
+        invalid_values = (None, True, -1, math.nan, math.inf, "80")
+        for value in invalid_values:
+            with self.subTest(value=value):
+                offers = [
+                    normalized_offer(1, dlperf=value, price=0.40),
+                    normalized_offer(2, dlperf=0, price=0.50),
+                ]
+                self.assertEqual(select_best_offer(offers)["offer_id"], 2)
+
+    def test_equal_dlperf_retains_existing_quality_order(self):
+        from cloud_run.offers import select_best_offer
+
+        offers = [
+            normalized_offer(
+                1,
+                dlperf=80,
+                reliability=0.99,
+                inet_down_mbps=1000,
+            ),
+            normalized_offer(
+                2,
+                dlperf=80,
+                reliability=1.0,
+                inet_down_mbps=1000,
+            ),
+        ]
+
+        self.assertEqual(select_best_offer(offers)["offer_id"], 2)
+
     def test_bait_price_is_removed_only_with_a_meaningful_class_median(self):
         from cloud_run.offers import apply_offer_policy
 

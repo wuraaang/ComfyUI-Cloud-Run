@@ -255,6 +255,7 @@ def normalize_offers(
         )
         inet_down = _finite_number(raw.get("inet_down"))
         disk_bw = _finite_number(raw.get("disk_bw"))
+        dlperf = _optional_nonnegative_number(raw.get("dlperf"))
         disk_space = _finite_number(raw.get("disk_space"))
         gpu_arch = raw.get("gpu_arch")
         cpu_arch = raw.get("cpu_arch")
@@ -338,9 +339,10 @@ def normalize_offers(
                 "inet_up_cost": _optional_nonnegative_number(
                     raw.get("inet_up_cost")
                 ),
+                "dlperf": dlperf,
             }
         )
-    offers.sort(key=lambda offer: offer["dph_total"])
+    offers.sort(key=offer_quality_key)
     return offers[:OFFER_SEARCH_LIMIT]
 
 
@@ -494,6 +496,7 @@ async def search_offers(
             min_vram_gb,
             target_options,
             order=[
+                ["dlperf", "desc"],
                 ["reliability", "desc"],
                 ["disk_bw", "desc"],
                 ["dph_total", "asc"],
@@ -510,6 +513,7 @@ async def search_offers(
                 options,
                 max_inet_down_mbps=PREFERRED_VAST_INET_DOWN_MBPS,
                 order=[
+                    ["dlperf", "desc"],
                     ["inet_down", "desc"],
                     ["reliability", "desc"],
                     ["disk_bw", "desc"],

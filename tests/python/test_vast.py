@@ -92,6 +92,7 @@ class VastRequestTests(unittest.TestCase):
                                 "disk_bw": 640.0,
                                 "inet_down_cost": 0.01,
                                 "inet_up_cost": 0.02,
+                                "dlperf": 72.5,
                                 "disk_space": 96,
                                 "gpu_arch": "nvidia",
                                 "cpu_arch": "amd64",
@@ -154,6 +155,7 @@ class VastRequestTests(unittest.TestCase):
                 **common,
                 "inet_down": {"gte": 1000},
                 "order": [
+                    ["dlperf", "desc"],
                     ["reliability", "desc"],
                     ["disk_bw", "desc"],
                     ["dph_total", "asc"],
@@ -167,6 +169,7 @@ class VastRequestTests(unittest.TestCase):
                 **common,
                 "inet_down": {"gte": 500, "lt": 1000},
                 "order": [
+                    ["dlperf", "desc"],
                     ["inet_down", "desc"],
                     ["reliability", "desc"],
                     ["disk_bw", "desc"],
@@ -191,6 +194,7 @@ class VastRequestTests(unittest.TestCase):
                     "disk_bw_mbps": 640.0,
                     "inet_down_cost": 0.01,
                     "inet_up_cost": 0.02,
+                    "dlperf": 72.5,
                 }
             ],
         )
@@ -281,6 +285,49 @@ class VastRequestTests(unittest.TestCase):
 
 
 class VastNormalizationAndErrorTests(unittest.TestCase):
+    def test_dlperf_is_optional_finite_nonnegative_provider_evidence(self):
+        from cloud_run.vast import normalize_offers
+
+        base = {
+            "id": 10,
+            "gpu_name": "RTX 5090",
+            "gpu_ram": 32768,
+            "dph_total": 0.25,
+            "reliability": 0.99,
+            "inet_down": 1000,
+            "disk_bw": 400,
+            "disk_space": 80,
+            "gpu_arch": "nvidia",
+            "cpu_arch": "amd64",
+            "cuda_max_good": 12.9,
+            "compute_cap": 750,
+            "type": "ondemand",
+            "num_gpus": 1,
+            "rentable": True,
+            "verified": True,
+        }
+        arguments = {
+            "max_price_per_hour": 0.75,
+            "min_vram_gb": 24,
+        }
+
+        for raw_value, expected in (
+            (72.5, 72.5),
+            (0, 0.0),
+            (None, None),
+            (-1, None),
+            (True, None),
+            (math.nan, None),
+            (math.inf, None),
+            ("72.5", None),
+        ):
+            with self.subTest(raw_value=raw_value):
+                offer = normalize_offers(
+                    {"offers": [{**base, "dlperf": raw_value}]},
+                    **arguments,
+                )[0]
+                self.assertEqual(offer["dlperf"], expected)
+
     def test_missing_response_type_requires_trusted_ondemand_request(self):
         from cloud_run.vast import normalize_offers
 
@@ -504,7 +551,7 @@ class VastNormalizationAndErrorTests(unittest.TestCase):
             }
 
         target = [raw(index, 1000 + index) for index in range(OFFER_SEARCH_LIMIT)]
-        fallback = [raw(0, 900)] + [
+        fallback = [raw(0, 999)] + [
             raw(index, 999 - index)
             for index in range(OFFER_SEARCH_LIMIT, 2 * OFFER_SEARCH_LIMIT + 5)
         ]

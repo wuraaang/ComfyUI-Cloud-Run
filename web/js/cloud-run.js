@@ -13,6 +13,7 @@ const OPEN_COMMAND_ID = "vast-cloud-run.open";
 const POLL_INTERVAL_MS = 1000;
 const DEFAULT_SESSION_SECONDS = 2 * 60 * 60;
 const SESSION_DURATION_SECONDS = new Map([
+  ["none", null],
   ["1800", 30 * 60],
   ["3600", 60 * 60],
   ["5400", 90 * 60],
@@ -256,6 +257,7 @@ export function renderOffers(document, container, offers, onSelect) {
       : "reliability unavailable";
     const downloadMbps = finiteNonnegativeNumber(offer?.inet_down_mbps);
     const diskSpeed = finiteNonnegativeNumber(offer?.disk_bw_mbps);
+    const dlperf = finiteNonnegativeNumber(offer?.dlperf);
     const down = finiteNonnegativeNumber(offer?.inet_down_cost);
     const up = finiteNonnegativeNumber(offer?.inet_up_cost);
     const downloadPrice = down !== null
@@ -270,11 +272,15 @@ export function renderOffers(document, container, offers, onSelect) {
     const disk = diskSpeed !== null
       ? `${metricNumberText(diskSpeed)} MB/s disk`
       : "disk speed unavailable";
+    const performance = dlperf !== null
+      ? `DLPerf ${metricNumberText(dlperf)}`
+      : "DLPerf unavailable";
     const estimate = theoreticalTransferText(offer?.estimated_transfer_seconds);
     details.textContent =
       `${String(offer?.gpu_name ?? "Unknown GPU")} — ` +
       `${decimalText(offer?.gpu_ram_gb)} GB — ` +
-      `${hourlyText(offer?.dph_total)} — ${reliability} — ${download} — ` +
+      `${hourlyText(offer?.dph_total)} — ${reliability} — ` +
+      `${performance} — ${download} — ` +
       `${disk} — ${downloadClassText(downloadMbps)} — ` +
       `${downloadPrice}, ${uploadPrice} — theoretical transfer ≈ ${estimate}; ` +
       "actual startup can be longer";
@@ -411,6 +417,7 @@ export function mountCloudRun(
     testId: "cloud-run-session-duration",
   });
   for (const [value, label] of [
+    ["none", "No automatic limit — manual destruction"],
     ["1800", "30 minutes"],
     ["3600", "60 minutes"],
     ["5400", "90 minutes"],
@@ -422,7 +429,7 @@ export function mountCloudRun(
     option.value = value;
     durationSelect.appendChild(option);
   }
-  durationSelect.value = String(DEFAULT_SESSION_SECONDS);
+  durationSelect.value = "none";
   const createLimitReview = createElement(document, "div", {
     id: "cloud-run-create-limit-review",
     testId: "cloud-run-create-limit-review",
@@ -556,7 +563,7 @@ export function mountCloudRun(
   appendField(document, card, "Vast API key", apiKeyInput);
   appendField(document, card, "Maximum hourly price ($/h)", priceInput);
   appendField(document, card, "Minimum VRAM (GB)", vramInput);
-  appendField(document, card, "Maximum session duration", durationSelect);
+  appendField(document, card, "Session duration", durationSelect);
   card.appendChild(createLimitReview);
   card.append(
     primaryActions,
@@ -571,6 +578,36 @@ export function mountCloudRun(
     saveButton.disabled = busy;
     searchButton.disabled = busy || !sessionConsole.canSearchOffers;
     reviewButton.disabled = busy || !selectedOffer;
+  }
+
+  function visibleSettingsPayload() {
+    const maxPrice = Number(priceInput.value);
+    const minVram = Number(vramInput.value);
+    if (
+      !Number.isFinite(maxPrice)
+      || maxPrice < 0.01
+      || maxPrice > 100
+      || !Number.isInteger(minVram)
+      || minVram < 1
+      || minVram > 1024
+    ) {
+      return null;
+    }
+    const payload = {
+      max_price_per_hour: maxPrice,
+      min_vram_gb: minVram,
+    };
+    const key = apiKeyInput.value.trim();
+    if (key) payload.api_key = key;
+    return payload;
+  }
+
+  function renderSavedSettings(result) {
+    apiKeyInput.value = "";
+    configured.textContent = result.configured
+      ? "Vast API key is configured."
+      : "Vast API key is not configured.";
+    sessionConsole.renderSettings(result);
   }
 
   async function loadSettings() {
@@ -643,35 +680,17 @@ export function mountCloudRun(
   });
 
   saveButton.addEventListener("click", async () => {
-    const maxPrice = Number(priceInput.value);
-    const minVram = Number(vramInput.value);
-    if (
-      !Number.isFinite(maxPrice)
-      || maxPrice < 0.01
-      || maxPrice > 100
-      || !Number.isInteger(minVram)
-      || minVram < 1
-      || minVram > 1024
-    ) {
+    const payload = visibleSettingsPayload();
+    if (!payload) {
       status.textContent =
         "Enter a valid price and whole-number VRAM value.";
       return;
     }
-    const payload = {
-      max_price_per_hour: maxPrice,
-      min_vram_gb: minVram,
-    };
-    const key = apiKeyInput.value.trim();
-    if (key) payload.api_key = key;
     setBusy(true);
     status.textContent = "Saving settings…";
     try {
       const result = await cloudApi.updateSettings(payload);
-      apiKeyInput.value = "";
-      configured.textContent = result.configured
-        ? "Vast API key is configured."
-        : "Vast API key is not configured.";
-      sessionConsole.renderSettings(result);
+      renderSavedSettings(result);
       status.textContent = "Settings saved.";
     } catch {
       status.textContent = "Settings could not be saved.";
@@ -686,11 +705,26 @@ export function mountCloudRun(
         "Run and resolve the free dependency preflight first.";
       return;
     }
+    const settingsPayload = visibleSettingsPayload();
+    if (!settingsPayload) {
+      status.textContent =
+        "Enter a valid price and whole-number VRAM value.";
+      return;
+    }
     clearBrowserPaidReview();
     sessionConsole.clearPaidReview();
     setBusy(true);
-    status.textContent = "Searching eligible Vast GPUs…";
     try {
+      status.textContent = "Saving settings for this search…";
+      try {
+        const settings = await cloudApi.updateSettings(settingsPayload);
+        renderSavedSettings(settings);
+      } catch {
+        status.textContent =
+          "Search settings could not be saved; no offer search was started.";
+        return;
+      }
+      status.textContent = "Searching eligible Vast GPUs…";
       const result = await cloudApi.searchOffers(
         sessionConsole.preflightId,
       );
@@ -721,7 +755,7 @@ export function mountCloudRun(
     );
     if (durationSeconds === undefined) {
       status.textContent =
-        "Choose one of the listed finite session durations.";
+        "Choose manual destruction or one of the listed session durations.";
       return;
     }
     try {
@@ -734,14 +768,16 @@ export function mountCloudRun(
       return;
     }
     setBusy(true);
-    status.textContent = "Creating a short-lived paid review…";
+    status.textContent = durationSeconds === null
+      ? "Creating a paid review with manual destruction…"
+      : "Creating a paid review with an automatic limit…";
     try {
       const session = await cloudApi.createSession({
         preflight_id: sessionConsole.preflightId,
         offer_id: selectedOffer.offer_id,
         idempotency_key: sessionIdempotencyKey,
         deadline: {
-          mode: "finite",
+          mode: durationSeconds === null ? "none" : "finite",
           duration_seconds: durationSeconds,
         },
         max_instance_creates: 1,
@@ -750,7 +786,9 @@ export function mountCloudRun(
         idempotencyKey: sessionIdempotencyKey,
       });
       status.textContent =
-        "Review every bounded cost before explicit paid confirmation.";
+        durationSeconds === null
+          ? "Review the price: billing continues until you Destroy the GPU."
+          : "Review the price and automatic limit before paid confirmation.";
     } catch (error) {
       const message =
         error instanceof Error

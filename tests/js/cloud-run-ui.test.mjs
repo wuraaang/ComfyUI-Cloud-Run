@@ -94,6 +94,23 @@ function quoteSession(status = "offer_selected", overrides = {}) {
 }
 
 
+function manualQuoteSession(status = "offer_selected", overrides = {}) {
+  const session = quoteSession(status);
+  return {
+    ...session,
+    offer: {
+      ...session.offer,
+      duration_seconds: null,
+      deadline_mode: "none",
+      approximate_max_active_charge: null,
+    },
+    deadline_at: null,
+    deadline_mode: "none",
+    ...overrides,
+  };
+}
+
+
 function preflightPayload() {
   return {
     preflight_id: "preflight-1",
@@ -311,7 +328,108 @@ test("registers through the pinned ComfyUI extension API", async () => {
 });
 
 
-test("paid review fixes one create and sends the selected bounded duration", async () => {
+test("Search persists visible settings before requesting offers", async () => {
+  const document = new FakeDocument();
+  mountLocalRunButton(document);
+  const { api, app } = captureHost();
+  const calls = [];
+  mountCloudRun(document, async (endpoint, options = {}) => {
+    calls.push([endpoint, options]);
+    if (endpoint === "/cloud-run/api/settings") {
+      return jsonResponse(settingsPayload({ configured: true }));
+    }
+    if (endpoint === "/cloud-run/api/captures") {
+      return jsonResponse({
+        capture_id: "capture-1",
+        prompt_digest: "d".repeat(64),
+        status: "captured",
+      });
+    }
+    if (endpoint === "/cloud-run/api/preflights") {
+      return jsonResponse(preflightPayload());
+    }
+    if (endpoint === "/cloud-run/api/offers") {
+      return jsonResponse({ offers: [] });
+    }
+    throw new Error(`unexpected endpoint: ${endpoint}`);
+  }, {}, { app, api });
+
+  await document.getElementById("cloud-run-button").click();
+  await document.getElementById("cloud-run-preflight").click();
+  document.getElementById("cloud-run-max-price").value = "1.25";
+  document.getElementById("cloud-run-min-vram").value = "48";
+  await document.getElementById("cloud-run-search").click();
+
+  assert.deepEqual(
+    calls.map(([endpoint, options]) => [endpoint, options.method ?? "GET"]),
+    [
+      ["/cloud-run/api/settings", "GET"],
+      ["/cloud-run/api/captures", "POST"],
+      ["/cloud-run/api/preflights", "POST"],
+      ["/cloud-run/api/settings", "PUT"],
+      ["/cloud-run/api/offers", "POST"],
+    ],
+  );
+  const settingsPut = calls.find(
+    ([endpoint, options]) => (
+      endpoint === "/cloud-run/api/settings" && options.method === "PUT"
+    ),
+  );
+  assert.deepEqual(JSON.parse(settingsPut[1].body), {
+    max_price_per_hour: 1.25,
+    min_vram_gb: 48,
+  });
+});
+
+
+test("Search persists visible settings failure prevents offer request", async () => {
+  const document = new FakeDocument();
+  mountLocalRunButton(document);
+  const { api, app } = captureHost();
+  const calls = [];
+  mountCloudRun(document, async (endpoint, options = {}) => {
+    calls.push([endpoint, options]);
+    if (endpoint === "/cloud-run/api/settings") {
+      if (options.method === "PUT") {
+        return jsonResponse(
+          { error: "settings rejected" },
+          { ok: false, status: 500 },
+        );
+      }
+      return jsonResponse(settingsPayload({ configured: true }));
+    }
+    if (endpoint === "/cloud-run/api/captures") {
+      return jsonResponse({
+        capture_id: "capture-1",
+        prompt_digest: "d".repeat(64),
+        status: "captured",
+      });
+    }
+    if (endpoint === "/cloud-run/api/preflights") {
+      return jsonResponse(preflightPayload());
+    }
+    if (endpoint === "/cloud-run/api/offers") {
+      assert.fail("offer search must not run after settings save failure");
+    }
+    throw new Error(`unexpected endpoint: ${endpoint}`);
+  }, {}, { app, api });
+
+  await document.getElementById("cloud-run-button").click();
+  await document.getElementById("cloud-run-preflight").click();
+  await document.getElementById("cloud-run-search").click();
+
+  assert.equal(
+    calls.filter(([endpoint]) => endpoint === "/cloud-run/api/offers").length,
+    0,
+  );
+  assert.match(
+    document.getElementById("cloud-run-status").textContent,
+    /settings could not be saved/i,
+  );
+});
+
+
+test("paid review defaults to manual destruction with one provider create", async () => {
   const document = new FakeDocument();
   mountLocalRunButton(document);
   const { api, app, localSubmissions } = captureHost();
@@ -342,10 +460,10 @@ test("paid review fixes one create and sends the selected bounded duration", asy
       });
     }
     if (endpoint === "/cloud-run/api/sessions") {
-      return jsonResponse(quoteSession());
+      return jsonResponse(manualQuoteSession());
     }
     if (endpoint === "/cloud-run/api/sessions/session-1/confirm") {
-      return jsonResponse(quoteSession("creating"));
+      return jsonResponse(manualQuoteSession("creating"));
     }
     throw new Error(`unexpected endpoint: ${endpoint}`);
   };
@@ -385,10 +503,13 @@ test("paid review fixes one create and sends the selected bounded duration", asy
   assert.ok(duration);
   assert.deepEqual(
     duration.children.map((option) => option.value),
-    ["1800", "3600", "5400", "7200"],
+    ["none", "1800", "3600", "5400", "7200"],
   );
-  assert.equal(duration.value, "7200");
-  duration.value = "5400";
+  assert.equal(
+    duration.children[0].textContent,
+    "No automatic limit — manual destruction",
+  );
+  assert.equal(duration.value, "none");
   await document.getElementById("cloud-run-review-session").click();
 
   const sessionRequest = calls.find(
@@ -398,12 +519,16 @@ test("paid review fixes one create and sends the selected bounded duration", asy
     preflight_id: "preflight-1",
     offer_id: "42",
     idempotency_key: "session-key",
-    deadline: { mode: "finite", duration_seconds: 5_400 },
+    deadline: { mode: "none", duration_seconds: null },
     max_instance_creates: 1,
   });
   assert.match(
     document.getElementById("cloud-run-dependency-console").textContent,
-    /approximately \$1\.00 active\/storage/,
+    /no automatic limit/,
+  );
+  assert.match(
+    document.getElementById("cloud-run-dependency-console").textContent,
+    /billing continues until verified destruction/i,
   );
   assert.match(
     document.getElementById("cloud-run-dependency-console").textContent,
@@ -439,6 +564,61 @@ test("paid review fixes one create and sends the selected bounded duration", asy
   assert.ok(calls.every(([endpoint]) => !endpoint.includes("/quotes")));
   assert.ok(calls.every(([endpoint]) => !endpoint.includes("/attempts/")));
   assert.ok(timers.length >= 1);
+});
+
+
+test("listed finite session duration remains available", async () => {
+  const document = new FakeDocument();
+  mountLocalRunButton(document);
+  const { api, app } = captureHost();
+  const calls = [];
+  mountCloudRun(document, async (endpoint, options = {}) => {
+    calls.push([endpoint, options]);
+    if (endpoint === "/cloud-run/api/settings") {
+      return jsonResponse(settingsPayload({ configured: true }));
+    }
+    if (endpoint === "/cloud-run/api/preflights") {
+      return jsonResponse(preflightPayload());
+    }
+    if (endpoint === "/cloud-run/api/offers") {
+      return jsonResponse({
+        offers: [{
+          offer_id: "42",
+          gpu_name: "RTX 4090",
+          gpu_ram_gb: 24,
+          dph_total: 0.5,
+          reliability: 0.99,
+        }],
+      });
+    }
+    if (endpoint === "/cloud-run/api/sessions") {
+      return jsonResponse(quoteSession());
+    }
+    throw new Error(`unexpected endpoint: ${endpoint}`);
+  }, {
+    crypto: { randomUUID: () => "session-key" },
+  }, {
+    app,
+    api,
+    async onCapture() {
+      return { capture_id: "capture-1" };
+    },
+  });
+
+  await document.getElementById("cloud-run-button").click();
+  await document.getElementById("cloud-run-preflight").click();
+  await document.getElementById("cloud-run-search").click();
+  await document.getElementById("cloud-run-offer-0").click();
+  document.getElementById("cloud-run-session-duration").value = "5400";
+  await document.getElementById("cloud-run-review-session").click();
+
+  const sessionRequest = calls.find(
+    ([endpoint]) => endpoint === "/cloud-run/api/sessions",
+  );
+  assert.deepEqual(JSON.parse(sessionRequest[1].body).deadline, {
+    mode: "finite",
+    duration_seconds: 5_400,
+  });
 });
 
 
@@ -495,7 +675,7 @@ test("forged session duration is rejected instead of using a fallback", async ()
   );
   assert.match(
     document.getElementById("cloud-run-status").textContent,
-    /Choose one of the listed finite session durations/,
+    /Choose manual destruction or one of the listed session durations/,
   );
 });
 
@@ -948,11 +1128,13 @@ test("offer rendering treats provider strings as inert text", async () => {
     gpu_ram_gb: 24,
     dph_total: 0.5,
     reliability: 0.99,
+    dlperf: 72.5,
   }], (offer) => {
     selected = offer;
   });
 
   assert.match(container.textContent, /<script>unsafe\(\)<\/script>/);
+  assert.match(container.textContent, /DLPerf 72\.5/);
   assert.equal(container.querySelector("script"), null);
   await container.querySelector("input").click();
   assert.equal(selected.offer_id, "42");
@@ -978,6 +1160,7 @@ test("offer rendering marks missing connection metrics unavailable", () => {
   }], () => {});
 
   assert.match(container.textContent, /download unavailable/);
+  assert.match(container.textContent, /DLPerf unavailable/);
   assert.match(container.textContent, /disk speed unavailable/);
   assert.match(container.textContent, /download class unavailable/);
   assert.match(container.textContent, /theoretical transfer ≈ unavailable/);

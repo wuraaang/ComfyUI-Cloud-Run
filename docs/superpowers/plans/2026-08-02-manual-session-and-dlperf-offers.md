@@ -120,7 +120,7 @@ Run:
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest \
   tests.python.test_offers.RankingPolicyTests \
-  tests.python.test_vast.VastSearchContractTests \
+  tests.python.test_vast.VastRequestTests \
   tests.python.test_vast.VastNormalizationAndErrorTests \
   -v
 
