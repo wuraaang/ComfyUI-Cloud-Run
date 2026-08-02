@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import math
+import ssl
 
 from .constants import (
     DEFAULT_DISK_GB,
@@ -12,6 +14,7 @@ from .constants import (
     MIN_VAST_INET_DOWN_MBPS,
     MIN_VAST_RELIABILITY,
     PREFERRED_VAST_INET_DOWN_MBPS,
+    VAST_CREATE_FAILURE_CODES,
 )
 from .offers import offer_quality_key
 from .worker_release import WorkerRelease, WorkerReleaseError
@@ -31,10 +34,35 @@ OFFER_TIMEOUT_SECONDS = 30
 
 
 class VastError(RuntimeError):
-    def __init__(self, message, *, status=None, retryable=False):
+    code: str | None
+    status: int | None
+    retryable: bool
+
+    def __init__(self, message, *, code=None, status=None, retryable=False):
+        if code is not None and code not in VAST_CREATE_FAILURE_CODES:
+            raise ValueError("Invalid safe Vast error code.")
         super().__init__(message)
-        self.status = status
+        self.code = code
+        self.status = (
+            status
+            if isinstance(status, int) and not isinstance(status, bool)
+            else None
+        )
         self.retryable = bool(retryable)
+
+    def __repr__(self):
+        return (
+            type(self).__name__
+            + "(message="
+            + repr(str(self))
+            + ", code="
+            + repr(self.code)
+            + ", status="
+            + repr(self.status)
+            + ", retryable="
+            + repr(self.retryable)
+            + ")"
+        )
 
 
 class VastConfigurationError(VastError):
@@ -392,10 +420,25 @@ async def _run_with_session(operation, session):
     try:
         import aiohttp
     except ImportError:
-        raise VastError("Vast is temporarily unavailable.") from None
-    timeout = aiohttp.ClientTimeout(total=OFFER_TIMEOUT_SECONDS)
-    async with aiohttp.ClientSession(timeout=timeout) as client:
-        return await operation(client)
+        raise VastError(
+            "Vast is temporarily unavailable.",
+            code="transport_unknown",
+            retryable=True,
+        ) from None
+    try:
+        timeout = aiohttp.ClientTimeout(total=OFFER_TIMEOUT_SECONDS)
+        async with aiohttp.ClientSession(timeout=timeout) as client:
+            return await operation(client)
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        raise
+    except VastError:
+        raise
+    except Exception as error:
+        raise VastError(
+            "Vast is temporarily unavailable.",
+            code=_create_transport_code(error),
+            retryable=True,
+        ) from None
 
 
 async def search_offers(
@@ -493,16 +536,30 @@ async def search_offers(
         ) from None
 
 
+def _numeric_identifier(value):
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        return None
+    text = str(value)
+    if (
+        not text
+        or len(text) > 160
+        or not text.isdigit()
+        or (isinstance(value, str) and value != value.strip())
+    ):
+        return None
+    return text
+
+
 def _validate_instance_id(instance_id):
-    value = _safe_identifier(instance_id)
-    if value is None or not value.isdigit():
+    value = _numeric_identifier(instance_id)
+    if value is None:
         raise VastConfigurationError("A valid Vast instance ID is required.")
     return value
 
 
 def _validate_offer_id(offer_id):
-    value = _safe_identifier(offer_id)
-    if value is None or not value.isdigit():
+    value = _numeric_identifier(offer_id)
+    if value is None:
         raise VastConfigurationError("A valid Vast offer ID is required.")
     return value
 
@@ -576,9 +633,10 @@ async def get_offer(
 
 
 def _validate_label(label):
-    value = _safe_identifier(label)
+    value = label if isinstance(label, str) else None
     if (
         value is None
+        or value != value.strip()
         or len(value) > 64
         or not value.startswith("comfy-cloud-run-")
         or any(character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-" for character in value)
@@ -595,9 +653,121 @@ def _worker_environment(boundary_token, session_id):
         raise VastConfigurationError(
             "A valid worker boundary context is required."
         )
-    return (
-        "-e " + BOUNDARY_TOKEN_ENVIRONMENT + "=" + boundary_token
-        + " -e " + SESSION_ID_ENVIRONMENT + "=" + session_id
+    return {
+        BOUNDARY_TOKEN_ENVIRONMENT: boundary_token,
+        SESSION_ID_ENVIRONMENT: session_id,
+    }
+
+
+_CREATE_ERROR_MESSAGES = {
+    "configuration_rejected": "Vast rejected the instance configuration.",
+    "api_key_rejected": "Vast API key cannot create instances.",
+    "offer_unavailable": (
+        "The selected Vast offer or template is no longer available."
+    ),
+    "rate_limited": "Vast instance creation failed.",
+    "retryable_http": "Vast instance creation failed.",
+    "timeout": "Vast instance creation outcome is unknown.",
+    "connection": "Vast instance creation outcome is unknown.",
+    "tls": "Vast instance creation outcome is unknown.",
+    "server_disconnected": "Vast instance creation outcome is unknown.",
+    "invalid_response": (
+        "Vast instance creation returned an invalid response."
+    ),
+    "transport_unknown": "Vast instance creation outcome is unknown.",
+}
+
+
+def _create_http_error(status):
+    if status == 400:
+        code = "configuration_rejected"
+        retryable = False
+    elif status in (401, 403):
+        code = "api_key_rejected"
+        retryable = False
+    elif status in (404, 410):
+        code = "offer_unavailable"
+        retryable = False
+    elif status == 429:
+        code = "rate_limited"
+        retryable = True
+    elif status in (408, 409) or (
+        isinstance(status, int)
+        and not isinstance(status, bool)
+        and status >= 500
+    ):
+        code = "retryable_http"
+        retryable = True
+    else:
+        code = "transport_unknown"
+        retryable = True
+    return VastError(
+        _CREATE_ERROR_MESSAGES[code],
+        code=code,
+        status=status,
+        retryable=retryable,
+    )
+
+
+def _invalid_create_response():
+    return VastError(
+        _CREATE_ERROR_MESSAGES["invalid_response"],
+        code="invalid_response",
+        status=200,
+        retryable=True,
+    )
+
+
+def _optional_aiohttp_exception_types(*names):
+    try:
+        import aiohttp
+    except ImportError:
+        return ()
+    classes = []
+    for name in names:
+        candidate = getattr(aiohttp, name, None)
+        if isinstance(candidate, type) and candidate not in classes:
+            classes.append(candidate)
+    return tuple(classes)
+
+
+def _create_transport_code(error):
+    if isinstance(error, TimeoutError):
+        return "timeout"
+    tls_types = _optional_aiohttp_exception_types(
+        "ClientSSLError",
+        "ClientConnectorCertificateError",
+        "ClientConnectorSSLError",
+        "ServerFingerprintMismatch",
+        "FingerprintMismatch",
+    )
+    if isinstance(error, (ssl.SSLError, *tls_types)):
+        return "tls"
+    disconnect_types = _optional_aiohttp_exception_types(
+        "ServerDisconnectedError",
+        "ClientPayloadError",
+    )
+    if isinstance(
+        error,
+        (ConnectionResetError, BrokenPipeError, EOFError, *disconnect_types),
+    ):
+        return "server_disconnected"
+    connection_types = _optional_aiohttp_exception_types(
+        "ClientConnectionError",
+        "ClientConnectorError",
+        "ClientOSError",
+    )
+    if isinstance(error, (ConnectionError, *connection_types)):
+        return "connection"
+    return "transport_unknown"
+
+
+def _create_transport_error(error):
+    code = _create_transport_code(error)
+    return VastError(
+        _CREATE_ERROR_MESSAGES[code],
+        code=code,
+        retryable=True,
     )
 
 
@@ -645,52 +815,45 @@ async def create_instance(
                 },
             ) as response:
                 if response.status != 200:
-                    if response.status in (401, 403):
-                        message = "Vast API key cannot create instances."
-                    elif response.status in (404, 410):
-                        message = (
-                            "The selected Vast offer or template is no longer "
-                            "available."
-                        )
-                    elif response.status == 400:
-                        message = "Vast rejected the instance configuration."
-                    else:
-                        message = "Vast instance creation failed."
-                    raise VastError(
-                        message,
-                        status=response.status,
-                        retryable=response.status in (408, 409, 429)
-                        or response.status >= 500,
-                    )
+                    raise _create_http_error(response.status)
                 try:
                     payload = await response.json()
+                except (asyncio.CancelledError, KeyboardInterrupt):
+                    raise
                 except Exception:
-                    raise VastError(
-                        "Vast instance creation returned an invalid response."
-                    ) from None
+                    raise _invalid_create_response() from None
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            raise
         except VastError:
             raise
-        except Exception:
-            raise VastError(
-                "Vast instance creation outcome is unknown.",
-                retryable=True,
-            ) from None
+        except Exception as error:
+            raise _create_transport_error(error) from None
+        contract_id = (
+            _numeric_identifier(payload.get("new_contract"))
+            if isinstance(payload, dict)
+            and payload.get("success") is True
+            else None
+        )
         if (
-            not isinstance(payload, dict)
-            or payload.get("success") is not True
-            or _safe_identifier(payload.get("new_contract")) is None
+            contract_id is None
+            or not contract_id.isdigit()
         ):
-            raise VastError("Vast instance creation returned an invalid response.")
-        return str(payload["new_contract"])
+            raise _invalid_create_response()
+        return contract_id
 
     return await _run_with_session(operation, session)
 
 
 def _normalize_instance(raw):
-    if not isinstance(raw, dict) or _safe_identifier(raw.get("id")) is None:
+    identifier = (
+        _numeric_identifier(raw.get("id"))
+        if isinstance(raw, dict)
+        else None
+    )
+    if identifier is None:
         return None
     return {
-        "instance_id": str(raw["id"]),
+        "instance_id": identifier,
         "actual_status": _safe_identifier(raw.get("actual_status")),
         "public_ipaddr": _safe_identifier(raw.get("public_ipaddr")),
         "ports": raw.get("ports") if isinstance(raw.get("ports"), dict) else {},
@@ -704,38 +867,128 @@ async def list_instances(api_key, *, session=None):
     key = _require_key(api_key)
 
     async def operation(client):
-        try:
-            async with client.get(
-                VAST_API_V1 + "/instances/",
-                headers=_headers(key),
-            ) as response:
-                if response.status != 200:
-                    raise VastError(
-                        "Vast instance inventory is unavailable.",
-                        status=response.status,
-                        retryable=response.status == 429 or response.status >= 500,
-                    )
-                try:
-                    payload = await response.json()
-                except Exception:
+        instances = []
+        instance_ids = set()
+        requested_tokens = set()
+        expected_total = None
+        instances_found = 0
+        after_token = None
+
+        while True:
+            params = {"limit": 25}
+            if after_token is not None:
+                params["after_token"] = after_token
+            try:
+                async with client.get(
+                    VAST_API_V1 + "/instances/",
+                    headers=_headers(key),
+                    params=params,
+                ) as response:
+                    if response.status != 200:
+                        raise VastError(
+                            "Vast instance inventory is unavailable.",
+                            status=response.status,
+                            retryable=response.status == 429
+                            or response.status >= 500,
+                        )
+                    try:
+                        payload = await response.json()
+                    except (asyncio.CancelledError, KeyboardInterrupt):
+                        raise
+                    except Exception:
+                        raise VastError(
+                            "Vast instance inventory returned an invalid response."
+                        ) from None
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                raise
+            except VastError:
+                raise
+            except Exception:
+                raise VastError(
+                    "Vast instance inventory is unavailable.",
+                    retryable=True,
+                ) from None
+
+            if (
+                not isinstance(payload, dict)
+                or payload.get("success") is not True
+                or "next_token" not in payload
+            ):
+                raise VastError(
+                    "Vast instance inventory returned an invalid response."
+                )
+            raw_instances = payload.get("instances")
+            page_count = payload.get("instances_found")
+            total = payload.get("total_instances")
+            next_token = payload["next_token"]
+            if (
+                not isinstance(raw_instances, list)
+                or isinstance(page_count, bool)
+                or not isinstance(page_count, int)
+                or page_count < 0
+                or page_count > 25
+                or page_count != len(raw_instances)
+                or isinstance(total, bool)
+                or not isinstance(total, int)
+                or total < 0
+                or (next_token is not None and page_count == 0)
+            ):
+                raise VastError(
+                    "Vast instance inventory returned an invalid response."
+                )
+            if expected_total is None:
+                expected_total = total
+            elif total != expected_total:
+                raise VastError(
+                    "Vast instance inventory returned an invalid response."
+                )
+
+            page_instances = []
+            for raw_instance in raw_instances:
+                normalized = _normalize_instance(raw_instance)
+                if normalized is None:
                     raise VastError(
                         "Vast instance inventory returned an invalid response."
-                    ) from None
-        except VastError:
-            raise
-        except Exception:
-            raise VastError(
-                "Vast instance inventory is unavailable.",
-                retryable=True,
-            ) from None
-        raw_instances = payload.get("instances") if isinstance(payload, dict) else None
-        if not isinstance(raw_instances, list):
-            raise VastError("Vast instance inventory returned an invalid response.")
-        return [
-            normalized
-            for normalized in (_normalize_instance(item) for item in raw_instances)
-            if normalized is not None
-        ]
+                    )
+                identifier = normalized["instance_id"]
+                if identifier in instance_ids:
+                    raise VastError(
+                        "Vast instance inventory returned an invalid response."
+                    )
+                instance_ids.add(identifier)
+                page_instances.append(normalized)
+            instances.extend(page_instances)
+            instances_found += page_count
+            if (
+                instances_found > expected_total
+                or len(instance_ids) > expected_total
+            ):
+                raise VastError(
+                    "Vast instance inventory returned an invalid response."
+                )
+
+            if next_token is None:
+                if (
+                    instances_found != expected_total
+                    or len(instance_ids) != expected_total
+                ):
+                    raise VastError(
+                        "Vast instance inventory returned an invalid response."
+                    )
+                return instances
+            if (
+                not isinstance(next_token, str)
+                or not next_token
+                or next_token != next_token.strip()
+                or len(next_token) > 4096
+                or next_token in requested_tokens
+                or instances_found >= expected_total
+            ):
+                raise VastError(
+                    "Vast instance inventory returned an invalid response."
+                )
+            requested_tokens.add(next_token)
+            after_token = next_token
 
     return await _run_with_session(operation, session)
 
