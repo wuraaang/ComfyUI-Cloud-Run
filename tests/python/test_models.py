@@ -1,5 +1,6 @@
 import json
 import unittest
+from dataclasses import replace
 
 from cloud_run import models
 
@@ -38,6 +39,8 @@ def quote(OfferQuote):
         worker_archive_sha256="b" * 64,
         protocol_version="1",
         manifest_digest="c" * 64,
+        execution_baseline_digest="f" * 64,
+        randomized_seed_node_ids=("3",),
         machine_id="machine-7",
         host_id="host-3",
         public_ipaddr="203.0.113.7",
@@ -190,6 +193,35 @@ class LifecycleModelTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         OfferQuote.from_record({**values, field: malformed})
 
+    def test_quote_rejects_malformed_execution_baseline_contract(self):
+        from cloud_run.models import OfferQuote
+
+        values = quote(OfferQuote).to_record()
+        for malformed in (None, True, b"a" * 64, "g" * 64):
+            with self.subTest(baseline=malformed):
+                with self.assertRaises(ValueError):
+                    OfferQuote(
+                        **{
+                            **values,
+                            "execution_baseline_digest": malformed,
+                        }
+                    )
+        for malformed in (
+            "3",
+            ["3", "3"],
+            ["4", "3"],
+            ["../3"],
+            [3],
+        ):
+            with self.subTest(seed_nodes=malformed):
+                with self.assertRaises(ValueError):
+                    OfferQuote.from_record(
+                        {
+                            **values,
+                            "randomized_seed_node_ids": malformed,
+                        }
+                    )
+
     def test_quote_without_quality_metrics_is_legacy_inspection_only(self):
         from cloud_run.models import OfferQuote
 
@@ -264,6 +296,7 @@ class LifecycleModelTests(unittest.TestCase):
                 "offer_selected",
                 "confirming",
                 "creating",
+                "reconciling_create",
                 "bootstrapping",
                 "provisioning",
                 "validating",
@@ -470,6 +503,404 @@ class LifecycleModelTests(unittest.TestCase):
         )
 
         self.assertTrue(session.public_payload()["billing_may_continue"])
+
+    def test_reconciling_create_transitions_and_evidence_are_validated(self):
+        from cloud_run.models import CloudSession, SessionState
+
+        creating = CloudSession.new(
+            "session-key",
+            session_id="session-1",
+            manifest_digest="a" * 64,
+            deadline_at=7_300.0,
+            deadline_mode="finite",
+            disk_gb=80,
+            now=100.0,
+            state=SessionState.CREATING,
+        ).transition(
+            SessionState.CREATING,
+            provider_token="a" * 64,
+            session_secret_hex="b" * 64,
+        )
+        reconciling = creating.transition(
+            SessionState.RECONCILING_CREATE,
+            now=101.0,
+            failure_code="timeout",
+            create_reconcile_started_at=101.0,
+        )
+
+        observed = reconciling.record_create_empty_observation(now=101.0)
+
+        self.assertEqual(observed.create_empty_observations, 1)
+        self.assertEqual(observed.create_first_empty_at, 101.0)
+        self.assertEqual(observed.create_last_empty_at, 101.0)
+        self.assertEqual(
+            observed.transition(
+                SessionState.BOOTSTRAPPING,
+                now=102.0,
+                instance_id="77",
+            ).state,
+            SessionState.BOOTSTRAPPING,
+        )
+        self.assertEqual(
+            observed.transition(SessionState.FAILED, now=102.0).state,
+            SessionState.FAILED,
+        )
+        self.assertEqual(
+            observed.transition(
+                SessionState.DESTROY_REQUESTED,
+                now=102.0,
+                destroy_requested=True,
+            ).state,
+            SessionState.DESTROY_REQUESTED,
+        )
+        for changes in (
+            {
+                "create_empty_observations": 0,
+                "create_first_empty_at": 101.0,
+                "create_last_empty_at": 101.0,
+            },
+            {
+                "create_empty_observations": 1,
+                "create_first_empty_at": None,
+                "create_last_empty_at": None,
+            },
+            {
+                "create_empty_observations": 1,
+                "create_first_empty_at": 102.0,
+                "create_last_empty_at": 101.0,
+            },
+            {"create_empty_observations": True},
+            {"create_empty_observations": 4},
+        ):
+            with self.subTest(changes=changes):
+                with self.assertRaises(ValueError):
+                    replace(observed, **changes)._validate()
+
+    def test_three_empty_observations_must_span_120_seconds(self):
+        from cloud_run.models import CloudSession, SessionState
+
+        session = CloudSession.new(
+            "session-key",
+            session_id="session-1",
+            now=100.0,
+            state=SessionState.CREATING,
+        ).transition(
+            SessionState.RECONCILING_CREATE,
+            now=100.0,
+            create_reconcile_started_at=100.0,
+            failure_code="timeout",
+        )
+        for timestamp in (100.0, 115.0, 130.0):
+            session = session.record_create_empty_observation(now=timestamp)
+
+        self.assertFalse(session.create_absence_verified)
+
+        session = session.record_create_empty_observation(now=220.0)
+
+        self.assertTrue(session.create_absence_verified)
+
+    def test_saturated_empty_count_still_updates_last_empty_timestamp(self):
+        from cloud_run.models import CloudSession, SessionState
+
+        session = CloudSession.new(
+            "session-key",
+            session_id="session-1",
+            now=100.0,
+            state=SessionState.CREATING,
+        ).transition(
+            SessionState.RECONCILING_CREATE,
+            now=100.0,
+            create_reconcile_started_at=100.0,
+            failure_code="timeout",
+        )
+        for timestamp in (100.0, 115.0, 130.0, 160.0, 220.0):
+            session = session.record_create_empty_observation(now=timestamp)
+
+        self.assertEqual(session.create_empty_observations, 3)
+        self.assertEqual(session.create_first_empty_at, 100.0)
+        self.assertEqual(session.create_last_empty_at, 220.0)
+
+    def test_public_rental_outcome_and_capability_matrix_is_exact(self):
+        from cloud_run.models import CloudSession, SessionState
+
+        base = CloudSession.new(
+            "matrix-key",
+            session_id="matrix-session",
+            now=100.0,
+        )
+
+        def state(value, **changes):
+            candidate = replace(base, state=value, **changes)
+            candidate._validate()
+            return candidate
+
+        cases = (
+            (state(SessionState.PREFLIGHT), "not_started", False, True, False),
+            (state(SessionState.OFFER_SELECTED), "not_started", False, True, False),
+            (state(SessionState.CONFIRMING), "not_started", False, False, False),
+            (
+                state(
+                    SessionState.CREATING,
+                    provider_token="a" * 64,
+                    session_secret_hex="b" * 64,
+                ),
+                "unknown",
+                True,
+                False,
+                True,
+            ),
+            (
+                state(
+                    SessionState.RECONCILING_CREATE,
+                    provider_token="a" * 64,
+                    session_secret_hex="b" * 64,
+                    create_reconcile_started_at=100.0,
+                ),
+                "unknown",
+                True,
+                False,
+                True,
+            ),
+            (
+                state(SessionState.READY, instance_id="77"),
+                "active",
+                True,
+                False,
+                True,
+            ),
+            (
+                state(
+                    SessionState.DESTROY_REQUESTED,
+                    destroy_requested=True,
+                ),
+                "unknown",
+                True,
+                False,
+                False,
+            ),
+            (
+                state(
+                    SessionState.DESTROYING,
+                    instance_id="77",
+                    destroy_requested=True,
+                ),
+                "active",
+                True,
+                False,
+                False,
+            ),
+            (
+                state(
+                    SessionState.FAILED,
+                    instance_id="77",
+                    residual_inventory=("77",),
+                ),
+                "active",
+                True,
+                False,
+                True,
+            ),
+            (
+                state(
+                    SessionState.FAILED,
+                    failure_code="offer_unavailable",
+                ),
+                "absent",
+                False,
+                True,
+                False,
+            ),
+            (
+                state(SessionState.DESTROYED),
+                "absent",
+                False,
+                True,
+                False,
+            ),
+        )
+        for session, outcome, billing, search, destroy in cases:
+            with self.subTest(state=session.state, outcome=outcome):
+                public = session.public_payload()
+                self.assertEqual(session.rental_outcome, outcome)
+                self.assertEqual(public["rental_outcome"], outcome)
+                self.assertEqual(public["billing_may_continue"], billing)
+                self.assertEqual(public["can_search_offers"], search)
+                self.assertEqual(public["can_destroy"], destroy)
+                self.assertIn("can_verify_vast_access", public)
+
+    def test_failed_session_with_uncleared_secrets_remains_unknown(self):
+        from cloud_run.models import CloudSession, SessionState
+
+        failed = CloudSession.new(
+            "session-key",
+            session_id="session-1",
+            now=100.0,
+            state=SessionState.FAILED,
+        ).transition(
+            SessionState.FAILED,
+            failure_code="offer_unavailable",
+            provider_token="a" * 64,
+            session_secret_hex="b" * 64,
+        )
+
+        self.assertEqual(failed.rental_outcome, "unknown")
+        self.assertTrue(failed.billing_may_continue)
+        self.assertFalse(failed.can_search_offers)
+        self.assertTrue(failed.can_destroy)
+
+    def test_definitive_or_verified_absence_requires_cleared_secrets(self):
+        from cloud_run.models import CloudSession, SessionState
+
+        failed = CloudSession.new(
+            "session-key",
+            session_id="session-1",
+            now=100.0,
+            state=SessionState.FAILED,
+        ).transition(
+            SessionState.FAILED,
+            failure_code="offer_unavailable",
+            provider_token="a" * 64,
+            session_secret_hex="b" * 64,
+        )
+        cleared = failed.transition(
+            SessionState.FAILED,
+            now=101.0,
+            provider_token=None,
+            session_secret_hex=None,
+        )
+
+        self.assertEqual(failed.rental_outcome, "unknown")
+        self.assertEqual(cleared.rental_outcome, "absent")
+
+    def test_quote_and_session_repr_omit_private_provider_identity(self):
+        from cloud_run.models import CloudSession, OfferQuote
+
+        paid_quote = quote(OfferQuote)
+        session = CloudSession.new(
+            "session-key",
+            session_id="session-1",
+            quote=paid_quote,
+            manifest_digest=paid_quote.manifest_digest,
+            deadline_at=7_300.0,
+            deadline_mode="finite",
+            disk_gb=paid_quote.disk_gb,
+            now=100.0,
+        )
+
+        for marker in ("machine-7", "host-3", "203.0.113.7"):
+            self.assertNotIn(marker, repr(paid_quote))
+            self.assertNotIn(marker, repr(session))
+            self.assertNotIn(marker, json.dumps(session.public_payload()))
+        self.assertEqual(paid_quote.to_record()["machine_id"], "machine-7")
+
+    def test_unremediated_configuration_and_api_failures_block_new_rental(self):
+        from cloud_run.models import CloudSession, SessionState
+
+        for failure_code, revision_field, revision in (
+            (
+                "configuration_rejected",
+                "create_configuration_revision",
+                "typed-env-string-v0",
+            ),
+            (
+                "api_key_rejected",
+                "create_settings_revision",
+                "11111111-1111-4111-8111-111111111111",
+            ),
+        ):
+            with self.subTest(failure_code=failure_code):
+                failed = CloudSession.new(
+                    "session-key-" + failure_code,
+                    session_id="session-" + failure_code,
+                    now=100.0,
+                    state=SessionState.FAILED,
+                ).transition(
+                    SessionState.FAILED,
+                    failure_code=failure_code,
+                    **{revision_field: revision},
+                )
+                self.assertEqual(failed.rental_outcome, "absent")
+                self.assertTrue(failed.blocks_new_rental)
+                self.assertFalse(failed.can_search_offers)
+
+    def test_verify_access_capability_is_true_only_for_unremediated_api_key_failure(self):
+        from cloud_run.models import CloudSession, SessionState
+
+        api_failure = CloudSession.new(
+            "api-key",
+            session_id="api-session",
+            now=100.0,
+            state=SessionState.FAILED,
+        ).transition(
+            SessionState.FAILED,
+            failure_code="api_key_rejected",
+            create_settings_revision="11111111-1111-4111-8111-111111111111",
+        )
+        configuration_failure = replace(
+            api_failure,
+            idempotency_key="configuration-key",
+            session_id="configuration-session",
+            label="comfy-cloud-run-configuration-session",
+            failure_code="configuration_rejected",
+            create_settings_revision=None,
+            create_configuration_revision="typed-env-string-v0",
+        )
+        remediated = api_failure.transition(
+            SessionState.FAILED,
+            now=110.0,
+            remediation_verified_at=110.0,
+            remediation_revision="22222222-2222-4222-8222-222222222222",
+        )
+
+        self.assertTrue(api_failure.can_verify_vast_access)
+        self.assertFalse(configuration_failure.can_verify_vast_access)
+        self.assertFalse(remediated.can_verify_vast_access)
+        self.assertTrue(remediated.can_search_offers)
+
+    def test_remediation_revisions_are_private_and_strictly_validated(self):
+        from cloud_run.models import CloudSession, SessionState
+
+        failed_revision = "11111111-1111-4111-8111-111111111111"
+        remediated_revision = "22222222-2222-4222-8222-222222222222"
+        api_failure = CloudSession.new(
+            "api-key",
+            session_id="api-session",
+            now=100.0,
+            state=SessionState.FAILED,
+        ).transition(
+            SessionState.FAILED,
+            failure_code="api_key_rejected",
+            create_settings_revision=failed_revision,
+        )
+        remediated = api_failure.transition(
+            SessionState.FAILED,
+            now=110.0,
+            remediation_verified_at=110.0,
+            remediation_revision=remediated_revision,
+        )
+        public = json.dumps(remediated.public_payload(), sort_keys=True)
+
+        self.assertFalse(remediated.blocks_new_rental)
+        self.assertNotIn(failed_revision, public)
+        self.assertNotIn(remediated_revision, public)
+        self.assertNotIn("remediation_verified_at", public)
+        for changes in (
+            {
+                "remediation_verified_at": None,
+                "remediation_revision": remediated_revision,
+            },
+            {
+                "remediation_verified_at": 110.0,
+                "remediation_revision": failed_revision,
+            },
+            {
+                "remediation_verified_at": 110.0,
+                "remediation_revision": "not-a-uuid",
+            },
+        ):
+            with self.subTest(changes=changes):
+                with self.assertRaises(ValueError):
+                    replace(api_failure, **changes)._validate()
 
     def test_new_attempt_has_a_durable_identity_and_confirming_state(self):
         AttemptState, CloudAttempt, _, OfferQuote = model_api(self)

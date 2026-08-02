@@ -251,7 +251,7 @@ class JobRepositoryTests(unittest.TestCase):
         self.assertIsNone(legacy.phase)
         self.assertEqual(legacy.transferred_bytes, 0)
         self.assertEqual(legacy.total_bytes, 0)
-        self.assertEqual(schema_version, "5")
+        self.assertEqual(schema_version, "6")
 
     def test_duplicate_job_key_returns_original_and_stale_save_is_rejected(self):
         jobs = JobRepository(self.path)

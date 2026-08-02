@@ -16,7 +16,11 @@ import time
 import uuid
 
 from .artifacts import ArtifactPathError, hash_file
-from .capture import CompiledCapture
+from .capture import (
+    CaptureValidationError,
+    CompiledCapture,
+    certified_execution_baseline,
+)
 from .manifest import (
     DependencyManifest,
     ManifestDelta,
@@ -364,6 +368,8 @@ class PreflightResult:
     transfer_bytes: int
     output_allowance_bytes: int | None
     disk_gb: int | None
+    execution_baseline_digest: str
+    randomized_seed_node_ids: tuple[str, ...]
 
     def __post_init__(self):
         _identifier(self.preflight_id, "preflight ID")
@@ -392,6 +398,26 @@ class PreflightResult:
             or not 80 <= self.disk_gb <= 2048
         ):
             raise SessionServiceError("Invalid disk allocation.")
+        if (
+            not isinstance(self.execution_baseline_digest, str)
+            or not _HEX_64.fullmatch(self.execution_baseline_digest)
+        ):
+            raise SessionServiceError(
+                "Invalid execution baseline digest."
+            )
+        if (
+            not isinstance(self.randomized_seed_node_ids, tuple)
+            or any(
+                not isinstance(node_id, str)
+                or not _IDENTIFIER.fullmatch(node_id)
+                for node_id in self.randomized_seed_node_ids
+            )
+            or tuple(sorted(set(self.randomized_seed_node_ids)))
+            != self.randomized_seed_node_ids
+        ):
+            raise SessionServiceError(
+                "Invalid randomized seed node IDs."
+            )
         if self.rentable:
             if (
                 not isinstance(self.manifest_digest, str)
@@ -418,6 +444,12 @@ class PreflightResult:
             "transfer_bytes": self.transfer_bytes,
             "output_allowance_bytes": self.output_allowance_bytes,
             "disk_gb": self.disk_gb,
+            "execution_baseline_digest": (
+                self.execution_baseline_digest
+            ),
+            "randomized_seed_node_ids": list(
+                self.randomized_seed_node_ids
+            ),
         }
 
     @classmethod
@@ -431,16 +463,22 @@ class PreflightResult:
             "transfer_bytes",
             "output_allowance_bytes",
             "disk_gb",
+            "execution_baseline_digest",
+            "randomized_seed_node_ids",
         }
         if (
             not isinstance(payload, dict)
             or set(payload) != fields
             or not isinstance(payload["rows"], list)
+            or not isinstance(payload["randomized_seed_node_ids"], list)
         ):
             raise SessionServiceError("Stored preflight is invalid.")
         values = dict(payload)
         values["rows"] = tuple(
             PreflightRow.from_payload(row) for row in payload["rows"]
+        )
+        values["randomized_seed_node_ids"] = tuple(
+            payload["randomized_seed_node_ids"]
         )
         return cls(**values)
 
@@ -976,6 +1014,10 @@ class SessionService:
         capture = self.job_repository.get_capture(str(capture_id))
         if capture is None:
             raise CaptureNotFound("Cloud Run capture was not found.")
+        (
+            execution_baseline_digest,
+            randomized_seed_node_ids,
+        ) = certified_execution_baseline(capture)
         resolution = await self.resolver.resolve_preflight(
             capture,
             explicit_output_allowance_bytes=(
@@ -1059,6 +1101,8 @@ class SessionService:
             transfer_bytes=_transfer_bytes(resolution),
             output_allowance_bytes=output_allowance,
             disk_gb=disk_gb,
+            execution_baseline_digest=execution_baseline_digest,
+            randomized_seed_node_ids=randomized_seed_node_ids,
         )
         self.job_repository.save_preflight(
             result.preflight_id,
@@ -1107,8 +1151,17 @@ class SessionService:
         except json.JSONDecodeError:
             raise PreflightBlocked("Stored dependency manifest is invalid.") from None
         capture = self.job_repository.get_capture(result.capture_id)
+        try:
+            baseline = certified_execution_baseline(capture)
+        except CaptureValidationError:
+            baseline = None
         if (
             capture is None
+            or baseline
+            != (
+                result.execution_baseline_digest,
+                result.randomized_seed_node_ids,
+            )
             or manifest.get("prompt_digest") != capture.prompt_digest
             or manifest.get("output_allowance_bytes")
             != result.output_allowance_bytes
@@ -2479,6 +2532,19 @@ class SessionService:
         )
         if not isinstance(capture, CompiledCapture):
             raise CaptureNotFound("Cloud Run capture was not found.")
+        try:
+            execution_baseline = certified_execution_baseline(capture)
+        except CaptureValidationError:
+            raise IncompatibleSession(
+                "The current canvas no longer matches the reviewed session."
+            ) from None
+        if execution_baseline != (
+            session.execution_baseline_digest,
+            session.randomized_seed_node_ids,
+        ):
+            raise IncompatibleSession(
+                "The current canvas no longer matches the reviewed session."
+            )
         installed, desired = await self._fresh_manifest(session, capture)
         delta = ManifestDelta.between(installed, desired)
         if not delta.compatible:

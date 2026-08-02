@@ -42,7 +42,11 @@ _SESSION_COLUMNS = """
     session_secret_hex, deadline_at, deadline_mode, disk_gb, retry_count,
     destroy_requested, residual_inventory_json, sanitized_error, created_at,
     updated_at, version, pending_deadline_at, pending_deadline_mode,
-    pending_deadline_action
+    pending_deadline_action, failure_code, create_reconcile_started_at,
+    create_empty_observations, create_first_empty_at, create_last_empty_at,
+    create_settings_revision, create_configuration_revision,
+    remediation_verified_at, remediation_revision,
+    execution_baseline_digest, randomized_seed_node_ids_json
 """
 
 
@@ -63,6 +67,16 @@ def _canonical_json(value):
         separators=(",", ":"),
         sort_keys=True,
     )
+
+
+def _randomized_seed_node_ids(value):
+    try:
+        parsed = json.loads(value or "[]")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        raise ValueError("Stored randomized seed policy is invalid.") from None
+    if not isinstance(parsed, list):
+        raise ValueError("Stored randomized seed policy is invalid.")
+    return tuple(parsed)
 
 
 def _private_connection(path):
@@ -113,7 +127,18 @@ def _initialize_database(path):
                     version INTEGER NOT NULL,
                     pending_deadline_at REAL,
                     pending_deadline_mode TEXT,
-                    pending_deadline_action TEXT
+                    pending_deadline_action TEXT,
+                    failure_code TEXT,
+                    create_reconcile_started_at REAL,
+                    create_empty_observations INTEGER NOT NULL DEFAULT 0,
+                    create_first_empty_at REAL,
+                    create_last_empty_at REAL,
+                    create_settings_revision TEXT,
+                    create_configuration_revision TEXT,
+                    remediation_verified_at REAL,
+                    remediation_revision TEXT,
+                    execution_baseline_digest TEXT,
+                    randomized_seed_node_ids_json TEXT
                 )
                 """
             )
@@ -127,6 +152,20 @@ def _initialize_database(path):
                 ("pending_deadline_at", "REAL"),
                 ("pending_deadline_mode", "TEXT"),
                 ("pending_deadline_action", "TEXT"),
+                ("failure_code", "TEXT"),
+                ("create_reconcile_started_at", "REAL"),
+                (
+                    "create_empty_observations",
+                    "INTEGER NOT NULL DEFAULT 0",
+                ),
+                ("create_first_empty_at", "REAL"),
+                ("create_last_empty_at", "REAL"),
+                ("create_settings_revision", "TEXT"),
+                ("create_configuration_revision", "TEXT"),
+                ("remediation_verified_at", "REAL"),
+                ("remediation_revision", "TEXT"),
+                ("execution_baseline_digest", "TEXT"),
+                ("randomized_seed_node_ids_json", "TEXT"),
             ):
                 if name not in session_columns:
                     connection.execute(
@@ -314,7 +353,7 @@ def _initialize_database(path):
             _migrate_legacy_attempts(connection)
             connection.execute(
                 """
-                INSERT INTO schema_meta(key, value) VALUES('schema_version', '5')
+                INSERT INTO schema_meta(key, value) VALUES('schema_version', '6')
                 ON CONFLICT(key) DO UPDATE SET value = excluded.value
                 """
             )
@@ -374,6 +413,19 @@ def _migrate_legacy_attempts(connection):
             residual_inventory.append(str(row["instance_id"]))
         if state != SessionState.FAILED:
             residual_inventory = []
+        try:
+            migrated_quote = OfferQuote.from_record(
+                json.loads(row["quote_json"])
+            )
+            execution_baseline_digest = (
+                migrated_quote.execution_baseline_digest
+            )
+            randomized_seed_node_ids_json = _canonical_json(
+                list(migrated_quote.randomized_seed_node_ids)
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            execution_baseline_digest = "0" * 64
+            randomized_seed_node_ids_json = "[]"
         connection.execute(
             """
             INSERT OR IGNORE INTO sessions (
@@ -382,10 +434,11 @@ def _migrate_legacy_attempts(connection):
                 worker_base_url, provider_token, session_secret_hex,
                 deadline_at, deadline_mode, disk_gb, retry_count,
                 destroy_requested, residual_inventory_json, sanitized_error,
-                created_at, updated_at, version
+                created_at, updated_at, version,
+                execution_baseline_digest, randomized_seed_node_ids_json
             ) VALUES (
                 ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, NULL,
-                NULL, 'finite', 80, ?, ?, ?, ?, ?, ?, ?
+                NULL, 'finite', 80, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )
             """,
             (
@@ -404,6 +457,8 @@ def _migrate_legacy_attempts(connection):
                 float(row["created_at"]),
                 float(row["updated_at"]),
                 int(row["version"]),
+                execution_baseline_digest,
+                randomized_seed_node_ids_json,
             ),
         )
 
@@ -715,6 +770,41 @@ class SessionRepository:
             ),
             pending_deadline_mode=row["pending_deadline_mode"],
             pending_deadline_action=row["pending_deadline_action"],
+            failure_code=row["failure_code"],
+            create_reconcile_started_at=(
+                float(row["create_reconcile_started_at"])
+                if row["create_reconcile_started_at"] is not None
+                else None
+            ),
+            create_empty_observations=int(
+                row["create_empty_observations"]
+            ),
+            create_first_empty_at=(
+                float(row["create_first_empty_at"])
+                if row["create_first_empty_at"] is not None
+                else None
+            ),
+            create_last_empty_at=(
+                float(row["create_last_empty_at"])
+                if row["create_last_empty_at"] is not None
+                else None
+            ),
+            create_settings_revision=row["create_settings_revision"],
+            create_configuration_revision=(
+                row["create_configuration_revision"]
+            ),
+            remediation_verified_at=(
+                float(row["remediation_verified_at"])
+                if row["remediation_verified_at"] is not None
+                else None
+            ),
+            remediation_revision=row["remediation_revision"],
+            execution_baseline_digest=(
+                row["execution_baseline_digest"] or "0" * 64
+            ),
+            randomized_seed_node_ids=_randomized_seed_node_ids(
+                row["randomized_seed_node_ids_json"]
+            ),
         )
 
     @staticmethod
@@ -745,6 +835,17 @@ class SessionRepository:
             session.pending_deadline_at,
             session.pending_deadline_mode,
             session.pending_deadline_action,
+            session.failure_code,
+            session.create_reconcile_started_at,
+            session.create_empty_observations,
+            session.create_first_empty_at,
+            session.create_last_empty_at,
+            session.create_settings_revision,
+            session.create_configuration_revision,
+            session.remediation_verified_at,
+            session.remediation_revision,
+            session.execution_baseline_digest,
+            _canonical_json(list(session.randomized_seed_node_ids)),
         )
 
     def get(self, session_id):
@@ -785,7 +886,7 @@ class SessionRepository:
                 connection.execute(
                     f"""
                     INSERT INTO sessions ({_SESSION_COLUMNS})
-                    VALUES ({",".join("?" for _ in range(24))})
+                    VALUES ({",".join("?" for _ in range(35))})
                     """,
                     self._values(session),
                 )
@@ -838,6 +939,17 @@ class SessionRepository:
                 pending_deadline_at = ?,
                 pending_deadline_mode = ?,
                 pending_deadline_action = ?,
+                failure_code = ?,
+                create_reconcile_started_at = ?,
+                create_empty_observations = ?,
+                create_first_empty_at = ?,
+                create_last_empty_at = ?,
+                create_settings_revision = ?,
+                create_configuration_revision = ?,
+                remediation_verified_at = ?,
+                remediation_revision = ?,
+                execution_baseline_digest = ?,
+                randomized_seed_node_ids_json = ?,
                 version = version + 1
             WHERE session_id = ? AND version = ?
             """,
@@ -861,6 +973,17 @@ class SessionRepository:
                 session.pending_deadline_at,
                 session.pending_deadline_mode,
                 session.pending_deadline_action,
+                session.failure_code,
+                session.create_reconcile_started_at,
+                session.create_empty_observations,
+                session.create_first_empty_at,
+                session.create_last_empty_at,
+                session.create_settings_revision,
+                session.create_configuration_revision,
+                session.remediation_verified_at,
+                session.remediation_revision,
+                session.execution_baseline_digest,
+                _canonical_json(list(session.randomized_seed_node_ids)),
                 session.session_id,
                 session.version,
             ),
@@ -986,6 +1109,17 @@ class SessionRepository:
                     pending_deadline_at = ?,
                     pending_deadline_mode = ?,
                     pending_deadline_action = ?,
+                    failure_code = ?,
+                    create_reconcile_started_at = ?,
+                    create_empty_observations = ?,
+                    create_first_empty_at = ?,
+                    create_last_empty_at = ?,
+                    create_settings_revision = ?,
+                    create_configuration_revision = ?,
+                    remediation_verified_at = ?,
+                    remediation_revision = ?,
+                    execution_baseline_digest = ?,
+                    randomized_seed_node_ids_json = ?,
                     version = version + 1
                 WHERE session_id = ? AND version = ? AND state = ?
                 """,
@@ -1009,6 +1143,19 @@ class SessionRepository:
                     changed.pending_deadline_at,
                     changed.pending_deadline_mode,
                     changed.pending_deadline_action,
+                    changed.failure_code,
+                    changed.create_reconcile_started_at,
+                    changed.create_empty_observations,
+                    changed.create_first_empty_at,
+                    changed.create_last_empty_at,
+                    changed.create_settings_revision,
+                    changed.create_configuration_revision,
+                    changed.remediation_verified_at,
+                    changed.remediation_revision,
+                    changed.execution_baseline_digest,
+                    _canonical_json(
+                        list(changed.randomized_seed_node_ids)
+                    ),
                     changed.session_id,
                     current.version,
                     expected.value,
@@ -1205,9 +1352,28 @@ class SessionRepository:
                 f"""
                 SELECT {_SESSION_COLUMNS}
                 FROM sessions
-                WHERE state != ?
                 ORDER BY created_at, session_id
-                """,
-                (SessionState.DESTROYED.value,),
+                """
             ).fetchall()
-        return [self._row_to_session(row) for row in rows]
+        sessions = [self._row_to_session(row) for row in rows]
+        return [
+            session
+            for session in sessions
+            if session.state == SessionState.CONFIRMING
+            or session.rental_outcome in {"unknown", "active"}
+        ]
+
+    def list_recent(self, limit=20):
+        if type(limit) is not int or not 1 <= limit <= 20:
+            raise ValueError("Recent session limit must be between 1 and 20.")
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                f"""
+                SELECT {_SESSION_COLUMNS}
+                FROM sessions
+                ORDER BY created_at DESC, session_id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [self._row_to_session(row) for row in reversed(rows)]

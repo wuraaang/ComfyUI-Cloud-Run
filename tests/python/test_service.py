@@ -57,6 +57,8 @@ class FakePreflightService:
             transfer_bytes=12_000,
             output_allowance_bytes=4_000,
             disk_gb=96,
+            execution_baseline_digest="e" * 64,
+            randomized_seed_node_ids=("3",),
         )
 
     def require_rentable_preflight(self, preflight_id):
@@ -238,6 +240,16 @@ class CloudRunServiceTests(unittest.TestCase):
         self.assertEqual(reopened.quote.disk_bw_mbps, 600.0)
         self.assertEqual(reopened.quote.duration_seconds, 7_200)
         self.assertEqual(reopened.quote.max_instance_creates, 1)
+        self.assertEqual(
+            reopened.quote.execution_baseline_digest,
+            "e" * 64,
+        )
+        self.assertEqual(
+            reopened.quote.randomized_seed_node_ids,
+            ("3",),
+        )
+        self.assertEqual(reopened.execution_baseline_digest, "e" * 64)
+        self.assertEqual(reopened.randomized_seed_node_ids, ("3",))
         self.assertEqual(
             reopened.quote.approximate_max_active_charge,
             1.0,

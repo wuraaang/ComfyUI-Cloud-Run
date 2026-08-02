@@ -6,6 +6,7 @@ import sys
 import tempfile
 import types
 import unittest
+import uuid
 from pathlib import Path
 from unittest import mock
 
@@ -122,6 +123,77 @@ class SettingsValidationTests(unittest.TestCase):
 
 
 class SettingsPersistenceTests(unittest.TestCase):
+    def test_api_key_revision_rotates_only_for_explicit_key_update_and_stays_private(self):
+        from cloud_run.settings import SettingsStore, public_settings
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            store = SettingsStore(Path(temporary_directory))
+            first = store.update(
+                {
+                    "api_key": "synthetic-value",
+                    "max_price_per_hour": 0.8,
+                    "min_vram_gb": 24,
+                }
+            )
+            first_revision = str(
+                uuid.UUID(first["api_key_revision"])
+            )
+            unrelated = store.update(
+                {
+                    "max_price_per_hour": 0.5,
+                    "min_vram_gb": 32,
+                }
+            )
+            explicit = store.update(
+                {
+                    "api_key": "synthetic-value",
+                    "max_price_per_hour": 0.5,
+                    "min_vram_gb": 32,
+                }
+            )
+
+            self.assertEqual(unrelated["api_key_revision"], first_revision)
+            self.assertNotEqual(
+                explicit["api_key_revision"],
+                first_revision,
+            )
+            uuid.UUID(explicit["api_key_revision"])
+            public = public_settings(explicit)
+            self.assertNotIn("api_key_revision", public)
+            self.assertNotIn(first_revision, repr(public))
+            self.assertNotIn(explicit["api_key_revision"], repr(public))
+
+    def test_legacy_settings_with_api_key_receive_one_private_revision(self):
+        from cloud_run.settings import SettingsStore, public_settings
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            data_directory = Path(temporary_directory)
+            path = data_directory / "settings.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "api_key": "legacy-synthetic-value",
+                        "max_price_per_hour": 0.8,
+                        "min_vram_gb": 24,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            store = SettingsStore(data_directory)
+
+            migrated = store.load()
+            reopened = store.load()
+
+            revision = str(uuid.UUID(migrated["api_key_revision"]))
+            self.assertEqual(reopened["api_key_revision"], revision)
+            self.assertEqual(
+                json.loads(path.read_text(encoding="utf-8"))[
+                    "api_key_revision"
+                ],
+                revision,
+            )
+            self.assertNotIn("api_key_revision", public_settings(migrated))
+
     def test_atomic_file_is_private_and_public_settings_are_redacted(self):
         from cloud_run.settings import SettingsStore, public_settings
 

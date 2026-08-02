@@ -1,6 +1,8 @@
 import concurrent.futures
 import hashlib
+import json
 import os
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -39,6 +41,8 @@ def make_attempt(key="idem-1", attempt_id="attempt-1", now=100.0):
             worker_archive_sha256="b" * 64,
             protocol_version="1",
             manifest_digest="a" * 64,
+            execution_baseline_digest="e" * 64,
+            randomized_seed_node_ids=("3",),
             machine_id="machine-7",
             host_id="host-3",
             public_ipaddr="203.0.113.7",
@@ -367,6 +371,294 @@ class SessionRepositoryTests(unittest.TestCase):
             pending.pending_deadline_action,
             "add_30_minutes",
         )
+
+    def test_create_reconciliation_evidence_survives_reopen(self):
+        sessions = repository.SessionRepository(self.database_path)
+        creating = make_session().transition(
+            SessionState.OFFER_SELECTED,
+            now=101.0,
+        ).transition(
+            SessionState.CONFIRMING,
+            now=102.0,
+        ).transition(
+            SessionState.CREATING,
+            now=103.0,
+            provider_token="a" * 64,
+            session_secret_hex="b" * 64,
+        ).transition(
+            SessionState.RECONCILING_CREATE,
+            now=104.0,
+            failure_code="timeout",
+            create_reconcile_started_at=104.0,
+            create_settings_revision=(
+                "11111111-1111-4111-8111-111111111111"
+            ),
+            create_configuration_revision="typed-env-object-v1",
+        )
+        for timestamp in (104.0, 119.0, 134.0, 224.0):
+            creating = creating.record_create_empty_observation(
+                now=timestamp
+            )
+        saved, _created = sessions.create_or_get(creating)
+
+        reopened = repository.SessionRepository(self.database_path).get(
+            saved.session_id
+        )
+
+        self.assertEqual(reopened, saved)
+        self.assertEqual(reopened.failure_code, "timeout")
+        self.assertEqual(reopened.create_empty_observations, 3)
+        self.assertEqual(reopened.create_first_empty_at, 104.0)
+        self.assertEqual(reopened.create_last_empty_at, 224.0)
+        self.assertTrue(reopened.create_absence_verified)
+
+    def test_legacy_database_migration_defaults_reconciliation_evidence(self):
+        self.database_path.parent.mkdir(parents=True)
+        legacy_quote = make_attempt().quote.to_record()
+        legacy_quote.pop("execution_baseline_digest")
+        legacy_quote.pop("randomized_seed_node_ids")
+        with sqlite3.connect(self.database_path) as connection:
+            connection.execute(
+                "CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+            )
+            connection.execute(
+                "INSERT INTO schema_meta VALUES ('schema_version', '5')"
+            )
+            connection.execute(
+                """
+                CREATE TABLE sessions (
+                    session_id TEXT PRIMARY KEY,
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    label TEXT NOT NULL UNIQUE,
+                    state TEXT NOT NULL,
+                    quote_json TEXT,
+                    manifest_digest TEXT,
+                    installed_manifest_digest TEXT,
+                    instance_id TEXT,
+                    worker_base_url TEXT,
+                    provider_token TEXT,
+                    session_secret_hex TEXT,
+                    deadline_at REAL,
+                    deadline_mode TEXT NOT NULL DEFAULT 'finite',
+                    disk_gb INTEGER NOT NULL DEFAULT 80,
+                    retry_count INTEGER NOT NULL DEFAULT 0,
+                    destroy_requested INTEGER NOT NULL DEFAULT 0,
+                    residual_inventory_json TEXT,
+                    sanitized_error TEXT,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    version INTEGER NOT NULL,
+                    pending_deadline_at REAL,
+                    pending_deadline_mode TEXT,
+                    pending_deadline_action TEXT
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO sessions VALUES (
+                    ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL,
+                    ?, 'finite', 80, 0, 0, '[]', NULL, ?, ?, 1,
+                    NULL, NULL, NULL
+                )
+                """,
+                (
+                    "legacy-session",
+                    "legacy-key",
+                    "comfy-cloud-run-legacy-session",
+                    SessionState.PREFLIGHT.value,
+                    json.dumps(legacy_quote),
+                    "a" * 64,
+                    7300.0,
+                    100.0,
+                    100.0,
+                ),
+            )
+
+        sessions = repository.SessionRepository(self.database_path)
+        migrated = sessions.get("legacy-session")
+        with sessions._connect() as connection:
+            version = connection.execute(
+                "SELECT value FROM schema_meta WHERE key = 'schema_version'"
+            ).fetchone()[0]
+            columns = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(sessions)"
+                ).fetchall()
+            }
+
+        self.assertEqual(version, "6")
+        self.assertEqual(migrated.failure_code, None)
+        self.assertEqual(migrated.create_empty_observations, 0)
+        self.assertIsNone(migrated.create_first_empty_at)
+        self.assertIsNone(migrated.create_last_empty_at)
+        self.assertEqual(migrated.execution_baseline_digest, "0" * 64)
+        self.assertEqual(migrated.randomized_seed_node_ids, ())
+        self.assertTrue(
+            {
+                "failure_code",
+                "create_reconcile_started_at",
+                "create_empty_observations",
+                "create_first_empty_at",
+                "create_last_empty_at",
+                "create_settings_revision",
+                "create_configuration_revision",
+                "remediation_verified_at",
+                "remediation_revision",
+                "execution_baseline_digest",
+                "randomized_seed_node_ids_json",
+            }.issubset(columns)
+        )
+
+    def test_recoverable_filter_retains_unknown_active_and_orphaned_confirming(self):
+        sessions = repository.SessionRepository(self.database_path)
+        confirming = CloudSession.new(
+            "confirming-key",
+            session_id="confirming-session",
+            now=100.0,
+            state=SessionState.CONFIRMING,
+        )
+        reconciling = CloudSession.new(
+            "reconciling-key",
+            session_id="reconciling-session",
+            now=101.0,
+            state=SessionState.CREATING,
+        ).transition(
+            SessionState.RECONCILING_CREATE,
+            now=102.0,
+            create_reconcile_started_at=102.0,
+            failure_code="timeout",
+        )
+        active = CloudSession.new(
+            "active-key",
+            session_id="active-session",
+            now=103.0,
+            state=SessionState.READY,
+        ).transition(
+            SessionState.READY,
+            instance_id="77",
+        )
+        failed_residual = CloudSession.new(
+            "residual-key",
+            session_id="residual-session",
+            now=104.0,
+            state=SessionState.FAILED,
+        ).transition(
+            SessionState.FAILED,
+            residual_inventory=("88",),
+        )
+        for candidate in (
+            confirming,
+            reconciling,
+            active,
+            failed_residual,
+        ):
+            sessions.create_or_get(candidate)
+
+        self.assertEqual(
+            [item.session_id for item in sessions.list_recoverable()],
+            [
+                "confirming-session",
+                "reconciling-session",
+                "active-session",
+                "residual-session",
+            ],
+        )
+
+    def test_recoverable_filter_excludes_failed_absent(self):
+        sessions = repository.SessionRepository(self.database_path)
+        failed = CloudSession.new(
+            "failed-key",
+            session_id="failed-session",
+            now=100.0,
+            state=SessionState.FAILED,
+        ).transition(
+            SessionState.FAILED,
+            failure_code="offer_unavailable",
+        )
+        sessions.create_or_get(failed)
+
+        self.assertEqual(sessions.list_recoverable(), [])
+
+    def test_recent_sessions_query_is_bounded(self):
+        sessions = repository.SessionRepository(self.database_path)
+        for index in range(25):
+            sessions.create_or_get(
+                CloudSession.new(
+                    "recent-key-" + str(index),
+                    session_id="recent-session-" + str(index),
+                    now=100.0 + index,
+                )
+            )
+
+        recent = sessions.list_recent(limit=20)
+
+        self.assertEqual(len(recent), 20)
+        self.assertEqual(recent[0].session_id, "recent-session-5")
+        self.assertEqual(recent[-1].session_id, "recent-session-24")
+        for invalid in (True, 0, 21, 1.0, "20", None):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    sessions.list_recent(limit=invalid)
+
+    def test_remediation_and_execution_baseline_survive_legacy_migration_and_reopen(self):
+        sessions = repository.SessionRepository(self.database_path)
+        failed = CloudSession.new(
+            "failed-key",
+            session_id="failed-session",
+            now=100.0,
+            state=SessionState.FAILED,
+            execution_baseline_digest="e" * 64,
+            randomized_seed_node_ids=("3",),
+        ).transition(
+            SessionState.FAILED,
+            now=110.0,
+            failure_code="api_key_rejected",
+            create_settings_revision=(
+                "11111111-1111-4111-8111-111111111111"
+            ),
+            remediation_verified_at=110.0,
+            remediation_revision=(
+                "22222222-2222-4222-8222-222222222222"
+            ),
+        )
+        saved, _created = sessions.create_or_get(failed)
+
+        reopened = repository.SessionRepository(self.database_path).get(
+            saved.session_id
+        )
+
+        self.assertEqual(reopened.execution_baseline_digest, "e" * 64)
+        self.assertEqual(reopened.randomized_seed_node_ids, ("3",))
+        self.assertEqual(
+            reopened.create_settings_revision,
+            "11111111-1111-4111-8111-111111111111",
+        )
+        self.assertEqual(reopened.remediation_verified_at, 110.0)
+        self.assertEqual(
+            reopened.remediation_revision,
+            "22222222-2222-4222-8222-222222222222",
+        )
+
+    def test_randomized_seed_storage_rejects_non_array_json(self):
+        sessions = repository.SessionRepository(self.database_path)
+        saved, _created = sessions.create_or_get(make_session())
+        with sessions._connect() as connection:
+            connection.execute(
+                """
+                UPDATE sessions
+                SET randomized_seed_node_ids_json = ?
+                WHERE session_id = ?
+                """,
+                ('{"3":true}', saved.session_id),
+            )
+            connection.commit()
+
+        with self.assertRaises(ValueError):
+            repository.SessionRepository(self.database_path).get(
+                saved.session_id
+            )
 
 
 if __name__ == "__main__":

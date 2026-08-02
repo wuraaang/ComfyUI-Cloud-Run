@@ -8,6 +8,7 @@ from unittest import mock
 
 from cloud_run.artifacts import ArtifactResolution
 from cloud_run.capture import CompiledCapture
+from cloud_run.capture import certified_execution_baseline
 from cloud_run.job_repository import JobRepository
 from cloud_run.manifest import (
     ArtifactSpec,
@@ -50,7 +51,15 @@ def capture_payload():
     return {
         "workflow": {
             "version": 1,
-            "nodes": [{"id": 1}],
+            "nodes": [
+                {
+                    "id": 1,
+                    "type": "KSampler",
+                    "mode": 0,
+                    "properties": {"cnr_id": "comfy-core"},
+                    "widgets_values": [7, "randomize"],
+                }
+            ],
             "extra": {"frontendVersion": "1.47.10"},
         },
         "output": {
@@ -428,6 +437,17 @@ class SessionServiceTests(unittest.TestCase):
         self.assertEqual(result.transfer_bytes, 12)
         self.assertEqual(result.output_allowance_bytes, 8)
         self.assertEqual(result.disk_gb, 80)
+        expected_baseline, expected_seed_nodes = (
+            certified_execution_baseline(self.capture)
+        )
+        self.assertEqual(
+            result.execution_baseline_digest,
+            expected_baseline,
+        )
+        self.assertEqual(
+            result.randomized_seed_node_ids,
+            expected_seed_nodes,
+        )
         self.assertEqual(len(result.manifest_digest), 64)
         self.assertIsNotNone(
             self.repository.get_manifest(result.manifest_digest)
@@ -453,6 +473,11 @@ class SessionServiceTests(unittest.TestCase):
         self.assertEqual(self.offer_search.disk_gb, 80)
         self.assertEqual(self.offer_search.mutations, [])
         public = result.public_payload()
+        self.assertEqual(
+            public["execution_baseline_digest"],
+            expected_baseline,
+        )
+        self.assertEqual(public["randomized_seed_node_ids"], ["1"])
         self.assertNotIn("private_path", repr(public))
         self.assertNotIn("'source':", repr(public))
 
@@ -1193,6 +1218,9 @@ class ReusableSessionTests(unittest.TestCase):
             initial.canonical_bytes().decode("utf-8"),
             created_at=100.0,
         )
+        baseline_digest, randomized_seed_node_ids = (
+            certified_execution_baseline(self.first_capture)
+        )
         session = CloudSession.new(
             "session-key",
             session_id="session-1",
@@ -1202,6 +1230,8 @@ class ReusableSessionTests(unittest.TestCase):
             disk_gb=80,
             now=100.0,
             state=SessionState.READY,
+            execution_baseline_digest=baseline_digest,
+            randomized_seed_node_ids=randomized_seed_node_ids,
         ).transition(
             SessionState.READY,
             now=100.0,
@@ -1223,6 +1253,10 @@ class ReusableSessionTests(unittest.TestCase):
             disk_gb=80,
             now=100.0,
             state=SessionState.BOOTSTRAPPING,
+            execution_baseline_digest=(
+                certified_execution_baseline(self.first_capture)[0]
+            ),
+            randomized_seed_node_ids=("1",),
         ).transition(
             SessionState.BOOTSTRAPPING,
             now=100.0,
@@ -1589,6 +1623,84 @@ class ReusableSessionTests(unittest.TestCase):
         self.assertIsNone(
             self.jobs.latest_provision_transaction("session-1")
         )
+
+    def test_submit_job_accepts_only_a_seed_normalized_reviewed_baseline(self):
+        reviewed = self.sessions.get("session-1")
+        fresh_digest, fresh_seed_nodes = certified_execution_baseline(
+            self.second_capture
+        )
+
+        job = asyncio.run(
+            self.service.submit_job(
+                "session-1",
+                capture_id=self.second_capture.capture_id,
+                idempotency_key="seed-normalized-key",
+            )
+        )
+
+        self.assertEqual(fresh_digest, reviewed.execution_baseline_digest)
+        self.assertEqual(
+            fresh_seed_nodes,
+            reviewed.randomized_seed_node_ids,
+        )
+        self.assertEqual(job.prompt_digest, self.second_capture.prompt_digest)
+        self.assertEqual(len(self.worker.job_calls), 1)
+
+    def test_canvas_modified_after_preflight_issues_zero_worker_jobs(self):
+        payload = capture_payload()
+        payload["output"]["1"]["inputs"]["seed"] = 999
+        payload["output"]["1"]["inputs"]["steps"] = 21
+        changed = CompiledCapture.from_payload(payload)
+        self.jobs.save_capture(changed, created_at=100.0)
+        self.service.resolver.resolutions[
+            changed.capture_id
+        ] = self.first_resolution
+        before_jobs = tuple(self.jobs.list_jobs("session-1"))
+
+        with self.assertRaises(IncompatibleSession):
+            asyncio.run(
+                self.service.submit_job(
+                    "session-1",
+                    capture_id=changed.capture_id,
+                    idempotency_key="modified-canvas-key",
+                )
+            )
+
+        self.assertEqual(tuple(self.jobs.list_jobs("session-1")), before_jobs)
+        self.assertEqual(self.worker.job_calls, [])
+        self.assertEqual(self.worker.manifest_calls, [])
+        self.assertEqual(
+            self.sessions.get("session-1").state,
+            SessionState.READY,
+        )
+
+    def test_changed_seed_control_is_blocked_before_fresh_resolution(self):
+        payload = capture_payload()
+        payload["output"]["1"]["inputs"]["seed"] = 11
+        payload["workflow"]["nodes"][0]["widgets_values"][1] = "fixed"
+        changed = CompiledCapture.from_payload(payload)
+        self.jobs.save_capture(changed, created_at=100.0)
+        self.service.resolver.resolutions[
+            changed.capture_id
+        ] = self.first_resolution
+        before_resolver_calls = tuple(self.service.resolver.calls)
+
+        with self.assertRaises(IncompatibleSession):
+            asyncio.run(
+                self.service.submit_job(
+                    "session-1",
+                    capture_id=changed.capture_id,
+                    idempotency_key="changed-seed-control-key",
+                )
+            )
+
+        self.assertEqual(
+            tuple(self.service.resolver.calls),
+            before_resolver_calls,
+        )
+        self.assertEqual(self.worker.job_calls, [])
+        self.assertEqual(self.worker.manifest_calls, [])
+        self.assertEqual(self.jobs.list_jobs("session-1"), [])
 
     def test_two_compatible_jobs_reuse_one_session_and_transfer_only_delta(self):
         first = asyncio.run(

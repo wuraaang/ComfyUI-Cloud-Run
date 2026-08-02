@@ -5,6 +5,7 @@ import math
 import os
 import re
 import tempfile
+import uuid
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -59,6 +60,17 @@ def _default_settings():
         "max_price_per_hour": DEFAULT_MAX_PRICE_PER_HOUR,
         "min_vram_gb": DEFAULT_MIN_VRAM_GB,
     }
+
+
+def _api_key_revision(value):
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = uuid.UUID(value)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    canonical = str(parsed)
+    return canonical if canonical == value else None
 
 
 def _optional_value(field, value):
@@ -194,6 +206,7 @@ class SettingsStore:
             )
             settings.update(filters)
 
+            migrate_api_key_revision = False
             key = stored.get("api_key")
             if (
                 isinstance(key, str)
@@ -201,6 +214,13 @@ class SettingsStore:
                 and len(key.strip()) <= MAX_API_KEY_LENGTH
             ):
                 settings["api_key"] = key.strip()
+                revision = _api_key_revision(
+                    stored.get("api_key_revision")
+                )
+                if revision is None:
+                    revision = str(uuid.uuid4())
+                    migrate_api_key_revision = True
+                settings["api_key_revision"] = revision
             optional = {}
             for field in _OPTIONAL_FIELDS:
                 if field not in stored:
@@ -216,13 +236,18 @@ class SettingsStore:
             for field in ("hf_token", "civitai_token"):
                 if field in optional:
                     settings[field] = optional[field]
+            if migrate_api_key_revision:
+                self._write(settings)
         except (OSError, ValueError, json.JSONDecodeError, SettingsValidationError):
             return _default_settings()
         return settings
 
     def update(self, payload):
         updated = self.load()
-        updated.update(validate_update(payload))
+        normalized = validate_update(payload)
+        updated.update(normalized)
+        if "api_key" in normalized:
+            updated["api_key_revision"] = str(uuid.uuid4())
         if any(field in updated for field in _R2_FIELDS) and not all(
             field in updated for field in _R2_FIELDS
         ):

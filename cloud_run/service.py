@@ -451,6 +451,12 @@ class CloudRunService:
             worker_archive_sha256=release.worker_archive_sha256,
             protocol_version=release.protocol_version,
             manifest_digest=preflight.manifest_digest,
+            execution_baseline_digest=(
+                preflight.execution_baseline_digest
+            ),
+            randomized_seed_node_ids=(
+                preflight.randomized_seed_node_ids
+            ),
             machine_id=selected.get("machine_id"),
             host_id=selected.get("host_id"),
             public_ipaddr=selected.get("public_ipaddr"),
@@ -460,6 +466,12 @@ class CloudRunService:
             key,
             quote=quote,
             manifest_digest=preflight.manifest_digest,
+            execution_baseline_digest=(
+                preflight.execution_baseline_digest
+            ),
+            randomized_seed_node_ids=(
+                preflight.randomized_seed_node_ids
+            ),
             deadline_at=(now + duration if duration is not None else None),
             deadline_mode=mode,
             disk_gb=preflight.disk_gb,
