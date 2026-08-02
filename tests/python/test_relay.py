@@ -1,6 +1,8 @@
 import asyncio
 import hashlib
 import json
+import os
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -181,6 +183,10 @@ class LocalRelayTests(unittest.TestCase):
         transfer = self.repository.get_transfer("job-1", "output-1")
         self.assertEqual(transfer.offset, len(EXPECTED_OUTPUT))
         self.assertEqual(transfer.state, TransferState.VERIFIED)
+        metadata = os.stat(result.local_path)
+        self.assertEqual(transfer.source_node_id, "7")
+        self.assertEqual(transfer.published_device, metadata.st_dev)
+        self.assertEqual(transfer.published_inode, metadata.st_ino)
 
         duplicate = asyncio.run(
             relay.download_output(
@@ -191,6 +197,33 @@ class LocalRelayTests(unittest.TestCase):
         )
         self.assertEqual(duplicate.local_path, result.local_path)
         self.assertEqual(relay.worker.ranges, ["bytes=5-"])
+
+    def test_verified_output_rejects_changed_node_and_same_byte_replacement(self):
+        from cloud_run.relay import ArtifactVerificationError
+
+        relay = self.relay(FakeWorker())
+        result = asyncio.run(
+            relay.download_output(
+                job_id="job-1",
+                descriptor=descriptor(),
+            )
+        )
+        changed_node = descriptor()
+        changed_node["node_id"] = "8"
+
+        with self.assertRaises(ArtifactVerificationError):
+            asyncio.run(
+                relay.download_output(
+                    job_id="job-1",
+                    descriptor=changed_node,
+                )
+            )
+
+        replacement = result.local_path.with_suffix(".replacement")
+        shutil.copyfile(result.local_path, replacement)
+        os.replace(replacement, result.local_path)
+        with self.assertRaises(ArtifactVerificationError):
+            relay.published_artifact("job-1", "output-1")
 
     def test_transport_interruption_keeps_only_a_resumable_private_part(self):
         from cloud_run.relay import ArtifactVerificationError

@@ -39,6 +39,9 @@ class TransferRecord:
     offset: int
     state: TransferState
     private_path: str
+    source_node_id: str | None
+    published_device: int | None
+    published_inode: int | None
 
 
 @dataclass(frozen=True)
@@ -778,6 +781,9 @@ class JobRepository:
         offset,
         state,
         private_path,
+        source_node_id=None,
+        published_device=None,
+        published_inode=None,
     ):
         job_identifier = _require_identifier(job_id, "job ID")
         artifact_identifier = _require_identifier(artifact_id, "artifact ID")
@@ -793,11 +799,38 @@ class JobRepository:
         private = str(private_path or "")
         if not private:
             raise ValueError("A private transfer path is required.")
+        node_id = _require_strict_identifier(
+            source_node_id,
+            "source node ID",
+            optional=True,
+        )
+        if (published_device is None) != (published_inode is None):
+            raise ValueError("Invalid published output identity.")
+        if published_device is None:
+            device = inode = None
+        else:
+            if (
+                isinstance(published_device, bool)
+                or not isinstance(published_device, int)
+                or published_device < 0
+                or isinstance(published_inode, bool)
+                or not isinstance(published_inode, int)
+                or published_inode < 0
+                or node_id is None
+                or normalized_direction != "download"
+                or artifact_identifier.startswith("preview:")
+                or transfer_state != TransferState.VERIFIED
+            ):
+                raise ValueError("Invalid published output identity.")
+            device = published_device
+            inode = published_inode
         with closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
             existing = connection.execute(
                 """
-                SELECT expected_size, sha256, offset, direction
+                SELECT
+                    expected_size, sha256, offset, direction,
+                    source_node_id, published_device, published_inode
                 FROM transfers
                 WHERE job_id = ? AND artifact_id = ?
                 """,
@@ -812,6 +845,14 @@ class JobRepository:
                 if identity != (total, digest, normalized_direction):
                     connection.rollback()
                     raise ValueError("Transfer identity cannot change.")
+                for stored, candidate in (
+                    (existing["source_node_id"], node_id),
+                    (existing["published_device"], device),
+                    (existing["published_inode"], inode),
+                ):
+                    if stored is not None and stored != candidate:
+                        connection.rollback()
+                        raise ValueError("Transfer identity cannot change.")
                 if current < int(existing["offset"]):
                     connection.rollback()
                     raise ValueError("Transfer offsets cannot move backwards.")
@@ -819,12 +860,25 @@ class JobRepository:
                 """
                 INSERT INTO transfers(
                     job_id, artifact_id, direction, expected_size, sha256,
-                    offset, state, private_path
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    offset, state, private_path, source_node_id,
+                    published_device, published_inode
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(job_id, artifact_id) DO UPDATE SET
                     offset = excluded.offset,
                     state = excluded.state,
-                    private_path = excluded.private_path
+                    private_path = excluded.private_path,
+                    source_node_id = COALESCE(
+                        transfers.source_node_id,
+                        excluded.source_node_id
+                    ),
+                    published_device = COALESCE(
+                        transfers.published_device,
+                        excluded.published_device
+                    ),
+                    published_inode = COALESCE(
+                        transfers.published_inode,
+                        excluded.published_inode
+                    )
                 """,
                 (
                     job_identifier,
@@ -835,6 +889,9 @@ class JobRepository:
                     current,
                     transfer_state.value,
                     private,
+                    node_id,
+                    device,
+                    inode,
                 ),
             )
             connection.commit()
@@ -845,7 +902,8 @@ class JobRepository:
                 """
                 SELECT
                     job_id, artifact_id, direction, expected_size, sha256,
-                    offset, state, private_path
+                    offset, state, private_path, source_node_id,
+                    published_device, published_inode
                 FROM transfers
                 WHERE job_id = ? AND artifact_id = ?
                 """,
@@ -862,6 +920,17 @@ class JobRepository:
             offset=int(row["offset"]),
             state=TransferState(row["state"]),
             private_path=row["private_path"],
+            source_node_id=row["source_node_id"],
+            published_device=(
+                int(row["published_device"])
+                if row["published_device"] is not None
+                else None
+            ),
+            published_inode=(
+                int(row["published_inode"])
+                if row["published_inode"] is not None
+                else None
+            ),
         )
 
     def list_transfers(self, job_id):
@@ -870,7 +939,8 @@ class JobRepository:
                 """
                 SELECT
                     job_id, artifact_id, direction, expected_size, sha256,
-                    offset, state, private_path
+                    offset, state, private_path, source_node_id,
+                    published_device, published_inode
                 FROM transfers
                 WHERE job_id = ?
                 ORDER BY artifact_id
@@ -887,6 +957,17 @@ class JobRepository:
                 offset=int(row["offset"]),
                 state=TransferState(row["state"]),
                 private_path=row["private_path"],
+                source_node_id=row["source_node_id"],
+                published_device=(
+                    int(row["published_device"])
+                    if row["published_device"] is not None
+                    else None
+                ),
+                published_inode=(
+                    int(row["published_inode"])
+                    if row["published_inode"] is not None
+                    else None
+                ),
             )
             for row in rows
         ]

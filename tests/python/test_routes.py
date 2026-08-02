@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import closing
 from dataclasses import replace
 import hashlib
 import json
@@ -21,6 +22,7 @@ from cloud_run.routes import (
     build_service,
     register_routes,
 )
+from cloud_run.repository import PaidRentalConflict
 from cloud_run.models import (
     AttemptState,
     CloudAttempt,
@@ -831,6 +833,38 @@ class LegacyRouteRemovalTests(unittest.TestCase):
 
 
 class PaidSessionRouteTests(unittest.TestCase):
+    def test_paid_rental_conflict_maps_to_static_http_409(self):
+        service = mock.Mock()
+        service.confirm_session = mock.AsyncMock(
+            side_effect=PaidRentalConflict()
+        )
+        handlers = captured_handlers(service_factory=lambda: service)
+
+        response = asyncio.run(
+            handlers[
+                (
+                    "POST",
+                    "/cloud-run/api/sessions/{session_id}/confirm",
+                )
+            ](
+                FakeRequest(
+                    {"idempotency_key": "private-session-key"},
+                    match_info={"session_id": "session-1"},
+                )
+            )
+        )
+
+        self.assertEqual(response.status, 409)
+        self.assertEqual(
+            response.payload,
+            {
+                "error": (
+                    "Another Cloud Run rental is active or unresolved. "
+                    "Do not start another rental yet."
+                )
+            },
+        )
+
     def test_quote_and_confirm_routes_use_only_the_exact_session_contract(self):
         quoted = CloudSession.new(
             "private-session-idempotency-key",
@@ -1238,6 +1272,7 @@ class RelayMediaRouteTests(unittest.TestCase):
         output_path = self.output_root / "job-1" / "wallpaper.png"
         output_path.parent.mkdir(mode=0o700)
         output_path.write_bytes(output)
+        output_metadata = output_path.stat()
         repository.save_transfer(
             job_id="job-1",
             artifact_id="output-1",
@@ -1247,6 +1282,9 @@ class RelayMediaRouteTests(unittest.TestCase):
             offset=len(output),
             state=TransferState.VERIFIED,
             private_path=str(output_path),
+            source_node_id="9",
+            published_device=output_metadata.st_dev,
+            published_inode=output_metadata.st_ino,
         )
         self.service = types.SimpleNamespace(
             job_repository=repository,
@@ -1390,6 +1428,8 @@ class RelayMediaRouteTests(unittest.TestCase):
             response.payload["outputs"][0]["filename"],
             "wallpaper.png",
         )
+        self.assertEqual(response.payload["outputs"][0]["node_id"], "9")
+        self.assertNotIn("node_id", response.payload["transfers"][1])
         self.assertNotIn(str(self.root), repr(response.payload))
 
     def test_session_status_aggregates_cost_alerts_job_and_local_history(self):
@@ -1547,7 +1587,7 @@ class RelayMediaRouteTests(unittest.TestCase):
         self.assertNotIn("local-upload", repr(response.payload))
         self.assertNotIn(str(self.root), repr(response.payload))
 
-        with repository._connect() as connection:
+        with closing(repository._connect()) as connection:
             connection.execute(
                 """
                 UPDATE provision_transactions

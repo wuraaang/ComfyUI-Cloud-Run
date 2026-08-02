@@ -1,3 +1,4 @@
+from contextlib import closing
 import json
 import os
 import sqlite3
@@ -76,6 +77,9 @@ class JobRepositoryTests(unittest.TestCase):
         self.assertEqual(reopened.get_manifest("a" * 64), '{"schema_version":1}')
         self.assertEqual(transfer.offset, 4)
         self.assertEqual(transfer.state, TransferState.TRANSFERRING)
+        self.assertIsNone(transfer.source_node_id)
+        self.assertIsNone(transfer.published_device)
+        self.assertIsNone(transfer.published_inode)
         self.assertEqual(event.sequence, 1)
         self.assertEqual(event.payload, {"max": 10, "value": 2})
         self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o600)
@@ -194,9 +198,9 @@ class JobRepositoryTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     jobs.record_provision_progress(**payload)
 
-    def test_legacy_provision_table_is_migrated_idempotently(self):
+    def test_legacy_schema_is_migrated_idempotently_to_output_provenance_v7(self):
         self.path.parent.mkdir(parents=True)
-        with sqlite3.connect(self.path) as connection:
+        with closing(sqlite3.connect(self.path)) as connection:
             connection.execute(
                 """
                 CREATE TABLE provision_transactions (
@@ -222,12 +226,40 @@ class JobRepositoryTests(unittest.TestCase):
                 """,
                 ("d" * 64,),
             )
+            connection.execute(
+                """
+                CREATE TABLE transfers (
+                    job_id TEXT NOT NULL,
+                    artifact_id TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    expected_size INTEGER NOT NULL,
+                    sha256 TEXT NOT NULL,
+                    offset INTEGER NOT NULL,
+                    state TEXT NOT NULL,
+                    private_path TEXT NOT NULL,
+                    PRIMARY KEY(job_id, artifact_id)
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO transfers VALUES (
+                    'legacy-job', 'legacy-output', 'download', 10, ?, 10,
+                    'verified', '/private/legacy-output.png'
+                )
+                """,
+                ("e" * 64,),
+            )
             connection.commit()
 
         jobs = JobRepository(self.path)
         reopened = JobRepository(self.path)
         legacy = reopened.get_provision_transaction("legacy-tx")
-        with sqlite3.connect(self.path) as connection:
+        legacy_transfer = reopened.get_transfer(
+            "legacy-job",
+            "legacy-output",
+        )
+        with closing(sqlite3.connect(self.path)) as connection:
             columns = {
                 row[1]
                 for row in connection.execute(
@@ -237,6 +269,12 @@ class JobRepositoryTests(unittest.TestCase):
             schema_version = connection.execute(
                 "SELECT value FROM schema_meta WHERE key = 'schema_version'"
             ).fetchone()[0]
+            transfer_columns = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(transfers)"
+                )
+            }
 
         self.assertIsNotNone(jobs)
         self.assertEqual(
@@ -251,7 +289,69 @@ class JobRepositoryTests(unittest.TestCase):
         self.assertIsNone(legacy.phase)
         self.assertEqual(legacy.transferred_bytes, 0)
         self.assertEqual(legacy.total_bytes, 0)
-        self.assertEqual(schema_version, "6")
+        self.assertEqual(
+            {
+                "source_node_id",
+                "published_device",
+                "published_inode",
+            }.difference(transfer_columns),
+            set(),
+        )
+        self.assertIsNone(legacy_transfer.source_node_id)
+        self.assertIsNone(legacy_transfer.published_device)
+        self.assertIsNone(legacy_transfer.published_inode)
+        self.assertEqual(schema_version, "7")
+
+    def test_verified_output_provenance_survives_reopen_and_is_immutable(self):
+        jobs = JobRepository(self.path)
+        jobs.save_transfer(
+            job_id="job-1",
+            artifact_id="output-1",
+            direction="download",
+            expected_size=10,
+            sha256="b" * 64,
+            offset=10,
+            state=TransferState.VERIFIED,
+            private_path="/private/output.png",
+            source_node_id="2",
+            published_device=101,
+            published_inode=202,
+        )
+
+        transfer = JobRepository(self.path).get_transfer(
+            "job-1",
+            "output-1",
+        )
+
+        self.assertEqual(transfer.source_node_id, "2")
+        self.assertEqual(transfer.published_device, 101)
+        self.assertEqual(transfer.published_inode, 202)
+        for changes in (
+            {"source_node_id": "9"},
+            {"published_device": 303},
+            {"published_inode": 404},
+        ):
+            with self.subTest(changes=changes):
+                with self.assertRaisesRegex(ValueError, "identity"):
+                    jobs.save_transfer(
+                        job_id="job-1",
+                        artifact_id="output-1",
+                        direction="download",
+                        expected_size=10,
+                        sha256="b" * 64,
+                        offset=10,
+                        state=TransferState.VERIFIED,
+                        private_path="/private/output.png",
+                        source_node_id=changes.get("source_node_id", "2"),
+                        published_device=changes.get(
+                            "published_device",
+                            101,
+                        ),
+                        published_inode=changes.get(
+                            "published_inode",
+                            202,
+                        ),
+                    )
 
     def test_duplicate_job_key_returns_original_and_stale_save_is_rejected(self):
         jobs = JobRepository(self.path)

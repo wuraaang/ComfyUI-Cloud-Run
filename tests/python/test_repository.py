@@ -1,4 +1,5 @@
 import concurrent.futures
+from contextlib import closing
 import hashlib
 import json
 import os
@@ -62,6 +63,24 @@ def make_session(key="session-key", session_id="session-1", now=100.0):
         deadline_at=now + 7200,
         disk_gb=80,
         now=now,
+    )
+
+
+def make_confirming_session(
+    key="confirming-key",
+    session_id="confirming-session",
+    now=100.0,
+):
+    return make_session(
+        key=key,
+        session_id=session_id,
+        now=now,
+    ).transition(
+        SessionState.OFFER_SELECTED,
+        now=now + 1,
+    ).transition(
+        SessionState.CONFIRMING,
+        now=now + 2,
     )
 
 
@@ -172,6 +191,250 @@ class SessionRepositoryTests(unittest.TestCase):
             Path(self.temporary_directory.name)
             / "private"
             / "sessions.sqlite3"
+        )
+
+    def _assert_create_claim_blocked(self, blocker):
+        sessions = repository.SessionRepository(self.database_path)
+        target = make_confirming_session()
+        sessions.create_or_get(target)
+        sessions.create_or_get(blocker)
+
+        with self.assertRaises(repository.PaidRentalConflict):
+            sessions.claim_create_intent(
+                target.session_id,
+                now=110.0,
+                provider_token="a" * 64,
+                session_secret_hex="b" * 64,
+            )
+
+        reopened = sessions.get(target.session_id)
+        self.assertEqual(reopened.state, SessionState.OFFER_SELECTED)
+        self.assertIsNone(reopened.provider_token)
+        self.assertIsNone(reopened.session_secret_hex)
+
+    def test_atomic_create_claim_blocks_another_unknown_session(self):
+        blocker = make_confirming_session(
+            key="unknown-key",
+            session_id="unknown-session",
+        ).transition(
+            SessionState.CREATING,
+            now=103.0,
+            provider_token="c" * 64,
+            session_secret_hex="d" * 64,
+        )
+
+        self._assert_create_claim_blocked(blocker)
+
+    def test_atomic_create_claim_blocks_another_active_session(self):
+        blocker = CloudSession.new(
+            "active-key",
+            session_id="active-session",
+            now=90.0,
+            state=SessionState.READY,
+        ).transition(
+            SessionState.READY,
+            now=91.0,
+            instance_id="instance-active",
+        )
+
+        self._assert_create_claim_blocked(blocker)
+
+    def test_failed_with_instance_blocks_create(self):
+        blocker = CloudSession.new(
+            "failed-instance-key",
+            session_id="failed-instance-session",
+            now=90.0,
+            state=SessionState.FAILED,
+        ).transition(
+            SessionState.FAILED,
+            now=91.0,
+            instance_id="instance-residual",
+            failure_code="offer_unavailable",
+        )
+
+        self._assert_create_claim_blocked(blocker)
+
+    def test_failed_with_residual_inventory_blocks_create(self):
+        blocker = CloudSession.new(
+            "failed-residual-key",
+            session_id="failed-residual-session",
+            now=90.0,
+            state=SessionState.FAILED,
+        ).transition(
+            SessionState.FAILED,
+            now=91.0,
+            residual_inventory=("instance-1", "instance-2"),
+            failure_code="offer_unavailable",
+        )
+
+        self._assert_create_claim_blocked(blocker)
+
+    def test_unremediated_400_401_403_block_direct_create_claim(self):
+        cases = (
+            (
+                "400",
+                "configuration_rejected",
+                {"create_configuration_revision": "typed-env-object-v1"},
+            ),
+            (
+                "401",
+                "api_key_rejected",
+                {
+                    "create_settings_revision": (
+                        "11111111-1111-4111-8111-111111111111"
+                    )
+                },
+            ),
+            (
+                "403",
+                "api_key_rejected",
+                {
+                    "create_settings_revision": (
+                        "11111111-1111-4111-8111-111111111111"
+                    )
+                },
+            ),
+        )
+        original_path = self.database_path
+        try:
+            for status, failure_code, evidence in cases:
+                with self.subTest(status=status):
+                    self.database_path = original_path.with_name(
+                        "sessions-" + status + ".sqlite3"
+                    )
+                    blocker = CloudSession.new(
+                        "blocker-key-" + status,
+                        session_id="blocker-session-" + status,
+                        now=90.0,
+                        state=SessionState.FAILED,
+                    ).transition(
+                        SessionState.FAILED,
+                        now=91.0,
+                        failure_code=failure_code,
+                        **evidence,
+                    )
+                    self._assert_create_claim_blocked(blocker)
+        finally:
+            self.database_path = original_path
+
+    def test_typed_newer_revision_proof_lifts_only_the_matching_blocker(self):
+        sessions = repository.SessionRepository(self.database_path)
+        target = make_confirming_session()
+        api_remediated = CloudSession.new(
+            "api-blocker-key",
+            session_id="api-blocker-session",
+            now=80.0,
+            state=SessionState.FAILED,
+        ).transition(
+            SessionState.FAILED,
+            now=90.0,
+            failure_code="api_key_rejected",
+            create_settings_revision=(
+                "11111111-1111-4111-8111-111111111111"
+            ),
+            remediation_verified_at=90.0,
+            remediation_revision=(
+                "22222222-2222-4222-8222-222222222222"
+            ),
+        )
+        configuration_blocked = CloudSession.new(
+            "configuration-blocker-key",
+            session_id="configuration-blocker-session",
+            now=80.0,
+            state=SessionState.FAILED,
+        ).transition(
+            SessionState.FAILED,
+            now=90.0,
+            failure_code="configuration_rejected",
+            create_configuration_revision="typed-env-object-v1",
+        )
+        for candidate in (target, api_remediated, configuration_blocked):
+            sessions.create_or_get(candidate)
+
+        with self.assertRaises(repository.PaidRentalConflict):
+            sessions.claim_create_intent(
+                target.session_id,
+                now=110.0,
+                provider_token="a" * 64,
+                session_secret_hex="b" * 64,
+            )
+
+        configuration_blocked = sessions.get(
+            configuration_blocked.session_id
+        )
+        sessions.save(
+            configuration_blocked.transition(
+                SessionState.FAILED,
+                now=111.0,
+                remediation_verified_at=111.0,
+                remediation_revision="typed-env-object-v2",
+            )
+        )
+        target = sessions.get(target.session_id)
+        sessions.save(
+            target.transition(SessionState.CONFIRMING, now=112.0)
+        )
+
+        claimed = sessions.claim_create_intent(
+            target.session_id,
+            now=113.0,
+            provider_token="c" * 64,
+            session_secret_hex="d" * 64,
+        )
+
+        self.assertEqual(claimed.state, SessionState.CREATING)
+        self.assertEqual(claimed.provider_token, "c" * 64)
+        self.assertEqual(claimed.session_secret_hex, "d" * 64)
+
+    def test_concurrent_atomic_create_claims_select_exactly_one_session(self):
+        sessions = repository.SessionRepository(self.database_path)
+        first = make_confirming_session(
+            key="first-claim-key",
+            session_id="first-claim-session",
+        )
+        second = make_confirming_session(
+            key="second-claim-key",
+            session_id="second-claim-session",
+        )
+        sessions.create_or_get(first)
+        sessions.create_or_get(second)
+
+        def claim(candidate):
+            try:
+                return sessions.claim_create_intent(
+                    candidate.session_id,
+                    now=110.0,
+                    provider_token=(
+                        "a" * 64
+                        if candidate is first
+                        else "c" * 64
+                    ),
+                    session_secret_hex=(
+                        "b" * 64
+                        if candidate is first
+                        else "d" * 64
+                    ),
+                )
+            except repository.PaidRentalConflict as error:
+                return error
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(claim, (first, second)))
+
+        self.assertEqual(
+            sum(isinstance(item, CloudSession) for item in results),
+            1,
+        )
+        self.assertEqual(
+            sum(
+                isinstance(item, repository.PaidRentalConflict)
+                for item in results
+            ),
+            1,
+        )
+        self.assertEqual(
+            {session.state for session in sessions.list_all()},
+            {SessionState.OFFER_SELECTED, SessionState.CREATING},
         )
 
     def test_legacy_attempt_is_migrated_without_losing_billing_identity(self):
@@ -288,7 +551,7 @@ class SessionRepositoryTests(unittest.TestCase):
             ("output-2",),
         )
         self.assertIsNone(repeated)
-        with sessions._connect() as connection:
+        with closing(sessions._connect()) as connection:
             rows = connection.execute(
                 "SELECT token_digest FROM destroy_reviews"
             ).fetchall()
@@ -417,7 +680,7 @@ class SessionRepositoryTests(unittest.TestCase):
         legacy_quote = make_attempt().quote.to_record()
         legacy_quote.pop("execution_baseline_digest")
         legacy_quote.pop("randomized_seed_node_ids")
-        with sqlite3.connect(self.database_path) as connection:
+        with closing(sqlite3.connect(self.database_path)) as connection:
             connection.execute(
                 "CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
             )
@@ -474,10 +737,11 @@ class SessionRepositoryTests(unittest.TestCase):
                     100.0,
                 ),
             )
+            connection.commit()
 
         sessions = repository.SessionRepository(self.database_path)
         migrated = sessions.get("legacy-session")
-        with sessions._connect() as connection:
+        with closing(sessions._connect()) as connection:
             version = connection.execute(
                 "SELECT value FROM schema_meta WHERE key = 'schema_version'"
             ).fetchone()[0]
@@ -488,7 +752,7 @@ class SessionRepositoryTests(unittest.TestCase):
                 ).fetchall()
             }
 
-        self.assertEqual(version, "6")
+        self.assertEqual(version, "7")
         self.assertEqual(migrated.failure_code, None)
         self.assertEqual(migrated.create_empty_observations, 0)
         self.assertIsNone(migrated.create_first_empty_at)
@@ -644,7 +908,7 @@ class SessionRepositoryTests(unittest.TestCase):
     def test_randomized_seed_storage_rejects_non_array_json(self):
         sessions = repository.SessionRepository(self.database_path)
         saved, _created = sessions.create_or_get(make_session())
-        with sessions._connect() as connection:
+        with closing(sessions._connect()) as connection:
             connection.execute(
                 """
                 UPDATE sessions

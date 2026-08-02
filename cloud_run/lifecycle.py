@@ -1,18 +1,12 @@
-"""Billing-safe cancellation, readiness, recovery, and one replacement."""
+"""Billing-safe cancellation, readiness, and recovery."""
 
 from __future__ import annotations
 
 import asyncio
-import secrets
 import time
 
 from .constants import COMFYUI_CONTAINER_PORT, DEFAULT_DISK_GB
-from .models import AttemptState, OfferQuote, SessionState
-from .offers import (
-    apply_offer_policy,
-    offer_meets_connection_quality_policy,
-    select_best_offer,
-)
+from .models import AttemptState, SessionState
 from .session_service import TerminalProvisioningError
 from .worker_protocol import is_boundary_token
 from .worker_release import WorkerRelease
@@ -21,11 +15,6 @@ from . import vast
 
 DEFAULT_POLL_INTERVAL_SECONDS = 5
 DEFAULT_BOOT_DEADLINE_SECONDS = 15 * 60
-RETRYABLE_START_FAILURES = {
-    "boot_timeout",
-    "healthcheck_failure",
-    "transport_failure",
-}
 _WATCHDOGS = {}
 _SESSION_WATCHDOGS = {}
 
@@ -470,7 +459,7 @@ class CloudRunLifecycle:
         task.add_done_callback(finished)
         return task
 
-    async def _destroy_for_replacement(self, attempt):
+    async def _destroy_failed_attempt(self, attempt):
         _settings, api_key = self._api_key()
         instance_id = attempt.instance_id
         if not instance_id:
@@ -497,12 +486,12 @@ class CloudRunLifecycle:
                 ready_url=None,
             )
         if instance_id:
-            destroyed = await self.provider.destroy_instance(
-                api_key,
-                instance_id,
-            )
-            if not destroyed:
-                return attempt, False
+            try:
+                await self.provider.destroy_instance(api_key, instance_id)
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                raise
+            except Exception:
+                pass
         absent = await self._verified_absent(
             api_key,
             attempt,
@@ -511,18 +500,17 @@ class CloudRunLifecycle:
         return attempt, absent
 
     async def handle_start_failure(self, attempt_id, *, failure_code):
+        del failure_code
+        diagnostic = "The managed instance did not become ready."
         attempt = self._attempt(attempt_id)
         if attempt.state != AttemptState.FAILED:
             attempt = self.repository.transition(
                 attempt.attempt_id,
                 AttemptState.FAILED,
                 now=float(self.clock()),
-                sanitized_error="The managed instance did not become ready.",
+                sanitized_error=diagnostic,
             )
-        if failure_code not in RETRYABLE_START_FAILURES:
-            return attempt
-
-        attempt, absent = await self._destroy_for_replacement(attempt)
+        attempt, absent = await self._destroy_failed_attempt(attempt)
         if not absent:
             return self.repository.transition(
                 attempt.attempt_id,
@@ -533,177 +521,15 @@ class CloudRunLifecycle:
                     "Vast console immediately."
                 ),
             )
-        if (
-            1 + attempt.retry_count
-            >= attempt.quote.max_instance_creates
-        ):
-            return self.repository.transition(
-                attempt.attempt_id,
-                AttemptState.FAILED,
-                now=float(self.clock()),
-                instance_id=None,
-                sanitized_error=(
-                    "The authorized total instance-create limit was reached."
-                ),
-            )
-
-        if self.blacklist is not None:
-            self.blacklist.add(
-                attempt.quote.to_record(),
-                reason=failure_code,
-                now=float(self.clock()),
-            )
-        attempt = self.repository.transition(
-            attempt.attempt_id,
-            AttemptState.RETRYING,
-            now=float(self.clock()),
-            retry_count=1,
-            instance_id=None,
-            residual_inventory=(),
-            ready_url=None,
-            sanitized_error=None,
-        )
-        settings, api_key = self._api_key()
-        if (
-            self.release is None
-            or not attempt.quote.reviewed_release_bound
-            or attempt.quote.template_hash_id
-            != self.release.template_hash_id
-            or attempt.quote.worker_commit != self.release.worker_commit
-            or attempt.quote.worker_archive_sha256
-            != self.release.worker_archive_sha256
-            or attempt.quote.protocol_version
-            != self.release.protocol_version
-        ):
-            return self.repository.transition(
-                attempt.attempt_id,
-                AttemptState.FAILED,
-                now=float(self.clock()),
-                sanitized_error=(
-                    "Reviewed worker release lock is unavailable."
-                ),
-            )
-        try:
-            offers = await self.provider.search_offers(
-                api_key,
-                max_price_per_hour=settings["max_price_per_hour"],
-                min_vram_gb=settings["min_vram_gb"],
-                disk_gb=attempt.quote.disk_gb,
-            )
-            eligible = apply_offer_policy(
-                [
-                    offer
-                    for offer in offers
-                    if float(offer.get("dph_total", float("inf")))
-                    <= attempt.quote.max_price_per_hour
-                    and offer_meets_connection_quality_policy(offer)
-                ],
-                blacklist=self.blacklist,
-                now=float(self.clock()),
-            )
-            selected = select_best_offer(
-                eligible,
-                requested_gpu=attempt.quote.gpu_name,
-            )
-        except Exception:
-            return self.repository.transition(
-                attempt.attempt_id,
-                AttemptState.FAILED,
-                now=float(self.clock()),
-                sanitized_error=(
-                    "No safe replacement offer is currently available."
-                ),
-            )
-
-        replacement_quote = OfferQuote(
-            offer_id=str(selected["offer_id"]),
-            gpu_name=str(selected["gpu_name"]),
-            gpu_ram_gb=float(selected["gpu_ram_gb"]),
-            dph_total=float(selected["dph_total"]),
-            reliability=(
-                float(selected["reliability"])
-                if selected.get("reliability") is not None
-                else None
-            ),
-            inet_down_mbps=selected.get("inet_down_mbps"),
-            disk_bw_mbps=selected.get("disk_bw_mbps"),
-            max_price_per_hour=attempt.quote.max_price_per_hour,
-            expires_at=float(self.clock()) + 120,
-            disk_gb=attempt.quote.disk_gb,
-            transfer_bytes=attempt.quote.transfer_bytes,
-            output_allowance_bytes=(
-                attempt.quote.output_allowance_bytes
-            ),
-            inet_down_cost=selected.get("inet_down_cost"),
-            inet_up_cost=selected.get("inet_up_cost"),
-            duration_seconds=attempt.quote.duration_seconds,
-            deadline_mode=attempt.quote.deadline_mode,
-            approximate_max_active_charge=(
-                float(selected["dph_total"])
-                * attempt.quote.duration_seconds
-                / 3600
-                if attempt.quote.duration_seconds is not None
-                else None
-            ),
-            template_hash_id=attempt.quote.template_hash_id,
-            worker_commit=attempt.quote.worker_commit,
-            worker_archive_sha256=(
-                attempt.quote.worker_archive_sha256
-            ),
-            protocol_version=attempt.quote.protocol_version,
-            manifest_digest=attempt.quote.manifest_digest,
-            machine_id=selected.get("machine_id"),
-            host_id=selected.get("host_id"),
-            public_ipaddr=selected.get("public_ipaddr"),
-            max_instance_creates=attempt.quote.max_instance_creates,
-        )
-        attempt = self.repository.transition(
-            attempt.attempt_id,
-            AttemptState.CREATING,
-            now=float(self.clock()),
-            quote=replacement_quote,
-            retry_count=1,
-            provider_token=secrets.token_hex(32),
-            residual_inventory=(),
-        )
-        try:
-            instance_id = await self.provider.create_instance(
-                api_key,
-                offer_id=replacement_quote.offer_id,
-                disk_gb=replacement_quote.disk_gb,
-                label=attempt.label,
-                release=self.release,
-                boundary_token=attempt.provider_token,
-                session_id=attempt.attempt_id,
-            )
-        except Exception:
-            inventory = await self._inventory(api_key)
-            matches = self._by_label(inventory, attempt.label)
-            if len(matches) > 1:
-                return self._fail_attempt_on_multiple_matches(
-                    attempt,
-                    matches,
-                )
-            if (
-                len(matches) != 1
-                or not matches[0].get("instance_id")
-            ):
-                return self.repository.transition(
-                    attempt.attempt_id,
-                    AttemptState.FAILED,
-                    now=float(self.clock()),
-                    sanitized_error=(
-                        "Replacement creation could not be confirmed."
-                    ),
-                )
-            instance_id = matches[0].get("instance_id")
         return self.repository.transition(
             attempt.attempt_id,
-            AttemptState.STARTING,
+            AttemptState.FAILED,
             now=float(self.clock()),
-            instance_id=str(instance_id),
+            instance_id=None,
+            provider_token=None,
             residual_inventory=(),
-            sanitized_error=None,
+            ready_url=None,
+            sanitized_error=diagnostic,
         )
 
     async def recover(self):
@@ -724,8 +550,83 @@ class CloudRunLifecycle:
         recovered = []
         for attempt in attempts:
             matches = self._by_label(managed, attempt.label)
+            known_id_matches = [
+                item
+                for item in inventory
+                if attempt.instance_id is not None
+                and str(item.get("instance_id"))
+                == str(attempt.instance_id)
+            ]
             current = attempt
-            if attempt.state == AttemptState.CREATING and len(matches) > 1:
+            if attempt.state == AttemptState.RETRYING:
+                diagnostic = (
+                    "Automatic Vast replacement is disabled. "
+                    "Start a new reviewed rental."
+                )
+                if len(matches) > 1:
+                    current = self._fail_attempt_on_multiple_matches(
+                        attempt,
+                        matches,
+                    )
+                elif len(matches) == 1:
+                    current = self.repository.transition(
+                        attempt.attempt_id,
+                        AttemptState.FAILED,
+                        now=float(self.clock()),
+                        instance_id=str(matches[0]["instance_id"]),
+                        sanitized_error=diagnostic,
+                    )
+                    current, absent = await self._destroy_failed_attempt(
+                        current
+                    )
+                    current = self.repository.transition(
+                        current.attempt_id,
+                        AttemptState.FAILED,
+                        now=float(self.clock()),
+                        instance_id=None if absent else current.instance_id,
+                        provider_token=None if absent else current.provider_token,
+                        residual_inventory=(
+                            () if absent else current.residual_inventory
+                        ),
+                        ready_url=None,
+                        sanitized_error=(
+                            diagnostic
+                            if absent
+                            else (
+                                "The Vast instance is still present; destroy "
+                                "it in the Vast console immediately."
+                            )
+                        ),
+                    )
+                elif known_id_matches:
+                    current = self.repository.transition(
+                        attempt.attempt_id,
+                        AttemptState.FAILED,
+                        now=float(self.clock()),
+                        instance_id=str(attempt.instance_id),
+                        residual_inventory=tuple(
+                            str(item.get("instance_id"))
+                            for item in known_id_matches
+                            if item.get("instance_id") is not None
+                        ),
+                        sanitized_error=(
+                            "The managed Vast instance identity no longer "
+                            "matches its attempt label. Destroy it in the "
+                            "Vast console immediately."
+                        ),
+                    )
+                else:
+                    current = self.repository.transition(
+                        attempt.attempt_id,
+                        AttemptState.FAILED,
+                        now=float(self.clock()),
+                        instance_id=None,
+                        provider_token=None,
+                        residual_inventory=(),
+                        ready_url=None,
+                        sanitized_error=diagnostic,
+                    )
+            elif attempt.state == AttemptState.CREATING and len(matches) > 1:
                 current = self._fail_attempt_on_multiple_matches(
                     attempt,
                     matches,
@@ -1300,18 +1201,16 @@ class CloudRunLifecycle:
         *,
         failure_code,
     ):
+        del failure_code
+        diagnostic = "The managed worker did not become ready."
         session = self._session(session_id)
         if session.state != SessionState.FAILED:
             session = self.session_repository.transition(
                 session.session_id,
                 SessionState.FAILED,
                 now=float(self.clock()),
-                sanitized_error=(
-                    "The managed worker did not become ready."
-                ),
+                sanitized_error=diagnostic,
             )
-        if failure_code not in RETRYABLE_START_FAILURES:
-            return session
         _settings, api_key = self._api_key()
         instance_id = session.instance_id
         session = self.session_repository.transition(
@@ -1323,22 +1222,14 @@ class CloudRunLifecycle:
         )
         if instance_id:
             try:
-                destroyed = await self.provider.destroy_instance(
+                await self.provider.destroy_instance(
                     api_key,
                     instance_id,
                 )
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                raise
             except Exception:
-                destroyed = False
-            if not destroyed:
-                return self.session_repository.transition(
-                    session.session_id,
-                    SessionState.FAILED,
-                    now=float(self.clock()),
-                    residual_inventory=(str(instance_id),),
-                    sanitized_error=(
-                        "The Vast instance could not be destroyed."
-                    ),
-                )
+                pass
         inventory = await self._inventory(api_key)
         absent = inventory is not None and not any(
             str(item.get("instance_id")) == str(instance_id)
@@ -1373,182 +1264,14 @@ class CloudRunLifecycle:
                     "the Vast console immediately."
                 ),
             )
-        if (
-            session.quote is not None
-            and 1 + session.retry_count
-            >= session.quote.max_instance_creates
-        ):
-            return self.session_repository.transition(
-                session.session_id,
-                SessionState.FAILED,
-                now=float(self.clock()),
-                instance_id=None,
-                residual_inventory=(),
-                sanitized_error=(
-                    "The authorized total instance-create limit was reached."
-                ),
-            )
-        if (
-            self.release is None
-            or session.quote is None
-            or session.quote.template_hash_id
-            != self.release.template_hash_id
-            or session.quote.worker_commit != self.release.worker_commit
-            or session.quote.worker_archive_sha256
-            != self.release.worker_archive_sha256
-            or session.quote.protocol_version
-            != self.release.protocol_version
-        ):
-            return self.session_repository.transition(
-                session.session_id,
-                SessionState.FAILED,
-                now=float(self.clock()),
-                instance_id=None,
-                sanitized_error=(
-                    "Reviewed worker release lock is unavailable."
-                ),
-            )
-        if self.blacklist is not None:
-            self.blacklist.add(
-                session.quote.to_record(),
-                reason=failure_code,
-                now=float(self.clock()),
-            )
-        settings, api_key = self._api_key()
-        try:
-            offers = await self.provider.search_offers(
-                api_key,
-                max_price_per_hour=settings["max_price_per_hour"],
-                min_vram_gb=settings["min_vram_gb"],
-                disk_gb=session.disk_gb,
-            )
-            eligible = apply_offer_policy(
-                [
-                    offer
-                    for offer in offers
-                    if float(offer.get("dph_total", float("inf")))
-                    <= session.quote.max_price_per_hour
-                    and offer_meets_connection_quality_policy(offer)
-                ],
-                blacklist=self.blacklist,
-                now=float(self.clock()),
-            )
-            selected = select_best_offer(
-                eligible,
-                requested_gpu=session.quote.gpu_name,
-            )
-        except Exception:
-            return self.session_repository.transition(
-                session.session_id,
-                SessionState.FAILED,
-                now=float(self.clock()),
-                instance_id=None,
-                sanitized_error=(
-                    "No safe replacement offer is currently available."
-                ),
-            )
-        replacement_quote = OfferQuote(
-            offer_id=str(selected["offer_id"]),
-            gpu_name=str(selected["gpu_name"]),
-            gpu_ram_gb=float(selected["gpu_ram_gb"]),
-            dph_total=float(selected["dph_total"]),
-            reliability=(
-                float(selected["reliability"])
-                if selected.get("reliability") is not None
-                else None
-            ),
-            inet_down_mbps=selected.get("inet_down_mbps"),
-            disk_bw_mbps=selected.get("disk_bw_mbps"),
-            max_price_per_hour=session.quote.max_price_per_hour,
-            expires_at=float(self.clock()) + 120,
-            disk_gb=session.quote.disk_gb,
-            transfer_bytes=session.quote.transfer_bytes,
-            output_allowance_bytes=(
-                session.quote.output_allowance_bytes
-            ),
-            inet_down_cost=selected.get("inet_down_cost"),
-            inet_up_cost=selected.get("inet_up_cost"),
-            duration_seconds=session.quote.duration_seconds,
-            deadline_mode=session.quote.deadline_mode,
-            approximate_max_active_charge=(
-                float(selected["dph_total"])
-                * session.quote.duration_seconds
-                / 3600
-                if session.quote.duration_seconds is not None
-                else None
-            ),
-            template_hash_id=session.quote.template_hash_id,
-            worker_commit=session.quote.worker_commit,
-            worker_archive_sha256=(
-                session.quote.worker_archive_sha256
-            ),
-            protocol_version=session.quote.protocol_version,
-            manifest_digest=session.quote.manifest_digest,
-            machine_id=selected.get("machine_id"),
-            host_id=selected.get("host_id"),
-            public_ipaddr=selected.get("public_ipaddr"),
-            max_instance_creates=session.quote.max_instance_creates,
-        )
-        session = self.session_repository.transition(
-            session.session_id,
-            SessionState.CREATING,
-            now=float(self.clock()),
-            quote=replacement_quote,
-            retry_count=1,
-            instance_id=None,
-            provider_token=secrets.token_hex(32),
-            residual_inventory=(),
-            sanitized_error=None,
-        )
-        try:
-            replacement_id = await self.provider.create_instance(
-                api_key,
-                offer_id=replacement_quote.offer_id,
-                disk_gb=replacement_quote.disk_gb,
-                label=session.label,
-                release=self.release,
-                boundary_token=session.provider_token,
-                session_id=session.session_id,
-            )
-        except Exception:
-            inventory = await self._inventory(api_key)
-            matches = self._session_matches(inventory, session.label)
-            if len(matches) == 1 and matches[0].get("instance_id"):
-                return self.session_repository.transition(
-                    session.session_id,
-                    SessionState.BOOTSTRAPPING,
-                    now=float(self.clock()),
-                    instance_id=str(matches[0]["instance_id"]),
-                    residual_inventory=(),
-                    sanitized_error=None,
-                )
-            if len(matches) > 1:
-                return self.session_repository.transition(
-                    session.session_id,
-                    SessionState.FAILED,
-                    now=float(self.clock()),
-                    instance_id=None,
-                    residual_inventory=tuple(
-                        str(item.get("instance_id"))
-                        for item in matches
-                        if item.get("instance_id") is not None
-                    ),
-                    sanitized_error=(
-                        "Multiple managed Vast instances match this session."
-                    ),
-                )
-            return self.session_repository.transition(
-                session.session_id,
-                SessionState.FAILED,
-                now=float(self.clock()),
-                sanitized_error=(
-                    "Replacement creation could not be confirmed."
-                ),
-            )
         return self.session_repository.transition(
             session.session_id,
-            SessionState.BOOTSTRAPPING,
+            SessionState.FAILED,
             now=float(self.clock()),
-            instance_id=str(replacement_id),
-            sanitized_error=None,
+            instance_id=None,
+            worker_base_url=None,
+            provider_token=None,
+            session_secret_hex=None,
+            residual_inventory=(),
+            sanitized_error=diagnostic,
         )

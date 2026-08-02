@@ -87,6 +87,7 @@ class ArtifactVerificationError(RelayError):
 class RelayArtifactResult:
     job_id: str
     artifact_id: str
+    node_id: str
     state: TransferState
     local_path: Path
     size_bytes: int
@@ -97,6 +98,7 @@ class RelayArtifactResult:
         return {
             "job_id": self.job_id,
             "artifact_id": self.artifact_id,
+            "node_id": self.node_id,
             "state": self.state.value,
             "size_bytes": self.size_bytes,
             "sha256": self.sha256,
@@ -239,7 +241,7 @@ def _fsync_directory(path):
             os.close(descriptor)
 
 
-def _hash_path(path, *, maximum):
+def _hash_path_identity(path, *, maximum):
     descriptor = None
     try:
         flags = os.O_RDONLY
@@ -273,11 +275,17 @@ def _hash_path(path, *, maximum):
             or after.st_size != metadata.st_size
             or after.st_mtime_ns != metadata.st_mtime_ns
             or after.st_ino != metadata.st_ino
+            or after.st_dev != metadata.st_dev
         ):
             raise ArtifactVerificationError(
                 "Local artifact verification failed."
             )
-        return size, digest.hexdigest()
+        return (
+            size,
+            digest.hexdigest(),
+            metadata.st_dev,
+            metadata.st_ino,
+        )
     except ArtifactVerificationError:
         raise
     except OSError:
@@ -287,6 +295,14 @@ def _hash_path(path, *, maximum):
     finally:
         if descriptor is not None:
             os.close(descriptor)
+
+
+def _hash_path(path, *, maximum):
+    size, digest, _device, _inode = _hash_path_identity(
+        path,
+        maximum=maximum,
+    )
+    return size, digest
 
 
 def _validated_output(descriptor):
@@ -729,6 +745,7 @@ class LocalRelay:
             existing.expected_size != output["size_bytes"]
             or existing.sha256 != output["sha256"]
             or existing.direction != "download"
+            or existing.source_node_id not in {None, output["node_id"]}
         ):
             raise ArtifactVerificationError(
                 "Remote output identity changed."
@@ -747,7 +764,20 @@ class LocalRelay:
                 raise ArtifactVerificationError(
                     "Local output verification failed."
                 ) from None
-            size, current_digest = _hash_path(
+            if (
+                existing.source_node_id != output["node_id"]
+                or existing.published_device is None
+                or existing.published_inode is None
+            ):
+                raise ArtifactVerificationError(
+                    "Local output verification failed."
+                )
+            (
+                size,
+                current_digest,
+                current_device,
+                current_inode,
+            ) = _hash_path_identity(
                 published,
                 maximum=output["size_bytes"],
             )
@@ -757,6 +787,8 @@ class LocalRelay:
                     current_digest,
                     output["sha256"],
                 )
+                or current_device != existing.published_device
+                or current_inode != existing.published_inode
             ):
                 raise ArtifactVerificationError(
                     "Local output verification failed."
@@ -764,6 +796,7 @@ class LocalRelay:
             return RelayArtifactResult(
                 job_id=job_id,
                 artifact_id=artifact_id,
+                node_id=output["node_id"],
                 state=TransferState.VERIFIED,
                 local_path=published,
                 size_bytes=output["size_bytes"],
@@ -793,6 +826,7 @@ class LocalRelay:
                 else TransferState.TRANSFERRING
             ),
             private_path=str(part),
+            source_node_id=output["node_id"],
         )
         file_descriptor = None
         current = offset
@@ -828,6 +862,7 @@ class LocalRelay:
                         offset=current,
                         state=TransferState.TRANSFERRING,
                         private_path=str(part),
+                        source_node_id=output["node_id"],
                     )
 
                 receipt = await self.worker.download_artifact(
@@ -873,6 +908,25 @@ class LocalRelay:
                 expected_size=output["size_bytes"],
                 sha256=output["sha256"],
             )
+            (
+                published_size,
+                published_digest,
+                published_device,
+                published_inode,
+            ) = _hash_path_identity(
+                published,
+                maximum=output["size_bytes"],
+            )
+            if (
+                published_size != output["size_bytes"]
+                or not hmac.compare_digest(
+                    published_digest,
+                    output["sha256"],
+                )
+            ):
+                raise ArtifactVerificationError(
+                    "Local output verification failed."
+                )
             self.repository.save_transfer(
                 job_id=job_id,
                 artifact_id=artifact_id,
@@ -882,10 +936,14 @@ class LocalRelay:
                 offset=output["size_bytes"],
                 state=TransferState.VERIFIED,
                 private_path=str(published),
+                source_node_id=output["node_id"],
+                published_device=published_device,
+                published_inode=published_inode,
             )
             return RelayArtifactResult(
                 job_id=job_id,
                 artifact_id=artifact_id,
+                node_id=output["node_id"],
                 state=TransferState.VERIFIED,
                 local_path=published,
                 size_bytes=output["size_bytes"],
@@ -918,6 +976,7 @@ class LocalRelay:
                 offset=actual,
                 state=TransferState.FAILED,
                 private_path=str(part),
+                source_node_id=output["node_id"],
             )
             raise
         except (WorkerClientError, OSError, ValueError):
@@ -933,6 +992,7 @@ class LocalRelay:
                 offset=current,
                 state=TransferState.FAILED,
                 private_path=str(part),
+                source_node_id=output["node_id"],
             )
             raise ArtifactVerificationError(
                 "Remote output transfer failed."
@@ -950,6 +1010,7 @@ class LocalRelay:
                 offset=current,
                 state=TransferState.FAILED,
                 private_path=str(part),
+                source_node_id=output["node_id"],
             )
             raise ArtifactVerificationError(
                 "Remote output transfer failed."
@@ -1271,7 +1332,15 @@ class LocalRelay:
         if not _identifier(artifact_id):
             raise _relay_error()
         transfer = self.repository.get_transfer(job_id, artifact_id)
-        if transfer is None or transfer.state != TransferState.VERIFIED:
+        if (
+            transfer is None
+            or transfer.state != TransferState.VERIFIED
+            or transfer.direction != "download"
+            or transfer.artifact_id.startswith("preview:")
+            or transfer.source_node_id is None
+            or transfer.published_device is None
+            or transfer.published_inode is None
+        ):
             raise _relay_error("Local output was not found.")
         path = Path(transfer.private_path)
         try:
@@ -1280,10 +1349,15 @@ class LocalRelay:
             raise ArtifactVerificationError(
                 "Local output verification failed."
             ) from None
-        size, digest = _hash_path(path, maximum=MAX_OUTPUT_BYTES)
+        size, digest, device, inode = _hash_path_identity(
+            path,
+            maximum=MAX_OUTPUT_BYTES,
+        )
         if (
             size != transfer.expected_size
             or not hmac.compare_digest(digest, transfer.sha256)
+            or device != transfer.published_device
+            or inode != transfer.published_inode
         ):
             raise ArtifactVerificationError(
                 "Local output verification failed."

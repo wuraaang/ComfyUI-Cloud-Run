@@ -82,7 +82,7 @@ LEGACY_SESSION_STATES = {
     "starting": SessionState.BOOTSTRAPPING,
     "cancel_requested": SessionState.DESTROY_REQUESTED,
     "destroying": SessionState.DESTROYING,
-    "retrying": SessionState.CREATING,
+    "retrying": SessionState.FAILED,
     "ready": SessionState.READY,
     "cancelled": SessionState.DESTROYED,
     "failed": SessionState.FAILED,
@@ -166,14 +166,12 @@ SESSION_TRANSITIONS = {
     },
     SessionState.DESTROYING: {
         SessionState.DESTROYED,
-        SessionState.CREATING,
         SessionState.FAILED,
     },
     SessionState.FAILED: {
         SessionState.REPAIRING,
         SessionState.DESTROY_REQUESTED,
         SessionState.DESTROYING,
-        SessionState.CREATING,
     },
     SessionState.DESTROYED: set(),
 }
@@ -227,10 +225,8 @@ _TRANSITIONS = {
     AttemptState.DESTROYING: {
         AttemptState.CANCELLED,
         AttemptState.FAILED,
-        AttemptState.RETRYING,
     },
     AttemptState.RETRYING: {
-        AttemptState.CREATING,
         AttemptState.CANCEL_REQUESTED,
         AttemptState.FAILED,
     },
@@ -239,7 +235,6 @@ _TRANSITIONS = {
         AttemptState.FAILED,
     },
     AttemptState.FAILED: {
-        AttemptState.RETRYING,
         AttemptState.DESTROYING,
         AttemptState.CANCELLED,
     },

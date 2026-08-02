@@ -1,7 +1,7 @@
 """Complete offline certification of one reusable paid-session contract."""
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 from pathlib import Path
@@ -11,6 +11,7 @@ import unittest
 import uuid
 
 from cloud_run.artifacts import ArtifactResolution, FileInputMetadata
+from cloud_run.capture import certified_execution_baseline
 from cloud_run.dependency_repository import (
     DependencyRepository,
     MappingValidationError,
@@ -42,7 +43,13 @@ def native_capture(*, model, input_name, seed, custom_revision=None):
     workflow_nodes = [
         {"id": 1, "type": "CheckpointLoaderSimple"},
         {"id": 2, "type": "LoadImage"},
-        {"id": 3, "type": "KSampler"},
+        {
+            "id": 3,
+            "type": "KSampler",
+            "mode": 0,
+            "properties": {"cnr_id": "comfy-core"},
+            "widgets_values": [seed, "randomize"],
+        },
     ]
     output = {
         "1": {
@@ -1523,9 +1530,17 @@ class FakeReusableSessionIntegrationTests(unittest.TestCase):
         second_capture = system.capture(
             native_capture(
                 model="model-a",
-                input_name="input-b.jpg",
+                input_name="input-a.jpg",
                 seed=12,
             )
+        )
+        first_baseline = certified_execution_baseline(first_capture)
+        second_baseline = certified_execution_baseline(second_capture)
+        self.assertEqual(first_baseline, second_baseline)
+        self.assertEqual(first_baseline[1], ("3",))
+        self.assertNotEqual(
+            first_capture.prompt_digest,
+            second_capture.prompt_digest,
         )
         second = system.run_job(session, second_capture, "job-key-2")
         self.assertEqual(second.state, JobState.SUCCEEDED)
@@ -1533,7 +1548,6 @@ class FakeReusableSessionIntegrationTests(unittest.TestCase):
         self.assertEqual(system.vast.create_count, 1)
         self.assertEqual(system.worker.download_count("model-a"), 1)
         self.assertEqual(system.worker.download_count("input-a.jpg"), 1)
-        self.assertEqual(system.worker.download_count("input-b.jpg"), 1)
         self.assertEqual(system.local_prompt_posts, [])
 
         review = system.review_destroy(session)
@@ -1542,7 +1556,7 @@ class FakeReusableSessionIntegrationTests(unittest.TestCase):
         self.assertEqual(system.vast.inventory, [])
         self.assertEqual(system.local_prompt_posts, [])
 
-    def test_duplicate_confirmation_job_and_compatible_artifact_delta_are_idempotent(self):
+    def test_duplicate_calls_are_idempotent_but_model_and_input_changes_are_rejected(self):
         system = FakeCloudRunSystem()
         self.addCleanup(system.close)
         first_capture = system.capture(
@@ -1570,27 +1584,45 @@ class FakeReusableSessionIntegrationTests(unittest.TestCase):
             first_capture,
             "same-job-key",
         )
-        delta_capture = system.capture(
-            native_capture(
-                model="model-b",
-                input_name="input-b.jpg",
-                seed=12,
-            )
+        changed_captures = (
+            (
+                "changed-model-key",
+                system.capture(
+                    native_capture(
+                        model="model-b",
+                        input_name="input-a.jpg",
+                        seed=12,
+                    )
+                ),
+            ),
+            (
+                "changed-input-key",
+                system.capture(
+                    native_capture(
+                        model="model-a",
+                        input_name="input-b.jpg",
+                        seed=12,
+                    )
+                ),
+            ),
         )
-        delta = system.run_job(session, delta_capture, "delta-job-key")
+        for key, changed_capture in changed_captures:
+            with self.subTest(key=key):
+                with self.assertRaises(IncompatibleSession):
+                    system.run_job(session, changed_capture, key)
 
         self.assertEqual(duplicate_session.session_id, session.session_id)
         self.assertEqual(duplicate_job.job_id, first.job_id)
-        self.assertEqual(delta.state, JobState.SUCCEEDED)
         self.assertEqual(system.vast.create_count, 1)
-        self.assertEqual(len(system.worker.job_calls), 2)
+        self.assertEqual(len(system.worker.job_calls), 1)
+        self.assertEqual(len(system.jobs.list_jobs(session.session_id)), 1)
         self.assertEqual(system.worker.download_count("model-a"), 1)
         self.assertEqual(system.worker.download_count("input-a.jpg"), 1)
-        self.assertEqual(system.worker.download_count("model-b"), 1)
-        self.assertEqual(system.worker.download_count("input-b.jpg"), 1)
+        self.assertEqual(system.worker.download_count("model-b"), 0)
+        self.assertEqual(system.worker.download_count("input-b.jpg"), 0)
         self.assertEqual(system.worker.planned_restart_count, 0)
 
-    def test_custom_node_delta_restarts_once_and_changed_revision_requires_new_session(self):
+    def test_same_custom_node_canvas_allows_seed_change_but_revision_change_is_rejected(self):
         system = FakeCloudRunSystem()
         self.addCleanup(system.close)
         first_capture = system.capture(
@@ -1598,6 +1630,7 @@ class FakeReusableSessionIntegrationTests(unittest.TestCase):
                 model="model-a",
                 input_name="input-a.jpg",
                 seed=11,
+                custom_revision="c" * 40,
             )
         )
         session = system.quote_confirm_and_ready(
@@ -1606,7 +1639,7 @@ class FakeReusableSessionIntegrationTests(unittest.TestCase):
             idempotency_key="session-key",
             duration_seconds=7200,
         )
-        compatible = system.capture(
+        same_canvas = system.capture(
             native_capture(
                 model="model-a",
                 input_name="input-a.jpg",
@@ -1614,10 +1647,14 @@ class FakeReusableSessionIntegrationTests(unittest.TestCase):
                 custom_revision="c" * 40,
             )
         )
-        job = system.run_job(session, compatible, "custom-node-key")
+        restart_count = system.worker.planned_restart_count
+        job = system.run_job(session, same_canvas, "custom-node-key")
 
         self.assertEqual(job.state, JobState.SUCCEEDED)
-        self.assertEqual(system.worker.planned_restart_count, 1)
+        self.assertEqual(
+            system.worker.planned_restart_count,
+            restart_count,
+        )
         self.assertEqual(system.vast.create_count, 1)
 
         incompatible = system.capture(
@@ -1630,7 +1667,11 @@ class FakeReusableSessionIntegrationTests(unittest.TestCase):
         )
         with self.assertRaises(IncompatibleSession):
             system.run_job(session, incompatible, "changed-revision-key")
-        self.assertEqual(system.worker.planned_restart_count, 1)
+        self.assertEqual(
+            system.worker.planned_restart_count,
+            restart_count,
+        )
+        self.assertEqual(len(system.worker.job_calls), 1)
         self.assertEqual(system.vast.create_count, 1)
 
     def test_one_repair_is_bounded_and_ten_minute_stall_fails_closed(self):
@@ -1819,7 +1860,7 @@ class FakeReusableSessionIntegrationTests(unittest.TestCase):
         self.assertEqual(failed.residual_inventory, (session.instance_id,))
         self.assertEqual(len(system.vast.inventory), 1)
 
-    def test_boot_replacement_occurs_once_and_only_after_verified_absence(self):
+    def test_boot_failure_never_issues_a_second_paid_create(self):
         system = FakeCloudRunSystem()
         self.addCleanup(system.close)
         capture = system.capture(
@@ -1834,32 +1875,28 @@ class FakeReusableSessionIntegrationTests(unittest.TestCase):
             offer_id="42",
             idempotency_key="replacement-session-key",
             duration_seconds=7200,
-            max_instance_creates=2,
+        )
+        session = system.sessions.transition(
+            session.session_id,
+            session.state,
+            now=system.clock(),
+            quote=replace(session.quote, max_instance_creates=2),
         )
 
-        replacement = system.fail_boot(session)
+        failed = system.fail_boot(session)
 
-        self.assertEqual(replacement.state, SessionState.BOOTSTRAPPING)
-        self.assertEqual(replacement.retry_count, 1)
-        self.assertEqual(replacement.quote.max_instance_creates, 2)
-        self.assertEqual(system.vast.create_count, 2)
+        self.assertEqual(failed.state, SessionState.FAILED)
+        self.assertEqual(failed.retry_count, 0)
+        self.assertEqual(failed.quote.max_instance_creates, 2)
+        self.assertIsNone(failed.instance_id)
+        self.assertIsNone(failed.provider_token)
+        self.assertIsNone(failed.session_secret_hex)
+        self.assertEqual(system.vast.create_count, 1)
         self.assertEqual(system.vast.destroy_count, 1)
         self.assertEqual(
             [kind for kind, _identifier in system.vast.mutations],
-            ["create", "destroy", "create"],
+            ["create", "destroy"],
         )
-        self.assertEqual(len(system.vast.inventory), 1)
-
-        exhausted = system.fail_boot(replacement)
-
-        self.assertEqual(exhausted.state, SessionState.FAILED)
-        self.assertEqual(exhausted.retry_count, 1)
-        self.assertEqual(
-            exhausted.sanitized_error,
-            "The authorized total instance-create limit was reached.",
-        )
-        self.assertEqual(system.vast.create_count, 2)
-        self.assertEqual(system.vast.destroy_count, 2)
         self.assertEqual(system.vast.inventory, [])
 
     def test_no_limit_requires_explicit_acknowledgement_and_worker_sync(self):

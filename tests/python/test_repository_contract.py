@@ -38,8 +38,11 @@ class RepositoryContractTests(unittest.TestCase):
             "scripts/build_worker_release_bundle.py",
             "scripts/publish_worker_template.py",
             "scripts/render_worker_template.py",
+            "scripts/run_with_comfyui_python.sh",
             "scripts/validate_gold_output.py",
+            "scripts/validate_smoke_output.py",
             "scripts/write_worker_release_lock.py",
+            "tests/fixtures/cloud-run-core-output-smoke.json",
             "remote_worker/bootstrap.py",
             "remote_worker/gateway.py",
             "docs/remote-worker-bootstrap-review.md",
@@ -159,6 +162,7 @@ class RepositoryContractTests(unittest.TestCase):
             '("remote_worker/gateway.py", "subprocess.Popen")',
             "secret_patterns",
             'Path("tests/fixtures/native-model-metadata-workflow.json")',
+            'Path("tests/fixtures/cloud-run-core-output-smoke.json")',
         ):
             with self.subTest(text=required_text):
                 self.assertIn(required_text, gate)

@@ -3,6 +3,7 @@ set -eu
 
 script_directory=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repository_root=$(CDPATH= cd -- "$script_directory/.." && pwd)
+comfyui_python_runner="$script_directory/run_with_comfyui_python.sh"
 cd "$repository_root"
 
 python_command=${PYTHON_COMMAND:-python3}
@@ -16,27 +17,8 @@ command -v "$node_command" >/dev/null 2>&1 || {
   echo "[check] Node command not found" >&2
   exit 1
 }
-
-gold_python_command=${COMFYUI_PYTHON_COMMAND:-}
-if [ -z "$gold_python_command" ] && \
-  "$python_command" -c 'import PIL' >/dev/null 2>&1; then
-  gold_python_command=$python_command
-fi
-if [ -z "$gold_python_command" ] && [ -n "${HOME:-}" ]; then
-  for comfy_python_candidate in \
-    "$HOME/ComfyUI-Installs/ComfyUI/standalone-env/bin/python3.13" \
-    "$HOME/ComfyUI-Installs/ComfyUI/standalone-env/bin/python3"
-  do
-    if [ -x "$comfy_python_candidate" ] && \
-      "$comfy_python_candidate" -c 'import PIL' >/dev/null 2>&1; then
-      gold_python_command=$comfy_python_candidate
-      break
-    fi
-  done
-fi
-if [ -z "$gold_python_command" ] || \
-  ! "$gold_python_command" -c 'import PIL' >/dev/null 2>&1; then
-  echo "[check] ComfyUI Python with Pillow not found; set COMFYUI_PYTHON_COMMAND" >&2
+if [ ! -x "$comfyui_python_runner" ]; then
+  echo "[check] shared ComfyUI Python runner is unavailable" >&2
   exit 1
 fi
 
@@ -128,8 +110,10 @@ with tempfile.TemporaryDirectory() as temporary_directory:
 PY
 
 echo "[check] synthetic Gold validator"
-PYTHONDONTWRITEBYTECODE=1 "$gold_python_command" -W error -m unittest \
-  tests.python.test_gold_output_validation -v
+PYTHONDONTWRITEBYTECODE=1 "$comfyui_python_runner" \
+  -W error -m unittest \
+  tests.python.test_gold_output_validation \
+  tests.python.test_smoke_output_validation -v
 
 echo "[check] Node tests"
 "$node_command" --test tests/js/*.test.mjs
@@ -347,6 +331,7 @@ expected_session_states = {
     "offer_selected",
     "confirming",
     "creating",
+    "reconciling_create",
     "bootstrapping",
     "provisioning",
     "validating",
@@ -677,6 +662,7 @@ allowed_suffixes = {
 allowed_json = {
     Path("package.json"),
     Path("remote_worker/template-policy.json"),
+    Path("tests/fixtures/cloud-run-core-output-smoke.json"),
     Path("tests/fixtures/native-model-metadata-workflow.json"),
 }
 forbidden_suffixes = {

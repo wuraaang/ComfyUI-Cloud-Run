@@ -30,6 +30,16 @@ class ConcurrentSessionUpdate(RuntimeError):
     pass
 
 
+class PaidRentalConflict(RuntimeError):
+    """A static refusal while another paid rental may still exist."""
+
+    def __init__(self):
+        super().__init__(
+            "Another Cloud Run rental is active or unresolved. "
+            "Do not start another rental yet."
+        )
+
+
 _COLUMNS = """
     attempt_id, idempotency_key, label, state, quote_json, instance_id,
     residual_inventory_json, ready_url, provider_token, retry_count,
@@ -242,10 +252,28 @@ def _initialize_database(path):
                     offset INTEGER NOT NULL,
                     state TEXT NOT NULL,
                     private_path TEXT NOT NULL,
+                    source_node_id TEXT,
+                    published_device INTEGER,
+                    published_inode INTEGER,
                     PRIMARY KEY(job_id, artifact_id)
                 )
                 """
             )
+            transfer_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(transfers)"
+                ).fetchall()
+            }
+            for name, declaration in (
+                ("source_node_id", "TEXT"),
+                ("published_device", "INTEGER"),
+                ("published_inode", "INTEGER"),
+            ):
+                if name not in transfer_columns:
+                    connection.execute(
+                        f"ALTER TABLE transfers ADD COLUMN {name} {declaration}"
+                    )
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS provision_transactions (
@@ -353,7 +381,7 @@ def _initialize_database(path):
             _migrate_legacy_attempts(connection)
             connection.execute(
                 """
-                INSERT INTO schema_meta(key, value) VALUES('schema_version', '6')
+                INSERT INTO schema_meta(key, value) VALUES('schema_version', '7')
                 ON CONFLICT(key) DO UPDATE SET value = excluded.value
                 """
             )
@@ -1176,6 +1204,83 @@ class SessionRepository:
             ).fetchone()
             connection.commit()
         return self._row_to_session(saved_row)
+
+    def claim_create_intent(
+        self,
+        session_id,
+        *,
+        now,
+        provider_token,
+        session_secret_hex,
+    ):
+        """Atomically serialize the boundary immediately before Vast PUT."""
+        identifier = str(session_id)
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                f"""
+                SELECT {_SESSION_COLUMNS}
+                FROM sessions
+                WHERE session_id = ?
+                """,
+                (identifier,),
+            ).fetchone()
+            if row is None:
+                connection.rollback()
+                raise KeyError(identifier)
+            target = self._row_to_session(row)
+            if target.state != SessionState.CONFIRMING:
+                connection.rollback()
+                raise ConcurrentSessionUpdate(
+                    "The session is not awaiting a paid create claim."
+                )
+
+            other_rows = connection.execute(
+                f"""
+                SELECT {_SESSION_COLUMNS}
+                FROM sessions
+                WHERE session_id != ?
+                """,
+                (identifier,),
+            ).fetchall()
+            conflict = any(
+                other.rental_outcome in {"unknown", "active"}
+                or other.instance_id is not None
+                or bool(other.residual_inventory)
+                or other.blocks_new_rental
+                for other in (
+                    self._row_to_session(other_row)
+                    for other_row in other_rows
+                )
+            )
+            if conflict:
+                offered = target.transition(
+                    SessionState.OFFER_SELECTED,
+                    now=now,
+                    sanitized_error=None,
+                )
+                try:
+                    self._save_in_transaction(connection, offered)
+                except Exception:
+                    connection.rollback()
+                    raise
+                connection.commit()
+                raise PaidRentalConflict()
+
+            creating = target.transition(
+                SessionState.CREATING,
+                now=now,
+                provider_token=provider_token,
+                session_secret_hex=session_secret_hex,
+                sanitized_error=None,
+            )
+            try:
+                saved = self._save_in_transaction(connection, creating)
+            except Exception:
+                connection.rollback()
+                raise
+            connection.commit()
+        return saved
 
     def save_destroy_review(
         self,

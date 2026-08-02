@@ -628,7 +628,7 @@ class RecoveryAndReplacementTests(LifecycleTestCase):
             {"attempt-" + str(index) for index in range(len(states))},
         )
 
-    def test_transient_failure_replaces_once_after_verified_destroy_and_blacklist(self):
+    def test_attempt_boot_failure_with_historical_limit_two_never_searches_or_creates(self):
         attempt = self.save_attempt(
             AttemptState.STARTING,
             instance_id="instance-1",
@@ -639,198 +639,28 @@ class RecoveryAndReplacementTests(LifecycleTestCase):
         ]
         self.provider.search_results = [
             {
-                "offer_id": 42,
+                "offer_id": 43,
                 "gpu_name": "RTX 4090",
                 "gpu_ram_gb": 24.0,
-                "dph_total": 0.42,
+                "dph_total": 0.44,
                 "reliability": 0.99,
-                "machine_id": "machine-7",
-                "host_id": "host-3",
-                "public_ipaddr": "8.8.8.8",
-            },
-            {
-                "offer_id": 43,
-                "gpu_name": "RTX 4090",
-                "gpu_ram_gb": 24.0,
-                "dph_total": 0.44,
-                "reliability": 0.995,
-                "machine_id": "machine-8",
-                "host_id": "host-4",
-                "public_ipaddr": "1.1.1.1",
-                "inet_down_mbps": 1200.0,
-                "disk_bw_mbps": 700.0,
-            },
-        ]
-
-        replacement = asyncio.run(
-            self.lifecycle().handle_start_failure(
-                attempt.attempt_id,
-                failure_code="boot_timeout",
-            )
-        )
-
-        self.assertEqual(replacement.state, AttemptState.STARTING)
-        self.assertEqual(replacement.retry_count, 1)
-        self.assertEqual(replacement.instance_id, "instance-2")
-        self.assertEqual(replacement.quote.offer_id, "43")
-        self.assertIn("inet_down_mbps", replacement.quote.to_record())
-        self.assertEqual(replacement.quote.inet_down_mbps, 1200.0)
-        self.assertEqual(replacement.quote.disk_bw_mbps, 700.0)
-        self.assertEqual(replacement.quote.max_instance_creates, 2)
-        actions = [call[0] for call in self.provider.calls]
-        self.assertLess(actions.index("destroy"), actions.index("search"))
-        self.assertLess(actions.index("list"), actions.index("create"))
-        self.assertTrue(
-            self.blacklist.contains(
-                {
-                    "machine_id": "machine-7",
-                    "host_id": "host-3",
-                    "public_ipaddr": "8.8.8.8",
-                },
-                now=self.clock(),
-            )
-        )
-
-        self.provider.instances = [
-            provider_instance("instance-2", replacement.label)
-        ]
-        second_failure = asyncio.run(
-            self.lifecycle().handle_start_failure(
-                attempt.attempt_id,
-                failure_code="healthcheck_failure",
-            )
-        )
-        self.assertEqual(second_failure.state, AttemptState.FAILED)
-        self.assertEqual(
-            second_failure.sanitized_error,
-            "The authorized total instance-create limit was reached.",
-        )
-        self.assertEqual(
-            len([call for call in self.provider.calls if call[0] == "create"]),
-            1,
-        )
-
-    def test_attempt_replacement_rotates_boundary_before_create(self):
-        attempt = self.save_attempt(
-            AttemptState.STARTING,
-            instance_id="instance-1",
-            selected_quote=quote(max_instance_creates=2),
-            provider_token="a" * 64,
-        )
-        self.provider.instances = [
-            provider_instance("instance-1", attempt.label)
-        ]
-        self.provider.search_results = [
-            {
-                "offer_id": 43,
-                "gpu_name": "RTX 4090",
-                "gpu_ram_gb": 24.0,
-                "dph_total": 0.44,
-                "reliability": 0.995,
-                "machine_id": "machine-8",
-                "host_id": "host-4",
-                "public_ipaddr": "1.1.1.1",
-                "inet_down_mbps": 1200.0,
-                "disk_bw_mbps": 700.0,
-            }
-        ]
-        original_create = self.provider.create_instance
-
-        async def ambiguous_create(*args, **kwargs):
-            persisted = self.repository.get(attempt.attempt_id)
-            self.assertEqual(persisted.state, AttemptState.CREATING)
-            self.assertEqual(persisted.provider_token, "b" * 64)
-            self.assertEqual(kwargs["boundary_token"], "b" * 64)
-            self.assertNotEqual(kwargs["boundary_token"], "a" * 64)
-            self.assertEqual(kwargs["session_id"], attempt.attempt_id)
-            await original_create(*args, **kwargs)
-            self.provider.instances = [
-                provider_instance("instance-2", attempt.label)
-            ]
-            raise VastError("Synthetic lost response.", retryable=True)
-
-        self.provider.create_instance = ambiguous_create
-
-        with patch("secrets.token_hex", return_value="b" * 64):
-            replacement = asyncio.run(
-                self.lifecycle().handle_start_failure(
-                    attempt.attempt_id,
-                    failure_code="boot_timeout",
-                )
-            )
-
-        self.assertEqual(replacement.state, AttemptState.STARTING)
-        self.assertEqual(replacement.instance_id, "instance-2")
-        self.assertEqual(replacement.provider_token, "b" * 64)
-        self.assertEqual(len(self.provider.create_boundaries), 1)
-        boundary = self.provider.create_boundaries[0]
-        self.assertEqual(boundary.boundary_token, "b" * 64)
-        self.assertEqual(boundary.session_id, attempt.attempt_id)
-        self.assertNotIn("provider_token", repr(replacement))
-        self.assertNotIn("provider_token", replacement.public_payload())
-
-    def test_replacement_reapplies_connection_floors_before_create(self):
-        attempt = self.save_attempt(
-            AttemptState.STARTING,
-            instance_id="instance-1",
-            selected_quote=quote(max_instance_creates=2),
-        )
-        self.provider.instances = [
-            provider_instance("instance-1", attempt.label)
-        ]
-        self.provider.search_results = [
-            {
-                "offer_id": 43,
-                "gpu_name": "RTX 4090",
-                "gpu_ram_gb": 24.0,
-                "dph_total": 0.44,
-                "reliability": 0.999,
-                "inet_down_mbps": 400.0,
-                "disk_bw_mbps": 700.0,
             }
         ]
 
-        failed = asyncio.run(
+        result = asyncio.run(
             self.lifecycle().handle_start_failure(
                 attempt.attempt_id,
                 failure_code="boot_timeout",
             )
         )
 
-        self.assertEqual(failed.state, AttemptState.FAILED)
-        self.assertEqual(
-            failed.sanitized_error,
-            "No safe replacement offer is currently available.",
-        )
-        self.assertEqual(
-            [call for call in self.provider.calls if call[0] == "create"],
-            [],
-        )
-
-    def test_legacy_limit_one_stops_before_blacklist_and_replacement_search(self):
-        attempt = self.save_attempt(
-            AttemptState.STARTING,
-            instance_id="instance-1",
-            selected_quote=quote(max_instance_creates=1),
-        )
-        self.provider.instances = [
-            provider_instance("instance-1", attempt.label)
-        ]
-
-        failed = asyncio.run(
-            self.lifecycle().handle_start_failure(
-                attempt.attempt_id,
-                failure_code="boot_timeout",
-            )
-        )
-
-        self.assertEqual(failed.state, AttemptState.FAILED)
-        self.assertIsNone(failed.instance_id)
-        self.assertEqual(failed.retry_count, 0)
-        self.assertEqual(
-            failed.sanitized_error,
-            "The authorized total instance-create limit was reached.",
-        )
+        self.assertEqual(result.state, AttemptState.FAILED)
+        self.assertIsNone(result.instance_id)
+        self.assertEqual(result.residual_inventory, ())
+        self.assertEqual(result.retry_count, 0)
+        self.assertEqual(result.quote.max_instance_creates, 2)
+        self.assertEqual(result.sanitized_error, "The managed instance did not become ready.")
+        self.assertEqual([call[0] for call in self.provider.calls], ["destroy", "list"])
         self.assertEqual(
             [call for call in self.provider.calls if call[0] == "search"],
             [],
@@ -841,74 +671,71 @@ class RecoveryAndReplacementTests(LifecycleTestCase):
         )
         self.assertFalse(
             self.blacklist.contains(
-                {
-                    "machine_id": "machine-7",
-                    "host_id": "host-3",
-                    "public_ipaddr": "8.8.8.8",
-                },
+                attempt.quote.to_record(),
                 now=self.clock(),
             )
         )
 
-    def test_replacement_never_uses_a_release_different_from_the_quote(self):
+    def test_authentication_failure_destroys_without_replacement(self):
+        attempt = self.save_attempt(
+            AttemptState.STARTING,
+            instance_id="instance-auth",
+            selected_quote=quote(max_instance_creates=2),
+        )
+        self.provider.instances = [
+            provider_instance("instance-auth", attempt.label)
+        ]
+
+        result = asyncio.run(
+            self.lifecycle().handle_start_failure(
+                attempt.attempt_id,
+                failure_code="auth",
+            )
+        )
+
+        self.assertEqual(result.state, AttemptState.FAILED)
+        self.assertIsNone(result.instance_id)
+        self.assertEqual([call[0] for call in self.provider.calls], ["destroy", "list"])
+
+    def test_restart_never_resurrects_historical_retry_state(self):
+        attempt = self.save_attempt(
+            AttemptState.RETRYING,
+            instance_id="instance-legacy",
+            retry_count=1,
+            selected_quote=quote(max_instance_creates=2),
+        )
+        self.provider.instances = [
+            provider_instance("instance-legacy", attempt.label)
+        ]
+
+        recovered = asyncio.run(self.lifecycle().recover())
+
+        self.assertEqual(len(recovered), 1)
+        result = recovered[0]
+        self.assertEqual(result.state, AttemptState.FAILED)
+        self.assertIsNone(result.instance_id)
+        self.assertEqual(result.retry_count, 1)
+        self.assertEqual(
+            result.sanitized_error,
+            "Automatic Vast replacement is disabled. Start a new reviewed rental.",
+        )
+        self.assertEqual(
+            [call[0] for call in self.provider.calls],
+            ["list", "destroy", "list"],
+        )
+        self.assertEqual(
+            [call for call in self.provider.calls if call[0] in {"search", "create"}],
+            [],
+        )
+
+    def test_failed_boot_with_unverified_destruction_retains_billing_warning(self):
         attempt = self.save_attempt(
             AttemptState.STARTING,
             instance_id="instance-1",
             selected_quote=quote(max_instance_creates=2),
         )
-        self.provider.instances = [
-            provider_instance("instance-1", attempt.label)
-        ]
-        self.provider.search_results = [
-            {
-                "offer_id": 43,
-                "gpu_name": "RTX 4090",
-                "gpu_ram_gb": 24.0,
-                "dph_total": 0.44,
-                "reliability": 0.995,
-            }
-        ]
-        changed_release = worker_release(
-            template_character="2",
-            commit_character="c",
-            archive_character="d",
-        )
-
-        failed = asyncio.run(
-            self.lifecycle(release=changed_release).handle_start_failure(
-                attempt.attempt_id,
-                failure_code="boot_timeout",
-            )
-        )
-
-        self.assertEqual(failed.state, AttemptState.FAILED)
-        self.assertEqual(
-            [call for call in self.provider.calls if call[0] == "create"],
-            [],
-        )
-        self.assertEqual(
-            [call for call in self.provider.calls if call[0] == "search"],
-            [],
-        )
-
-    def test_no_replacement_when_destruction_cannot_be_verified(self):
-        attempt = self.save_attempt(
-            AttemptState.STARTING,
-            instance_id="instance-1",
-        )
-        self.provider.instances = [
-            provider_instance("instance-1", attempt.label)
-        ]
+        self.provider.instances = [provider_instance("instance-1", attempt.label)]
         self.provider.destroy_removes = False
-        self.provider.search_results = [
-            {
-                "offer_id": 43,
-                "gpu_name": "RTX 4090",
-                "gpu_ram_gb": 24.0,
-                "dph_total": 0.44,
-                "reliability": 0.99,
-            }
-        ]
 
         failed = asyncio.run(
             self.lifecycle().handle_start_failure(
@@ -919,53 +746,11 @@ class RecoveryAndReplacementTests(LifecycleTestCase):
 
         self.assertEqual(failed.state, AttemptState.FAILED)
         self.assertEqual(failed.instance_id, "instance-1")
+        self.assertTrue(failed.public_payload()["billing_may_continue"])
         self.assertEqual(
-            [call for call in self.provider.calls if call[0] == "search"],
+            [call for call in self.provider.calls if call[0] in {"search", "create"}],
             [],
         )
-        self.assertEqual(
-            [call for call in self.provider.calls if call[0] == "create"],
-            [],
-        )
-
-    def test_auth_quota_budget_validation_and_configuration_never_retry(self):
-        for failure_code in (
-            "auth",
-            "quota",
-            "budget",
-            "validation",
-            "configuration",
-        ):
-            with self.subTest(failure_code=failure_code):
-                self.provider.calls.clear()
-                attempt = self.save_attempt(
-                    AttemptState.STARTING,
-                    attempt_id="attempt-" + failure_code,
-                    instance_id="instance-" + failure_code,
-                )
-                self.provider.instances = [
-                    provider_instance(
-                        "instance-" + failure_code,
-                        attempt.label,
-                    )
-                ]
-
-                failed = asyncio.run(
-                    self.lifecycle().handle_start_failure(
-                        attempt.attempt_id,
-                        failure_code=failure_code,
-                    )
-                )
-
-                self.assertEqual(failed.state, AttemptState.FAILED)
-                self.assertEqual(
-                    [
-                        call
-                        for call in self.provider.calls
-                        if call[0] == "create"
-                    ],
-                    [],
-                )
 
 
 class RecoveringSessionService:
@@ -1543,7 +1328,7 @@ class SessionLifecycleTests(LifecycleTestCase):
             ["destroy", "list"],
         )
 
-    def test_only_boot_failure_replaces_once_after_inventory_absence(self):
+    def test_session_boot_failure_with_historical_limit_two_never_searches_or_creates(self):
         session = self.save_session(max_instance_creates=2)
         self.provider.instances = [
             self.worker_instance("instance-1", session.label)
@@ -1563,51 +1348,36 @@ class SessionLifecycleTests(LifecycleTestCase):
             }
         ]
 
-        replacement = asyncio.run(
+        result = asyncio.run(
             self.session_lifecycle().handle_session_boot_failure(
                 session.session_id,
                 failure_code="boot_timeout",
             )
         )
 
-        self.assertEqual(replacement.state, SessionState.BOOTSTRAPPING)
-        self.assertEqual(replacement.retry_count, 1)
-        self.assertEqual(replacement.instance_id, "instance-2")
-        self.assertEqual(replacement.quote.offer_id, "43")
-        self.assertIn("inet_down_mbps", replacement.quote.to_record())
-        self.assertEqual(replacement.quote.inet_down_mbps, 1000.0)
-        self.assertEqual(replacement.quote.disk_bw_mbps, 750.0)
-        self.assertEqual(replacement.quote.max_instance_creates, 2)
+        self.assertEqual(result.state, SessionState.FAILED)
+        self.assertEqual(result.retry_count, 0)
+        self.assertIsNone(result.instance_id)
+        self.assertIsNone(result.provider_token)
+        self.assertIsNone(result.session_secret_hex)
+        self.assertEqual(result.quote.offer_id, "42")
+        self.assertEqual(result.quote.max_instance_creates, 2)
+        self.assertEqual(
+            result.sanitized_error,
+            "The managed worker did not become ready.",
+        )
         actions = [call[0] for call in self.provider.calls]
-        self.assertEqual(actions, ["destroy", "list", "search", "create"])
-
-        self.provider.instances = [
-            self.worker_instance("instance-2", replacement.label)
-        ]
-        search_count = len(
-            [call for call in self.provider.calls if call[0] == "search"]
-        )
-        exhausted = asyncio.run(
-            self.session_lifecycle().handle_session_boot_failure(
-                session.session_id,
-                failure_code="healthcheck_failure",
-            )
-        )
-        self.assertEqual(exhausted.state, SessionState.FAILED)
+        self.assertEqual(actions, ["destroy", "list"])
         self.assertEqual(
-            exhausted.sanitized_error,
-            "The authorized total instance-create limit was reached.",
+            [call for call in self.provider.calls if call[0] == "search"],
+            [],
         )
         self.assertEqual(
-            len([call for call in self.provider.calls if call[0] == "search"]),
-            search_count,
-        )
-        self.assertEqual(
-            len([call for call in self.provider.calls if call[0] == "create"]),
-            1,
+            [call for call in self.provider.calls if call[0] == "create"],
+            [],
         )
 
-    def test_session_replacement_rotates_boundary_before_create(self):
+    def test_session_boot_failure_never_rotates_boundary_for_a_second_create(self):
         session = self.save_session(max_instance_creates=2)
         original_secret = session.session_secret_hex
         self.provider.instances = [
@@ -1655,27 +1425,24 @@ class SessionLifecycleTests(LifecycleTestCase):
         self.provider.create_instance = ambiguous_create
 
         with patch("secrets.token_hex", return_value="b" * 64):
-            replacement = asyncio.run(
+            result = asyncio.run(
                 self.session_lifecycle().handle_session_boot_failure(
                     session.session_id,
                     failure_code="boot_timeout",
                 )
             )
 
-        self.assertEqual(replacement.state, SessionState.BOOTSTRAPPING)
-        self.assertEqual(replacement.instance_id, "instance-2")
-        self.assertEqual(replacement.provider_token, "b" * 64)
-        self.assertEqual(replacement.session_secret_hex, original_secret)
-        self.assertEqual(len(self.provider.create_boundaries), 1)
-        boundary = self.provider.create_boundaries[0]
-        self.assertEqual(boundary.boundary_token, "b" * 64)
-        self.assertEqual(boundary.session_id, session.session_id)
-        rendered = repr(replacement)
+        self.assertEqual(result.state, SessionState.FAILED)
+        self.assertIsNone(result.instance_id)
+        self.assertIsNone(result.provider_token)
+        self.assertIsNone(result.session_secret_hex)
+        self.assertEqual(self.provider.create_boundaries, [])
+        rendered = repr(result)
         self.assertNotIn("provider_token", rendered)
         self.assertNotIn("session_secret_hex", rendered)
-        self.assertNotIn("provider_token", replacement.public_payload())
+        self.assertNotIn("provider_token", result.public_payload())
 
-    def test_session_ambiguous_replacement_fails_closed_on_multiple_matches(self):
+    def test_session_boot_failure_never_invokes_ambiguous_second_create(self):
         session = self.save_session(max_instance_creates=2)
         self.provider.instances = [
             self.worker_instance("instance-1", session.label)
@@ -1715,14 +1482,11 @@ class SessionLifecycleTests(LifecycleTestCase):
 
         self.assertEqual(failed.state, SessionState.FAILED)
         self.assertIsNone(failed.instance_id)
-        self.assertEqual(
-            failed.residual_inventory,
-            ("instance-2", "instance-3"),
-        )
-        self.assertTrue(failed.public_payload()["billing_may_continue"])
+        self.assertEqual(failed.residual_inventory, ())
+        self.assertFalse(failed.public_payload()["billing_may_continue"])
         self.assertEqual(
             len([call for call in self.provider.calls if call[0] == "create"]),
-            1,
+            0,
         )
 
         repeated = asyncio.run(
@@ -1734,17 +1498,14 @@ class SessionLifecycleTests(LifecycleTestCase):
 
         self.assertEqual(repeated.state, SessionState.FAILED)
         self.assertIsNone(repeated.instance_id)
-        self.assertEqual(
-            repeated.residual_inventory,
-            ("instance-2", "instance-3"),
-        )
-        self.assertTrue(repeated.public_payload()["billing_may_continue"])
+        self.assertEqual(repeated.residual_inventory, ())
+        self.assertFalse(repeated.public_payload()["billing_may_continue"])
         self.assertEqual(
             len([call for call in self.provider.calls if call[0] == "create"]),
-            1,
+            0,
         )
 
-    def test_session_replacement_reapplies_connection_floors_before_create(self):
+    def test_session_failure_never_searches_connection_floor_replacements(self):
         session = self.save_session(max_instance_creates=2)
         self.provider.instances = [
             self.worker_instance("instance-1", session.label)
@@ -1771,14 +1532,18 @@ class SessionLifecycleTests(LifecycleTestCase):
         self.assertEqual(failed.state, SessionState.FAILED)
         self.assertEqual(
             failed.sanitized_error,
-            "No safe replacement offer is currently available.",
+            "The managed worker did not become ready.",
+        )
+        self.assertEqual(
+            [call for call in self.provider.calls if call[0] == "search"],
+            [],
         )
         self.assertEqual(
             [call for call in self.provider.calls if call[0] == "create"],
             [],
         )
 
-    def test_limit_one_destroys_failed_boot_without_replacement_search(self):
+    def test_limit_one_destroys_failed_boot_without_offer_search(self):
         session = self.save_session(max_instance_creates=1)
         self.provider.instances = [
             self.worker_instance("instance-1", session.label)
@@ -1829,10 +1594,10 @@ class SessionLifecycleTests(LifecycleTestCase):
         )
         self.assertEqual(
             result.sanitized_error,
-            "The authorized total instance-create limit was reached.",
+            "The managed worker did not become ready.",
         )
 
-    def test_ambiguous_replacement_create_adopts_inventory_without_second_create(self):
+    def test_boot_failure_cannot_enter_ambiguous_second_create(self):
         session = self.save_session(max_instance_creates=2)
         self.provider.instances = [
             self.worker_instance("instance-1", session.label)
@@ -1868,27 +1633,27 @@ class SessionLifecycleTests(LifecycleTestCase):
 
         self.provider.create_instance = ambiguous_create
 
-        replacement = asyncio.run(
+        result = asyncio.run(
             self.session_lifecycle().handle_session_boot_failure(
                 session.session_id,
                 failure_code="boot_timeout",
             )
         )
 
-        self.assertEqual(replacement.state, SessionState.BOOTSTRAPPING)
-        self.assertEqual(replacement.instance_id, "instance-2")
-        self.assertEqual(replacement.retry_count, 1)
-        self.assertEqual(replacement.quote.max_instance_creates, 2)
+        self.assertEqual(result.state, SessionState.FAILED)
+        self.assertIsNone(result.instance_id)
+        self.assertEqual(result.retry_count, 0)
+        self.assertEqual(result.quote.max_instance_creates, 2)
         self.assertEqual(
             [call[0] for call in self.provider.calls],
-            ["destroy", "list", "search", "create", "list"],
+            ["destroy", "list"],
         )
         self.assertEqual(
             len([call for call in self.provider.calls if call[0] == "create"]),
-            1,
+            0,
         )
 
-    def test_attempt_ambiguous_replacement_fails_closed_on_multiple_matches(self):
+    def test_attempt_boot_failure_cannot_enter_ambiguous_second_create(self):
         attempt = self.save_attempt(
             AttemptState.STARTING,
             instance_id="instance-1",
@@ -1933,17 +1698,10 @@ class SessionLifecycleTests(LifecycleTestCase):
 
         self.assertEqual(failed.state, AttemptState.FAILED)
         self.assertIsNone(failed.instance_id)
-        self.assertEqual(
-            failed.residual_inventory,
-            ("instance-2", "instance-3"),
-        )
-        payload = failed.public_payload()
-        self.assertTrue(payload["billing_may_continue"])
-        self.assertIn("instance-2", payload["emergency_action"])
-        self.assertIn("instance-3", payload["emergency_action"])
+        self.assertEqual(failed.residual_inventory, ())
         self.assertEqual(
             len([call for call in self.provider.calls if call[0] == "create"]),
-            1,
+            0,
         )
 
     def test_session_destroy_requires_inventory_absence_after_delete(self):

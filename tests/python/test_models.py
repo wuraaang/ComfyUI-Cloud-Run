@@ -919,8 +919,8 @@ class LifecycleModelTests(unittest.TestCase):
         self.assertEqual(attempt.created_at, 100.0)
         self.assertEqual(attempt.updated_at, 100.0)
 
-    def test_happy_cancel_and_retry_transitions_are_explicit(self):
-        AttemptState, CloudAttempt, _, OfferQuote = model_api(self)
+    def test_happy_cancel_and_legacy_retry_transitions_are_explicit(self):
+        AttemptState, CloudAttempt, InvalidStateTransition, OfferQuote = model_api(self)
         attempt = CloudAttempt.new(
             idempotency_key="idem-1",
             quote=quote(OfferQuote),
@@ -958,20 +958,58 @@ class LifecycleModelTests(unittest.TestCase):
             quote=quote(OfferQuote),
             attempt_id="attempt-3",
             now=300.0,
-        ).transition(AttemptState.CREATING, now=301.0)
-        retrying = retrying.transition(AttemptState.STARTING, now=302.0)
-        retrying = retrying.transition(
-            AttemptState.FAILED,
-            now=303.0,
-            sanitized_error="pod did not become ready",
-        )
-        retrying = retrying.transition(
+            state=AttemptState.RETRYING,
+        ).transition(
             AttemptState.RETRYING,
-            now=304.0,
+            now=301.0,
             retry_count=1,
             instance_id=None,
         )
         self.assertEqual(retrying.retry_count, 1)
+        with self.assertRaises(InvalidStateTransition):
+            retrying.transition(AttemptState.CREATING, now=302.0)
+        failed = retrying.transition(
+            AttemptState.FAILED,
+            now=302.0,
+            sanitized_error="Automatic replacement is disabled.",
+        )
+        self.assertEqual(failed.state, AttemptState.FAILED)
+
+    def test_no_state_transition_can_issue_a_second_paid_create(self):
+        (
+            AttemptState,
+            CloudAttempt,
+            InvalidStateTransition,
+            OfferQuote,
+        ) = model_api(self)
+        from cloud_run.models import CloudSession, SessionState
+
+        historical = CloudAttempt.new(
+            idempotency_key="idem-historical",
+            quote=replace(quote(OfferQuote), max_instance_creates=2),
+            attempt_id="attempt-historical",
+            state=AttemptState.RETRYING,
+            now=100.0,
+        )
+        with self.assertRaises(InvalidStateTransition):
+            historical.transition(AttemptState.CREATING, now=101.0)
+
+        selected = replace(quote(OfferQuote), max_instance_creates=2)
+        for state in (SessionState.DESTROYING, SessionState.FAILED):
+            with self.subTest(state=state):
+                session = CloudSession.new(
+                    "session-key-" + state.value,
+                    session_id="session-" + state.value,
+                    quote=selected,
+                    manifest_digest=selected.manifest_digest,
+                    deadline_at=7300.0,
+                    deadline_mode="finite",
+                    disk_gb=selected.disk_gb,
+                    now=100.0,
+                    state=state,
+                )
+                with self.assertRaises(InvalidStateTransition):
+                    session.transition(SessionState.CREATING, now=101.0)
 
     def test_invalid_or_terminal_transition_is_rejected(self):
         AttemptState, CloudAttempt, InvalidStateTransition, OfferQuote = model_api(self)

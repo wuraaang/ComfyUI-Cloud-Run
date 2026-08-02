@@ -1507,6 +1507,9 @@ class SessionService:
                         offset=transfer.offset,
                         state=TransferState.ABANDONED,
                         private_path=transfer.private_path,
+                        source_node_id=transfer.source_node_id,
+                        published_device=transfer.published_device,
+                        published_inode=transfer.published_inode,
                     )
             if job.state in {
                 JobState.CAPTURED,

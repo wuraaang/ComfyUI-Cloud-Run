@@ -19,7 +19,11 @@ from .lifecycle import CloudRunLifecycle
 from .model_sources import WorkflowModelSourceResolver
 from .models import SessionState
 from .offers import HostBlacklist
-from .repository import AttemptRepository, SessionRepository
+from .repository import (
+    AttemptRepository,
+    PaidRentalConflict,
+    SessionRepository,
+)
 from .registry import RegistryClient
 from .resolver import DependencyResolver
 from .r2 import R2TransferError, R2ValidationError
@@ -366,6 +370,7 @@ def _job_payload(service, job):
                 "size_bytes": transfer.expected_size,
                 "transferred_bytes": transfer.offset,
                 "sha256": transfer.sha256,
+                "node_id": transfer.source_node_id,
             }
         )
     payload["previews"] = previews
@@ -662,7 +667,10 @@ def register_routes(service_factory=None):
     make_service = service_factory or build_service
 
     def service_error(error):
-        if isinstance(error, (SessionBusy, IncompatibleSession)):
+        if isinstance(
+            error,
+            (PaidRentalConflict, SessionBusy, IncompatibleSession),
+        ):
             return web.json_response({"error": str(error)}, status=409)
         if isinstance(
             error,

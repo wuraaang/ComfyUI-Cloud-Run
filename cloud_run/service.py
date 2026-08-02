@@ -23,7 +23,11 @@ from .offers import (
     apply_offer_policy,
     offer_meets_connection_quality_policy,
 )
-from .repository import ConcurrentAttemptUpdate, ConcurrentSessionUpdate
+from .repository import (
+    ConcurrentAttemptUpdate,
+    ConcurrentSessionUpdate,
+    PaidRentalConflict,
+)
 from .worker_release import WorkerRelease, WorkerReleaseUnavailable
 from . import vast
 
@@ -136,9 +140,9 @@ def _offer_id(value):
 
 
 def _max_instance_creates(value):
-    if type(value) is not int or value not in {1, 2}:
+    if type(value) is not int or value != 1:
         raise CloudRunValidationError(
-            "Maximum total instance creates must be 1 or 2."
+            "Maximum total instance creates must be 1."
         )
     return value
 
@@ -612,7 +616,11 @@ class CloudRunService:
             return session
         repository = self._session_repository()
         now = float(self.clock())
-        if 1 + session.retry_count > session.quote.max_instance_creates:
+        if (
+            session.retry_count != 0
+            or 1 + session.retry_count
+            > session.quote.max_instance_creates
+        ):
             return repository.transition(
                 session.session_id,
                 SessionState.FAILED,
@@ -656,22 +664,25 @@ class CloudRunService:
             raise QuoteUnavailable(
                 "The selected offer changed or is no longer eligible."
             )
-        try:
-            if session.state == SessionState.OFFER_SELECTED:
+        if session.state == SessionState.OFFER_SELECTED:
+            try:
                 session = repository.save(
                     session.transition(
                         SessionState.CONFIRMING,
                         now=float(self.clock()),
                     )
                 )
-            session = repository.save(
-                session.transition(
-                    SessionState.CREATING,
-                    now=float(self.clock()),
-                    provider_token=secrets.token_hex(32),
-                    session_secret_hex=secrets.token_hex(32),
-                    sanitized_error=None,
-                )
+            except ConcurrentSessionUpdate:
+                return self.get_session(session.session_id)
+        claim_now = float(self.clock())
+        provider_token = secrets.token_hex(32)
+        session_secret_hex = secrets.token_hex(32)
+        try:
+            session = repository.claim_create_intent(
+                session.session_id,
+                now=claim_now,
+                provider_token=provider_token,
+                session_secret_hex=session_secret_hex,
             )
         except ConcurrentSessionUpdate:
             return self.get_session(session.session_id)
