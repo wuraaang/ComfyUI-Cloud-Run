@@ -674,14 +674,33 @@ class CloudRunService:
                 session_id=session.session_id,
             )
         except Exception as error:
-            reconciled = await self._instance_for_label(
+            matches = await self._instance_for_label(
                 settings["api_key"],
                 session.label,
             )
-            if reconciled is not None and reconciled.get("instance_id"):
+            if (
+                matches is not None
+                and len(matches) == 1
+                and matches[0].get("instance_id")
+            ):
                 return await self._finish_created_session(
                     session.session_id,
-                    str(reconciled["instance_id"]),
+                    str(matches[0]["instance_id"]),
+                )
+            if matches is not None and len(matches) > 1:
+                return repository.transition(
+                    session.session_id,
+                    SessionState.FAILED,
+                    now=float(self.clock()),
+                    instance_id=None,
+                    residual_inventory=tuple(
+                        str(item.get("instance_id"))
+                        for item in matches
+                        if item.get("instance_id") is not None
+                    ),
+                    sanitized_error=(
+                        "Multiple managed Vast instances match this session."
+                    ),
                 )
             retryable = isinstance(error, vast.VastError) and error.retryable
             if retryable:
@@ -869,15 +888,15 @@ class CloudRunService:
             instances = await self.provider.list_instances(api_key)
         except Exception:
             return None
+        if not isinstance(instances, list):
+            return None
         matches = [
             instance
             for instance in instances
             if isinstance(instance, dict) and instance.get("label") == label
         ]
-        if not matches:
-            return None
         matches.sort(key=lambda item: str(item.get("instance_id") or ""))
-        return matches[0]
+        return tuple(matches)
 
     async def _finish_created_instance(self, attempt_id, instance_id):
         current = self.get_attempt(attempt_id)
@@ -898,6 +917,7 @@ class CloudRunService:
             AttemptState.STARTING,
             now=float(self.clock()),
             instance_id=str(instance_id),
+            residual_inventory=(),
             sanitized_error=None,
         )
         if self.lifecycle is not None:
@@ -979,14 +999,33 @@ class CloudRunService:
                 session_id=attempt.attempt_id,
             )
         except Exception as error:
-            reconciled = await self._instance_for_label(
+            matches = await self._instance_for_label(
                 settings["api_key"],
                 attempt.label,
             )
-            if reconciled is not None and reconciled.get("instance_id"):
+            if (
+                matches is not None
+                and len(matches) == 1
+                and matches[0].get("instance_id")
+            ):
                 return await self._finish_created_instance(
                     attempt.attempt_id,
-                    str(reconciled["instance_id"]),
+                    str(matches[0]["instance_id"]),
+                )
+            if matches is not None and len(matches) > 1:
+                return self.repository.transition(
+                    attempt.attempt_id,
+                    AttemptState.FAILED,
+                    now=float(self.clock()),
+                    instance_id=None,
+                    residual_inventory=tuple(
+                        str(item.get("instance_id"))
+                        for item in matches
+                        if item.get("instance_id") is not None
+                    ),
+                    sanitized_error=(
+                        "Multiple managed Vast instances match this attempt."
+                    ),
                 )
             retryable = isinstance(error, vast.VastError) and error.retryable
             if retryable:

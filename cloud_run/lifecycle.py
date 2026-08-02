@@ -111,6 +111,27 @@ class CloudRunLifecycle:
             key=lambda item: str(item.get("instance_id") or ""),
         )
 
+    @staticmethod
+    def _attempt_residual_ids(matches):
+        return tuple(
+            str(item.get("instance_id"))
+            for item in matches
+            if item.get("instance_id") is not None
+        )
+
+    def _fail_attempt_on_multiple_matches(self, attempt, matches):
+        return self.repository.transition(
+            attempt.attempt_id,
+            AttemptState.FAILED,
+            now=float(self.clock()),
+            instance_id=None,
+            residual_inventory=self._attempt_residual_ids(matches),
+            ready_url=None,
+            sanitized_error=(
+                "Multiple managed Vast instances match this attempt."
+            ),
+        )
+
     async def _verified_absent(self, api_key, attempt, instance_id):
         inventory = await self._inventory(api_key)
         if inventory is None:
@@ -141,7 +162,12 @@ class CloudRunLifecycle:
                     sanitized_error=message,
                 )
             matches = self._by_label(inventory, attempt.label)
-            if matches:
+            if len(matches) > 1:
+                return self._fail_attempt_on_multiple_matches(
+                    attempt,
+                    matches,
+                )
+            if len(matches) == 1:
                 instance_id = str(matches[0].get("instance_id") or "")
                 attempt = self.repository.transition(
                     attempt.attempt_id,
@@ -209,6 +235,7 @@ class CloudRunLifecycle:
             AttemptState.CANCELLED,
             now=float(self.clock()),
             instance_id=None,
+            residual_inventory=(),
             ready_url=None,
             sanitized_error=None,
         )
@@ -283,13 +310,19 @@ class CloudRunLifecycle:
             _settings, api_key = self._api_key()
             inventory = await self._inventory(api_key)
             matches = self._by_label(inventory, attempt.label)
-            if not matches:
+            if len(matches) > 1:
+                return self._fail_attempt_on_multiple_matches(
+                    attempt,
+                    matches,
+                )
+            if len(matches) != 1:
                 return attempt
             return self.repository.transition(
                 attempt.attempt_id,
                 AttemptState.STARTING,
                 now=float(self.clock()),
                 instance_id=str(matches[0]["instance_id"]),
+                residual_inventory=(),
                 sanitized_error=None,
             )
         if attempt.state != AttemptState.STARTING or not attempt.instance_id:
@@ -445,7 +478,15 @@ class CloudRunLifecycle:
             matches = self._by_label(inventory, attempt.label)
             if inventory is None:
                 return attempt, False
-            if matches:
+            if len(matches) > 1:
+                return (
+                    self._fail_attempt_on_multiple_matches(
+                        attempt,
+                        matches,
+                    ),
+                    False,
+                )
+            if len(matches) == 1:
                 instance_id = str(matches[0].get("instance_id") or "")
         if attempt.state != AttemptState.DESTROYING:
             attempt = self.repository.transition(
@@ -518,6 +559,7 @@ class CloudRunLifecycle:
             now=float(self.clock()),
             retry_count=1,
             instance_id=None,
+            residual_inventory=(),
             ready_url=None,
             sanitized_error=None,
         )
@@ -622,6 +664,7 @@ class CloudRunLifecycle:
             quote=replacement_quote,
             retry_count=1,
             provider_token=secrets.token_hex(32),
+            residual_inventory=(),
         )
         try:
             instance_id = await self.provider.create_instance(
@@ -636,7 +679,15 @@ class CloudRunLifecycle:
         except Exception:
             inventory = await self._inventory(api_key)
             matches = self._by_label(inventory, attempt.label)
-            if not matches:
+            if len(matches) > 1:
+                return self._fail_attempt_on_multiple_matches(
+                    attempt,
+                    matches,
+                )
+            if (
+                len(matches) != 1
+                or not matches[0].get("instance_id")
+            ):
                 return self.repository.transition(
                     attempt.attempt_id,
                     AttemptState.FAILED,
@@ -651,6 +702,7 @@ class CloudRunLifecycle:
             AttemptState.STARTING,
             now=float(self.clock()),
             instance_id=str(instance_id),
+            residual_inventory=(),
             sanitized_error=None,
         )
 
@@ -673,33 +725,48 @@ class CloudRunLifecycle:
         for attempt in attempts:
             matches = self._by_label(managed, attempt.label)
             current = attempt
-            if attempt.state == AttemptState.CREATING and matches:
+            if attempt.state == AttemptState.CREATING and len(matches) > 1:
+                current = self._fail_attempt_on_multiple_matches(
+                    attempt,
+                    matches,
+                )
+            elif attempt.state == AttemptState.CREATING and matches:
                 current = self.repository.transition(
                     attempt.attempt_id,
                     AttemptState.STARTING,
                     now=float(self.clock()),
                     instance_id=str(matches[0]["instance_id"]),
+                    residual_inventory=(),
                     sanitized_error=None,
                 )
             elif attempt.state == AttemptState.STARTING:
-                if matches and not attempt.instance_id:
+                if len(matches) > 1:
+                    current = self._fail_attempt_on_multiple_matches(
+                        attempt,
+                        matches,
+                    )
+                    recovered.append(current)
+                    continue
+                if len(matches) == 1 and not attempt.instance_id:
                     current = self.repository.transition(
                         attempt.attempt_id,
                         AttemptState.STARTING,
                         now=float(self.clock()),
                         instance_id=str(matches[0]["instance_id"]),
+                        residual_inventory=(),
                     )
                 current = await self.reconcile_once(current.attempt_id)
             elif attempt.state in {
                 AttemptState.CANCEL_REQUESTED,
                 AttemptState.DESTROYING,
             }:
-                if matches and not attempt.instance_id:
+                if len(matches) == 1 and not attempt.instance_id:
                     current = self.repository.transition(
                         attempt.attempt_id,
                         attempt.state,
                         now=float(self.clock()),
                         instance_id=str(matches[0]["instance_id"]),
+                        residual_inventory=(),
                     )
                 current = await self.cancel(current.attempt_id)
             recovered.append(current)
@@ -837,10 +904,7 @@ class CloudRunLifecycle:
                     session.session_id,
                     SessionState.FAILED,
                     now=float(self.clock()),
-                    instance_id=(
-                        str(matches[0].get("instance_id") or "")
-                        or session.instance_id
-                    ),
+                    instance_id=None,
                     residual_inventory=tuple(
                         str(item.get("instance_id"))
                         for item in matches
@@ -926,10 +990,7 @@ class CloudRunLifecycle:
                     session.session_id,
                     SessionState.FAILED,
                     now=float(self.clock()),
-                    instance_id=(
-                        str(matches[0].get("instance_id") or "")
-                        or None
-                    ),
+                    instance_id=None,
                     residual_inventory=tuple(
                         str(item.get("instance_id"))
                         for item in matches
@@ -983,7 +1044,6 @@ class CloudRunLifecycle:
                 instance_id=str(instance_id),
                 destroy_requested=True,
                 worker_base_url=None,
-                provider_token=None,
             )
         try:
             await self.provider.destroy_instance(api_key, instance_id)
@@ -1115,10 +1175,7 @@ class CloudRunLifecycle:
                     session.session_id,
                     SessionState.FAILED,
                     now=float(self.clock()),
-                    instance_id=(
-                        str(matches[0].get("instance_id") or "")
-                        or session.instance_id
-                    ),
+                    instance_id=None,
                     residual_inventory=tuple(
                         str(item.get("instance_id"))
                         for item in matches
@@ -1188,7 +1245,6 @@ class CloudRunLifecycle:
                         now=float(self.clock()),
                         instance_id=None,
                         worker_base_url=None,
-                        provider_token=None,
                         residual_inventory=(),
                         sanitized_error=(
                             "The managed Vast instance is absent."
@@ -1264,7 +1320,6 @@ class CloudRunLifecycle:
             now=float(self.clock()),
             instance_id=instance_id,
             worker_base_url=None,
-            provider_token=None,
         )
         if instance_id:
             try:
@@ -1291,13 +1346,28 @@ class CloudRunLifecycle:
             for item in inventory
         )
         if not absent:
+            residual_ids = list(session.residual_inventory)
+            if inventory is not None:
+                residual_ids = [
+                    str(item.get("instance_id"))
+                    for item in inventory
+                    if item.get("instance_id") is not None
+                    and (
+                        item.get("label") == session.label
+                        or (
+                            instance_id is not None
+                            and str(item.get("instance_id"))
+                            == str(instance_id)
+                        )
+                    )
+                ]
+            elif instance_id is not None:
+                residual_ids.append(str(instance_id))
             return self.session_repository.transition(
                 session.session_id,
                 SessionState.FAILED,
                 now=float(self.clock()),
-                residual_inventory=(
-                    (str(instance_id),) if instance_id else ()
-                ),
+                residual_inventory=tuple(sorted(set(residual_ids))),
                 sanitized_error=(
                     "The Vast instance is still present; destroy it in "
                     "the Vast console immediately."
@@ -1457,10 +1527,7 @@ class CloudRunLifecycle:
                     session.session_id,
                     SessionState.FAILED,
                     now=float(self.clock()),
-                    instance_id=(
-                        str(matches[0].get("instance_id") or "")
-                        or None
-                    ),
+                    instance_id=None,
                     residual_inventory=tuple(
                         str(item.get("instance_id"))
                         for item in matches

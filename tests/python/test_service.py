@@ -556,6 +556,75 @@ class CloudRunServiceTests(unittest.TestCase):
             self.assertFalse(boundary_token in rendered)
             self.assertFalse(session_secret_hex in rendered)
 
+    def test_ambiguous_initial_session_create_fails_closed_on_multiple_matches(self):
+        provider = FakeProvider(
+            lookups=[offer(price=0.50), offer(price=0.50)]
+        )
+        provider.create_error = VastError(
+            "sensitive lost create response",
+            retryable=True,
+        )
+        service = self.service(
+            provider,
+            session_service=FakePreflightService(),
+        )
+        quoted = asyncio.run(
+            service.preview_session(
+                preflight_id="preflight-1",
+                offer_id=42,
+                idempotency_key="ambiguous-multiple-session",
+                deadline={
+                    "mode": "finite",
+                    "duration_seconds": 7_200,
+                },
+                max_instance_creates=1,
+            )
+        )
+        provider.instances = [
+            {
+                "instance_id": instance_id,
+                "label": quoted.label,
+                "actual_status": "loading",
+            }
+            for instance_id in ("instance-77", "instance-78")
+        ]
+
+        failed = asyncio.run(
+            service.confirm_session(
+                quoted.session_id,
+                idempotency_key="ambiguous-multiple-session",
+            )
+        )
+        duplicate = asyncio.run(
+            service.confirm_session(
+                quoted.session_id,
+                idempotency_key="ambiguous-multiple-session",
+            )
+        )
+
+        self.assertEqual(failed.state, SessionState.FAILED)
+        self.assertIsNone(failed.instance_id)
+        self.assertEqual(
+            failed.residual_inventory,
+            ("instance-77", "instance-78"),
+        )
+        self.assertTrue(failed.public_payload()["billing_may_continue"])
+        self.assertEqual(duplicate, failed)
+        self.assertEqual(len(provider.create_calls), 1)
+        self.assertEqual(len(provider.inventory_calls), 1)
+        boundary_token = provider.create_calls[0][
+            "worker_boundary"
+        ].boundary_token
+        for public_value in (
+            failed.public_payload(),
+            failed.sanitized_error,
+            repr(provider),
+        ):
+            rendered = repr(public_value)
+            self.assertNotIn("sensitive", rendered)
+            self.assertNotIn(boundary_token, rendered)
+            self.assertNotIn(failed.session_secret_hex, rendered)
+
     def test_concurrent_paid_confirmations_issue_exactly_one_create(self):
         async def scenario():
             provider = FakeProvider(
@@ -1081,6 +1150,60 @@ class CloudRunServiceTests(unittest.TestCase):
         self.assertEqual(len(provider.create_calls), 1)
         self.assertEqual(len(provider.inventory_calls), 1)
         self.assertNotIn("sensitive", repr(reconciled.public_payload()))
+
+    def test_ambiguous_initial_attempt_create_fails_closed_on_multiple_matches(self):
+        provider = FakeProvider(lookups=[offer(), offer()])
+        provider.create_error = VastError(
+            "sensitive provider timeout",
+            retryable=True,
+        )
+        service = self.service(provider)
+        preview = asyncio.run(
+            service.preview_offer(
+                offer_id=42,
+                idempotency_key="idem-ambiguous-multiple",
+            )
+        )
+        provider.instances = [
+            {
+                "instance_id": instance_id,
+                "label": preview.label,
+                "actual_status": "loading",
+            }
+            for instance_id in ("instance-77", "instance-78")
+        ]
+
+        failed = asyncio.run(
+            service.confirm(
+                preview.attempt_id,
+                idempotency_key="idem-ambiguous-multiple",
+            )
+        )
+        duplicate = asyncio.run(
+            service.confirm(
+                preview.attempt_id,
+                idempotency_key="idem-ambiguous-multiple",
+            )
+        )
+
+        self.assertEqual(failed.state, AttemptState.FAILED)
+        self.assertIsNone(failed.instance_id)
+        self.assertEqual(
+            failed.residual_inventory,
+            ("instance-77", "instance-78"),
+        )
+        payload = failed.public_payload()
+        self.assertEqual(
+            payload["residual_inventory"],
+            ["instance-77", "instance-78"],
+        )
+        self.assertTrue(payload["billing_may_continue"])
+        self.assertIn("instance-77", payload["emergency_action"])
+        self.assertIn("instance-78", payload["emergency_action"])
+        self.assertNotIn("sensitive", repr(payload))
+        self.assertEqual(duplicate, failed)
+        self.assertEqual(len(provider.create_calls), 1)
+        self.assertEqual(len(provider.inventory_calls), 1)
 
     def test_unknown_create_outcome_stays_recoverable_and_is_never_reissued(self):
         provider = FakeProvider(lookups=[offer(), offer()])

@@ -1800,6 +1800,8 @@ class SessionService:
                 )
             except (asyncio.CancelledError, KeyboardInterrupt):
                 raise
+            except WorkerBoundaryAuthenticationError:
+                raise
             except Exception:
                 remote_status = None
             if remote_status is not None:
@@ -1905,6 +1907,8 @@ class SessionService:
             )
         except (asyncio.CancelledError, KeyboardInterrupt):
             raise
+        except WorkerBoundaryAuthenticationError:
+            raise
         except Exception:
             current = self.job_repository.get_transfer(
                 job_id,
@@ -2009,6 +2013,8 @@ class SessionService:
                     observed = await transaction(transaction_id)
                 except (asyncio.CancelledError, KeyboardInterrupt):
                     raise
+                except WorkerBoundaryAuthenticationError:
+                    raise
                 except Exception:
                     continue
                 if observed is None:
@@ -2069,6 +2075,8 @@ class SessionService:
                 )
             except (asyncio.CancelledError, KeyboardInterrupt):
                 raise
+            except WorkerBoundaryAuthenticationError:
+                raise
             except SessionExecutionError:
                 raise
             except Exception:
@@ -2109,6 +2117,8 @@ class SessionService:
                 )
             try:
                 response = await transaction(response["transaction_id"])
+            except WorkerBoundaryAuthenticationError:
+                raise
             except Exception:
                 raise SessionExecutionError(
                     "Remote provisioning status is unavailable."
@@ -2132,6 +2142,14 @@ class SessionService:
         )
 
     async def bootstrap_session(self, session_id):
+        try:
+            return await self._bootstrap_session(session_id)
+        except WorkerBoundaryAuthenticationError:
+            raise TerminalProvisioningError(
+                "Remote worker boundary authentication failed."
+            ) from None
+
+    async def _bootstrap_session(self, session_id):
         session = self.session(session_id)
         if session.state not in {
             SessionState.BOOTSTRAPPING,
@@ -2160,9 +2178,7 @@ class SessionService:
         except (asyncio.CancelledError, KeyboardInterrupt):
             raise
         except WorkerBoundaryAuthenticationError:
-            raise TerminalProvisioningError(
-                "Remote worker boundary authentication failed."
-            ) from None
+            raise
         except Exception:
             raise SessionExecutionError(
                 "Remote worker authentication failed."
@@ -2211,6 +2227,8 @@ class SessionService:
             deadline_result = await deadline(policy)
         except (asyncio.CancelledError, KeyboardInterrupt):
             raise
+        except WorkerBoundaryAuthenticationError:
+            raise
         except Exception:
             raise SessionExecutionError(
                 "Remote deadline enforcement failed."
@@ -2232,6 +2250,14 @@ class SessionService:
         )
 
     async def recover_session(self, session_id):
+        try:
+            return await self._recover_session(session_id)
+        except WorkerBoundaryAuthenticationError:
+            raise TerminalProvisioningError(
+                "Remote worker boundary authentication failed."
+            ) from None
+
+    async def _recover_session(self, session_id):
         session = self.session(session_id)
         if session.state not in {
             SessionState.READY,
@@ -2262,9 +2288,7 @@ class SessionService:
         except (asyncio.CancelledError, KeyboardInterrupt):
             raise
         except WorkerBoundaryAuthenticationError:
-            raise TerminalProvisioningError(
-                "Remote worker boundary authentication failed."
-            ) from None
+            raise
         except Exception:
             raise SessionExecutionError(
                 "Remote worker authentication failed."
@@ -2301,6 +2325,8 @@ class SessionService:
             deadline_result = await deadline(policy)
         except (asyncio.CancelledError, KeyboardInterrupt):
             raise
+        except WorkerBoundaryAuthenticationError:
+            raise
         except Exception:
             raise SessionExecutionError(
                 "Remote deadline enforcement failed."
@@ -2336,6 +2362,8 @@ class SessionService:
             try:
                 result = await relay.sync_job(job.job_id)
             except (asyncio.CancelledError, KeyboardInterrupt):
+                raise
+            except WorkerBoundaryAuthenticationError:
                 raise
             except Exception:
                 raise SessionExecutionError(

@@ -786,6 +786,7 @@ class CloudAttempt:
     state: AttemptState
     quote: OfferQuote
     instance_id: str | None = None
+    residual_inventory: tuple[str, ...] = ()
     ready_url: str | None = None
     provider_token: str | None = field(default=None, repr=False)
     retry_count: int = 0
@@ -832,6 +833,7 @@ class CloudAttempt:
             "provider_token",
             "quote",
             "ready_url",
+            "residual_inventory",
             "retry_count",
             "sanitized_error",
         }
@@ -847,6 +849,10 @@ class CloudAttempt:
         retry_count = int(changes.get("retry_count", self.retry_count))
         if retry_count not in (0, 1):
             raise ValueError("At most one automatic retry is allowed.")
+        if "residual_inventory" in changes:
+            changes["residual_inventory"] = tuple(
+                str(item) for item in changes["residual_inventory"]
+            )
         changes["retry_count"] = retry_count
         timestamp = float(time.time() if now is None else now)
         return replace(self, state=target, updated_at=timestamp, **changes)
@@ -857,6 +863,7 @@ class CloudAttempt:
             "status": self.state.value,
             "offer": self.quote.public_payload(),
             "instance_id": self.instance_id,
+            "residual_inventory": list(self.residual_inventory),
             "ready_url": self.ready_url,
             "retry_count": self.retry_count,
             "cancel_requested": self.cancel_requested,
@@ -864,11 +871,15 @@ class CloudAttempt:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
-        residual = self.state == AttemptState.FAILED and bool(self.instance_id)
+        residual_ids = self.residual_inventory or (
+            (str(self.instance_id),) if self.instance_id else ()
+        )
+        residual = self.state == AttemptState.FAILED and bool(residual_ids)
         payload["billing_may_continue"] = residual
         payload["emergency_action"] = (
-            "Destroy Vast instance "
-            + str(self.instance_id)
+            "Destroy residual Vast instance"
+            + ("s " if len(residual_ids) != 1 else " ")
+            + ", ".join(residual_ids)
             + " in the Vast.ai console immediately."
             if residual
             else None

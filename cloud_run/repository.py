@@ -32,8 +32,8 @@ class ConcurrentSessionUpdate(RuntimeError):
 
 _COLUMNS = """
     attempt_id, idempotency_key, label, state, quote_json, instance_id,
-    ready_url, provider_token, retry_count, cancel_requested, sanitized_error,
-    created_at, updated_at, version
+    residual_inventory_json, ready_url, provider_token, retry_count,
+    cancel_requested, sanitized_error, created_at, updated_at, version
 """
 
 _SESSION_COLUMNS = """
@@ -334,11 +334,20 @@ def _migrate_legacy_attempts(connection):
     ).fetchone()
     if exists is None:
         return
+    attempt_columns = {
+        row["name"]
+        for row in connection.execute("PRAGMA table_info(attempts)").fetchall()
+    }
+    residual_expression = (
+        "residual_inventory_json"
+        if "residual_inventory_json" in attempt_columns
+        else "NULL AS residual_inventory_json"
+    )
     rows = connection.execute(
-        """
+        f"""
         SELECT
             attempt_id, idempotency_key, label, state, quote_json,
-            instance_id, ready_url, provider_token, retry_count,
+            instance_id, {residual_expression}, ready_url, provider_token, retry_count,
             cancel_requested, sanitized_error, created_at, updated_at, version
         FROM attempts
         """
@@ -348,11 +357,23 @@ def _migrate_legacy_attempts(connection):
             str(row["state"]),
             SessionState.FAILED,
         )
-        residual_inventory = (
-            [str(row["instance_id"])]
-            if state == SessionState.FAILED and row["instance_id"]
-            else []
-        )
+        try:
+            residual_inventory = [
+                str(item)
+                for item in json.loads(
+                    row["residual_inventory_json"] or "[]"
+                )
+            ]
+        except (TypeError, ValueError, json.JSONDecodeError):
+            residual_inventory = []
+        if (
+            state == SessionState.FAILED
+            and row["instance_id"]
+            and str(row["instance_id"]) not in residual_inventory
+        ):
+            residual_inventory.append(str(row["instance_id"]))
+        if state != SessionState.FAILED:
+            residual_inventory = []
         connection.execute(
             """
             INSERT OR IGNORE INTO sessions (
@@ -402,6 +423,7 @@ class AttemptRepository:
                     state TEXT NOT NULL,
                     quote_json TEXT NOT NULL,
                     instance_id TEXT,
+                    residual_inventory_json TEXT,
                     ready_url TEXT,
                     provider_token TEXT,
                     retry_count INTEGER NOT NULL,
@@ -413,6 +435,16 @@ class AttemptRepository:
                 )
                 """
             )
+            columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(attempts)"
+                ).fetchall()
+            }
+            if "residual_inventory_json" not in columns:
+                connection.execute(
+                    "ALTER TABLE attempts ADD COLUMN residual_inventory_json TEXT"
+                )
             connection.commit()
         os.chmod(self.path, 0o600)
 
@@ -442,6 +474,12 @@ class AttemptRepository:
             state=AttemptState(row["state"]),
             quote=OfferQuote.from_record(json.loads(row["quote_json"])),
             instance_id=row["instance_id"],
+            residual_inventory=tuple(
+                str(item)
+                for item in json.loads(
+                    row["residual_inventory_json"] or "[]"
+                )
+            ),
             ready_url=row["ready_url"],
             provider_token=row["provider_token"],
             retry_count=int(row["retry_count"]),
@@ -461,6 +499,7 @@ class AttemptRepository:
             attempt.state.value,
             AttemptRepository._quote_json(attempt.quote),
             attempt.instance_id,
+            _canonical_json(list(attempt.residual_inventory)),
             attempt.ready_url,
             attempt.provider_token,
             attempt.retry_count,
@@ -501,7 +540,7 @@ class AttemptRepository:
                 connection.execute(
                     f"""
                     INSERT INTO attempts ({_COLUMNS})
-                    VALUES ({",".join("?" for _ in range(14))})
+                    VALUES ({",".join("?" for _ in range(15))})
                     """,
                     self._values(attempt),
                 )
@@ -529,6 +568,7 @@ class AttemptRepository:
                 state = ?,
                 quote_json = ?,
                 instance_id = ?,
+                residual_inventory_json = ?,
                 ready_url = ?,
                 provider_token = ?,
                 retry_count = ?,
@@ -542,6 +582,7 @@ class AttemptRepository:
                 attempt.state.value,
                 self._quote_json(attempt.quote),
                 attempt.instance_id,
+                _canonical_json(list(attempt.residual_inventory)),
                 attempt.ready_url,
                 attempt.provider_token,
                 attempt.retry_count,

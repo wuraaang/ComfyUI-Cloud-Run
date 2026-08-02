@@ -1027,11 +1027,17 @@ class ReadySessionService(RecoveringSessionService):
 
 
 class TerminalSessionService(RecoveringSessionService):
-    diagnostic = "Remote provisioning response was invalid."
+    diagnostic = "Remote worker boundary authentication failed."
 
     async def bootstrap_session(self, session_id):
         session = self.repository.get(session_id)
         self.bootstrap_calls.append(session)
+        if session.state == SessionState.BOOTSTRAPPING:
+            self.repository.transition(
+                session.session_id,
+                SessionState.PROVISIONING,
+                now=session.updated_at + 1,
+            )
         raise TerminalProvisioningError(self.diagnostic)
 
 
@@ -1258,6 +1264,11 @@ class SessionLifecycleTests(LifecycleTestCase):
         self.assertEqual(failed.state, SessionState.FAILED)
         self.assertEqual(failed.instance_id, "instance-1")
         self.assertEqual(failed.residual_inventory, ("instance-1",))
+        self.assertEqual(failed.provider_token, session.provider_token)
+        self.assertEqual(
+            failed.session_secret_hex,
+            session.session_secret_hex,
+        )
         self.assertTrue(failed.public_payload()["billing_may_continue"])
         self.assertEqual(
             failed.sanitized_error,
@@ -1269,6 +1280,9 @@ class SessionLifecycleTests(LifecycleTestCase):
             [call[0] for call in self.provider.calls],
             ["get", "destroy", "list"],
         )
+        for rendered in (repr(failed), repr(failed.public_payload())):
+            self.assertNotIn(session.provider_token, rendered)
+            self.assertNotIn(session.session_secret_hex, rendered)
 
     def test_terminal_destroy_unverifiable_inventory_keeps_warning(self):
         self.session_service = TerminalSessionService(self.sessions)
@@ -1288,6 +1302,11 @@ class SessionLifecycleTests(LifecycleTestCase):
         self.assertEqual(failed.state, SessionState.FAILED)
         self.assertEqual(failed.instance_id, "instance-1")
         self.assertEqual(failed.residual_inventory, ("instance-1",))
+        self.assertEqual(failed.provider_token, session.provider_token)
+        self.assertEqual(
+            failed.session_secret_hex,
+            session.session_secret_hex,
+        )
         self.assertTrue(failed.public_payload()["billing_may_continue"])
         self.assertEqual(
             failed.sanitized_error,
@@ -1317,6 +1336,11 @@ class SessionLifecycleTests(LifecycleTestCase):
         self.assertEqual(failed.state, SessionState.FAILED)
         self.assertEqual(failed.instance_id, "instance-1")
         self.assertEqual(failed.residual_inventory, ("instance-1",))
+        self.assertEqual(failed.provider_token, session.provider_token)
+        self.assertEqual(
+            failed.session_secret_hex,
+            session.session_secret_hex,
+        )
         self.assertTrue(failed.public_payload()["billing_may_continue"])
         self.assertEqual(
             failed.sanitized_error,
@@ -1603,7 +1627,15 @@ class SessionLifecycleTests(LifecycleTestCase):
                 "disk_bw_mbps": 750.0,
             }
         ]
+        original_destroy = self.provider.destroy_instance
         original_create = self.provider.create_instance
+
+        async def observing_destroy(*args, **kwargs):
+            persisted = self.sessions.get(session.session_id)
+            self.assertEqual(persisted.state, SessionState.DESTROYING)
+            self.assertEqual(persisted.provider_token, "a" * 64)
+            self.assertEqual(persisted.session_secret_hex, original_secret)
+            return await original_destroy(*args, **kwargs)
 
         async def ambiguous_create(*args, **kwargs):
             persisted = self.sessions.get(session.session_id)
@@ -1619,6 +1651,7 @@ class SessionLifecycleTests(LifecycleTestCase):
             ]
             raise VastError("Synthetic lost response.", retryable=True)
 
+        self.provider.destroy_instance = observing_destroy
         self.provider.create_instance = ambiguous_create
 
         with patch("secrets.token_hex", return_value="b" * 64):
@@ -1641,6 +1674,75 @@ class SessionLifecycleTests(LifecycleTestCase):
         self.assertNotIn("provider_token", rendered)
         self.assertNotIn("session_secret_hex", rendered)
         self.assertNotIn("provider_token", replacement.public_payload())
+
+    def test_session_ambiguous_replacement_fails_closed_on_multiple_matches(self):
+        session = self.save_session(max_instance_creates=2)
+        self.provider.instances = [
+            self.worker_instance("instance-1", session.label)
+        ]
+        self.provider.search_results = [
+            {
+                "offer_id": 43,
+                "gpu_name": "RTX 4090",
+                "gpu_ram_gb": 24.0,
+                "dph_total": 0.44,
+                "reliability": 0.995,
+                "machine_id": "machine-8",
+                "host_id": "host-4",
+                "public_ipaddr": "1.1.1.1",
+                "inet_down_mbps": 1000.0,
+                "disk_bw_mbps": 750.0,
+            }
+        ]
+        original_create = self.provider.create_instance
+
+        async def ambiguous_create(*args, **kwargs):
+            await original_create(*args, **kwargs)
+            self.provider.instances = [
+                self.worker_instance(instance_id, session.label)
+                for instance_id in ("instance-2", "instance-3")
+            ]
+            raise VastError("Synthetic lost response.", retryable=True)
+
+        self.provider.create_instance = ambiguous_create
+
+        failed = asyncio.run(
+            self.session_lifecycle().handle_session_boot_failure(
+                session.session_id,
+                failure_code="boot_timeout",
+            )
+        )
+
+        self.assertEqual(failed.state, SessionState.FAILED)
+        self.assertIsNone(failed.instance_id)
+        self.assertEqual(
+            failed.residual_inventory,
+            ("instance-2", "instance-3"),
+        )
+        self.assertTrue(failed.public_payload()["billing_may_continue"])
+        self.assertEqual(
+            len([call for call in self.provider.calls if call[0] == "create"]),
+            1,
+        )
+
+        repeated = asyncio.run(
+            self.session_lifecycle().handle_session_boot_failure(
+                session.session_id,
+                failure_code="boot_timeout",
+            )
+        )
+
+        self.assertEqual(repeated.state, SessionState.FAILED)
+        self.assertIsNone(repeated.instance_id)
+        self.assertEqual(
+            repeated.residual_inventory,
+            ("instance-2", "instance-3"),
+        )
+        self.assertTrue(repeated.public_payload()["billing_may_continue"])
+        self.assertEqual(
+            len([call for call in self.provider.calls if call[0] == "create"]),
+            1,
+        )
 
     def test_session_replacement_reapplies_connection_floors_before_create(self):
         session = self.save_session(max_instance_creates=2)
@@ -1786,6 +1888,64 @@ class SessionLifecycleTests(LifecycleTestCase):
             1,
         )
 
+    def test_attempt_ambiguous_replacement_fails_closed_on_multiple_matches(self):
+        attempt = self.save_attempt(
+            AttemptState.STARTING,
+            instance_id="instance-1",
+            selected_quote=quote(max_instance_creates=2),
+            provider_token="a" * 64,
+        )
+        self.provider.instances = [
+            provider_instance("instance-1", attempt.label)
+        ]
+        self.provider.search_results = [
+            {
+                "offer_id": 43,
+                "gpu_name": "RTX 4090",
+                "gpu_ram_gb": 24.0,
+                "dph_total": 0.44,
+                "reliability": 0.995,
+                "machine_id": "machine-8",
+                "host_id": "host-4",
+                "public_ipaddr": "1.1.1.1",
+                "inet_down_mbps": 1200.0,
+                "disk_bw_mbps": 700.0,
+            }
+        ]
+        original_create = self.provider.create_instance
+
+        async def ambiguous_create(*args, **kwargs):
+            await original_create(*args, **kwargs)
+            self.provider.instances = [
+                provider_instance(instance_id, attempt.label)
+                for instance_id in ("instance-2", "instance-3")
+            ]
+            raise VastError("Synthetic lost response.", retryable=True)
+
+        self.provider.create_instance = ambiguous_create
+
+        failed = asyncio.run(
+            self.lifecycle().handle_start_failure(
+                attempt.attempt_id,
+                failure_code="boot_timeout",
+            )
+        )
+
+        self.assertEqual(failed.state, AttemptState.FAILED)
+        self.assertIsNone(failed.instance_id)
+        self.assertEqual(
+            failed.residual_inventory,
+            ("instance-2", "instance-3"),
+        )
+        payload = failed.public_payload()
+        self.assertTrue(payload["billing_may_continue"])
+        self.assertIn("instance-2", payload["emergency_action"])
+        self.assertIn("instance-3", payload["emergency_action"])
+        self.assertEqual(
+            len([call for call in self.provider.calls if call[0] == "create"]),
+            1,
+        )
+
     def test_session_destroy_requires_inventory_absence_after_delete(self):
         session = self.save_session(state=SessionState.READY)
         self.provider.instances = [
@@ -1800,6 +1960,8 @@ class SessionLifecycleTests(LifecycleTestCase):
 
         self.assertEqual(destroyed.state, SessionState.DESTROYED)
         self.assertIsNone(destroyed.instance_id)
+        self.assertIsNone(destroyed.provider_token)
+        self.assertIsNone(destroyed.session_secret_hex)
         self.assertEqual(
             [call[0] for call in self.provider.calls],
             ["destroy", "list"],
@@ -1820,6 +1982,11 @@ class SessionLifecycleTests(LifecycleTestCase):
 
         self.assertEqual(failed.state, SessionState.FAILED)
         self.assertEqual(failed.instance_id, "instance-1")
+        self.assertEqual(failed.provider_token, session.provider_token)
+        self.assertEqual(
+            failed.session_secret_hex,
+            session.session_secret_hex,
+        )
         self.assertTrue(failed.public_payload()["billing_may_continue"])
         self.assertEqual(
             [call[0] for call in self.provider.calls],

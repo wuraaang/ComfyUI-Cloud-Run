@@ -40,6 +40,10 @@ from cloud_run.session_service import (
     TerminalProvisioningError,
 )
 from cloud_run.worker_release import WorkerRelease
+from cloud_run.worker_client import (
+    WorkerBoundaryAuthenticationError,
+    WorkerClientError,
+)
 
 
 def capture_payload():
@@ -1014,6 +1018,110 @@ class SessionProvisioningTests(unittest.TestCase):
         with self.assertRaises(KeyboardInterrupt):
             asyncio.run(self.apply(worker))
 
+    def test_boundary_401_survives_upload_status_and_upload_helpers(self):
+        content = b"boundary-upload"
+        path = self.path.parent / "boundary-upload.bin"
+        path.write_bytes(content)
+        digest = __import__("hashlib").sha256(content).hexdigest()
+        artifact = ArtifactSpec(
+            artifact_id="boundary-upload",
+            kind="input",
+            logical_name="boundary-upload.bin",
+            destination="input/boundary-upload.bin",
+            size_bytes=len(content),
+            sha256=digest,
+            source=SourceSpec(
+                "local-upload",
+                "local-upload:boundary-upload",
+            ),
+        )
+        self.jobs.register_local_artifact(
+            types.SimpleNamespace(
+                artifact_id=artifact.artifact_id,
+                private_path=str(path),
+                size_bytes=artifact.size_bytes,
+                sha256=artifact.sha256,
+            )
+        )
+
+        class RejectedUploadWorker:
+            def __init__(inner_self, rejected_operation):
+                inner_self.rejected_operation = rejected_operation
+
+            async def upload_status(inner_self, _artifact_id):
+                if inner_self.rejected_operation == "status":
+                    raise WorkerBoundaryAuthenticationError(
+                        "Remote worker boundary authentication failed."
+                    )
+                return None
+
+            async def upload_artifact(inner_self, *_args, **_kwargs):
+                if inner_self.rejected_operation == "upload":
+                    raise WorkerBoundaryAuthenticationError(
+                        "Remote worker boundary authentication failed."
+                    )
+                return {
+                    "artifact_id": artifact.artifact_id,
+                    "state": "verified",
+                    "next_offset": artifact.size_bytes,
+                    "size_bytes": artifact.size_bytes,
+                    "sha256": artifact.sha256,
+                }
+
+        for operation in ("status", "upload"):
+            with self.subTest(operation=operation):
+                with self.assertRaises(WorkerBoundaryAuthenticationError):
+                    asyncio.run(
+                        self.service._upload_artifact(
+                            RejectedUploadWorker(operation),
+                            "boundary-upload-" + operation,
+                            artifact,
+                        )
+                    )
+
+    def test_boundary_401_survives_transaction_polling_and_lookup_helpers(self):
+        manifest = self.manifest
+        request = {"manifest_digest": manifest.digest}
+        self.service.job_poll_interval_seconds = 0
+
+        class RejectedPollingWorker:
+            async def apply_manifest(inner_self, _request):
+                await asyncio.Event().wait()
+
+            async def transaction(inner_self, _transaction_id):
+                raise WorkerBoundaryAuthenticationError(
+                    "Remote worker boundary authentication failed."
+                )
+
+        with self.assertRaises(WorkerBoundaryAuthenticationError):
+            asyncio.run(
+                asyncio.wait_for(
+                    self.service._apply_with_progress_polling(
+                        RejectedPollingWorker(),
+                        request,
+                        session=self.sessions.get("terminal-session"),
+                        manifest=manifest,
+                        transfer_job_id="bootstrap:terminal-session",
+                    ),
+                    timeout=0.2,
+                )
+            )
+
+        worker = SequentialWorker()
+
+        async def incomplete(_payload):
+            return self.response(state="applying")
+
+        async def rejected_transaction(_transaction_id):
+            raise WorkerBoundaryAuthenticationError(
+                "Remote worker boundary authentication failed."
+            )
+
+        worker.apply_manifest = incomplete
+        worker.transaction = rejected_transaction
+        with self.assertRaises(WorkerBoundaryAuthenticationError):
+            asyncio.run(self.apply(worker))
+
 
 class ReusableSessionTests(unittest.TestCase):
     def setUp(self):
@@ -1666,6 +1774,76 @@ class ReusableSessionTests(unittest.TestCase):
             "Remote worker boundary authentication failed.",
         )
         self.assertIsNone(raised.exception.__cause__)
+
+    def test_bootstrap_later_phase_boundary_401_is_terminal(self):
+        self._save_bootstrapping_session()
+
+        async def rejected_provisioning(_payload):
+            raise WorkerBoundaryAuthenticationError(
+                "Remote worker boundary authentication failed."
+            )
+
+        self.worker.apply_manifest = rejected_provisioning
+
+        with self.assertRaises(TerminalProvisioningError) as raised:
+            asyncio.run(self.service.bootstrap_session("session-boot"))
+
+        self.assertIs(type(raised.exception), TerminalProvisioningError)
+        self.assertEqual(
+            str(raised.exception),
+            "Remote worker boundary authentication failed.",
+        )
+        self.assertIsNone(raised.exception.__cause__)
+
+    def test_recovery_later_phase_boundary_401_is_terminal(self):
+        self.worker.claimed = True
+
+        async def rejected_deadline(_policy):
+            raise WorkerBoundaryAuthenticationError(
+                "Remote worker boundary authentication failed."
+            )
+
+        self.worker.update_deadline = rejected_deadline
+
+        with self.assertRaises(TerminalProvisioningError) as raised:
+            asyncio.run(self.service.recover_session("session-1"))
+
+        self.assertIs(type(raised.exception), TerminalProvisioningError)
+        self.assertEqual(
+            str(raised.exception),
+            "Remote worker boundary authentication failed.",
+        )
+        self.assertIsNone(raised.exception.__cause__)
+
+    def test_later_phase_worker_transport_failures_remain_retryable(self):
+        self._save_bootstrapping_session()
+
+        async def failed_provisioning(_payload):
+            raise WorkerClientError("Remote worker request failed.")
+
+        self.worker.apply_manifest = failed_provisioning
+        with self.assertRaises(SessionExecutionError) as bootstrap_error:
+            asyncio.run(self.service.bootstrap_session("session-boot"))
+        self.assertIs(type(bootstrap_error.exception), SessionExecutionError)
+        self.assertEqual(
+            str(bootstrap_error.exception),
+            "Remote provisioning failed.",
+        )
+
+        self.worker = SequentialWorker()
+        self.worker.claimed = True
+
+        async def failed_deadline(_policy):
+            raise WorkerClientError("Remote worker request failed.")
+
+        self.worker.update_deadline = failed_deadline
+        with self.assertRaises(SessionExecutionError) as recovery_error:
+            asyncio.run(self.service.recover_session("session-1"))
+        self.assertIs(type(recovery_error.exception), SessionExecutionError)
+        self.assertEqual(
+            str(recovery_error.exception),
+            "Remote deadline enforcement failed.",
+        )
 
     def test_worker_transport_failures_remain_retryable(self):
         from cloud_run.worker_client import WorkerClientError
