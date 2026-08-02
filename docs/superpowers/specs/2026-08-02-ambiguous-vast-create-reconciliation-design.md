@@ -1,7 +1,7 @@
 # Ambiguous Vast Create Reconciliation Design
 
 **Date:** 2026-08-02
-**Status:** Proposed for written review
+**Status:** Approved for TDD implementation and a controlled 3 + 2 live rollout
 **Scope:** Correct the Vast instance-create request contract and make every failed or ambiguous rental outcome explicit, safe, and manually recoverable before another paid confirmation.
 
 ## Goal
@@ -24,7 +24,13 @@ The latest attempt used session `ec0a4cbb-a51f-417b-8e7c-64bebbe77054` and offer
 
 The precise transport failure cannot be recovered. `cloud_run.vast.create_instance()` currently replaces the original exception type and message with one generic `VastError`, and `CloudRunService.confirm_session()` replaces every retryable create error with the same public text.
 
-The review also found a deterministic request-contract defect introduced with the worker boundary. The current controller sends instance `env` as a Docker-flag string. Vast's official CLI parses the human Docker-flag syntax into a JSON object before `PUT /api/v0/asks/{offer_id}/`, and the current official SDK types `InstanceConfig.env` as `dict[str, str]`. The request must therefore use an object:
+The review also found a request-contract mismatch introduced with the worker
+boundary. The current controller sends instance `env` as a Docker-flag string.
+Vast's current API workflow guide documents `env` as a JSON object, its
+official CLI parses human Docker-flag syntax into an object before
+`PUT /api/v0/asks/{offer_id}/`, and the CLI's current `InstanceConfig` model
+types `env` as `dict[str, str]`. The controller will therefore follow that
+object contract:
 
 ```json
 {
@@ -44,7 +50,17 @@ Authoritative references:
 - <https://github.com/vast-ai/vast-cli/blob/bc7356483dd0f922ee17975c5357741f0d5d81fc/vast.py#L2477-L2534>
 - <https://github.com/vast-ai/vast-cli/blob/bc7356483dd0f922ee17975c5357741f0d5d81fc/vastai/data/instance.py#L6-L31>
 
-This request mismatch is a plausible cause of the latest failure because that was the first live create after request-level boundary injection. It is not claimed as the proven incident cause because the original exception was discarded.
+The sources are not unanimous: the generated create-endpoint reference still
+describes `env` as a Docker-flag string. That contradiction is recorded rather
+than hidden. The implementation follows the object form used by the workflow
+guide and current official client, pins the client revision in its contract
+test, and relies on a single manually authorized smoke rental for live
+confirmation. No unauthorised create is used to probe the discrepancy.
+
+This request mismatch is a plausible cause of the latest failure because that
+was the first live create after request-level boundary injection. It is not
+claimed as the proven incident cause because the original exception was
+discarded.
 
 ## Decisions
 
@@ -137,6 +153,19 @@ successful full inventory response. Verified absence requires all three of:
 2. `create_last_empty_at - create_first_empty_at >= 120`;
 3. the last observation occurred after reconciliation began.
 
+The bounded count may saturate at three, but every later successful full empty
+snapshot updates `create_last_empty_at`. A "full empty snapshot" is deliberately
+strict: every paginated response must have `success=true`, an `instances` list
+whose every row validates, `instances_found == len(instances)`, one coherent
+non-negative integer total across all pages, and a terminal null `next_token`.
+Any duplicate contract ID across pages, repeated token, malformed row,
+inconsistent count/total, or partial page makes inventory unavailable. At the
+terminal token, both the sum of page `instances_found` values and the number of
+unique normalized contracts must equal `total_instances`. Exact global zero
+requires an empty accumulated list, both counts zero, and terminal null token.
+No filtered, duplicated, short, partial, or malformed response can contribute
+empty evidence.
+
 Three rapid reads after a long process outage therefore cannot manufacture a
 120-second evidence window. This evidence is not exposed as provider data and
 is cleared when the session adopts an instance, reaches verified absence, or
@@ -197,6 +226,7 @@ rental_outcome: not_started | unknown | active | absent
 failure_code: safe enum | null
 can_search_offers: boolean
 can_destroy: boolean
+can_verify_vast_access: boolean
 billing_may_continue: boolean
 ```
 
@@ -219,7 +249,8 @@ The exact capability matrix is:
 | identified instance from `bootstrapping` through `harvesting` | `active` | true | false | true |
 | `destroy_requested` or `destroying` | `unknown` or `active` from inventory evidence | true | false | false while the request is already pending |
 | `failed` with an instance or residual inventory | `active` | true | false | true |
-| `failed` because of 400/401/403 | `absent` | false | false until settings or controller configuration is corrected and preflight is rerun | false |
+| `failed` because of 400 | `absent` | false | false until a verified controller/config repair, any authorized reload, and a new campaign authorization | false |
+| `failed` because of 401/403 | `absent` | false | false until corrected settings and a successful authenticated full inventory read | false |
 | `failed` because of 404/410 | `absent` | false | true with a current rentable preflight | false |
 | recovered `failed + confirmation_interrupted` | `absent` | false | true with a current rentable preflight | false |
 | `failed` after the complete empty-evidence window | `absent` | false | true with a current rentable preflight | false |
@@ -227,6 +258,12 @@ The exact capability matrix is:
 
 The actual Search button requires both the session capability and the current
 frontend `preflightId`. No capability is inferred from `error` text.
+
+`can_verify_vast_access` is true only for terminal `failed + absent +
+api_key_rejected` without remediation evidence. It is false for 400, 404/410,
+unknown/active, and already remediated sessions. The explicit read-only button
+is rendered solely from this capability, never by matching `failure_code` or
+message text.
 
 ### 7. Give the user one unambiguous next action
 
@@ -240,9 +277,12 @@ Billing status is not yet known; Vast may have created an instance.
 
 Search, offer review, and paid confirmation are disabled. Polling and the reviewed destruction control remain available.
 
-The backend enforces the same paid-mutation gate. Before any create, it rejects
-the confirmation if another session has rental outcome `unknown` or `active`.
-This check is repository-backed and cannot be bypassed by calling the route
+The backend enforces the same paid-mutation gate. Before any create, one SQLite
+transaction scans every other session, including terminal records, and rejects
+the confirmation if any record derives rental outcome `unknown` or `active`,
+has an attached instance ID, or retains residual inventory. A terminal
+`failed` record with provider evidence therefore still blocks a rental. This
+check is repository-backed and cannot be bypassed by calling the route
 directly. Read-only inventory reconciliation remains allowed.
 
 After verified absence, the UI displays:
@@ -267,11 +307,48 @@ or `active` records; an `absent` record never produces the generic
 `SessionRepository.list_recoverable()` excludes `failed + absent`, while
 retaining every `unknown` or `active` record for watchdog recovery. The settings
 payload exposes sanitized `active_sessions` from that recoverable set and a
-separate bounded `recent_sessions` history from `list_all()`. This preserves a
-terminal failure across dialog reload without repeatedly running provider
-recovery against it.
+separate `recent_sessions` history from a bounded `list_recent(limit=20)`
+query. This preserves a terminal failure across dialog reload without loading
+unbounded history or repeatedly running provider recovery against it.
+
+The browser-facing offer search omits provider machine ID, host ID, and public
+IP. The backend revalidates the selected offer and retains those identities
+privately in the reviewed quote for anti-switch checks and sanitized campaign
+diversity evidence.
 
 Definitive errors retain their actionable reason. An unavailable offer says to search again; a rejected API key or configuration says to correct settings rather than misleadingly suggesting another GPU.
+
+For a terminal absent configuration or API-key failure,
+`can_search_offers=false` remains false on that historical session record. A
+successful workflow preflight alone cannot prove that provider credentials or
+the create payload were repaired and must not unlock another rental. A 401/403
+gate requires corrected settings plus a successful authenticated read-only
+full inventory. A 400 gate requires a demonstrated controller/configuration
+repair, offline verification, any separately authorized restart needed to load
+it, and a new paid-campaign authorization. The failed record remains in
+`recent_sessions`; no frontend selection reset can bypass these gates.
+
+These are backend gates, not merely UI advice. Each paid create records the
+private API-key settings revision and `VAST_CREATE_CONFIGURATION_REVISION` used.
+A terminal 400/401/403 record derives `blocks_new_rental=true` until typed,
+durable remediation evidence is attached:
+
+- updating the API key creates a new private settings revision; an explicit
+  free `Verify Vast access` action must then complete one strict full inventory
+  read with that revision before the repository may mark an older 401/403
+  failure remediated;
+- a 400 can be remediated only when a later controller with a deliberately
+  changed create-configuration revision is actually loaded. Startup records
+  that loaded revision, and may mark an older differing 400 revision remediated
+  only after the repair passed the offline gate and the restart was separately
+  authorized operationally.
+
+The SQLite remediation update verifies terminal absence, cleared secrets, no
+instance/residual IDs, the expected failure code, and a revision strictly
+different from the failed one. `claim_create_intent()` scans every unremediated
+blocker in its same `BEGIN IMMEDIATE` transaction. Search, preflight, browser
+reload, and a direct confirm route cannot synthesize this evidence. Resuming
+after either failure still needs a new exact paid-campaign GO.
 
 ### 8. Remove automatic paid replacement from this flow
 
@@ -290,6 +367,38 @@ after secrets were persisted in `creating`, clears `provider_token` and
 
 This preserves the user's paid-action boundary and makes the previous `authorized total instance-create limit was reached` message irrelevant to create reconciliation.
 
+### 9. Bind every counted job to its certified executable canvas
+
+Raw workflow-file SHA, canonical parsed-workflow SHA, executable-baseline
+digest, and prompt digest are four different identities. The first two freeze
+the imported file. The executable-baseline digest hashes the compiled `output`
+and queue options after normalizing only a backend-derived set of core
+`KSampler` seed inputs whose workflow control is exactly `randomize`. The hash
+envelope includes that sorted node-ID set, so enabling/disabling randomization
+or changing any other executable input changes the baseline. The prompt digest
+remains the exact unnormalized prompt for one capture/job and may differ between
+two valid randomized runs.
+
+Rentable preflight persists the executable-baseline digest and normalized seed
+node set into the reviewed quote and session. `Run current canvas` still makes
+one fresh capture, but before any remote job or manifest mutation the backend
+recomputes the baseline and requires exact equality with the reviewed session.
+For this campaign the smoke set is empty and the Gold set is exactly node `3`.
+The fresh job then stores its own exact prompt digest. The evidence helper
+recomputes the baseline from `job.capture_json`, checks it against the frozen
+session value, and checks the job prompt digest against the same unnormalized
+capture. Editing any node, model, text, input, parameter, queue option, or seed
+mode after preflight therefore fails before remote submission; only the numeric
+seed at an already certified randomized core KSampler may vary.
+
+Harvesting persists each output descriptor's validated source node together
+with the published file device/inode, size, and SHA-256. Live evidence opens the
+SQLite database read-only, selects by exact session/job/prompt/baseline/node,
+rehashes the same regular file under the approved output root, and for Gold
+resolves the frozen source from the exact manifest `local-upload` artifact and
+local artifact catalog under the approved input root. A newest-file or
+caller-chosen output path is never acceptance evidence.
+
 ## Test contract
 
 Implementation follows red-green TDD.
@@ -301,6 +410,8 @@ Implementation follows red-green TDD.
 - 400/401/403/404/410 remain definitive and specific;
 - 408/409/429/5xx and recognized transport failures receive stable safe codes;
 - no provider body, exception message, or secret appears publicly.
+- inventory is usable only after every page, row, count, total, token, and
+  success marker validates; a partial or malformed snapshot never proves zero.
 
 ### Durable model and repository
 
@@ -312,6 +423,8 @@ Implementation follows red-green TDD.
   reads from satisfying the evidence span;
 - `rental_outcome`, capabilities, and billing status match each state;
 - terminal verified absence clears boundary and HMAC secrets.
+- reviewed sessions persist one executable-baseline digest and the exact
+  backend-derived randomized-seed node set.
 
 ### Service and lifecycle
 
@@ -321,6 +434,11 @@ Implementation follows red-green TDD.
 - duplicate confirmation issues no second create;
 - a different session cannot confirm while any session is `unknown` or
   `active`, even through a direct route call;
+- terminal failed sessions with an attached instance or residual inventory also
+  block the atomic create claim;
+- unremediated 400/401/403 failures block direct and UI confirmation; only a
+  newer typed configuration revision or a newer settings revision with strict
+  authenticated inventory proof lifts the matching blocker;
 - one late match is adopted with the original boundary token;
 - multiple matches retain residual IDs and emergency action;
 - empty evidence before 120 seconds remains ambiguous;
@@ -334,6 +452,11 @@ Implementation follows red-green TDD.
 - neither `handle_start_failure()` nor `handle_session_boot_failure()` searches
   or creates a replacement, including attempt and session records with
   historical `max_instance_creates=2`.
+- a fresh Run capture with any non-seed executable change is rejected before a
+  worker job, while only a numeric seed change at the certified randomized core
+  KSampler preserves the executable baseline.
+- output evidence rejects wrong job/node/baseline provenance, path escape,
+  symlink or device/inode replacement, digest change, and ambiguous Gold input.
 
 ### Frontend
 
@@ -341,6 +464,12 @@ Implementation follows red-green TDD.
 - verified absence shows the exact safe message, hides Destroy/Confirm, enables search, and clears the old selection and idempotency key;
 - an inventory outage never displays `No Vast billing is active`;
 - all provider-derived values remain inert `textContent`.
+- repeated preflight never clears a configuration/API gate; the explicit
+  read-only access verification and loaded-repair evidence drive the narrow
+  recovery UI.
+- the Verify Vast access button appears only from
+  `can_verify_vast_access=true`, sends no provider data, and a failed/429 check
+  changes no capability.
 
 ### Complete offline gate
 
@@ -350,17 +479,55 @@ Focused tests run first. The final committed controller repair must pass `script
 
 This repair changes the local controller and frontend only. It does not require a new worker release or a second Vast template. The existing release, private template `522713`, template hash, and local worker lock remain untouched.
 
-After a clean offline gate, restarting the existing ComfyUI Desktop backend requires a new explicit authorization. The next Gold then remains fully manual:
+After a clean offline gate, restarting the existing ComfyUI Desktop backend
+requires a new explicit authorization. Before any paid action, the human must
+also approve exact numeric limits for:
 
-1. free preflight and fresh offer search;
-2. human selects and confirms exactly one offer;
-3. controller observes a typed create outcome;
-4. if created, the session must reach authenticated `ready`;
-5. human runs the current canvas;
-6. output bytes are retrieved and verified;
-7. human destroys the GPU and inventory returns to zero.
+- maximum hourly price for the three lightweight sessions;
+- maximum hourly price for the two FLUX sessions;
+- maximum duration per session or one explicit total campaign budget.
 
-The prior successful rental makes another successful allocation plausible, but only this complete run can expose or clear the next boundary. Gold remains failed until a real image returns and destruction is verified.
+The extension keeps a fixed limit of one instance create per reviewed session.
+The human selects, reviews, confirms, runs, and destroys every session from the
+ComfyUI interface. An agent may observe read-only state and recommend an offer,
+but it never calls the create or destroy API and never clicks a paid control.
+
+The rollout is a stop-on-first-failure sequence with one instance at a time:
+
+1. three lightweight core-output sessions use a committed native
+   `EmptyImage -> SaveImage` canvas with no models, preferably on three
+   different `machine_id`/`host_id` pairs;
+2. two full sessions use the exact Wallpaper Outpaint FLUX Fill 4K workflow,
+   preferably on two further distinct hosts, with all five native model
+   records resolved by preflight;
+3. each session must reach controller-authenticated `ready`, execute the
+   current canvas, return a newly harvested and independently verified image,
+   receive a manual `Destroy GPU` click, become terminal, and finish with a
+   successful full Vast inventory read containing zero instances;
+4. a failed or ambiguous session does not count and exhausts the current
+   attempt authorization. The campaign pauses for evidence-driven diagnosis,
+   an offline repair when required, full re-verification, and a new exact human
+   authorization for any additional attempt before it can continue. Earlier
+   successful rows survive only while controller code, immutable assets,
+   workflows, and inputs remain unchanged; otherwise the success counter
+   resets.
+
+Distinct provider placement is preferred evidence, not an excuse to weaken a
+price or safety bound. If no new eligible pair exists under the accepted cap,
+the campaign pauses and asks the human whether to authorize a duplicate. The
+final report states the actual number of distinct placements and the total
+paid attempts, while acceptance still requires five counted successes.
+
+The three lightweight successes validate the create contract, labelled
+reconciliation, worker authentication, current-canvas submission, harvesting,
+and destruction without repeatedly transferring the approximately 29.35 GB
+FLUX model set. The two final runs validate the real model metadata, transfer,
+provisioning, inference, 4K output, and cleanup path. Five allocations alone
+are not acceptance evidence.
+
+Gold remains failed until the second real FLUX image is returned correctly,
+all five successful-session evidence records are complete, the final session
+is terminal, and a fresh Vast inventory read proves zero instances.
 
 ## Non-goals
 
