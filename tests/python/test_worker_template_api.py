@@ -209,6 +209,16 @@ def publication_intent_path(settings):
     )
 
 
+def publication_recovery_paths(settings):
+    return tuple(
+        settings.parent.glob(
+            ".template-publication-"
+            + WORKER_COMMIT
+            + ".recovery.*.intent"
+        )
+    )
+
+
 def write_publication_intent(settings, request=None, *, payload=None):
     request = request or template_request()
     if payload is None:
@@ -762,6 +772,72 @@ class WorkerTemplateApiTests(unittest.TestCase):
                     )
             self.assertEqual(opened, closed)
 
+    def test_recursive_private_json_is_sanitized_before_lookup(self):
+        nested = "[" * 1100 + json.dumps(KEY) + "]" * 1100
+        for source in ("request", "settings"):
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as root:
+                settings, output, request_path = self._private_inputs(root)
+                target = request_path if source == "request" else settings
+                target.write_text(nested)
+                os.chmod(target, 0o600)
+                transport = ReadOnlyRecoveryTransport([], [])
+
+                with self.assertRaisesRegex(
+                    TemplatePublicationError,
+                    "^Private template publication failed\\.$",
+                ) as caught:
+                    self._reconcile_worker_template(
+                        request_path,
+                        output,
+                        settings_path_resolver=lambda: settings,
+                        transport=transport,
+                    )
+
+                self.assertIsNone(caught.exception.__cause__)
+                self.assertNotIn(KEY, str(caught.exception))
+                self.assertEqual(transport.calls, [])
+                self.assertEqual(tuple(output.iterdir()), ())
+
+    def test_recursive_private_json_cli_failure_has_no_traceback_or_secret(self):
+        nested = "[" * 1100 + json.dumps(KEY) + "]" * 1100
+        for source in ("request", "settings"):
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as root:
+                settings, output, request_path = self._private_inputs(root)
+                target = request_path if source == "request" else settings
+                target.write_text(nested)
+                os.chmod(target, 0o600)
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                store = mock.Mock()
+                store.path = settings
+
+                with mock.patch(
+                    "scripts.publish_worker_template.SettingsStore",
+                    return_value=store,
+                ), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(
+                    stderr
+                ):
+                    with self.assertRaises(SystemExit) as caught:
+                        main(
+                            [
+                                "reconcile",
+                                "--request-file",
+                                str(request_path),
+                                "--output-directory",
+                                str(output),
+                            ]
+                        )
+
+                combined = stdout.getvalue() + stderr.getvalue()
+                self.assertEqual(caught.exception.code, 1)
+                self.assertEqual(
+                    combined,
+                    "Private template publication failed.\n",
+                )
+                self.assertNotIn(KEY, combined)
+                self.assertNotIn("Traceback", combined)
+                self.assertEqual(tuple(output.iterdir()), ())
+
     def test_publish_checks_absence_posts_once_and_verifies_exact_hash(self):
         request = template_request()
         responses = [
@@ -1109,13 +1185,14 @@ class WorkerTemplateApiTests(unittest.TestCase):
             settings, output, request_path = self._private_inputs(root)
             intent = write_publication_intent(settings, request)
             original = intent.read_bytes()
-            failed = False
+            settings_fsync_calls = 0
 
             def fail_intent_fsync_once(directory):
-                nonlocal failed
-                if Path(directory) == settings.parent and not failed:
-                    failed = True
-                    raise OSError("synthetic intent fsync failure")
+                nonlocal settings_fsync_calls
+                if Path(directory) == settings.parent:
+                    settings_fsync_calls += 1
+                    if settings_fsync_calls == 2:
+                        raise OSError("synthetic intent fsync failure")
                 return real_fsync_directory(directory)
 
             with mock.patch(
@@ -1133,10 +1210,277 @@ class WorkerTemplateApiTests(unittest.TestCase):
                         transport=transport,
                     )
 
-            self.assertTrue(failed)
+            self.assertGreaterEqual(settings_fsync_calls, 2)
             self.assertEqual(intent.read_bytes(), original)
             self.assertEqual(stat.S_IMODE(intent.stat().st_mode), 0o600)
             self.assertEqual(intent.stat().st_nlink, 1)
+            self.assertEqual(tuple(output.iterdir()), ())
+
+    def test_reconcile_prepares_recovery_before_unlinking_intent(self):
+        request = template_request()
+        real_mkstemp = tempfile.mkstemp
+        real_write = os.write
+        real_fsync = os.fsync
+
+        for failure in ("open", "write", "fsync"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as root:
+                settings, output, request_path = self._private_inputs(root)
+                intent = write_publication_intent(settings, request)
+                original = intent.read_bytes()
+                original_inode = intent.stat().st_ino
+                recovery_descriptors = set()
+                triggered = False
+
+                def failing_mkstemp(*args, **kwargs):
+                    nonlocal triggered
+                    prefix = kwargs.get("prefix", "")
+                    if ".recovery." not in prefix:
+                        return real_mkstemp(*args, **kwargs)
+                    if failure == "open":
+                        triggered = True
+                        raise OSError("synthetic recovery open failure")
+                    descriptor, path = real_mkstemp(*args, **kwargs)
+                    recovery_descriptors.add(descriptor)
+                    return descriptor, path
+
+                def failing_write(descriptor, content):
+                    nonlocal triggered
+                    if failure == "write" and descriptor in recovery_descriptors:
+                        triggered = True
+                        raise OSError("synthetic recovery write failure")
+                    return real_write(descriptor, content)
+
+                def failing_fsync(descriptor):
+                    nonlocal triggered
+                    if failure == "fsync" and descriptor in recovery_descriptors:
+                        triggered = True
+                        raise OSError("synthetic recovery fsync failure")
+                    return real_fsync(descriptor)
+
+                transport = ReadOnlyRecoveryTransport(
+                    [template_row(request)],
+                    [template_row(request)],
+                )
+                with mock.patch(
+                    "scripts.publish_worker_template.tempfile.mkstemp",
+                    side_effect=failing_mkstemp,
+                ), mock.patch(
+                    "scripts.publish_worker_template.os.write",
+                    side_effect=failing_write,
+                ), mock.patch(
+                    "scripts.publish_worker_template.os.fsync",
+                    side_effect=failing_fsync,
+                ):
+                    with self.assertRaises(TemplatePublicationError):
+                        self._reconcile_worker_template(
+                            request_path,
+                            output,
+                            settings_path_resolver=lambda: settings,
+                            transport=transport,
+                        )
+
+                self.assertTrue(triggered)
+                self.assertEqual(intent.read_bytes(), original)
+                self.assertEqual(intent.stat().st_ino, original_inode)
+                self.assertEqual(stat.S_IMODE(intent.stat().st_mode), 0o600)
+                self.assertEqual(intent.stat().st_nlink, 1)
+                self.assertEqual(publication_recovery_paths(settings), ())
+                self.assertEqual(tuple(output.iterdir()), ())
+
+    def test_reconcile_restores_prepared_copy_without_rewriting_bytes(self):
+        request = template_request()
+        real_fsync_directory = __import__(
+            "scripts.publish_worker_template",
+            fromlist=["_fsync_directory"],
+        )._fsync_directory
+        real_open = os.open
+
+        with tempfile.TemporaryDirectory() as root:
+            settings, output, request_path = self._private_inputs(root)
+            intent = write_publication_intent(settings, request)
+            original = intent.read_bytes()
+            settings_fsync_calls = 0
+
+            def fail_unlink_fsync_once(directory):
+                nonlocal settings_fsync_calls
+                if Path(directory) == settings.parent:
+                    settings_fsync_calls += 1
+                    if settings_fsync_calls == 2:
+                        raise OSError("synthetic post-unlink fsync failure")
+                return real_fsync_directory(directory)
+
+            def forbid_recreating_intent(path, flags, *args, **kwargs):
+                if (
+                    Path(path) == intent
+                    and flags & os.O_CREAT
+                    and not intent.exists()
+                ):
+                    raise OSError("intent bytes must not be rewritten")
+                return real_open(path, flags, *args, **kwargs)
+
+            transport = ReadOnlyRecoveryTransport(
+                [template_row(request)],
+                [template_row(request)],
+            )
+            with mock.patch(
+                "scripts.publish_worker_template._fsync_directory",
+                side_effect=fail_unlink_fsync_once,
+            ), mock.patch(
+                "scripts.publish_worker_template.os.open",
+                side_effect=forbid_recreating_intent,
+            ):
+                with self.assertRaises(TemplatePublicationError):
+                    self._reconcile_worker_template(
+                        request_path,
+                        output,
+                        settings_path_resolver=lambda: settings,
+                        transport=transport,
+                    )
+
+            self.assertGreaterEqual(settings_fsync_calls, 2)
+            self.assertEqual(intent.read_bytes(), original)
+            self.assertEqual(stat.S_IMODE(intent.stat().st_mode), 0o600)
+            self.assertEqual(intent.stat().st_nlink, 1)
+            self.assertEqual(publication_recovery_paths(settings), ())
+            self.assertEqual(tuple(output.iterdir()), ())
+
+    def test_reconcile_retains_prepared_copy_when_restore_rename_fails(self):
+        request = template_request()
+        publisher = __import__(
+            "scripts.publish_worker_template",
+            fromlist=["_fsync_directory"],
+        )
+        real_fsync_directory = publisher._fsync_directory
+        real_replace = os.replace
+        real_mkstemp = tempfile.mkstemp
+        real_close = os.close
+
+        with tempfile.TemporaryDirectory() as root:
+            settings, output, request_path = self._private_inputs(root)
+            intent = write_publication_intent(settings, request)
+            original = intent.read_bytes()
+            settings_fsync_calls = 0
+            failed_restore = False
+            recovery_descriptors = set()
+            closed_descriptors = set()
+
+            def recording_mkstemp(*args, **kwargs):
+                descriptor, path = real_mkstemp(*args, **kwargs)
+                if ".recovery." in kwargs.get("prefix", ""):
+                    recovery_descriptors.add(descriptor)
+                return descriptor, path
+
+            def recording_close(descriptor):
+                closed_descriptors.add(descriptor)
+                return real_close(descriptor)
+
+            def fail_unlink_fsync_once(directory):
+                nonlocal settings_fsync_calls
+                if Path(directory) == settings.parent:
+                    settings_fsync_calls += 1
+                    if settings_fsync_calls == 2:
+                        raise OSError("synthetic post-unlink fsync failure")
+                return real_fsync_directory(directory)
+
+            def fail_recovery_replace(source, destination):
+                nonlocal failed_restore
+                if (
+                    Path(destination) == intent
+                    and ".recovery." in Path(source).name
+                ):
+                    failed_restore = True
+                    raise OSError("synthetic recovery rename failure")
+                return real_replace(source, destination)
+
+            transport = ReadOnlyRecoveryTransport(
+                [template_row(request)],
+                [template_row(request)],
+            )
+            with mock.patch(
+                "scripts.publish_worker_template._fsync_directory",
+                side_effect=fail_unlink_fsync_once,
+            ), mock.patch(
+                "scripts.publish_worker_template.os.replace",
+                side_effect=fail_recovery_replace,
+            ), mock.patch(
+                "scripts.publish_worker_template.tempfile.mkstemp",
+                side_effect=recording_mkstemp,
+            ), mock.patch(
+                "scripts.publish_worker_template.os.close",
+                side_effect=recording_close,
+            ):
+                with self.assertRaises(TemplatePublicationError):
+                    self._reconcile_worker_template(
+                        request_path,
+                        output,
+                        settings_path_resolver=lambda: settings,
+                        transport=transport,
+                    )
+
+            self.assertGreaterEqual(settings_fsync_calls, 2)
+            self.assertTrue(failed_restore)
+            recovery = publication_recovery_paths(settings)
+            self.assertEqual(len(recovery), 1)
+            self.assertEqual(recovery[0].read_bytes(), original)
+            self.assertEqual(stat.S_IMODE(recovery[0].stat().st_mode), 0o600)
+            self.assertEqual(recovery[0].stat().st_nlink, 1)
+            self.assertFalse(recovery[0].is_symlink())
+            self.assertFalse(intent.exists())
+            self.assertTrue(recovery_descriptors)
+            self.assertTrue(recovery_descriptors.issubset(closed_descriptors))
+            self.assertEqual(tuple(output.iterdir()), ())
+
+    def test_reconcile_detects_same_inode_intent_rewrite_before_removal(self):
+        request = template_request()
+        with tempfile.TemporaryDirectory() as root:
+            settings, output, request_path = self._private_inputs(root)
+            intent = write_publication_intent(settings, request)
+            original = intent.read_bytes()
+            original_inode = intent.stat().st_ino
+            mutated_content = []
+
+            class RewritingTransport(ReadOnlyRecoveryTransport):
+                def lookup_hash(self, api_key, hash_id):
+                    mutated = bytearray(original)
+                    marker = mutated.index(b'"request_sha256":"') + len(
+                        b'"request_sha256":"'
+                    )
+                    mutated[marker] = (
+                        ord("0")
+                        if mutated[marker] != ord("0")
+                        else ord("1")
+                    )
+                    mutated_content.append(bytes(mutated))
+                    with intent.open("r+b") as stream:
+                        stream.write(mutated)
+                        stream.truncate()
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    self.calls.append(("lookup_hash", api_key, hash_id))
+                    return self.hash_rows
+
+            transport = RewritingTransport(
+                [template_row(request)],
+                [template_row(request)],
+            )
+            with self.assertRaises(TemplatePublicationError):
+                self._reconcile_worker_template(
+                    request_path,
+                    output,
+                    settings_path_resolver=lambda: settings,
+                    transport=transport,
+                )
+
+            self.assertEqual(intent.read_bytes(), mutated_content[0])
+            self.assertEqual(intent.stat().st_ino, original_inode)
+            self.assertEqual(stat.S_IMODE(intent.stat().st_mode), 0o600)
+            self.assertEqual(intent.stat().st_nlink, 1)
+            recovery = publication_recovery_paths(settings)
+            self.assertEqual(len(recovery), 1)
+            self.assertEqual(recovery[0].read_bytes(), original)
+            self.assertEqual(stat.S_IMODE(recovery[0].stat().st_mode), 0o600)
+            self.assertEqual(recovery[0].stat().st_nlink, 1)
+            self.assertFalse(recovery[0].is_symlink())
             self.assertEqual(tuple(output.iterdir()), ())
 
     def test_reconcile_requires_exact_private_intent_before_lookup(self):

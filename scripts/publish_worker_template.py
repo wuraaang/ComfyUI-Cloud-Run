@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import fcntl
 import gzip
 import hashlib
 import json
@@ -435,12 +436,35 @@ def _private_path(
     return candidate
 
 
-def _read_private_json_with_identity(path):
+def _read_descriptor_content(descriptor):
+    try:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        content = bytearray()
+        while len(content) <= MAX_PRIVATE_JSON_BYTES:
+            chunk = os.read(
+                descriptor,
+                min(8192, MAX_PRIVATE_JSON_BYTES + 1 - len(content)),
+            )
+            if not chunk:
+                break
+            content.extend(chunk)
+        return bytes(content)
+    except OSError:
+        _fail()
+
+
+def _read_private_json_with_identity(
+    path,
+    *,
+    hold_descriptor=False,
+    lock_exclusive=False,
+):
     candidate = Path(path)
     parent = _private_path(candidate.parent, require_directory=True)
     del parent
     before = None
     descriptor = None
+    descriptor_held = False
     try:
         before = os.lstat(candidate)
         if (
@@ -455,6 +479,8 @@ def _read_private_json_with_identity(path):
         if not hasattr(os, "O_NOFOLLOW"):
             _fail()
         descriptor = os.open(candidate, os.O_RDONLY | os.O_NOFOLLOW)
+        if lock_exclusive:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         opened = os.fstat(descriptor)
         if (
             opened.st_dev != before.st_dev
@@ -466,15 +492,7 @@ def _read_private_json_with_identity(path):
             or opened.st_size != before.st_size
         ):
             _fail()
-        content = bytearray()
-        while len(content) <= MAX_PRIVATE_JSON_BYTES:
-            chunk = os.read(
-                descriptor,
-                min(8192, MAX_PRIVATE_JSON_BYTES + 1 - len(content)),
-            )
-            if not chunk:
-                break
-            content.extend(chunk)
+        content = _read_descriptor_content(descriptor)
         after = os.fstat(descriptor)
         if (
             len(content) != opened.st_size
@@ -489,13 +507,21 @@ def _read_private_json_with_identity(path):
         )
         if not isinstance(payload, dict):
             _fail()
-        return payload, (opened.st_dev, opened.st_ino), bytes(content)
+        held = descriptor if hold_descriptor else None
+        descriptor_held = hold_descriptor
+        return payload, (opened.st_dev, opened.st_ino), content, held
     except TemplatePublicationError:
         raise
-    except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+    except (
+        OSError,
+        RecursionError,
+        UnicodeError,
+        ValueError,
+        json.JSONDecodeError,
+    ):
         _fail()
     finally:
-        if descriptor is not None:
+        if descriptor is not None and not descriptor_held:
             try:
                 os.close(descriptor)
             except OSError:
@@ -503,7 +529,9 @@ def _read_private_json_with_identity(path):
 
 
 def _read_private_json(path):
-    payload, _identity, _content = _read_private_json_with_identity(path)
+    payload, _identity, _content, _descriptor = (
+        _read_private_json_with_identity(path)
+    )
     return payload
 
 
@@ -797,6 +825,7 @@ class _ExistingPublicationIntent:
         )
         if name_match is None:
             _fail()
+        self.worker_commit = name_match.group(1)
         self.directory = _private_path(
             Path(settings_path).parent,
             require_directory=True,
@@ -805,77 +834,229 @@ class _ExistingPublicationIntent:
         self.path = self.directory / (
             ".template-publication-" + name_match.group(1) + ".intent"
         )
-        payload, self.identity, self.content = _read_private_json_with_identity(
-            self.path
+        self.descriptor = None
+        self.recovery_descriptor = None
+        self.recovery_path = None
+        self.recovery_identity = None
+        self.preserve_recovery = False
+        try:
+            (
+                payload,
+                self.identity,
+                self.content,
+                self.descriptor,
+            ) = _read_private_json_with_identity(
+                self.path,
+                hold_descriptor=True,
+                lock_exclusive=True,
+            )
+            expected_request_sha256 = hashlib.sha256(
+                _compact_json(template_payload)
+            ).hexdigest()
+            if (
+                set(payload) != {"schema_version", "name", "request_sha256"}
+                or type(payload.get("schema_version")) is not int
+                or payload["schema_version"] != 1
+                or payload.get("name") != template_name
+                or not isinstance(payload.get("request_sha256"), str)
+                or _SHA256.fullmatch(payload["request_sha256"]) is None
+                or payload["request_sha256"] != expected_request_sha256
+            ):
+                _fail()
+        except TemplatePublicationError:
+            self.close()
+            raise
+
+    @staticmethod
+    def _owned_metadata(metadata, identity):
+        return (
+            stat.S_ISREG(metadata.st_mode)
+            and not stat.S_ISLNK(metadata.st_mode)
+            and metadata.st_uid == os.getuid()
+            and stat.S_IMODE(metadata.st_mode) == 0o600
+            and metadata.st_nlink == 1
+            and (metadata.st_dev, metadata.st_ino) == identity
         )
-        expected_request_sha256 = hashlib.sha256(
-            _compact_json(template_payload)
-        ).hexdigest()
-        if (
-            set(payload) != {"schema_version", "name", "request_sha256"}
-            or type(payload.get("schema_version")) is not int
-            or payload["schema_version"] != 1
-            or payload.get("name") != template_name
-            or not isinstance(payload.get("request_sha256"), str)
-            or _SHA256.fullmatch(payload["request_sha256"]) is None
-            or payload["request_sha256"] != expected_request_sha256
-        ):
+
+    @classmethod
+    def _exact_metadata(cls, metadata, identity, size):
+        return (
+            cls._owned_metadata(metadata, identity)
+            and metadata.st_size == size
+        )
+
+    def _revalidate_descriptor(self, descriptor, identity):
+        try:
+            before = os.fstat(descriptor)
+            content = _read_descriptor_content(descriptor)
+            after = os.fstat(descriptor)
+            if (
+                not self._exact_metadata(
+                    before,
+                    identity,
+                    len(self.content),
+                )
+                or not self._exact_metadata(
+                    after,
+                    identity,
+                    len(self.content),
+                )
+                or content != self.content
+            ):
+                _fail()
+        except TemplatePublicationError:
+            raise
+        except OSError:
             _fail()
 
-    def _restore(self):
-        descriptor = None
+    def _revalidate_original(self):
         try:
-            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-            if hasattr(os, "O_NOFOLLOW"):
-                flags |= os.O_NOFOLLOW
-            descriptor = os.open(self.path, flags, 0o600)
+            metadata = os.lstat(self.path)
+            if not self._exact_metadata(
+                metadata,
+                self.identity,
+                len(self.content),
+            ):
+                _fail()
+            self._revalidate_descriptor(self.descriptor, self.identity)
+            final = os.lstat(self.path)
+            if not self._exact_metadata(
+                final,
+                self.identity,
+                len(self.content),
+            ):
+                _fail()
+        except TemplatePublicationError:
+            raise
+        except OSError:
+            _fail()
+
+    def _revalidate_recovery(self):
+        try:
+            metadata = os.lstat(self.recovery_path)
+            if not self._exact_metadata(
+                metadata,
+                self.recovery_identity,
+                len(self.content),
+            ):
+                _fail()
+            self._revalidate_descriptor(
+                self.recovery_descriptor,
+                self.recovery_identity,
+            )
+        except TemplatePublicationError:
+            raise
+        except OSError:
+            _fail()
+
+    def _discard_recovery(self):
+        if self.recovery_descriptor is not None:
+            try:
+                os.close(self.recovery_descriptor)
+            except OSError:
+                pass
+            self.recovery_descriptor = None
+        if self.recovery_path is None:
+            return
+        try:
+            metadata = os.lstat(self.recovery_path)
+            if self._owned_metadata(
+                metadata,
+                self.recovery_identity,
+            ):
+                self.recovery_path.unlink()
+                self.recovery_path = None
+        except OSError:
+            self.preserve_recovery = True
+
+    def prepare_recovery(self):
+        if self.recovery_path is not None:
+            _fail()
+        try:
+            descriptor, recovery_name = tempfile.mkstemp(
+                prefix=(
+                    ".template-publication-"
+                    + self.worker_commit
+                    + ".recovery."
+                ),
+                suffix=".intent",
+                dir=str(self.directory),
+            )
+            self.recovery_descriptor = descriptor
+            self.recovery_path = Path(recovery_name)
             os.fchmod(descriptor, 0o600)
             metadata = os.fstat(descriptor)
-            if (
-                not stat.S_ISREG(metadata.st_mode)
-                or metadata.st_uid != os.getuid()
-                or stat.S_IMODE(metadata.st_mode) != 0o600
-                or metadata.st_nlink != 1
+            self.recovery_identity = (metadata.st_dev, metadata.st_ino)
+            if not self._exact_metadata(
+                metadata,
+                self.recovery_identity,
+                0,
             ):
                 _fail()
             _write_all(descriptor, self.content)
             os.fsync(descriptor)
-            os.close(descriptor)
-            descriptor = None
+            self._revalidate_recovery()
             _fsync_directory(self.directory)
         except TemplatePublicationError:
+            self._discard_recovery()
             raise
         except OSError:
+            self._discard_recovery()
             _fail()
-        finally:
-            if descriptor is not None:
-                try:
-                    os.close(descriptor)
-                except OSError:
-                    pass
 
-    def complete(self):
+    def _restore_prepared(self):
         try:
+            self._revalidate_recovery()
+            os.replace(self.recovery_path, self.path)
+            self.recovery_path = None
             metadata = os.lstat(self.path)
-            if (
-                not stat.S_ISREG(metadata.st_mode)
-                or stat.S_ISLNK(metadata.st_mode)
-                or metadata.st_uid != os.getuid()
-                or stat.S_IMODE(metadata.st_mode) != 0o600
-                or metadata.st_nlink != 1
-                or (metadata.st_dev, metadata.st_ino) != self.identity
+            if not self._exact_metadata(
+                metadata,
+                self.recovery_identity,
+                len(self.content),
             ):
                 _fail()
-            self.path.unlink()
+            _fsync_directory(self.directory)
         except TemplatePublicationError:
+            self.preserve_recovery = self.recovery_path is not None
             raise
         except OSError:
+            self.preserve_recovery = self.recovery_path is not None
+            _fail()
+
+    def complete(self):
+        if self.recovery_path is None:
             _fail()
         try:
+            self._revalidate_original()
+        except TemplatePublicationError:
+            self.preserve_recovery = True
+            raise
+        try:
+            self.path.unlink()
             _fsync_directory(self.directory)
         except OSError:
-            self._restore()
+            if self.path.exists():
+                raise TemplatePublicationError(_FAILURE) from None
+            self._restore_prepared()
             _fail()
+        self._discard_recovery()
+
+    def close(self):
+        if not self.preserve_recovery:
+            self._discard_recovery()
+        elif self.recovery_descriptor is not None:
+            try:
+                os.close(self.recovery_descriptor)
+            except OSError:
+                pass
+            self.recovery_descriptor = None
+        if self.descriptor is not None:
+            try:
+                os.close(self.descriptor)
+            except OSError:
+                pass
+            self.descriptor = None
 
 
 class _PrivateRecordWriter:
@@ -1112,6 +1293,7 @@ def reconcile_worker_template(
         output_directory,
         "template-publication.json",
     )
+    intent = None
     try:
         intent = _ExistingPublicationIntent(
             settings_path,
@@ -1145,6 +1327,7 @@ def reconcile_worker_template(
             "hash_id": template_hash_id,
             "verified": True,
         }
+        intent.prepare_recovery()
         writer.publish(record)
         intent.complete()
         return record
@@ -1155,6 +1338,8 @@ def reconcile_worker_template(
         writer.rollback()
         _fail()
     finally:
+        if intent is not None:
+            intent.close()
         writer.close()
 
 
