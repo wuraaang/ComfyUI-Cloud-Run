@@ -48,6 +48,7 @@ def quote(
     host_id="host-3",
     public_ipaddr="8.8.8.8",
     max_instance_creates=1,
+    deadline_mode="finite",
 ):
     return OfferQuote(
         offer_id=offer_id,
@@ -62,9 +63,11 @@ def quote(
         output_allowance_bytes=1,
         inet_down_cost=None,
         inet_up_cost=None,
-        duration_seconds=7200,
-        deadline_mode="finite",
-        approximate_max_active_charge=price * 2,
+        duration_seconds=(7200 if deadline_mode == "finite" else None),
+        deadline_mode=deadline_mode,
+        approximate_max_active_charge=(
+            price * 2 if deadline_mode == "finite" else None
+        ),
         template_hash_id="1" * 32,
         worker_commit="a" * 40,
         worker_archive_sha256="b" * 64,
@@ -887,15 +890,23 @@ class SessionLifecycleTests(LifecycleTestCase):
         instance_id="instance-1",
         retry_count=0,
         max_instance_creates=1,
+        deadline_mode="finite",
     ):
-        selected = quote(max_instance_creates=max_instance_creates)
+        selected = quote(
+            max_instance_creates=max_instance_creates,
+            deadline_mode=deadline_mode,
+        )
         session = CloudSession.new(
             "key-" + session_id,
             session_id=session_id,
             quote=selected,
             manifest_digest=selected.manifest_digest,
-            deadline_at=self.clock() + 7200,
-            deadline_mode="finite",
+            deadline_at=(
+                self.clock() + 7200
+                if deadline_mode == "finite"
+                else None
+            ),
+            deadline_mode=deadline_mode,
             disk_gb=80,
             now=self.clock(),
             state=state,
@@ -1067,6 +1078,111 @@ class SessionLifecycleTests(LifecycleTestCase):
             ],
             [],
         )
+
+    def test_manual_terminal_failure_waits_for_reviewed_destroy(self):
+        self.session_service = ImmediateTerminalSessionService(self.sessions)
+        session = self.save_session(deadline_mode="none")
+        self.provider.instances = [
+            self.worker_instance("instance-1", session.label)
+        ]
+        lifecycle = self.session_lifecycle()
+
+        failed = asyncio.run(
+            lifecycle.wait_until_session_ready(session.session_id)
+        )
+
+        self.assertEqual(failed.state, SessionState.FAILED)
+        self.assertEqual(failed.instance_id, "instance-1")
+        self.assertEqual(failed.provider_token, session.provider_token)
+        self.assertEqual(
+            failed.session_secret_hex,
+            session.session_secret_hex,
+        )
+        self.assertFalse(failed.destroy_requested)
+        self.assertTrue(failed.public_payload()["billing_may_continue"])
+        self.assertTrue(failed.public_payload()["can_destroy"])
+        self.assertEqual(
+            failed.sanitized_error,
+            ImmediateTerminalSessionService.diagnostic,
+        )
+        self.assertEqual(
+            [call[0] for call in self.provider.calls],
+            ["get"],
+        )
+
+        destroyed = asyncio.run(
+            lifecycle.destroy_session(session.session_id)
+        )
+
+        self.assertEqual(destroyed.state, SessionState.DESTROYED)
+        self.assertFalse(
+            destroyed.public_payload()["billing_may_continue"]
+        )
+        self.assertEqual(
+            [call[0] for call in self.provider.calls],
+            ["get", "destroy", "list"],
+        )
+
+    def test_manual_boot_timeout_waits_for_reviewed_destroy(self):
+        session = self.save_session(deadline_mode="none")
+        self.provider.instances = [
+            self.worker_instance("instance-1", session.label)
+        ]
+
+        failed = asyncio.run(
+            self.session_lifecycle().handle_session_boot_failure(
+                session.session_id,
+                failure_code="boot_timeout",
+            )
+        )
+
+        self.assertEqual(failed.state, SessionState.FAILED)
+        self.assertEqual(failed.instance_id, "instance-1")
+        self.assertEqual(failed.provider_token, session.provider_token)
+        self.assertEqual(
+            failed.session_secret_hex,
+            session.session_secret_hex,
+        )
+        self.assertFalse(failed.destroy_requested)
+        self.assertTrue(failed.public_payload()["billing_may_continue"])
+        self.assertTrue(failed.public_payload()["can_destroy"])
+        self.assertEqual(self.provider.calls, [])
+
+    def test_manual_terminal_recovery_waits_for_reviewed_destroy(self):
+        self.session_service = TerminalRecoverySessionService(self.sessions)
+        session = self.save_session(
+            state=SessionState.READY,
+            deadline_mode="none",
+        )
+        self.provider.instances = [
+            self.worker_instance("instance-1", session.label)
+        ]
+
+        recovered = asyncio.run(
+            self.session_lifecycle().recover_sessions()
+        )
+
+        failed = self.sessions.get(session.session_id)
+        self.assertEqual(recovered, [failed])
+        self.assertEqual(failed.state, SessionState.FAILED)
+        self.assertEqual(failed.instance_id, "instance-1")
+        self.assertEqual(failed.provider_token, session.provider_token)
+        self.assertEqual(
+            failed.session_secret_hex,
+            session.session_secret_hex,
+        )
+        self.assertFalse(failed.destroy_requested)
+        self.assertTrue(failed.public_payload()["billing_may_continue"])
+        self.assertTrue(failed.public_payload()["can_destroy"])
+        self.assertEqual(
+            failed.sanitized_error,
+            TerminalRecoverySessionService.diagnostic,
+        )
+        self.assertEqual(
+            [call[0] for call in self.provider.calls],
+            ["list"],
+        )
+        self.assertEqual(self.session_service.terminal_destroy_calls, [])
 
     def test_terminal_destroy_exception_keeps_residual_billing_warning(self):
         self.session_service = ImmediateTerminalSessionService(self.sessions)

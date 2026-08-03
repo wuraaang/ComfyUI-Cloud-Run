@@ -864,6 +864,22 @@ class CloudRunLifecycle:
         if session.state == SessionState.DESTROYED:
             return session
         if (
+            terminal_error is not None
+            and session.deadline_mode == "none"
+            and not session.destroy_requested
+        ):
+            if (
+                session.state != SessionState.FAILED
+                or session.sanitized_error != terminal_error
+            ):
+                return self.session_repository.transition(
+                    session.session_id,
+                    SessionState.FAILED,
+                    now=float(self.clock()),
+                    sanitized_error=terminal_error,
+                )
+            return session
+        if (
             session.state
             in {
                 SessionState.PREFLIGHT,
@@ -1229,6 +1245,8 @@ class CloudRunLifecycle:
                 now=float(self.clock()),
                 sanitized_error=diagnostic,
             )
+        if session.deadline_mode == "none":
+            return session
         _settings, api_key = self._api_key()
         instance_id = session.instance_id
         session = self.session_repository.transition(
