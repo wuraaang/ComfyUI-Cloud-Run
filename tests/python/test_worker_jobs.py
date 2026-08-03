@@ -425,10 +425,15 @@ class WorkerJobTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("must-not-survive", repr(failed))
 
         succeeding = SuccessfulComfy(self.directory / "next-output")
+        succeeding.output.write_bytes(b"next-worker-output")
         jobs.comfy = succeeding
         recovered = await jobs.run(job_request("job-2"))
         self.assertEqual(recovered.state, "succeeded")
         self.assertEqual(len(succeeding.prompt_bodies), 1)
+        self.assertEqual(
+            recovered.outputs[0]["sha256"],
+            hashlib.sha256(b"next-worker-output").hexdigest(),
+        )
 
     async def test_wrong_manifest_and_duplicate_mismatch_never_touch_comfy(self):
         from remote_worker.jobs import JobManager, JobValidationError
@@ -510,6 +515,7 @@ class WorkerJobTests(unittest.IsolatedAsyncioTestCase):
             {
                 **running,
                 "state": "running",
+                "execution_state": "running",
             },
         )
 

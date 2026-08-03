@@ -69,7 +69,7 @@ class WorkerStateTests(unittest.TestCase):
             self.assertEqual(
                 reopened,
                 {
-                    "schema_version": 2,
+                    "schema_version": 3,
                     "protocol_version": "2",
                     "session_id": "session-1",
                     "session_secret_hex": "a" * 64,
@@ -94,7 +94,7 @@ class WorkerStateTests(unittest.TestCase):
                 ["worker-state.json"],
             )
 
-    def test_schema_one_job_migrates_created_at_and_persists_schema_two(self):
+    def test_schema_one_job_migrates_native_fields_and_persists_schema_three(self):
         from remote_worker.state import WorkerStateStore
 
         with tempfile.TemporaryDirectory() as directory:
@@ -132,13 +132,72 @@ class WorkerStateTests(unittest.TestCase):
 
             migrated = WorkerStateStore(path).load()
 
-            self.assertEqual(migrated["schema_version"], 2)
+            self.assertEqual(migrated["schema_version"], 3)
             self.assertEqual(
                 migrated["jobs"]["job-1"]["created_at"],
                 11.0,
             )
+            self.assertEqual(
+                migrated["jobs"]["job-1"]["request_id"],
+                "job-1",
+            )
+            self.assertEqual(
+                migrated["jobs"]["job-1"]["execution_state"],
+                "queued",
+            )
+            self.assertEqual(
+                migrated["jobs"]["job-1"]["harvest_state"],
+                "pending",
+            )
             persisted = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(persisted, migrated)
+
+    def test_schema_two_job_migrates_without_losing_terminal_success(self):
+        from remote_worker.state import WorkerStateStore
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "worker-state.json"
+            legacy = {
+                "schema_version": 2,
+                "protocol_version": "2",
+                "session_id": "session-1",
+                "session_secret_hex": "a" * 64,
+                "claimed": True,
+                "deadline_at": 0,
+                "deadline_mode": "finite",
+                "installed": {},
+                "transactions": {},
+                "jobs": {
+                    "job-1": {
+                        "kind": "job",
+                        "job_id": "job-1",
+                        "request_digest": "c" * 64,
+                        "manifest_digest": "d" * 64,
+                        "state": "succeeded",
+                        "client_id": "client-1",
+                        "prompt_id": (
+                            "11111111-1111-4111-8111-111111111111"
+                        ),
+                        "sequence": 0,
+                        "events": [],
+                        "previews": {},
+                        "outputs": {},
+                        "error": None,
+                        "created_at": 10.0,
+                        "updated_at": 11.0,
+                    }
+                },
+            }
+            path.write_text(json.dumps(legacy), encoding="utf-8")
+            os.chmod(path, 0o600)
+
+            migrated = WorkerStateStore(path).load()
+            job = migrated["jobs"]["job-1"]
+
+            self.assertEqual(migrated["schema_version"], 3)
+            self.assertEqual(job["execution_state"], "succeeded")
+            self.assertEqual(job["harvest_state"], "succeeded")
+            self.assertIsNone(job["native_response"])
 
     def test_corrupt_or_world_readable_state_fails_closed(self):
         from remote_worker.state import WorkerStateError, WorkerStateStore

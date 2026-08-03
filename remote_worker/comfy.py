@@ -90,6 +90,7 @@ class ComfyPromptValidationError(ComfyProcessError):
 class NativeExecution:
     prompt_id: str
     terminal_event: str
+    response: dict | None = None
 
     def __post_init__(self):
         try:
@@ -101,6 +102,25 @@ class NativeExecution:
         if (
             prompt_id != self.prompt_id
             or self.terminal_event not in _TERMINAL_EVENTS
+            or (
+                self.response is not None
+                and (
+                    not isinstance(self.response, dict)
+                    or set(self.response)
+                    != {"prompt_id", "number", "node_errors"}
+                    or self.response.get("prompt_id") != self.prompt_id
+                    or isinstance(self.response.get("number"), bool)
+                    or not isinstance(
+                        self.response.get("number"),
+                        (int, float),
+                    )
+                    or not math.isfinite(self.response["number"])
+                    or not isinstance(
+                        self.response.get("node_errors"),
+                        dict,
+                    )
+                )
+            )
         ):
             raise ComfyProcessError(
                 "Remote ComfyUI returned an invalid execution result."
@@ -473,6 +493,7 @@ class AiohttpComfyHttp:
                             return NativeExecution(
                                 prompt_id=prompt_id,
                                 terminal_event=event["type"],
+                                response=dict(payload),
                             )
         except (asyncio.CancelledError, KeyboardInterrupt):
             raise

@@ -54,6 +54,7 @@ _REVIEWED_ARCHIVE_FILES = frozenset(
         "remote_worker/install.py",
         "remote_worker/jobs.py",
         "remote_worker/main.py",
+        "remote_worker/native_jobs.py",
         "remote_worker/provision.py",
         "remote_worker/server.py",
         "remote_worker/state.py",
