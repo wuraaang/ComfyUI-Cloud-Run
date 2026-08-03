@@ -169,7 +169,7 @@ class SettingsRouteTests(unittest.TestCase):
                 "template_hash_id": "1" * 32,
                 "worker_commit": "a" * 40,
                 "worker_archive_sha256": "b" * 64,
-                "protocol_version": "1",
+                "protocol_version": "2",
                 "comfyui_core_version": "0.29.0",
                 "comfyui_frontend_version": "1.47.10",
                 "python_version": "3.12",
@@ -815,7 +815,7 @@ def attempt(state=AttemptState.OFFER_SELECTED):
             template_hash_id="1" * 32,
             worker_commit="a" * 40,
             worker_archive_sha256="b" * 64,
-            protocol_version="1",
+            protocol_version="2",
             manifest_digest="c" * 64,
             max_instance_creates=1,
         ),
@@ -1569,8 +1569,8 @@ class RelayMediaRouteTests(unittest.TestCase):
             ),
         )
         manifest = DependencyManifest(
-            schema_version=1,
-            protocol_version="1",
+            schema_version=2,
+            protocol_version="2",
             comfyui_core_version="0.29.0",
             comfyui_frontend_version="1.47.10",
             worker_version="a" * 40,

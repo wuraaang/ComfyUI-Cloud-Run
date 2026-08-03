@@ -108,7 +108,7 @@ def reviewed_release():
             "template_hash_id": "1" * 32,
             "worker_commit": "a" * 40,
             "worker_archive_sha256": "b" * 64,
-            "protocol_version": "1",
+            "protocol_version": "2",
             "comfyui_core_version": "0.29.0",
             "comfyui_frontend_version": "1.47.10",
             "python_version": "3.12",
@@ -532,13 +532,13 @@ class FakeWorkerClient:
         return dict(self._upload_offsets)
 
     async def health(self):
-        return {"protocol_version": "1", "claimed": self.claimed}
+        return {"protocol_version": "2", "claimed": self.claimed}
 
     async def claim(self):
         self.claimed = True
         self.claim_calls += 1
         return {
-            "protocol_version": "1",
+            "protocol_version": "2",
             "session_id": "offline-session",
             "claimed": True,
         }

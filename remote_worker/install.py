@@ -17,6 +17,7 @@ import tempfile
 from cloud_run.manifest import (
     CustomNodeSpec,
     PythonWheelSpec,
+    UiPackageSpec,
     validate_dependency,
 )
 from .transfers import TRANSFER_CHUNK_BYTES
@@ -539,4 +540,56 @@ class CustomNodeInstaller:
             revision=node.revision,
             destination=destination,
             wheels=installed_wheels,
+        )
+
+    async def install_ui_package(self, package):
+        try:
+            validate_dependency(package)
+        except (TypeError, ValueError):
+            raise _install_error() from None
+        if (
+            not isinstance(package, UiPackageSpec)
+            or package.archive.destination
+            != f"custom_nodes/{package.package_id}"
+        ):
+            raise _install_error()
+        archive_path = _verified_file(
+            self.archive_path(package.archive),
+            size_bytes=package.archive.size_bytes,
+            sha256=package.archive.sha256,
+        )
+        staging_parent = Path(
+            tempfile.mkdtemp(
+                prefix=f".{package.package_id}-",
+                suffix=".part",
+                dir=str(self.custom_nodes_root),
+            )
+        )
+        os.chmod(staging_parent, 0o700)
+        content = staging_parent / "content"
+        destination = self.custom_nodes_root / package.package_id
+        try:
+            safe_extract(archive_path, content)
+            self._replace_content(content, destination)
+        except (InstallError, asyncio.CancelledError, KeyboardInterrupt):
+            if staging_parent.exists():
+                try:
+                    _safe_remove_tree(staging_parent, self.custom_nodes_root)
+                except InstallError:
+                    pass
+            raise
+        except Exception:
+            if staging_parent.exists():
+                try:
+                    _safe_remove_tree(staging_parent, self.custom_nodes_root)
+                except InstallError:
+                    pass
+            raise _install_error() from None
+        if staging_parent.exists():
+            _safe_remove_tree(staging_parent, self.custom_nodes_root)
+        return InstallResult(
+            package_id=package.package_id,
+            revision=package.revision,
+            destination=destination,
+            wheels=(),
         )

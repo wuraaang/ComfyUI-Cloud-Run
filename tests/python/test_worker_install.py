@@ -13,6 +13,7 @@ from cloud_run.manifest import (
     CustomNodeSpec,
     PythonWheelSpec,
     SourceSpec,
+    UiPackageSpec,
 )
 
 
@@ -150,6 +151,37 @@ class WorkerInstallTests(unittest.TestCase):
             runner=runner,
         )
 
+    def ui_package_spec(self):
+        archive_id = "agent-panel-archive"
+        archive_path = self.artifacts / f"{archive_id}.tar"
+        write_tar(
+            archive_path,
+            (
+                {"name": "__init__.py", "payload": b"WEB_DIRECTORY = 'web'\n"},
+                {"name": "web/panel.js", "payload": b"export const panel = true;\n"},
+            ),
+        )
+        payload = archive_path.read_bytes()
+        return UiPackageSpec(
+            package_id="agent-panel",
+            repository_url="https://github.com/example/agent-panel",
+            revision=REVISION,
+            archive=ArtifactSpec(
+                artifact_id=archive_id,
+                kind="ui_package_archive",
+                logical_name="agent-panel",
+                destination="custom_nodes/agent-panel",
+                size_bytes=len(payload),
+                sha256=hashlib.sha256(payload).hexdigest(),
+                source=SourceSpec(
+                    kind="local-upload",
+                    locator=f"local-upload:{archive_id}",
+                ),
+            ),
+            web_sha256=hashlib.sha256(b"export const panel = true;\n").hexdigest(),
+            required_capabilities=("graph_read", "native_run"),
+        )
+
     def test_install_extracts_confined_archive_and_uses_no_shell(self):
         runner = RecordingRunner()
         spec = self.node_spec()
@@ -191,6 +223,22 @@ class WorkerInstallTests(unittest.TestCase):
                 for item in self.custom_nodes.iterdir()
             )
         )
+
+    def test_ui_only_package_installs_without_graph_classes_or_pip(self):
+        runner = RecordingRunner()
+        spec = self.ui_package_spec()
+
+        result = asyncio.run(
+            self.installer(runner).install_ui_package(spec)
+        )
+
+        self.assertEqual(result.package_id, "agent-panel")
+        self.assertEqual(result.wheels, ())
+        self.assertEqual(
+            (result.destination / "web" / "panel.js").read_bytes(),
+            b"export const panel = true;\n",
+        )
+        self.assertEqual(runner.calls, [])
 
     def test_archive_traversal_links_devices_and_bad_metadata_fail_closed(self):
         from remote_worker.install import InstallError, safe_extract

@@ -115,7 +115,7 @@ def release_lock(archive, destination, **overrides):
         "worker_commit": WORKER_COMMIT,
         "worker_archive_sha256": digest,
         "worker_archive_size_bytes": len(archive),
-        "protocol_version": "1",
+        "protocol_version": "2",
         "comfyui_core_version": "0.29.0",
         "comfyui_frontend_version": "1.47.10",
         "python_version": "3.12",

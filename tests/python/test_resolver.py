@@ -7,7 +7,13 @@ from pathlib import Path
 from cloud_run.artifacts import FileInputMetadata, GIB, StaticFileRequirement
 from cloud_run.comfy_host import NodeDescription, NodeNotFound
 from cloud_run.dependency_repository import DependencyRepository
-from cloud_run.manifest import SourceSpec
+from cloud_run.manifest import (
+    ArtifactSpec,
+    ProfileFileSpec,
+    ProfileSpec,
+    SourceSpec,
+    UiPackageSpec,
+)
 from cloud_run.model_sources import ModelSourceResolution
 from cloud_run.registry import RegistryCandidate
 from cloud_run.resolver import DependencyResolver
@@ -272,6 +278,106 @@ class DependencyResolverTests(unittest.TestCase):
         self.assertEqual(candidate.source_kind, "agent")
         self.assertFalse(candidate.approved)
         self.assertIsNone(self.repository.approved("AgentNode"))
+
+    def test_ui_packages_come_only_from_the_approved_profile_provider(self):
+        def archive(artifact_id, kind, destination, digest):
+            return ArtifactSpec(
+                artifact_id=artifact_id,
+                kind=kind,
+                logical_name=artifact_id,
+                destination=destination,
+                size_bytes=10,
+                sha256=digest,
+                source=SourceSpec(
+                    "local-upload",
+                    "local-upload:" + artifact_id,
+                ),
+            )
+
+        panel = UiPackageSpec(
+            package_id="comfyui-agent-panel",
+            repository_url="https://github.com/acme/comfyui-agent-panel",
+            revision="a" * 40,
+            archive=archive(
+                "ui-agent-panel",
+                "ui_package_archive",
+                "custom_nodes/comfyui-agent-panel",
+                "b" * 64,
+            ),
+            web_sha256="c" * 64,
+            required_capabilities=("graph_read",),
+        )
+        profile = ProfileSpec(
+            profile_id="profile-1",
+            revision=1,
+            archive=archive(
+                "profile-1",
+                "profile_archive",
+                "user/default/cloud-vast-profile",
+                "d" * 64,
+            ),
+            bootstrap_digest="e" * 64,
+            files=(
+                ProfileFileSpec(
+                    "workflows/example.json",
+                    12,
+                    "f" * 64,
+                ),
+            ),
+        )
+        input_root = Path(self.temporary_directory.name) / "profile-input"
+        input_root.mkdir()
+        capture = FakeCapture(
+            "KSampler",
+            "SaveImage",
+            output={
+                "1": {"class_type": "KSampler", "inputs": {}},
+                "2": {
+                    "class_type": "SaveImage",
+                    "inputs": {"images": ["1", 0]},
+                },
+            },
+            workflow={
+                "nodes": [
+                    {
+                        "type": "ComfyUI-Agent-Panel",
+                        "properties": {"repository_url": "https://evil.invalid"},
+                    }
+                ]
+            },
+        )
+        resolver = DependencyResolver(
+            host=FakeHost(
+                {
+                    "KSampler": core("KSampler"),
+                    "SaveImage": core("SaveImage"),
+                }
+            ),
+            repository=self.repository,
+            registry=FakeRegistry({}),
+            profile_provider=lambda observed: {
+                "ui_packages": (panel,),
+                "profile": profile,
+                "minimum_vram_gb": 12.0,
+            },
+        )
+
+        result = asyncio.run(
+            resolver.resolve_dependencies(
+                capture,
+                metadata={},
+                model_roots={},
+                input_root=input_root,
+                source_mappings={},
+                base_bytes=40 * GIB,
+                explicit_output_allowance_bytes=1024,
+            )
+        )
+
+        self.assertEqual(result.ui_packages, (panel,))
+        self.assertEqual(result.profile, profile)
+        self.assertEqual(result.minimum_vram_gb, 12.0)
+        self.assertEqual(result.custom_nodes, ())
 
     def test_dependency_preflight_assembles_verified_artifacts_and_disk(self):
         approved = self.repository.save_candidate(

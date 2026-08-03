@@ -167,14 +167,17 @@ class SessionOutputEvidenceTests(unittest.TestCase):
                     }
                 ]
         return {
-            "schema_version": 1,
-            "protocol_version": "1",
+            "schema_version": 2,
+            "protocol_version": "2",
             "comfyui_core_version": "0.29.0",
             "comfyui_frontend_version": "1.47.10",
             "worker_version": "worker-v1",
             "prompt_digest": self.prompt_digest,
             "custom_nodes": [],
             "artifacts": artifacts,
+            "ui_packages": [],
+            "profile": None,
+            "minimum_vram_gb": 0.0,
             "output_allowance_bytes": 1024 * 1024 * 1024,
             "disk_gb": 80,
         }

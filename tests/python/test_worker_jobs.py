@@ -239,7 +239,7 @@ class MutatingSnapshotState:
             def load(nested_self):
                 return {
                     "schema_version": 1,
-                    "protocol_version": "1",
+                    "protocol_version": "2",
                     "session_id": None,
                     "session_secret_hex": None,
                     "claimed": False,

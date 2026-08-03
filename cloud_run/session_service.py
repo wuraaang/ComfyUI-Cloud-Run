@@ -637,6 +637,15 @@ def _transfer_bytes(resolution):
             )
     for artifact in resolution.artifacts:
         identities[("artifact", artifact.artifact_id)] = artifact.size_bytes
+    for package in getattr(resolution, "ui_packages", ()):
+        identities[("ui-package", package.archive.artifact_id)] = (
+            package.archive.size_bytes
+        )
+    profile = getattr(resolution, "profile", None)
+    if profile is not None:
+        identities[("profile", profile.archive.artifact_id)] = (
+            profile.archive.size_bytes
+        )
     return sum(identities.values())
 
 
@@ -668,6 +677,23 @@ def _required_local_upload_ids(resolution):
                     "local-upload:"
                 )
                 identifiers.append((identifier,))
+    for package in getattr(resolution, "ui_packages", ()):
+        archive = package.archive
+        if archive.source.kind == "local-upload":
+            identifiers.append(
+                (
+                    archive.artifact_id,
+                    archive.source.locator.removeprefix("local-upload:"),
+                )
+            )
+    profile = getattr(resolution, "profile", None)
+    if profile is not None and profile.archive.source.kind == "local-upload":
+        identifiers.append(
+            (
+                profile.archive.artifact_id,
+                profile.archive.source.locator.removeprefix("local-upload:"),
+            )
+        )
     return tuple(identifiers)
 
 
@@ -690,6 +716,19 @@ def _manifest_transfer_bytes(payload):
             identity = ("artifact", artifact["artifact_id"])
             if identity not in seen:
                 total += int(artifact["size_bytes"])
+                seen.add(identity)
+        for package in payload["ui_packages"]:
+            archive = package["archive"]
+            identity = ("ui-package", archive["artifact_id"])
+            if identity not in seen:
+                total += int(archive["size_bytes"])
+                seen.add(identity)
+        profile = payload["profile"]
+        if profile is not None:
+            archive = profile["archive"]
+            identity = ("profile", archive["artifact_id"])
+            if identity not in seen:
+                total += int(archive["size_bytes"])
                 seen.add(identity)
     except (KeyError, TypeError, ValueError):
         raise PreflightBlocked("Stored dependency manifest is invalid.") from None
@@ -750,12 +789,15 @@ def _transfer_catalog(manifest):
         artifacts = [
             *manifest.artifacts,
             *(node.archive for node in manifest.custom_nodes),
+            *(package.archive for package in manifest.ui_packages),
             *(
                 wheel_artifact(wheel)
                 for node in manifest.custom_nodes
                 for wheel in node.wheels
             ),
         ]
+        if manifest.profile is not None:
+            artifacts.append(manifest.profile.archive)
     except Exception:
         raise SessionExecutionError(
             "Dependency transfer plan is unavailable."
@@ -779,6 +821,15 @@ def _installed_records(manifest):
             if node.archive.artifact_id == artifact_id:
                 revision = node.revision
                 break
+        for package in manifest.ui_packages:
+            if package.archive.artifact_id == artifact_id:
+                revision = package.revision
+                break
+        if (
+            manifest.profile is not None
+            and manifest.profile.archive.artifact_id == artifact_id
+        ):
+            revision = str(manifest.profile.revision)
         records.append(
             {
                 "dependency_id": artifact_id,
@@ -1113,6 +1164,15 @@ class SessionService:
                 prompt_digest=capture.prompt_digest,
                 custom_nodes=tuple(resolution.custom_nodes),
                 artifacts=tuple(resolution.artifacts),
+                ui_packages=tuple(
+                    getattr(resolution, "ui_packages", ())
+                ),
+                profile=getattr(resolution, "profile", None),
+                minimum_vram_gb=getattr(
+                    resolution,
+                    "minimum_vram_gb",
+                    0.0,
+                ),
                 output_allowance_bytes=output_allowance,
                 disk_gb=disk_gb,
             )

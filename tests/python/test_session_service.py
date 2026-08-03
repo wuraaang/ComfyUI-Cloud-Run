@@ -82,7 +82,7 @@ def worker_release():
             "template_hash_id": "1" * 32,
             "worker_commit": "a" * 40,
             "worker_archive_sha256": "b" * 64,
-            "protocol_version": "1",
+            "protocol_version": "2",
             "comfyui_core_version": "0.29.0",
             "comfyui_frontend_version": "1.47.10",
             "python_version": "3.12",
@@ -682,7 +682,7 @@ class SequentialWorker:
 
     async def health(self):
         return {
-            "protocol_version": "1",
+            "protocol_version": "2",
             "claimed": self.claimed,
         }
 
@@ -690,7 +690,7 @@ class SequentialWorker:
         self.claimed = True
         self.claim_calls += 1
         return {
-            "protocol_version": "1",
+            "protocol_version": "2",
             "session_id": "session-boot",
             "claimed": True,
         }
@@ -784,8 +784,8 @@ class SessionProvisioningTests(unittest.TestCase):
         self.jobs.save_capture(self.capture, created_at=100.0)
         self.artifact = local_artifact("terminal-input.jpg", "d")
         self.manifest = DependencyManifest(
-            schema_version=1,
-            protocol_version="1",
+            schema_version=2,
+            protocol_version="2",
             comfyui_core_version="0.29.0",
             comfyui_frontend_version="1.47.10",
             worker_version="a" * 40,
@@ -898,8 +898,8 @@ class SessionProvisioningTests(unittest.TestCase):
             ),
         )
         public_manifest = DependencyManifest(
-            schema_version=1,
-            protocol_version="1",
+            schema_version=2,
+            protocol_version="2",
             comfyui_core_version="0.29.0",
             comfyui_frontend_version="1.47.10",
             worker_version="a" * 40,
@@ -1228,8 +1228,8 @@ class ReusableSessionTests(unittest.TestCase):
             id_factory=lambda: next(self.ids),
         )
         initial = DependencyManifest(
-            schema_version=1,
-            protocol_version="1",
+            schema_version=2,
+            protocol_version="2",
             comfyui_core_version="0.29.0",
             comfyui_frontend_version="1.47.10",
             worker_version="a" * 40,
@@ -1825,8 +1825,8 @@ class ReusableSessionTests(unittest.TestCase):
         first_node = custom_node("e")
         second_node = custom_node("f")
         initial = DependencyManifest(
-            schema_version=1,
-            protocol_version="1",
+            schema_version=2,
+            protocol_version="2",
             comfyui_core_version="0.29.0",
             comfyui_frontend_version="1.47.10",
             worker_version="a" * 40,

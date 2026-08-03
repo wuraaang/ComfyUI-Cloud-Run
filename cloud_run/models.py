@@ -15,7 +15,7 @@ from .constants import (
     VAST_CREATE_FAILURE_CODES,
 )
 from .run_errors import RunErrorCode
-from .worker_protocol import is_boundary_token
+from .worker_protocol import PROTOCOL_VERSION, is_boundary_token
 
 
 class SessionState(str, Enum):
@@ -373,7 +373,7 @@ class OfferQuote:
                 r"[0-9a-f]{64}",
                 self.worker_archive_sha256,
             )
-            or self.protocol_version != "1"
+            or self.protocol_version != PROTOCOL_VERSION
             or not re.fullmatch(r"[0-9a-f]{64}", self.manifest_digest)
             or not isinstance(self.execution_baseline_digest, str)
             or re.fullmatch(
@@ -470,7 +470,7 @@ class OfferQuote:
                 "template_hash_id": _UNBOUND_TEMPLATE_HASH,
                 "worker_commit": _UNBOUND_WORKER_COMMIT,
                 "worker_archive_sha256": _UNBOUND_SHA256,
-                "protocol_version": "1",
+                "protocol_version": PROTOCOL_VERSION,
                 "manifest_digest": _UNBOUND_SHA256,
                 "execution_baseline_digest": _UNBOUND_SHA256,
                 "randomized_seed_node_ids": (),

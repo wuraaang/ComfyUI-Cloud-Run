@@ -281,7 +281,7 @@ def _validated_lock(payload, allowed_destination):
         or isinstance(size, bool)
         or not isinstance(size, int)
         or not 0 < size <= MAX_ARCHIVE_BYTES
-        or payload.get("protocol_version") != "1"
+        or payload.get("protocol_version") != "2"
         or payload.get("comfyui_core_version") != "0.29.0"
         or payload.get("comfyui_frontend_version") != "1.47.10"
         or payload.get("python_version") != "3.12"

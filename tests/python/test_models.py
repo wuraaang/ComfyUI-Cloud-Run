@@ -37,7 +37,7 @@ def quote(OfferQuote):
         template_hash_id="1" * 32,
         worker_commit="a" * 40,
         worker_archive_sha256="b" * 64,
-        protocol_version="1",
+        protocol_version="2",
         manifest_digest="c" * 64,
         execution_baseline_digest="f" * 64,
         randomized_seed_node_ids=("3",),
@@ -174,7 +174,7 @@ class LifecycleModelTests(unittest.TestCase):
         self.assertEqual(public["template_hash_id"], "1" * 32)
         self.assertEqual(public["worker_commit"], "a" * 40)
         self.assertEqual(public["worker_archive_sha256"], "b" * 64)
-        self.assertEqual(public["protocol_version"], "1")
+        self.assertEqual(public["protocol_version"], "2")
         self.assertEqual(public["manifest_digest"], "c" * 64)
         self.assertNotIn("session_secret_hex", public)
 

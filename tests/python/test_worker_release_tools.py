@@ -69,7 +69,7 @@ def release_metadata():
         ),
         worker_archive_size_bytes=12345,
         worker_archive_sha256=digest,
-        protocol_version="1",
+        protocol_version="2",
         comfyui_core_version="0.29.0",
         comfyui_frontend_version="1.47.10",
         python_version="3.12",
@@ -594,7 +594,7 @@ class TemplateRendererTests(unittest.TestCase):
 
     def test_renderer_rejects_altered_metadata_and_output_permissions(self):
         metadata = release_metadata()
-        object.__setattr__(metadata, "protocol_version", "2")
+        object.__setattr__(metadata, "protocol_version", "1")
         with tempfile.TemporaryDirectory() as root:
             private = self._private_directory(root, "private")
             symlink = Path(root) / "symlink"

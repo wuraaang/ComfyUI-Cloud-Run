@@ -53,7 +53,7 @@ _POLICY = {
     "comfyui_core_version": "0.29.0",
     "comfyui_frontend_version": "1.47.10",
     "python_version": "3.12",
-    "protocol_version": "1",
+    "protocol_version": "2",
     "worker_port": 8765,
 }
 _WORKER_JUPYTER_DIRECTORY = "/workspace"

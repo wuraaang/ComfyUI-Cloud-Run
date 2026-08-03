@@ -702,7 +702,7 @@ class WorkerUploadRouteTests(unittest.TestCase):
 
             claim = json.dumps(
                 {
-                    "protocol_version": "1",
+                    "protocol_version": "2",
                     "session_id": "session-1",
                     "session_secret_hex": "a" * 64,
                 },

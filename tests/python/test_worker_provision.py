@@ -17,8 +17,11 @@ from cloud_run.manifest import (
     ArtifactSpec,
     CustomNodeSpec,
     DependencyManifest,
+    ProfileFileSpec,
+    ProfileSpec,
     PythonWheelSpec,
     SourceSpec,
+    UiPackageSpec,
 )
 from cloud_run.worker_protocol import sign_request
 from remote_worker.state import WorkerStateStore
@@ -111,6 +114,8 @@ def manifest(
     prompt_marker="1",
     custom_nodes=(),
     artifacts=(),
+    ui_packages=(),
+    profile=None,
     worker_version=WORKER_VERSION,
 ):
     return DependencyManifest(
@@ -122,6 +127,9 @@ def manifest(
         prompt_digest=prompt_marker * 64,
         custom_nodes=tuple(custom_nodes),
         artifacts=tuple(artifacts),
+        ui_packages=tuple(ui_packages),
+        profile=profile,
+        minimum_vram_gb=12.0,
         output_allowance_bytes=1024,
         disk_gb=80,
     )
@@ -200,6 +208,7 @@ class FakeInstaller:
         self.events = events if events is not None else []
         self.nodes = []
         self.wheel_batches = []
+        self.ui_packages = []
 
     async def install(self, node):
         self.events.append(f"install:{node.package_id}")
@@ -209,6 +218,10 @@ class FakeInstaller:
         names = tuple(item.filename for item in wheels)
         self.events.append("install-wheels")
         self.wheel_batches.append(names)
+
+    async def install_ui_package(self, package):
+        self.events.append(f"install-ui:{package.package_id}")
+        self.ui_packages.append(package.package_id)
 
 
 class FakeComfy:
@@ -361,6 +374,78 @@ class ProvisionerTests(unittest.TestCase):
         self.assertEqual(
             persisted["transactions"][result.transaction_id]["state"],
             "ready",
+        )
+
+    def test_ui_package_and_profile_are_transferred_without_graph_authority(self):
+        panel_archive = artifact(
+            "agent-panel-archive",
+            kind="ui_package_archive",
+            destination="custom_nodes/comfyui-agent-panel",
+            payload=b"agent-panel",
+        )
+        panel = UiPackageSpec(
+            package_id="comfyui-agent-panel",
+            repository_url="https://github.com/example/comfyui-agent-panel",
+            revision="a" * 40,
+            archive=panel_archive,
+            web_sha256="b" * 64,
+            required_capabilities=(
+                "graph_read",
+                "graph_edit",
+                "native_run",
+                "native_batch",
+            ),
+        )
+        profile_archive = artifact(
+            "profile-archive",
+            kind="profile_archive",
+            destination="user/default/cloud-vast-profile",
+            payload=b"profile",
+        )
+        safe_profile = ProfileSpec(
+            profile_id="profile-1",
+            revision=3,
+            archive=profile_archive,
+            bootstrap_digest="c" * 64,
+            files=(
+                ProfileFileSpec(
+                    path="workflows/example.json",
+                    size_bytes=12,
+                    sha256="d" * 64,
+                ),
+            ),
+        )
+        desired = manifest(ui_packages=(panel,), profile=safe_profile)
+        artifacts = FakeArtifacts()
+        installer = FakeInstaller()
+        provisioner = self.provisioner(
+            comfy=FakeComfy([{"KSampler": {}}]),
+            artifacts=artifacts,
+            installer=installer,
+        )
+
+        result = asyncio.run(
+            provisioner.apply_manifest(
+                desired,
+                required_class_types=("KSampler",),
+            )
+        )
+
+        self.assertEqual(result.state, "ready")
+        self.assertEqual(
+            set(artifacts.ensure_calls[0][0]),
+            {"agent-panel-archive", "profile-archive"},
+        )
+        self.assertEqual(installer.ui_packages, ["comfyui-agent-panel"])
+        installed = self.state.load()["installed"]
+        self.assertEqual(installed["profile_revision"], 3)
+        self.assertEqual(
+            installed["ui_package_digests"],
+            {"comfyui-agent-panel": "b" * 64},
+        )
+        self.assertEqual(
+            installed["required_class_types"],
+            ["KSampler"],
         )
 
     def test_progress_is_bounded_monotonic_sanitized_and_reaches_ready(self):
@@ -1381,7 +1466,7 @@ class WorkerProvisionRouteTests(unittest.TestCase):
             )
             claim_body = json.dumps(
                 {
-                    "protocol_version": "1",
+                    "protocol_version": "2",
                     "session_id": "session-1",
                     "session_secret_hex": "a" * 64,
                 },
@@ -1510,7 +1595,7 @@ class WorkerProvisionRouteTests(unittest.TestCase):
             )
             claim_body = json.dumps(
                 {
-                    "protocol_version": "1",
+                    "protocol_version": "2",
                     "session_id": "session-1",
                     "session_secret_hex": "a" * 64,
                 },

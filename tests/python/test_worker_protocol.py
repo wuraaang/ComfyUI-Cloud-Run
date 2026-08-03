@@ -63,7 +63,7 @@ class WorkerProtocolTests(unittest.TestCase):
         self.assertEqual(
             envelope,
             {
-                "protocol_version": "1",
+                "protocol_version": "2",
                 "timestamp": 1000,
                 "nonce": "n-1",
                 "signature": hmac.new(
@@ -220,7 +220,7 @@ class WorkerProtocolTests(unittest.TestCase):
         )
         invalid_envelopes = (
             {**valid, "signature": "0" * 64},
-            {**valid, "protocol_version": "2"},
+            {**valid, "protocol_version": "1"},
             {**valid, "timestamp": True},
             {**valid, "nonce": "bad\nnonce"},
             {**valid, "extra": "value"},

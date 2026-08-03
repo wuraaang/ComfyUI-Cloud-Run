@@ -40,7 +40,7 @@ def make_attempt(key="idem-1", attempt_id="attempt-1", now=100.0):
             template_hash_id="1" * 32,
             worker_commit="a" * 40,
             worker_archive_sha256="b" * 64,
-            protocol_version="1",
+            protocol_version="2",
             manifest_digest="a" * 64,
             execution_baseline_digest="e" * 64,
             randomized_seed_node_ids=("3",),

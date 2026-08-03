@@ -15,7 +15,7 @@ def claim_payload(
     secret_character="a",
 ):
     return {
-        "protocol_version": "1",
+        "protocol_version": "2",
         "session_id": session_id,
         "session_secret_hex": secret_character * 64,
     }
@@ -70,7 +70,7 @@ class WorkerStateTests(unittest.TestCase):
                 reopened,
                 {
                     "schema_version": 2,
-                    "protocol_version": "1",
+                    "protocol_version": "2",
                     "session_id": "session-1",
                     "session_secret_hex": "a" * 64,
                     "claimed": True,
@@ -101,7 +101,7 @@ class WorkerStateTests(unittest.TestCase):
             path = Path(directory) / "worker-state.json"
             legacy = {
                 "schema_version": 1,
-                "protocol_version": "1",
+                "protocol_version": "2",
                 "session_id": "session-1",
                 "session_secret_hex": "a" * 64,
                 "claimed": True,
@@ -154,7 +154,7 @@ class WorkerStateTests(unittest.TestCase):
                 json.dumps(
                     {
                         "schema_version": 1,
-                        "protocol_version": "1",
+                        "protocol_version": "2",
                         "session_id": "session-1",
                         "session_secret_hex": "a" * 64,
                         "claimed": True,
@@ -304,7 +304,7 @@ class WorkerApplicationTests(unittest.TestCase):
         self.assertEqual(
             accepted.payload,
             {
-                "protocol_version": "1",
+                "protocol_version": "2",
                 "session_id": "session-1",
                 "claimed": True,
             },
@@ -472,7 +472,7 @@ class WorkerApplicationTests(unittest.TestCase):
         self.assertEqual(denied.status, 401)
         self.assertEqual(
             healthy.payload,
-            {"protocol_version": "1", "claimed": False},
+            {"protocol_version": "2", "claimed": False},
         )
         self.assertEqual(unknown.status, 404)
 

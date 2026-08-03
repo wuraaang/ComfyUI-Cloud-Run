@@ -16,8 +16,10 @@ from .dependency_repository import MappingValidationError
 from .manifest import (
     ArtifactSpec,
     CustomNodeSpec,
+    ProfileSpec,
     PythonWheelSpec,
     SourceSpec,
+    UiPackageSpec,
     validate_dependency,
 )
 from .registry import RegistryError
@@ -49,6 +51,9 @@ class DependencyPreflightResult:
     disk_gb: int
     rentable: bool
     local_artifacts: tuple = ()
+    ui_packages: tuple[UiPackageSpec, ...] = ()
+    profile: ProfileSpec | None = None
+    minimum_vram_gb: float = 0.0
 
 
 def _candidate_is_complete(candidate, class_type):
@@ -124,6 +129,7 @@ class DependencyResolver:
         cache_catalog=None,
         resolution_context=None,
         model_source_resolver=None,
+        profile_provider=None,
     ):
         self.host = host
         self.repository = repository
@@ -131,6 +137,49 @@ class DependencyResolver:
         self.cache_catalog = cache_catalog
         self.resolution_context = resolution_context
         self.model_source_resolver = model_source_resolver
+        self.profile_provider = profile_provider
+
+    def _approved_profile(self, capture):
+        if self.profile_provider is None:
+            return (), None, 0.0
+        try:
+            payload = self.profile_provider(capture)
+        except Exception:
+            raise MappingValidationError(
+                "Approved Desktop profile is unavailable."
+            ) from None
+        if not isinstance(payload, dict) or set(payload) != {
+            "ui_packages",
+            "profile",
+            "minimum_vram_gb",
+        }:
+            raise MappingValidationError(
+                "Approved Desktop profile is invalid."
+            )
+        ui_packages = payload["ui_packages"]
+        profile = payload["profile"]
+        minimum_vram = payload["minimum_vram_gb"]
+        if (
+            not isinstance(ui_packages, tuple)
+            or not all(isinstance(item, UiPackageSpec) for item in ui_packages)
+            or (profile is not None and not isinstance(profile, ProfileSpec))
+            or isinstance(minimum_vram, bool)
+            or not isinstance(minimum_vram, (int, float))
+            or not 0 <= float(minimum_vram) <= 1024
+        ):
+            raise MappingValidationError(
+                "Approved Desktop profile is invalid."
+            )
+        try:
+            for package in ui_packages:
+                validate_dependency(package)
+            if profile is not None:
+                validate_dependency(profile)
+        except (TypeError, ValueError):
+            raise MappingValidationError(
+                "Approved Desktop profile is invalid."
+            ) from None
+        return ui_packages, profile, float(minimum_vram)
 
     def register_agent_suggestion(self, payload):
         if not isinstance(payload, dict) or set(payload) != {
@@ -348,6 +397,9 @@ class DependencyResolver:
             capture,
             explicit_bytes=explicit_output_allowance_bytes,
         )
+        ui_packages, profile, minimum_vram_gb = self._approved_profile(
+            capture
+        )
 
         custom_nodes_by_package = {}
         for row in nodes.rows:
@@ -376,6 +428,9 @@ class DependencyResolver:
             + sum(wheel.size_bytes for wheel in node.wheels)
             for node in custom_nodes
         )
+        profile_dependency_bytes = sum(
+            package.archive.size_bytes for package in ui_packages
+        ) + (profile.archive.size_bytes if profile is not None else 0)
         model_bytes = sum(
             artifact.size_bytes
             for artifact in artifact_result.artifacts
@@ -388,7 +443,11 @@ class DependencyResolver:
         )
         disk_gb = calculate_disk_gb(
             base_bytes=base_bytes,
-            dependency_bytes=custom_dependency_bytes + model_bytes,
+            dependency_bytes=(
+                custom_dependency_bytes
+                + profile_dependency_bytes
+                + model_bytes
+            ),
             input_bytes=input_bytes,
             output_bytes=output_allowance,
         )
@@ -401,6 +460,9 @@ class DependencyResolver:
             disk_gb=disk_gb,
             rentable=nodes.rentable and artifact_result.rentable,
             local_artifacts=artifact_result.local_artifacts,
+            ui_packages=ui_packages,
+            profile=profile,
+            minimum_vram_gb=minimum_vram_gb,
         )
 
     async def resolve_preflight(

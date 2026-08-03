@@ -13,12 +13,12 @@ class RecordingTransport:
         self.requests = []
         self.responses = [
             {
-                "protocol_version": "1",
+                "protocol_version": "2",
                 "session_id": "session-1",
                 "claimed": True,
             },
             {
-                "protocol_version": "1",
+                "protocol_version": "2",
                 "claimed": True,
             },
         ]
@@ -334,7 +334,7 @@ class WorkerClientTests(unittest.TestCase):
         )
         self.assertEqual(
             client.public_payload(),
-            {"session_id": "session-1", "protocol_version": "1"},
+            {"session_id": "session-1", "protocol_version": "2"},
         )
         exposed = repr(
             [

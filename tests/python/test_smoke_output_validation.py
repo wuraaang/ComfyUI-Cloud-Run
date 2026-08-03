@@ -87,7 +87,7 @@ def _reviewed_worker_release():
         "worker_archive_sha256": (
             "844a829be884f2cb1cba3b7d8818f2592d3d0c42f3f25e291e3834863f527ad5"
         ),
-        "protocol_version": "1",
+        "protocol_version": "2",
         "comfyui_core_version": "0.29.0",
         "comfyui_frontend_version": "1.47.10",
         "python_version": "3.12",
