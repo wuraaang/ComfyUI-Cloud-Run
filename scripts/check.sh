@@ -291,6 +291,11 @@ allowed_cloud_run_routes = {
     ("POST", "/cloud-run/api/sessions"),
     ("POST", "/cloud-run/api/sessions/{session_id}/confirm"),
     ("GET", "/cloud-run/api/sessions/{session_id}"),
+    ("GET", "/cloud-run/api/sessions/{session_id}/profile"),
+    (
+        "POST",
+        "/cloud-run/api/sessions/{session_id}/profile/conflicts/{conflict_id}",
+    ),
     (
         "POST",
         "/cloud-run/api/sessions/{session_id}/desktop-relay",
@@ -332,6 +337,9 @@ allowed_worker_routes = {
     ("GET", "/worker/v1/jobs/{job_id}/events"),
     ("GET", "/worker/v1/jobs/{job_id}/snapshot"),
     ("GET", "/worker/v1/jobs/{job_id}/previews/{preview_id}"),
+    ("PUT", "/worker/v1/profile"),
+    ("GET", "/worker/v1/profile"),
+    ("GET", "/worker/v1/profile/artifacts/{artifact_id}"),
     ("PUT", "/worker/v1/deadline"),
 }
 if worker_route_set() != allowed_worker_routes:

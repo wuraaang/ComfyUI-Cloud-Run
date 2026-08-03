@@ -18,6 +18,7 @@ from cloud_run.manifest import (
     ProfileSpec,
     PythonWheelSpec,
     SourceSpec,
+    UiPackageSpec,
 )
 from cloud_run.models import (
     CloudJob,
@@ -135,6 +136,20 @@ class FakeOfferSearch:
         self.calls += 1
         self.disk_gb = disk_gb
         return [self.provider_offer]
+
+
+class FakeSessionAgentBridge:
+    def __init__(self, report=None):
+        self.report = report
+        self.probes = []
+        self.revoked = []
+
+    async def probe(self, session):
+        self.probes.append(session)
+        return self.report
+
+    async def revoke(self, session_id):
+        self.revoked.append(session_id)
 
 
 def blocked_resolution():
@@ -1203,6 +1218,7 @@ class ReusableSessionTests(unittest.TestCase):
             self.input_b,
         )
         self.worker = SequentialWorker()
+        self.agent_bridge = FakeSessionAgentBridge()
         self.ids = iter(
             (
                 "preflight-first",
@@ -1226,6 +1242,7 @@ class ReusableSessionTests(unittest.TestCase):
             release=worker_release(),
             worker_factory=lambda _session: self.worker,
             relay_factory=lambda worker, _session: SequentialRelay(worker),
+            agent_bridge=self.agent_bridge,
             clock=lambda: 100.0,
             id_factory=lambda: next(self.ids),
         )
@@ -2770,6 +2787,7 @@ class ReusableSessionTests(unittest.TestCase):
 
         self.assertEqual(destroyed.state, SessionState.DESTROYED)
         self.assertEqual(lifecycle.calls, ["session-1"])
+        self.assertEqual(self.agent_bridge.revoked, ["session-1"])
         self.assertEqual(
             self.jobs.get_transfer(
                 "destroy-job",
@@ -2923,6 +2941,144 @@ class ReusableSessionTests(unittest.TestCase):
         self.assertEqual(transfer.state.value, "verified")
         self.assertEqual(transfer.offset, len(content))
         self.assertEqual(apply_count, 2)
+
+
+class AgentPanelSessionBridgeTests(unittest.TestCase):
+    @staticmethod
+    def _panel_package():
+        return UiPackageSpec(
+            package_id="comfyui-agent-panel",
+            repository_url="https://github.com/acme/comfyui-agent-panel",
+            revision="a" * 40,
+            archive=ArtifactSpec(
+                artifact_id="ui-agent-panel",
+                kind="ui_package_archive",
+                logical_name="ui-agent-panel",
+                destination="custom_nodes/comfyui-agent-panel",
+                size_bytes=10,
+                sha256="b" * 64,
+                source=SourceSpec(
+                    "local-upload",
+                    "local-upload:ui-agent-panel",
+                ),
+            ),
+            web_sha256="c" * 64,
+            required_capabilities=(
+                "graph_read",
+                "graph_edit",
+                "native_run",
+                "native_batch",
+            ),
+        )
+
+    def _service(self, packages, report):
+        records = []
+        bridge = FakeSessionAgentBridge(report)
+        repository = mock.Mock()
+        service = SessionService(
+            job_repository=repository,
+            resolver=FakeResolver(resolved_resolution()),
+            release=worker_release(),
+            agent_bridge=bridge,
+            orchestrator=types.SimpleNamespace(
+                record=lambda entry: records.append(entry) or True
+            ),
+            clock=lambda: 100.0,
+        )
+        session = types.SimpleNamespace(
+            session_id="session-1",
+            manifest_digest="d" * 64,
+            installed_manifest_digest="d" * 64,
+        )
+        service._stored_session = lambda _session_id: session
+        service._profile_manifest = lambda _session: (
+            types.SimpleNamespace(ui_packages=tuple(packages)),
+            None,
+        )
+        service._reconciliation_job = lambda _session_id: None
+        return service, bridge, records
+
+    def test_absent_panel_is_not_required_and_present_panel_runs_exact_probe(self):
+        from cloud_run.agent_bridge import AgentBridgeProbe, AgentBridgeSession
+
+        report = AgentBridgeProbe(
+            orchestrator_identity="passed",
+            graph_read="passed",
+            graph_edit_restore="passed",
+            graph_run="passed",
+            ordered_batch="passed",
+        )
+        context = AgentBridgeSession(
+            session_id="session-1",
+            relay_origin="http://127.0.0.1:32145",
+            capability="c" * 48,
+            capability_expires_at=200.0,
+            local_comfy_root="/approved/comfyui",
+        )
+        absent, absent_bridge, _records = self._service((), report)
+        not_required = asyncio.run(
+            absent.probe_agent_panel("session-1", context)
+        )
+        self.assertEqual(
+            not_required,
+            {"required": False, "status": "not_required", "ready": True},
+        )
+        self.assertEqual(absent_bridge.probes, [])
+
+        present, bridge, records = self._service(
+            (self._panel_package(),),
+            report,
+        )
+        verified = asyncio.run(
+            present.probe_agent_panel("session-1", context)
+        )
+        self.assertTrue(present.agent_panel_required("session-1"))
+        self.assertEqual(verified["status"], "passed")
+        self.assertTrue(verified["ready"])
+        self.assertEqual(bridge.probes, [context])
+        self.assertEqual(records, [])
+
+    def test_failed_probe_and_pump_issue_create_only_typed_sanitized_journal(self):
+        from cloud_run.agent_bridge import AgentBridgeProbe, AgentBridgeSession
+        from cloud_run.run_errors import RunPhase
+
+        failed = AgentBridgeProbe(
+            orchestrator_identity="passed",
+            graph_read="failed",
+            graph_edit_restore="failed",
+            graph_run="failed",
+            ordered_batch="failed",
+        )
+        service, _bridge, records = self._service(
+            (self._panel_package(),),
+            failed,
+        )
+        context = AgentBridgeSession(
+            session_id="session-1",
+            relay_origin="http://127.0.0.1:32145",
+            capability="c" * 48,
+            capability_expires_at=200.0,
+            local_comfy_root="/approved/comfyui",
+        )
+
+        result = asyncio.run(
+            service.probe_agent_panel("session-1", context)
+        )
+        service.record_agent_bridge_issue(
+            "session-1",
+            "synchronization_error",
+            "Bearer private-token at /Users/private/comfy",
+        )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(len(records), 2)
+        for entry in records:
+            self.assertEqual(entry.phase, RunPhase.SYNCHRONIZATION)
+            self.assertEqual(entry.code, RunErrorCode.SYNCHRONIZATION)
+            self.assertEqual(entry.details["component"], "agent_panel_bridge")
+        rendered = repr(records)
+        self.assertNotIn("private-token", rendered)
+        self.assertNotIn("/Users/private", rendered)
 
 
 class DesktopProfileSynchronizationTests(unittest.TestCase):

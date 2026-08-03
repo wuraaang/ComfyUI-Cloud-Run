@@ -69,6 +69,10 @@ _SUSPICIOUS_KEY = re.compile(
 _SUSPICIOUS_VALUE = re.compile(
     r"(?i)(bearer\s+|[?&](?:token|signature|x-amz-[^=]+)=|-----begin .*private key)"
 )
+_AGENT_PANEL_PACKAGE_ID = "comfyui-agent-panel"
+_AGENT_PANEL_BRIDGE_SETTING = "comfyui-mcp.bridgeUrl.single"
+_AGENT_PANEL_REMOTE_SETTING = "comfyui-mcp.remoteComfyuiUrl"
+_AGENT_PANEL_BRIDGE_PATH = "/cloud-run/api/agent/ws"
 _DROP = object()
 
 
@@ -799,6 +803,10 @@ class DesktopProfileStore:
         if not _within(profile_root, user_root):
             raise DesktopProfileError("Desktop profile root is unavailable.")
         content = {}
+        agent_panel_enabled = any(
+            package.package_id == _AGENT_PANEL_PACKAGE_ID
+            for package in ui_packages
+        )
         workflows = profile_root / "workflows"
         palettes = profile_root / "color_palettes"
         for root, prefix in ((workflows, "workflows"), (palettes, "palettes")):
@@ -823,9 +831,22 @@ class DesktopProfileStore:
                 content[logical] = _canonical_json(value)
         assets = {}
         settings_path = profile_root / "comfy.settings.json"
+        sanitized = None
         if settings_path.exists():
             settings = _read_json(settings_path)
             sanitized = self._sanitize_settings(settings, input_root, assets)
+        elif agent_panel_enabled:
+            sanitized = {}
+        if sanitized is not None:
+            if agent_panel_enabled:
+                if not isinstance(sanitized, dict):
+                    raise DesktopProfileError(
+                        "Desktop profile settings are invalid."
+                    )
+                sanitized[_AGENT_PANEL_BRIDGE_SETTING] = (
+                    _AGENT_PANEL_BRIDGE_PATH
+                )
+                sanitized[_AGENT_PANEL_REMOTE_SETTING] = ""
             content["settings/comfy.settings.json"] = _canonical_json(sanitized)
         content.update(assets)
         bootstrap = _canonical_json(bootstrap_workflow)

@@ -86,6 +86,13 @@ _SOURCE_KINDS = {
     "r2",
     "registry",
 }
+_AGENT_PANEL_PACKAGE_ID = "comfyui-agent-panel"
+_AGENT_PANEL_CAPABILITIES = frozenset({
+    "graph_read",
+    "graph_edit",
+    "native_run",
+    "native_batch",
+})
 _MAPPING_CANDIDATE_FIELDS = {
     "approved",
     "archive_complete",
@@ -1051,6 +1058,7 @@ class SessionService:
         orchestrator=None,
         reconciler=None,
         profile_store=None,
+        agent_bridge=None,
     ):
         self.job_repository = job_repository
         self.resolver = resolver
@@ -1063,6 +1071,12 @@ class SessionService:
         self.source_url_resolver = source_url_resolver
         self.lifecycle = lifecycle
         self.profile_store = profile_store
+        if agent_bridge is not None and not all(
+            callable(getattr(agent_bridge, method, None))
+            for method in ("probe", "revoke")
+        ):
+            raise ValueError("Invalid Agent Panel bridge.")
+        self.agent_bridge = agent_bridge
         self.clock = clock or time.time
         self.id_factory = id_factory or (lambda: str(uuid.uuid4()))
         self.review_token_factory = (
@@ -1363,6 +1377,147 @@ class SessionService:
         digest = session.installed_manifest_digest or session.manifest_digest
         manifest = _stored_manifest(self.job_repository, digest)
         return manifest, manifest.profile
+
+    def _agent_panel_package(self, session):
+        manifest, _profile = self._profile_manifest(session)
+        for package in manifest.ui_packages:
+            if package.package_id == _AGENT_PANEL_PACKAGE_ID:
+                return package
+        return None
+
+    def agent_panel_required(self, session_id):
+        session = self._stored_session(session_id)
+        return self._agent_panel_package(session) is not None
+
+    def record_agent_bridge_issue(self, session_id, code, _diagnostic=None):
+        session = self._stored_session(session_id)
+        try:
+            classified = RunErrorCode(code)
+        except (TypeError, ValueError):
+            raise SessionExecutionError(
+                "Agent Panel bridge issue was rejected."
+            ) from None
+        if classified not in {
+            RunErrorCode.DEPENDENCY,
+            RunErrorCode.SYNCHRONIZATION,
+        }:
+            raise SessionExecutionError(
+                "Agent Panel bridge issue was rejected."
+            )
+        job = None
+        try:
+            job = self._reconciliation_job(session.session_id)
+        except Exception:
+            job = None
+        event_cursor = 0
+        if job is not None:
+            try:
+                event_cursor = self.job_repository.last_event_sequence(
+                    job.job_id
+                )
+            except Exception:
+                event_cursor = 0
+        digest = (
+            session.installed_manifest_digest
+            or session.manifest_digest
+        )
+        message = (
+            "Agent Panel dependency validation failed."
+            if classified == RunErrorCode.DEPENDENCY
+            else "Agent Panel bridge synchronization failed."
+        )
+        entry = RunJournalEntry(
+            entry_id=uuid.uuid4().hex,
+            session_id=session.session_id,
+            manifest_digest=digest,
+            transaction_id=None,
+            job_id=job.job_id if job is not None else None,
+            phase=(
+                RunPhase.PROVISIONING
+                if classified == RunErrorCode.DEPENDENCY
+                else RunPhase.SYNCHRONIZATION
+            ),
+            code=classified,
+            message=message,
+            node_id=None,
+            process_exit_code=None,
+            restart_count=0,
+            last_probe="agent_panel",
+            byte_cursor=0,
+            event_cursor=event_cursor,
+            output_state=(
+                job.harvest_state.value if job is not None else None
+            ),
+            details={
+                "component": "agent_panel_bridge",
+                "retryable": True,
+            },
+            created_at=self._now(),
+        )
+        return self.orchestrator.record(entry)
+
+    async def probe_agent_panel(self, session_id, bridge_session):
+        session = self._stored_session(session_id)
+        package = self._agent_panel_package(session)
+        if package is None:
+            return {
+                "required": False,
+                "status": "not_required",
+                "ready": True,
+            }
+        capabilities = frozenset(package.required_capabilities)
+        bridge = self.agent_bridge
+        report = None
+        if capabilities == _AGENT_PANEL_CAPABILITIES and bridge is not None:
+            try:
+                report = await bridge.probe(bridge_session)
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                raise
+            except Exception:
+                report = None
+        ready = bool(
+            report is not None
+            and getattr(report, "ready", None) is True
+            and callable(getattr(report, "public_payload", None))
+        )
+        if ready:
+            payload = report.public_payload()
+            if not isinstance(payload, dict) or payload.get("ready") is not True:
+                ready = False
+        if not ready:
+            self.record_agent_bridge_issue(
+                session.session_id,
+                RunErrorCode.SYNCHRONIZATION,
+            )
+            return {
+                "required": True,
+                "status": "failed",
+                "ready": False,
+            }
+        return {
+            "required": True,
+            "status": "passed",
+            **payload,
+        }
+
+    async def _revoke_agent_bridge(self, session_id):
+        bridge = self.agent_bridge
+        if bridge is None:
+            return
+        try:
+            result = bridge.revoke(session_id)
+            if inspect.isawaitable(result):
+                await result
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            raise
+        except Exception:
+            self.record_agent_bridge_issue(
+                session_id,
+                RunErrorCode.SYNCHRONIZATION,
+            )
+            raise SessionExecutionError(
+                "Agent Panel bridge revocation failed."
+            ) from None
 
     def _mark_profile_applied(self, session, profile):
         if profile is None or self.profile_store is None:
@@ -1925,6 +2080,7 @@ class SessionService:
             raise DestroyConfirmationError(
                 "Session outputs changed; review destruction again."
             )
+        await self._revoke_agent_bridge(session.session_id)
         destroy = getattr(self.lifecycle, "destroy_session", None)
         if not callable(destroy):
             raise SessionExecutionError(
@@ -1954,6 +2110,7 @@ class SessionService:
         if not callable(destroy):
             return None
         try:
+            await self._revoke_agent_bridge(session_id)
             return await destroy(
                 session_id,
                 terminal_error=diagnostic,

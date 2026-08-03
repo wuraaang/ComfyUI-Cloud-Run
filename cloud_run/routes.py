@@ -8,6 +8,7 @@ import re
 import stat
 
 from .artifacts import GIB
+from .agent_bridge import AgentBridge
 from .capture import CaptureValidationError
 from .comfy_host import ComfyHost, FORBIDDEN_TREE, HostCompatibilityError
 from .dependency_repository import (
@@ -324,6 +325,19 @@ def build_service():
             output_root=output_root,
         )
 
+    session_service_ref = {}
+
+    def agent_bridge_journal(session_id, code, diagnostic):
+        session_service = session_service_ref.get("service")
+        if session_service is None:
+            return False
+        return session_service.record_agent_bridge_issue(
+            session_id,
+            code,
+            diagnostic,
+        )
+
+    agent_bridge = AgentBridge(journal=agent_bridge_journal)
     service.session_service = SessionService(
         job_repository=job_repository,
         session_repository=session_repository,
@@ -335,7 +349,9 @@ def build_service():
         relay_factory=relay_factory,
         lifecycle=lifecycle,
         profile_store=profile_store,
+        agent_bridge=agent_bridge,
     )
+    session_service_ref["service"] = service.session_service
     lifecycle.session_service = service.session_service
     service.relay = LocalRelay(
         worker=None,
@@ -345,10 +361,15 @@ def build_service():
     )
     service.desktop_worker_factory = worker_factory
     service.desktop_profile_store = profile_store
+    service.agent_bridge = agent_bridge
     service.desktop_relay = DesktopRelay(
         repository=job_repository,
         worker_factory=worker_factory,
         native_prompt=service.prepare_native_prompt,
+        agent_bridge=agent_bridge,
+        local_comfy_root=lambda: str(
+            ComfyHost.from_running_host().comfy_root
+        ),
     )
     return service
 

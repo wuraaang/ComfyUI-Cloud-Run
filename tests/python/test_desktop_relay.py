@@ -98,6 +98,43 @@ class FakeRequest:
         self.headers = headers or {}
 
 
+class FakeAgentBridge:
+    def __init__(self):
+        self.allowed = []
+        self.opened = []
+        self.revoked = []
+        self.closed = False
+
+    def allow(self, session_id):
+        self.allowed.append(session_id)
+
+    async def open(self, request, session):
+        from cloud_run.desktop_relay import DesktopRelayResponse
+
+        self.opened.append((request, session))
+        return DesktopRelayResponse(299, b"agent-websocket")
+
+    def compatibility(self, path, session):
+        if path.endswith("/status"):
+            return {
+                "running": True,
+                "bridge_url": session.websocket_url,
+                "comfyui_path": "",
+            }
+        if path.endswith("/bridge_url"):
+            return {"url": session.websocket_url}
+        return {
+            "backends": [{"backend": "claude", "ready": True}],
+            "any_ready": True,
+        }
+
+    async def revoke(self, session_id):
+        self.revoked.append(session_id)
+
+    async def close(self):
+        self.closed = True
+
+
 def cookie_value(response):
     raw = response.headers.get("Set-Cookie", "")
     return raw.split(";", 1)[0].split("=", 1)[1]
@@ -210,6 +247,7 @@ class DesktopRelayBoundaryTests(unittest.IsolatedAsyncioTestCase):
         )
         self.listener = FakeListener(selected_port=32145)
         self.worker = FakeWorker()
+        self.agent_bridge = FakeAgentBridge()
         self.prompt_calls = []
         self.capability_calls = 0
         self.now = 100.0
@@ -233,6 +271,8 @@ class DesktopRelayBoundaryTests(unittest.IsolatedAsyncioTestCase):
             listener_factory=lambda _handler: self.listener,
             worker_factory=lambda _session: self.worker,
             native_prompt=native_prompt,
+            agent_bridge=self.agent_bridge,
+            local_comfy_root=lambda: "/approved/comfyui",
             capability_factory=capability,
             clock=lambda: self.now,
         )
@@ -477,6 +517,74 @@ class DesktopRelayBoundaryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 409)
         self.assertEqual(len(self.worker.envelopes), 1)
         self.assertEqual(self.worker.envelopes[0][1], "/")
+
+    async def test_agent_panel_routes_are_local_scoped_and_revoked_with_session(self):
+        await self.relay.activate(
+            "session-1",
+            self.worker,
+            profile_revision=3,
+        )
+        navigation = await self.relay.handle(
+            FakeRequest("GET", "/", headers=self.host)
+        )
+        capability = cookie_value(navigation)
+        headers = {
+            **self.host,
+            "Origin": "http://127.0.0.1:32145",
+            "Cookie": "comfy_vast_session=" + capability,
+        }
+
+        compatibility = {}
+        for path in (
+            "/comfyui_mcp_panel/status",
+            "/comfyui_mcp_panel/bridge_url",
+            "/comfyui_mcp_panel/backends",
+        ):
+            response = await self.relay.handle(
+                FakeRequest("GET", path, headers=headers)
+            )
+            self.assertEqual(response.status, 200)
+            compatibility[path] = json.loads(response.body)
+
+        websocket = await self.relay.handle(
+            FakeRequest(
+                "GET",
+                "/cloud-run/api/agent/ws",
+                headers=headers,
+            )
+        )
+        self.assertEqual(websocket.status, 299)
+        self.assertEqual(
+            compatibility["/comfyui_mcp_panel/bridge_url"]["url"],
+            "ws://127.0.0.1:32145/cloud-run/api/agent/ws",
+        )
+        self.assertEqual(self.agent_bridge.allowed, ["session-1"])
+        opened_session = self.agent_bridge.opened[0][1]
+        self.assertEqual(opened_session.session_id, "session-1")
+        self.assertEqual(opened_session.capability, capability)
+        self.assertEqual(opened_session.local_comfy_root, "/approved/comfyui")
+        self.assertNotIn(capability, repr(opened_session))
+        self.assertEqual(self.worker.transport.requests[-1][0].url, "http://worker.invalid/")
+
+        for path in (
+            "/comfyui_mcp_panel/advertise_bridge",
+            "/comfyui_mcp_panel/connect",
+            "/comfyui_mcp_panel/disconnect",
+            "/comfyui_mcp_panel/reload",
+            "/comfyui_mcp_panel/restart",
+            "/comfyui_mcp_panel/civitai/oauth/status",
+            "/comfyui_mcp_panel/training/file",
+            "/comfyui_mcp_panel/apps/run",
+            "/manager/queue/install",
+        ):
+            with self.subTest(path=path):
+                denied = await self.relay.handle(
+                    FakeRequest("GET", path, headers=headers)
+                )
+                self.assertEqual(denied.status, 404)
+
+        await self.relay.deactivate("session-1")
+        self.assertEqual(self.agent_bridge.revoked, ["session-1"])
 
 
 class NativeWorkerEnvelopeTests(unittest.TestCase):

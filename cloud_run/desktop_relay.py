@@ -10,6 +10,7 @@ import math
 import re
 import secrets
 
+from .agent_bridge import AgentBridgeSession
 from .repository import DesktopRelayConfig
 from .worker_client import (
     MAX_WORKER_JSON_BYTES,
@@ -40,6 +41,11 @@ _REQUEST_HEADERS = {
     "if-none-match": "If-None-Match",
     "range": "Range",
 }
+_AGENT_COMPATIBILITY_PATHS = frozenset({
+    "/comfyui_mcp_panel/status",
+    "/comfyui_mcp_panel/bridge_url",
+    "/comfyui_mcp_panel/backends",
+})
 
 
 class DesktopRelayError(RuntimeError):
@@ -201,6 +207,7 @@ class DesktopRelay:
         worker_factory=None,
         native_prompt=None,
         agent_bridge=None,
+        local_comfy_root=None,
         capability_factory=None,
         clock=None,
     ):
@@ -217,6 +224,21 @@ class DesktopRelay:
             raise DesktopRelayError("Desktop worker factory is unavailable.")
         if not callable(native_prompt):
             raise DesktopRelayError("Native prompt preparation is unavailable.")
+        if agent_bridge is not None and not all(
+            callable(getattr(agent_bridge, method, None))
+            for method in (
+                "allow",
+                "open",
+                "compatibility",
+                "revoke",
+                "close",
+            )
+        ):
+            raise DesktopRelayError("Agent Panel bridge is unavailable.")
+        if local_comfy_root is not None and not (
+            isinstance(local_comfy_root, str) or callable(local_comfy_root)
+        ):
+            raise DesktopRelayError("Approved ComfyUI root is unavailable.")
         self.repository = repository
         self.bind_host = bind_host
         self.port_selector = port_selector or (lambda: 0)
@@ -226,6 +248,7 @@ class DesktopRelay:
         self.worker_factory = worker_factory
         self.native_prompt = native_prompt
         self.agent_bridge = agent_bridge
+        self.local_comfy_root = local_comfy_root
         self.capability_factory = capability_factory or (
             lambda: secrets.token_urlsafe(48)
         )
@@ -347,6 +370,17 @@ class DesktopRelay:
         async with self._lock():
             if not self._bound or self._config is None:
                 raise DesktopRelayError("Desktop relay is not bound.")
+            if self.agent_bridge is not None:
+                try:
+                    allowed = self.agent_bridge.allow(session_id)
+                    if asyncio.iscoroutine(allowed):
+                        await allowed
+                except (asyncio.CancelledError, KeyboardInterrupt):
+                    raise
+                except Exception:
+                    raise DesktopRelayError(
+                        "Agent Panel bridge activation failed."
+                    ) from None
             previous = self._config
             updated = DesktopRelayConfig(
                 bind_host=previous.bind_host,
@@ -375,6 +409,16 @@ class DesktopRelay:
                 raise DesktopRelayError(
                     "Desktop relay session identity does not match."
                 )
+            revoke_failed = False
+            if self.agent_bridge is not None:
+                try:
+                    revoked = self.agent_bridge.revoke(session_id)
+                    if asyncio.iscoroutine(revoked):
+                        await revoked
+                except (asyncio.CancelledError, KeyboardInterrupt):
+                    raise
+                except Exception:
+                    revoke_failed = True
             previous = self._config
             self._config = self.repository.save_desktop_relay(
                 DesktopRelayConfig(
@@ -389,6 +433,11 @@ class DesktopRelay:
             self._worker = None
             self._capability = None
             self._capability_expires_at = None
+            if revoke_failed:
+                self._error = "agent_bridge_unavailable"
+                raise DesktopRelayError(
+                    "Agent Panel bridge revocation failed."
+                )
             return self.status()
 
     def status(self):
@@ -521,6 +570,63 @@ class DesktopRelay:
                 sort_keys=True,
             ).encode("utf-8"),
             headers=headers,
+        )
+
+    def _agent_session(self):
+        if (
+            self._config is None
+            or self._config.active_session_id is None
+            or self._capability is None
+            or self._capability_expires_at is None
+        ):
+            raise DesktopRelayError("Agent Panel bridge is unavailable.")
+        root = self.local_comfy_root
+        if callable(root):
+            try:
+                root = root()
+            except Exception:
+                raise DesktopRelayError(
+                    "Approved ComfyUI root is unavailable."
+                ) from None
+        if root is not None:
+            root = str(root)
+        return AgentBridgeSession(
+            session_id=self._config.active_session_id,
+            relay_origin="http://127.0.0.1:" + str(self._config.port),
+            capability=self._capability,
+            capability_expires_at=self._capability_expires_at,
+            local_comfy_root=root,
+        )
+
+    def _agent_compatibility_response(self, path):
+        if self.agent_bridge is None:
+            return self._response(404)
+        try:
+            payload = self.agent_bridge.compatibility(
+                path,
+                self._agent_session(),
+            )
+            body = json.dumps(
+                payload,
+                ensure_ascii=True,
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+            if len(body) > MAX_WORKER_JSON_BYTES:
+                raise DesktopRelayError(
+                    "Agent Panel compatibility response was rejected."
+                )
+        except Exception:
+            return self._response(502)
+        return self._response(
+            200,
+            body,
+            headers={
+                "Content-Type": "application/json",
+                "Cache-Control": "no-store",
+                "X-Content-Type-Options": "nosniff",
+            },
         )
 
     @staticmethod
@@ -709,8 +815,12 @@ class DesktopRelay:
             normalized_method == "GET"
             and path_qs == "/cloud-run/api/agent/ws"
         )
+        agent_compatibility = (
+            normalized_method == "GET"
+            and path_qs in _AGENT_COMPATIBILITY_PATHS
+        )
         route = NativeRoutePolicy().classify(method, path_qs)
-        if not context and not agent and route is None:
+        if not context and not agent and not agent_compatibility and route is None:
             return self._response(404)
         if not self.status().ready:
             return self._response(503)
@@ -728,11 +838,16 @@ class DesktopRelay:
         set_cookie = bootstrap and not valid_cookie
         if context:
             return self._context_response(set_cookie=set_cookie)
+        if agent_compatibility:
+            return self._agent_compatibility_response(path_qs)
         if agent:
-            if not callable(self.agent_bridge):
+            if self.agent_bridge is None:
                 return self._response(404)
             try:
-                result = self.agent_bridge(request, self._config.active_session_id)
+                result = self.agent_bridge.open(
+                    request,
+                    self._agent_session(),
+                )
                 if asyncio.iscoroutine(result):
                     result = await result
                 return result
@@ -759,3 +874,10 @@ class DesktopRelay:
                     await listener.close()
                 except Exception:
                     self._error = "local_relay_unavailable"
+            if self.agent_bridge is not None:
+                try:
+                    closed = self.agent_bridge.close()
+                    if asyncio.iscoroutine(closed):
+                        await closed
+                except Exception:
+                    self._error = "agent_bridge_unavailable"

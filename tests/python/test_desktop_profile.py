@@ -38,6 +38,35 @@ class DesktopProfileCaptureTests(unittest.TestCase):
             clock=lambda: 100.0,
         )
 
+    @staticmethod
+    def _agent_panel():
+        from cloud_run.manifest import ArtifactSpec, SourceSpec, UiPackageSpec
+
+        return UiPackageSpec(
+            package_id="comfyui-agent-panel",
+            repository_url="https://github.com/acme/comfyui-agent-panel",
+            revision="a" * 40,
+            archive=ArtifactSpec(
+                artifact_id="ui-agent-panel",
+                kind="ui_package_archive",
+                logical_name="ui-agent-panel",
+                destination="custom_nodes/comfyui-agent-panel",
+                size_bytes=10,
+                sha256="b" * 64,
+                source=SourceSpec(
+                    kind="local-upload",
+                    locator="local-upload:ui-agent-panel",
+                ),
+            ),
+            web_sha256="c" * 64,
+            required_capabilities=(
+                "graph_read",
+                "graph_edit",
+                "native_run",
+                "native_batch",
+            ),
+        )
+
     def _capture(self):
         return self.store.capture(
             user_root=self.user_root,
@@ -159,6 +188,62 @@ class DesktopProfileCaptureTests(unittest.TestCase):
                 ui_packages=(),
                 ui_assets=(("assets/approved/payload.js", self.root / "theme.css"),),
             )
+
+    def test_agent_panel_settings_are_rewritten_only_in_remote_profile(self):
+        original = {
+            "theme": "dark",
+            "comfyui-mcp.bridgeUrl.single": "ws://127.0.0.1:9180",
+            "comfyui-mcp.remoteComfyuiUrl": "http://127.0.0.1:8188",
+        }
+        settings_path = self.default / "comfy.settings.json"
+        settings_path.write_text(json.dumps(original), encoding="utf-8")
+        profile = self.store.capture(
+            user_root=self.user_root,
+            profile_name="default",
+            input_root=self.input_root,
+            bootstrap_workflow={"nodes": []},
+            ui_packages=(self._agent_panel(),),
+        )
+
+        with tarfile.open(profile.archive_private_path, mode="r:gz") as archive:
+            remote = json.loads(
+                archive.extractfile("settings/comfy.settings.json").read()
+            )
+        self.assertEqual(remote["theme"], "dark")
+        self.assertEqual(
+            remote["comfyui-mcp.bridgeUrl.single"],
+            "/cloud-run/api/agent/ws",
+        )
+        self.assertEqual(remote["comfyui-mcp.remoteComfyuiUrl"], "")
+        self.assertEqual(
+            json.loads(settings_path.read_text(encoding="utf-8")),
+            original,
+        )
+
+    def test_agent_panel_remote_settings_exist_without_creating_local_settings(self):
+        settings_path = self.default / "comfy.settings.json"
+        self.assertFalse(settings_path.exists())
+
+        profile = self.store.capture(
+            user_root=self.user_root,
+            profile_name="default",
+            input_root=self.input_root,
+            bootstrap_workflow={"nodes": []},
+            ui_packages=(self._agent_panel(),),
+        )
+
+        with tarfile.open(profile.archive_private_path, mode="r:gz") as archive:
+            remote = json.loads(
+                archive.extractfile("settings/comfy.settings.json").read()
+            )
+        self.assertEqual(
+            remote,
+            {
+                "comfyui-mcp.bridgeUrl.single": "/cloud-run/api/agent/ws",
+                "comfyui-mcp.remoteComfyuiUrl": "",
+            },
+        )
+        self.assertFalse(settings_path.exists())
 
 
 class DesktopProfileConflictTests(unittest.TestCase):
