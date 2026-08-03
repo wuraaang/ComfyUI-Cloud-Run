@@ -14,6 +14,7 @@ import re
 import stat
 import tarfile
 import tempfile
+from urllib.parse import unquote_to_bytes, urlsplit
 
 from .artifacts import ResolvedLocalArtifact
 from .manifest import (
@@ -376,6 +377,177 @@ def _within(path, root):
     return True
 
 
+def _strict_query_value(raw, *, allow_slash):
+    if not isinstance(raw, str) or re.search(r"%(?![0-9A-Fa-f]{2})", raw):
+        return None
+    if re.search(r"%(?:2[fF]|5[cC])", raw):
+        return None
+    try:
+        decoded = unquote_to_bytes(raw.replace("+", " ")).decode("utf-8")
+    except UnicodeError:
+        return None
+    if (
+        not decoded
+        or decoded.startswith("/")
+        or "\\" in decoded
+        or any(ord(character) < 32 for character in decoded)
+        or (not allow_slash and "/" in decoded)
+    ):
+        return None
+    parts = decoded.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        return None
+    return tuple(parts)
+
+
+def _input_view_parts(value):
+    if (
+        not isinstance(value, str)
+        or value != value.strip()
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        return None
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return None
+    if (
+        parsed.scheme
+        or parsed.netloc
+        or parsed.fragment
+        or parsed.path != "/api/view"
+        or not parsed.query
+    ):
+        return None
+    parameters = {}
+    for pair in parsed.query.split("&"):
+        key, separator, raw = pair.partition("=")
+        if (
+            not separator
+            or key not in {"filename", "type", "subfolder"}
+            or key in parameters
+        ):
+            return None
+        parameters[key] = raw
+    if set(parameters) not in (
+        {"filename", "type"},
+        {"filename", "type", "subfolder"},
+    ) or parameters["type"] != "input":
+        return None
+    filename = _strict_query_value(parameters["filename"], allow_slash=False)
+    if filename is None:
+        return None
+    suffix = Path(filename[0]).suffix.casefold()
+    if suffix not in _IMAGE_SUFFIXES:
+        return None
+    subfolder = ()
+    if "subfolder" in parameters:
+        subfolder = _strict_query_value(
+            parameters["subfolder"],
+            allow_slash=True,
+        )
+        if subfolder is None:
+            return None
+    return (*subfolder, filename[0]), suffix
+
+
+def _read_input_image(input_root, parts):
+    if (
+        not parts
+        or not hasattr(os, "O_NOFOLLOW")
+        or not hasattr(os, "O_DIRECTORY")
+    ):
+        raise DesktopProfileError("Desktop profile file is unavailable.")
+    directory = None
+    descriptor = None
+    try:
+        directory = os.open(
+            input_root,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+        for component in parts[:-1]:
+            before = os.stat(component, dir_fd=directory, follow_symlinks=False)
+            if not stat.S_ISDIR(before.st_mode) or stat.S_ISLNK(before.st_mode):
+                raise OSError("unsafe directory")
+            child = os.open(
+                component,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=directory,
+            )
+            opened = os.fstat(child)
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or (opened.st_dev, opened.st_ino)
+                != (before.st_dev, before.st_ino)
+            ):
+                os.close(child)
+                raise OSError("changed directory")
+            os.close(directory)
+            directory = child
+
+        before = os.stat(parts[-1], dir_fd=directory, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or stat.S_ISLNK(before.st_mode)
+            or before.st_uid != os.getuid()
+            or before.st_size < 0
+            or before.st_size > MAX_PROFILE_FILE_BYTES
+        ):
+            raise OSError("unsafe file")
+        descriptor = os.open(
+            parts[-1],
+            os.O_RDONLY | os.O_NOFOLLOW,
+            dir_fd=directory,
+        )
+        opened = os.fstat(descriptor)
+        if (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_size,
+            opened.st_uid,
+        ) != (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_uid,
+        ):
+            raise OSError("changed file")
+        chunks = []
+        total = 0
+        while True:
+            chunk = os.read(
+                descriptor,
+                min(1024 * 1024, MAX_PROFILE_FILE_BYTES + 1 - total),
+            )
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > MAX_PROFILE_FILE_BYTES:
+                raise OSError("oversized file")
+        after = os.fstat(descriptor)
+        if (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        ) != (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_size,
+            opened.st_mtime_ns,
+        ):
+            raise OSError("changed file")
+        return b"".join(chunks)
+    except (OSError, TypeError, ValueError):
+        raise DesktopProfileError("Desktop profile file is unavailable.") from None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if directory is not None:
+            os.close(directory)
+
+
 def _source_record(source):
     return {
         "kind": source.kind,
@@ -620,6 +792,27 @@ class DesktopProfileStore:
         if isinstance(value, str):
             if _SUSPICIOUS_VALUE.search(value):
                 return _DROP
+            view = _input_view_parts(value)
+            if value.startswith("/api/view"):
+                if view is None:
+                    return _DROP
+                parts, suffix = view
+                try:
+                    content = _read_input_image(input_root, parts)
+                except DesktopProfileError:
+                    return _DROP
+                digest = hashlib.sha256(content).hexdigest()
+                logical = "backgrounds/" + digest + suffix
+                existing = assets.get(logical)
+                if existing is not None and existing != content:
+                    raise DesktopProfileError("Desktop profile asset collided.")
+                assets[logical] = content
+                return (
+                    "/api/view?filename=cloud-vast/backgrounds/"
+                    + digest
+                    + suffix
+                    + "&type=input"
+                )
             candidate = Path(value)
             if not candidate.is_absolute():
                 return value

@@ -1,11 +1,13 @@
 import hashlib
 import io
 import json
+import os
 import tarfile
 import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest import mock
 
 
 def _jpeg_bytes():
@@ -79,6 +81,179 @@ class DesktopProfileCaptureTests(unittest.TestCase):
             ui_packages=(),
             ui_assets=(("assets/approved/theme.css", self.root / "theme.css"),),
         )
+
+    def _capture_settings(self, settings):
+        settings_path = self.default / "comfy.settings.json"
+        original = json.dumps(settings)
+        settings_path.write_text(original, encoding="utf-8")
+        profile = self.store.capture(
+            user_root=self.user_root,
+            profile_name="default",
+            input_root=self.input_root,
+            bootstrap_workflow={"nodes": []},
+        )
+        with tarfile.open(profile.archive_private_path, mode="r:gz") as archive:
+            names = archive.getnames()
+            remote = json.loads(
+                archive.extractfile("settings/comfy.settings.json").read()
+            )
+        self.assertEqual(settings_path.read_text(encoding="utf-8"), original)
+        return profile, names, remote
+
+    def test_same_origin_input_view_at_root_is_captured_content_addressably(self):
+        wallpaper = self.input_root / "wallpaper.jpg"
+        wallpaper.write_bytes(_jpeg_bytes())
+        source = "/api/view?filename=wallpaper.jpg&type=input"
+
+        first, names, remote = self._capture_settings(
+            {"theme": "dark", "background": source}
+        )
+        second, second_names, second_remote = self._capture_settings(
+            {"theme": "dark", "background": source}
+        )
+
+        digest = hashlib.sha256(_jpeg_bytes()).hexdigest()
+        logical = f"backgrounds/{digest}.jpg"
+        rewritten = (
+            f"/api/view?filename=cloud-vast/backgrounds/{digest}.jpg&type=input"
+        )
+        self.assertIn(logical, names)
+        self.assertEqual(remote["background"], rewritten)
+        self.assertEqual(first.archive_sha256, second.archive_sha256)
+        self.assertEqual(names, second_names)
+        self.assertEqual(remote, second_remote)
+
+    def test_same_origin_input_view_subfolder_is_captured_content_addressably(self):
+        wallpaper = self.backgrounds / "wallpaper.webp"
+        content = b"safe-webp-background"
+        wallpaper.write_bytes(content)
+        source = (
+            "/api/view?filename=wallpaper.webp&type=input&subfolder=backgrounds"
+        )
+
+        _profile, names, remote = self._capture_settings(
+            {"theme": "dark", "background": source}
+        )
+
+        digest = hashlib.sha256(content).hexdigest()
+        self.assertIn(f"backgrounds/{digest}.webp", names)
+        self.assertEqual(
+            remote["background"],
+            f"/api/view?filename=cloud-vast/backgrounds/{digest}.webp&type=input",
+        )
+
+    def test_same_origin_input_view_rejects_unsafe_forms_and_files(self):
+        (self.input_root / "wallpaper.jpg").write_bytes(_jpeg_bytes())
+        (self.backgrounds / "wallpaper.jpg").write_bytes(_jpeg_bytes())
+        (self.input_root / "linked.jpg").symlink_to(
+            self.backgrounds / "wallpaper.jpg"
+        )
+        (self.input_root / "linked-folder").symlink_to(self.backgrounds)
+
+        cases = (
+            (
+                "duplicate keys",
+                "/api/view?filename=wallpaper.jpg&filename=other.jpg&type=input",
+                None,
+            ),
+            (
+                "unknown key",
+                "/api/view?filename=wallpaper.jpg&type=input&preview=true",
+                None,
+            ),
+            (
+                "output type",
+                "/api/view?filename=wallpaper.jpg&type=output",
+                None,
+            ),
+            (
+                "absolute filename",
+                "/api/view?filename=/tmp/wallpaper.jpg&type=input",
+                None,
+            ),
+            (
+                "encoded dot traversal",
+                "/api/view?filename=wallpaper.jpg&type=input&subfolder=%2e%2e",
+                None,
+            ),
+            (
+                "encoded slash",
+                "/api/view?filename=backgrounds%2Fwallpaper.jpg&type=input",
+                None,
+            ),
+            (
+                "invalid percent encoding",
+                "/api/view?filename=wallpaper%2.jpg&type=input",
+                None,
+            ),
+            (
+                "raw control character",
+                "/api/\nview?filename=wallpaper.jpg&type=input",
+                None,
+            ),
+            (
+                "backslash",
+                "/api/view?filename=..\\wallpaper.jpg&type=input",
+                None,
+            ),
+            (
+                "unsupported suffix",
+                "/api/view?filename=wallpaper.txt&type=input",
+                None,
+            ),
+            (
+                "final symlink",
+                "/api/view?filename=linked.jpg&type=input",
+                None,
+            ),
+            (
+                "intermediate symlink",
+                "/api/view?filename=wallpaper.jpg&type=input&subfolder=linked-folder",
+                None,
+            ),
+            (
+                "non-owned file",
+                "/api/view?filename=wallpaper.jpg&type=input",
+                "non_owned",
+            ),
+            (
+                "escape outside root",
+                "/api/view?filename=wallpaper.jpg&type=input&subfolder=../outside",
+                None,
+            ),
+        )
+
+        real_stat = os.stat
+
+        def non_owned_stat(path, *args, **kwargs):
+            result = real_stat(path, *args, **kwargs)
+            if path == "wallpaper.jpg" and kwargs.get("dir_fd") is not None:
+                values = list(result)
+                values[4] = os.getuid() + 1
+                return os.stat_result(values)
+            return result
+
+        for label, source, special in cases:
+            with self.subTest(label=label):
+                context = (
+                    mock.patch(
+                        "cloud_run.desktop_profile.os.stat",
+                        side_effect=non_owned_stat,
+                    )
+                    if special == "non_owned"
+                    else mock.patch(
+                        "cloud_run.desktop_profile.os.stat",
+                        wraps=real_stat,
+                    )
+                )
+                with context:
+                    _profile, names, remote = self._capture_settings(
+                        {"theme": "dark", "background": source}
+                    )
+                self.assertNotIn("background", remote)
+                self.assertFalse(
+                    any(name.startswith("backgrounds/") for name in names)
+                )
 
     def test_capture_is_allowlisted_rewritten_and_reproducible(self):
         wallpaper = self.backgrounds / "wallpaper.jpg"
