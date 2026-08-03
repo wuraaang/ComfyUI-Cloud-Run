@@ -505,7 +505,44 @@ class CloudRunService:
             except (RuntimeError, ValueError):
                 pass
             session = self.get_session(session.session_id)
+        sync_profile = getattr(self.session_service, "sync_profile", None)
+        if callable(sync_profile) and session.state in {
+            SessionState.READY,
+            SessionState.RUNNING,
+            SessionState.HARVESTING,
+        }:
+            await sync_profile(session.session_id)
         return session
+
+    async def session_profile(self, session_id):
+        sync = getattr(self.session_service, "sync_profile", None)
+        if not callable(sync):
+            raise CloudRunValidationError(
+                "Desktop profile synchronization is unavailable."
+            )
+        return await sync(session_id)
+
+    async def resolve_session_profile_conflict(
+        self,
+        session_id,
+        conflict_id,
+        *,
+        winner,
+    ):
+        resolve = getattr(
+            self.session_service,
+            "resolve_profile_conflict",
+            None,
+        )
+        if not callable(resolve):
+            raise CloudRunValidationError(
+                "Desktop profile synchronization is unavailable."
+            )
+        return await resolve(
+            session_id,
+            conflict_id,
+            winner=winner,
+        )
 
     async def submit_job(
         self,

@@ -139,6 +139,134 @@ class AiohttpWorkerTransportTests(unittest.IsolatedAsyncioTestCase):
 
 
 class WorkerClientTests(unittest.TestCase):
+    def test_profile_snapshot_is_exact_cursor_bound_and_supports_unchanged(self):
+        from cloud_run.worker_client import (
+            WorkerClient,
+            WorkerTransportResponse,
+        )
+
+        payload = {
+            "profile_id": "desktop-profile",
+            "revision": 2,
+            "base_revision": 1,
+            "bootstrap_digest": "b" * 64,
+            "archive_size_bytes": 123,
+            "archive_sha256": "a" * 64,
+            "archive_artifact_id": "profile-" + "a" * 64,
+            "artifacts": [
+                {
+                    "path": "bootstrap/current.json",
+                    "kind": "bootstrap_workflow",
+                    "size_bytes": 2,
+                    "sha256": "c" * 64,
+                }
+            ],
+        }
+
+        class Transport:
+            def __init__(self):
+                self.requests = []
+
+            async def request(self, request, *, max_bytes):
+                self.requests.append(request)
+                if len(self.requests) == 1:
+                    return WorkerTransportResponse(
+                        status=200,
+                        headers={"Content-Type": "application/json"},
+                        body=json.dumps(payload).encode("utf-8"),
+                    )
+                return WorkerTransportResponse(
+                    status=204,
+                    headers={},
+                    body=b"",
+                )
+
+        transport = Transport()
+        client = WorkerClient(
+            base_url="http://8.8.8.8:30000",
+            provider_token="a" * 64,
+            session_id="session-1",
+            session_secret=b"s" * 32,
+            transport=transport,
+            clock=lambda: 1000,
+            nonce=lambda: "profile-snapshot",
+        )
+
+        changed = asyncio.run(client.profile_snapshot(1))
+        unchanged = asyncio.run(client.profile_snapshot(2))
+
+        self.assertEqual(changed, payload)
+        self.assertIsNone(unchanged)
+        self.assertTrue(
+            transport.requests[0].url.endswith(
+                "/worker/v1/profile?after_revision=1"
+            )
+        )
+
+    def test_profile_archive_download_uses_the_scoped_signed_route(self):
+        from cloud_run.worker_client import (
+            WorkerClient,
+            WorkerTransportResponse,
+        )
+
+        content = b"profile-archive"
+
+        class Transport:
+            def __init__(self):
+                self.request_seen = None
+
+            async def request(self, request, *, max_bytes):
+                return WorkerTransportResponse(500, {}, b"")
+
+            async def stream(
+                self,
+                request,
+                *,
+                on_headers,
+                on_chunk,
+                max_bytes,
+            ):
+                self.request_seen = request
+                on_headers(
+                    206,
+                    {
+                        "Content-Range": "bytes 0-14/15",
+                        "Content-Length": "15",
+                        "Content-Type": "application/gzip",
+                        "ETag": '"' + hashlib.sha256(content).hexdigest() + '"',
+                    },
+                )
+                on_chunk(content)
+                return len(content)
+
+        transport = Transport()
+        client = WorkerClient(
+            base_url="http://8.8.8.8:30000",
+            provider_token="a" * 64,
+            session_id="session-1",
+            session_secret=b"s" * 32,
+            transport=transport,
+            clock=lambda: 1000,
+            nonce=lambda: "profile-download",
+        )
+        chunks = []
+        artifact_id = "profile-" + hashlib.sha256(content).hexdigest()
+
+        result = asyncio.run(
+            client.download_profile_artifact(
+                artifact_id,
+                start=0,
+                on_chunk=chunks.append,
+            )
+        )
+
+        self.assertEqual(b"".join(chunks), content)
+        self.assertEqual(result.artifact_id, artifact_id)
+        self.assertIn(
+            "/worker/v1/profile/artifacts/" + artifact_id,
+            transport.request_seen.url,
+        )
+
     def test_native_websocket_uses_only_the_private_signed_request(self):
         from cloud_run.worker_client import WorkerClient
 

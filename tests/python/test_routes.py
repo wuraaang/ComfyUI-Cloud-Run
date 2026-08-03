@@ -14,6 +14,8 @@ from unittest import mock
 from cloud_run.artifacts import FileInputMetadata
 from cloud_run.capture import CompiledCapture
 from cloud_run.dependency_repository import DependencyRepository
+from cloud_run.desktop_profile import DesktopProfileStore
+from cloud_run.job_repository import JobRepository
 from cloud_run.manifest import ArtifactSpec, DependencyManifest, SourceSpec
 from cloud_run.model_sources import ModelSourceResolution
 from cloud_run.routes import (
@@ -415,10 +417,27 @@ class RuntimeResolverTests(unittest.TestCase):
             root = Path(temporary_directory)
             model_root = root / "models"
             input_root = root / "input"
+            comfy_root = root / "ComfyUI"
             model_root.mkdir()
             input_root.mkdir()
+            (comfy_root / "user" / "default" / "workflows").mkdir(
+                parents=True
+            )
+            (
+                comfy_root
+                / "user"
+                / "default"
+                / "workflows"
+                / "saved.json"
+            ).write_text('{"nodes":[]}', encoding="utf-8")
             repository = DependencyRepository(
                 root / "private" / "sessions.sqlite3"
+            )
+            profile_store = DesktopProfileStore(
+                repository=JobRepository(
+                    root / "private" / "sessions.sqlite3"
+                ),
+                private_root=root / "private" / "profiles",
             )
             revision = "a" * 40
             digest = "c" * 64
@@ -464,6 +483,7 @@ class RuntimeResolverTests(unittest.TestCase):
                     }
 
             host = FakeHost()
+            host.comfy_root = comfy_root
             folder_paths = types.ModuleType("folder_paths")
             folder_paths.folder_names_and_paths = {
                 "diffusion_models": ((str(model_root),), {".safetensors"})
@@ -483,6 +503,7 @@ class RuntimeResolverTests(unittest.TestCase):
             resolver = _RuntimeResolver(
                 repository,
                 model_source_resolver=model_source_resolver,
+                profile_store=profile_store,
             )
 
             with mock.patch.dict(
@@ -498,9 +519,15 @@ class RuntimeResolverTests(unittest.TestCase):
                         explicit_output_allowance_bytes=1024,
                     )
                 )
+                profile_archive_exists = profile_store.archive_path(
+                    profile_store.latest()
+                ).is_file()
 
         self.assertTrue(result.rentable)
         self.assertEqual(result.artifacts[0].source.kind, "huggingface")
+        self.assertEqual(result.profile.profile_id, "desktop-profile")
+        self.assertEqual(result.profile.revision, 1)
+        self.assertTrue(profile_archive_exists)
         model_source_resolver.resolve.assert_awaited_once()
 
 
@@ -1802,6 +1829,55 @@ class DesktopRelayRouteTests(unittest.TestCase):
         self.assertEqual(
             self.calls,
             [("activate", "session-1"), ("deactivate", "session-1")],
+        )
+
+
+class DesktopProfileRouteTests(unittest.TestCase):
+    def test_profile_status_and_explicit_conflict_choice_are_scoped(self):
+        service = mock.Mock()
+        status = {
+            "profile_id": "desktop-profile",
+            "local_revision": 3,
+            "remote_revision": 2,
+            "state": "conflict",
+            "warning": None,
+            "conflicts": [{"conflict_id": "conflict-1"}],
+        }
+        service.session_profile = mock.AsyncMock(return_value=status)
+        service.resolve_session_profile_conflict = mock.AsyncMock(
+            return_value={**status, "state": "local_changes_pending"}
+        )
+        handlers = captured_handlers(service_factory=lambda: service)
+
+        fetched = asyncio.run(
+            handlers[("GET", "/cloud-run/api/sessions/{session_id}/profile")](
+                FakeRequest(match_info={"session_id": "session-1"})
+            )
+        )
+        resolved = asyncio.run(
+            handlers[
+                (
+                    "POST",
+                    "/cloud-run/api/sessions/{session_id}/profile/conflicts/"
+                    "{conflict_id}",
+                )
+            ](
+                FakeRequest(
+                    {"winner": "cloud_vast"},
+                    match_info={
+                        "session_id": "session-1",
+                        "conflict_id": "conflict-1",
+                    },
+                )
+            )
+        )
+
+        self.assertEqual(fetched.payload, status)
+        self.assertEqual(resolved.payload["state"], "local_changes_pending")
+        service.resolve_session_profile_conflict.assert_awaited_once_with(
+            "session-1",
+            "conflict-1",
+            winner="cloud_vast",
         )
 
 

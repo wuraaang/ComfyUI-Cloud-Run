@@ -64,6 +64,21 @@ def archive_artifact_for(payload):
     )
 
 
+def profile_archive_for(payload):
+    return ArtifactSpec(
+        artifact_id="profile-archive",
+        kind="profile_archive",
+        logical_name="profile",
+        destination="user/default/cloud-vast-profile",
+        size_bytes=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+        source=SourceSpec(
+            kind="local-upload",
+            locator="local-upload:profile-archive",
+        ),
+    )
+
+
 class FakeResponse:
     def __init__(self, *, status, headers, url, payload, chunk_size=3):
         self.status = status
@@ -592,6 +607,27 @@ class TransferManagerTests(unittest.TestCase):
         )
         self.assertEqual(result.destination.read_bytes(), payload)
         self.assertFalse((self.root / "custom_nodes/fancy").exists())
+
+    def test_profile_archive_uses_private_staging_not_managed_user_path(self):
+        from remote_worker.transfers import TransferManager
+
+        payload = b"safe-profile-archive"
+        artifact = profile_archive_for(payload)
+        artifact_root = self.root.parent / "profile-artifacts"
+        artifact_root.mkdir()
+        manager = TransferManager(
+            root=self.root,
+            artifact_root=artifact_root,
+            sleeper=no_sleep,
+        )
+
+        destination = manager.destination_path(artifact)
+
+        self.assertEqual(destination.parent, manager.artifact_root)
+        self.assertNotEqual(
+            destination,
+            self.root / "user" / "default" / "cloud-vast-profile",
+        )
 
     def test_manifest_wheel_transfers_to_exact_private_wheel_filename(self):
         from remote_worker.transfers import TransferManager, wheel_artifact

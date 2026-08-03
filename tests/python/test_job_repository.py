@@ -325,7 +325,7 @@ class JobRepositoryTests(unittest.TestCase):
         for forbidden in ("bearer", "secret", "token", "worker_url"):
             self.assertNotIn(forbidden, rendered.casefold())
 
-    def test_legacy_schema_is_migrated_idempotently_to_run_journal_v9(self):
+    def test_legacy_schema_is_migrated_idempotently_to_profile_sync_v10(self):
         self.path.parent.mkdir(parents=True)
         with closing(sqlite3.connect(self.path)) as connection:
             connection.execute(
@@ -446,7 +446,7 @@ class JobRepositoryTests(unittest.TestCase):
             set(),
         )
         self.assertIsNotNone(journal_exists)
-        self.assertEqual(schema_version, "9")
+        self.assertEqual(schema_version, "10")
 
     def test_execution_success_survives_an_independent_harvest_failure(self):
         jobs = JobRepository(self.path)

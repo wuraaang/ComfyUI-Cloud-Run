@@ -15,6 +15,7 @@ from .dependency_repository import (
     MappingValidationError,
 )
 from .desktop_relay import DesktopRelay, DesktopRelayError
+from .desktop_profile import DesktopProfileStore
 from .job_repository import JobRepository
 from .huggingface import HuggingFaceClient
 from .lifecycle import CloudRunLifecycle
@@ -194,10 +195,12 @@ class _RuntimeResolver:
         dependency_repository,
         artifact_catalog=None,
         model_source_resolver=None,
+        profile_store=None,
     ):
         self.dependency_repository = dependency_repository
         self.artifact_catalog = artifact_catalog
         self.model_source_resolver = model_source_resolver
+        self.profile_store = profile_store
 
     async def resolve_preflight(
         self,
@@ -211,13 +214,35 @@ class _RuntimeResolver:
             model_source_resolver = WorkflowModelSourceResolver(
                 HuggingFaceClient()
             )
+        context = _runtime_resolution_context(host)(capture)
+
+        def profile_provider(observed_capture):
+            if self.profile_store is None:
+                return {
+                    "ui_packages": (),
+                    "profile": None,
+                    "minimum_vram_gb": 0.0,
+                }
+            profile = self.profile_store.capture(
+                user_root=host.comfy_root / "user",
+                profile_name="default",
+                input_root=context["input_root"],
+                bootstrap_workflow=observed_capture.workflow,
+            )
+            return {
+                "ui_packages": profile.ui_packages,
+                "profile": profile.manifest_spec(),
+                "minimum_vram_gb": 0.0,
+            }
+
         resolver = DependencyResolver(
             host=host,
             repository=self.dependency_repository,
             registry=RegistryClient(),
             cache_catalog=self.artifact_catalog,
-            resolution_context=_runtime_resolution_context(host),
+            resolution_context=context,
             model_source_resolver=model_source_resolver,
+            profile_provider=profile_provider,
         )
         return await resolver.resolve_preflight(
             capture,
@@ -245,6 +270,10 @@ def build_service():
     job_repository = JobRepository(data_directory / "attempts.sqlite3")
     dependency_repository = DependencyRepository(
         data_directory / "attempts.sqlite3"
+    )
+    profile_store = DesktopProfileStore(
+        repository=job_repository,
+        private_root=data_directory / "profiles",
     )
     blacklist = HostBlacklist(data_directory / "host-blacklist.json")
     provider = VastProvider()
@@ -275,6 +304,7 @@ def build_service():
     resolver = _RuntimeResolver(
         dependency_repository,
         artifact_catalog=job_repository,
+        profile_store=profile_store,
     )
     output_root = _runtime_output_root(data_directory)
 
@@ -304,6 +334,7 @@ def build_service():
         worker_factory=worker_factory,
         relay_factory=relay_factory,
         lifecycle=lifecycle,
+        profile_store=profile_store,
     )
     lifecycle.session_service = service.session_service
     service.relay = LocalRelay(
@@ -313,6 +344,7 @@ def build_service():
         output_root=output_root,
     )
     service.desktop_worker_factory = worker_factory
+    service.desktop_profile_store = profile_store
     service.desktop_relay = DesktopRelay(
         repository=job_repository,
         worker_factory=worker_factory,
@@ -1078,6 +1110,39 @@ def register_routes(service_factory=None):
         except Exception as error:
             return service_error(error)
         return web.json_response(_session_payload(session, service))
+
+    @routes.get("/cloud-run/api/sessions/{session_id}/profile")
+    async def get_session_profile(request):
+        try:
+            payload = await make_service().session_profile(
+                request.match_info.get("session_id", "")
+            )
+        except Exception as error:
+            return service_error(error)
+        return web.json_response(payload)
+
+    @routes.post(
+        "/cloud-run/api/sessions/{session_id}/profile/conflicts/{conflict_id}"
+    )
+    async def post_session_profile_conflict(request):
+        try:
+            payload = await _request_payload(
+                request,
+                allowed={"winner"},
+                required={"winner"},
+            )
+            if payload["winner"] not in {"local", "cloud_vast"}:
+                raise CloudRunValidationError(
+                    "Invalid Desktop profile conflict choice."
+                )
+            result = await make_service().resolve_session_profile_conflict(
+                request.match_info.get("session_id", ""),
+                request.match_info.get("conflict_id", ""),
+                winner=payload["winner"],
+            )
+        except Exception as error:
+            return service_error(error)
+        return web.json_response(result)
 
     @routes.post(
         "/cloud-run/api/sessions/{session_id}/desktop-relay"

@@ -393,8 +393,12 @@ class TransferManager:
 
     def _destination(self, artifact):
         artifact = self._artifact(artifact)
-        if artifact.kind == "custom_node_archive":
-            suffix = ".tar"
+        if artifact.kind in {"custom_node_archive", "profile_archive"}:
+            suffix = (
+                ".tar"
+                if artifact.kind == "custom_node_archive"
+                else ".profile.tar.gz"
+            )
             destination = self.artifact_root / (
                 artifact.artifact_id + suffix
             )

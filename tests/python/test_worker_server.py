@@ -32,9 +32,21 @@ class FakeRequest:
         boundary_authenticated=True,
         auth_envelope=None,
         headers=None,
+        query=None,
     ):
         self.method = method
         self.path = path
+        self.query = query or {}
+        self.path_qs = (
+            path
+            if not self.query
+            else path
+            + "?"
+            + "&".join(
+                str(key) + "=" + str(value)
+                for key, value in self.query.items()
+            )
+        )
         self.body = (
             json.dumps(
                 payload,
@@ -49,6 +61,32 @@ class FakeRequest:
         self.boundary_authenticated = boundary_authenticated
         self.auth_envelope = auth_envelope
         self.headers = headers or {}
+
+
+class FakeProfileStore:
+    def __init__(self, snapshot, artifact):
+        self.saved_snapshot = snapshot
+        self.saved_artifact = artifact
+        self.applied = []
+        self.cursors = []
+        self.artifact_calls = []
+
+    def apply(self, profile):
+        self.applied.append(profile)
+        return {
+            "profile_id": profile.profile_id,
+            "revision": profile.revision,
+            "bootstrap_digest": profile.bootstrap_digest,
+            "bootstrap_loaded_at_revision": None,
+        }
+
+    def snapshot(self, after_revision):
+        self.cursors.append(after_revision)
+        return self.saved_snapshot
+
+    def artifact(self, profile_id, path):
+        self.artifact_calls.append((profile_id, path))
+        return self.saved_artifact
 
 
 class WorkerStateTests(unittest.TestCase):
@@ -424,9 +462,165 @@ class WorkerApplicationTests(unittest.TestCase):
                     "GET",
                     "/worker/v1/jobs/{job_id}/previews/{preview_id}",
                 ),
+                ("PUT", "/worker/v1/profile"),
+                ("GET", "/worker/v1/profile"),
+                (
+                    "GET",
+                    "/worker/v1/profile/artifacts/{artifact_id}",
+                ),
                 ("PUT", "/worker/v1/deadline"),
             },
         )
+
+    def test_signed_profile_routes_apply_snapshot_and_serve_ranges(self):
+        from remote_worker.profile import (
+            WorkerProfileArtifact,
+            WorkerProfileSnapshot,
+        )
+
+        archive = self.directory / "profile.tar.gz"
+        archive.write_bytes(b"profile-archive")
+        digest = __import__("hashlib").sha256(
+            archive.read_bytes()
+        ).hexdigest()
+        snapshot = WorkerProfileSnapshot(
+            profile_id="desktop-profile",
+            revision=2,
+            base_revision=1,
+            bootstrap_digest="b" * 64,
+            archive_size_bytes=archive.stat().st_size,
+            archive_sha256=digest,
+            artifacts=(
+                {
+                    "path": "bootstrap/current.json",
+                    "kind": "bootstrap_workflow",
+                    "size_bytes": 2,
+                    "sha256": "c" * 64,
+                },
+            ),
+            archive_path=archive,
+        )
+        artifact = WorkerProfileArtifact(
+            path=archive,
+            size_bytes=archive.stat().st_size,
+            sha256=digest,
+            mime_type="application/gzip",
+        )
+        profiles = FakeProfileStore(snapshot, artifact)
+        worker = self.application(clock=lambda: 1000, profile_store=profiles)
+        asyncio.run(
+            worker.handle(
+                FakeRequest(
+                    "POST",
+                    "/worker/v1/claim",
+                    payload=claim_payload(),
+                )
+            )
+        )
+        profile_record = {
+            "profile_id": "desktop-profile",
+            "revision": 1,
+            "archive": {
+                "artifact_id": "profile-" + "d" * 64,
+                "kind": "profile_archive",
+                "logical_name": "profile-" + "d" * 64,
+                "destination": "user/default/cloud-vast-profile",
+                "size_bytes": 10,
+                "sha256": "d" * 64,
+                "source": {
+                    "kind": "local-upload",
+                    "locator": "local-upload:profile-" + "d" * 64,
+                    "immutable_revision": None,
+                },
+            },
+            "bootstrap_digest": "b" * 64,
+            "files": [
+                {
+                    "path": "bootstrap/current.json",
+                    "size_bytes": 2,
+                    "sha256": "c" * 64,
+                }
+            ],
+        }
+
+        def signed(method, path, *, payload=None, query=None, headers=None):
+            body = (
+                json.dumps(
+                    payload,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+                if payload is not None
+                else b""
+            )
+            path_qs = (
+                path
+                if not query
+                else path
+                + "?"
+                + "&".join(
+                    str(key) + "=" + str(value)
+                    for key, value in query.items()
+                )
+            )
+            nonce = "profile-" + str(len(profiles.cursors) + len(profiles.applied))
+            return FakeRequest(
+                method,
+                path,
+                body=body,
+                query=query,
+                headers=headers,
+                auth_envelope=sign_request(
+                    bytes.fromhex("a" * 64),
+                    method,
+                    path_qs,
+                    body,
+                    timestamp=1000,
+                    nonce=nonce,
+                ),
+            )
+
+        applied = asyncio.run(
+            worker.handle(
+                signed(
+                    "PUT",
+                    "/worker/v1/profile",
+                    payload={"profile": profile_record},
+                )
+            )
+        )
+        remote = asyncio.run(
+            worker.handle(
+                signed(
+                    "GET",
+                    "/worker/v1/profile",
+                    query={"after_revision": "1"},
+                )
+            )
+        )
+        artifact_id = "profile-" + digest
+        download = asyncio.run(
+            worker.handle(
+                signed(
+                    "GET",
+                    "/worker/v1/profile/artifacts/" + artifact_id,
+                    query={"start": "2"},
+                    headers={"Range": "bytes=2-"},
+                )
+            )
+        )
+
+        self.assertEqual(applied.status, 200)
+        self.assertEqual(profiles.applied[0].profile_id, "desktop-profile")
+        self.assertEqual(remote.payload, snapshot.public_payload())
+        self.assertEqual(profiles.cursors, [1, 0])
+        self.assertEqual(
+            profiles.artifact_calls,
+            [("desktop-profile", artifact_id)],
+        )
+        self.assertEqual(download.status, 206)
+        self.assertEqual(download.payload.start, 2)
+        self.assertEqual(download.headers["ETag"], '"' + digest + '"')
 
     def test_authenticated_routes_require_boundary_hmac_and_reject_replay(self):
         worker = self.application(clock=lambda: 1000)

@@ -50,6 +50,12 @@ from .native_proxy import (
     NativeProxyResponse,
     NativeRoutePolicy,
 )
+from .profile import (
+    ProfileError,
+    WorkerProfileArtifact,
+    WorkerProfileSnapshot,
+    parse_profile_request,
+)
 
 
 WORKER_BIND_HOST = "127.0.0.1"
@@ -76,6 +82,9 @@ _ROUTES = (
         "GET",
         "/worker/v1/jobs/{job_id}/previews/{preview_id}",
     ),
+    ("PUT", "/worker/v1/profile"),
+    ("GET", "/worker/v1/profile"),
+    ("GET", "/worker/v1/profile/artifacts/{artifact_id}"),
     ("PUT", "/worker/v1/deadline"),
 )
 
@@ -281,6 +290,7 @@ class WorkerApplication:
         job_manager=None,
         native_proxy=None,
         deadline_watchdog=None,
+        profile_store=None,
     ):
         self.state = WorkerStateStore(
             state_path,
@@ -296,6 +306,7 @@ class WorkerApplication:
         self.native_proxy = native_proxy
         self.native_route_policy = NativeRoutePolicy()
         self.deadline_watchdog = deadline_watchdog
+        self.profile_store = profile_store
         self.upload_artifacts = {}
         self._manifest_lock = None
         self._manifest_lock_loop = None
@@ -480,6 +491,29 @@ class WorkerApplication:
                 "Remote output range is invalid."
             )
         return 206, start, end
+
+    @staticmethod
+    def _profile_cursor(request):
+        query = getattr(request, "query", {})
+        try:
+            keys = set(query)
+        except (TypeError, ValueError):
+            raise ProfileError("Worker profile cursor is invalid.") from None
+        if not keys:
+            return 0
+        if keys != {"after_revision"}:
+            raise ProfileError("Worker profile cursor is invalid.")
+        try:
+            values = query.getall("after_revision")
+        except AttributeError:
+            values = [query.get("after_revision")]
+        if (
+            len(values) != 1
+            or not isinstance(values[0], str)
+            or not re.fullmatch(r"0|[1-9][0-9]{0,19}", values[0])
+        ):
+            raise ProfileError("Worker profile cursor is invalid.")
+        return int(values[0])
 
     async def _upload_artifact(self, request, artifact_id, body):
         artifact = self.upload_artifacts.get(artifact_id)
@@ -749,6 +783,86 @@ class WorkerApplication:
             headers=headers,
         )
 
+    async def _apply_profile(self, body):
+        if self.profile_store is None:
+            return _error(501, "Worker route is not implemented.")
+        try:
+            profile = parse_profile_request(body)
+            payload = self.profile_store.apply(profile)
+        except ProfileError:
+            return _error(400, "Worker profile was rejected.")
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            raise
+        except Exception:
+            return _error(503, "Worker profile is unavailable.")
+        if not isinstance(payload, dict):
+            return _error(503, "Worker profile is unavailable.")
+        return _response(200, dict(payload))
+
+    async def _profile_snapshot(self, request):
+        if self.profile_store is None:
+            return _error(501, "Worker route is not implemented.")
+        try:
+            cursor = self._profile_cursor(request)
+            snapshot = self.profile_store.snapshot(cursor)
+        except ProfileError:
+            return _error(400, "Worker profile cursor was rejected.")
+        except Exception:
+            return _error(503, "Worker profile is unavailable.")
+        if snapshot is None:
+            return _response(204, None)
+        if not isinstance(snapshot, WorkerProfileSnapshot):
+            return _error(503, "Worker profile is unavailable.")
+        return _response(200, snapshot.public_payload())
+
+    async def _profile_artifact(self, request, artifact_id):
+        if self.profile_store is None:
+            return _error(501, "Worker route is not implemented.")
+        try:
+            snapshot = self.profile_store.snapshot(0)
+            if snapshot is None:
+                return _error(404, "Worker profile was not found.")
+            artifact = self.profile_store.artifact(
+                snapshot.profile_id,
+                artifact_id,
+            )
+            if artifact is None:
+                return _error(404, "Worker profile artifact was not found.")
+            if not isinstance(artifact, WorkerProfileArtifact):
+                raise ProfileError("Worker profile artifact is invalid.")
+            status, start, end = self._file_range(
+                request,
+                artifact.size_bytes,
+            )
+        except (ProfileError, JobValidationError):
+            return _error(416, "Worker profile artifact range was rejected.")
+        except Exception:
+            return _error(503, "Worker profile artifact is unavailable.")
+        headers = {
+            "Content-Type": artifact.mime_type,
+            "Content-Length": str(end - start + 1),
+            "Accept-Ranges": "bytes",
+            "ETag": '"' + artifact.sha256 + '"',
+            "X-Content-Type-Options": "nosniff",
+            "Cache-Control": "no-store",
+        }
+        if status == 206:
+            headers["Content-Range"] = (
+                f"bytes {start}-{end}/{artifact.size_bytes}"
+            )
+        return _response(
+            status,
+            WorkerFile(
+                path=artifact.path,
+                start=start,
+                end=end,
+                size_bytes=artifact.size_bytes,
+                sha256=artifact.sha256,
+                mime_type=artifact.mime_type,
+            ),
+            headers=headers,
+        )
+
     async def _deadline(self, body):
         if self.deadline_watchdog is None:
             return _error(501, "Worker route is not implemented.")
@@ -822,6 +936,15 @@ class WorkerApplication:
             return await self._job_preview(
                 parameters["job_id"],
                 parameters["preview_id"],
+            )
+        if route == "/worker/v1/profile" and str(method).upper() == "PUT":
+            return await self._apply_profile(body)
+        if route == "/worker/v1/profile":
+            return await self._profile_snapshot(request)
+        if route == "/worker/v1/profile/artifacts/{artifact_id}":
+            return await self._profile_artifact(
+                request,
+                parameters["artifact_id"],
             )
         if route == "/worker/v1/deadline":
             return await self._deadline(body)

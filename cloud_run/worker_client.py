@@ -18,7 +18,7 @@ import stat
 import uuid
 from urllib.parse import urlsplit
 
-from .manifest import PROTOCOL_VERSION
+from .manifest import PROTOCOL_VERSION, ProfileFileSpec, validate_dependency
 from .vast import derive_base_url
 from .worker_protocol import (
     is_boundary_token,
@@ -89,6 +89,25 @@ _SNAPSHOT_ERROR_FIELDS = {
     "node_id",
     "class_type",
     "title",
+}
+_PROFILE_SNAPSHOT_FIELDS = {
+    "profile_id",
+    "revision",
+    "base_revision",
+    "bootstrap_digest",
+    "archive_size_bytes",
+    "archive_sha256",
+    "archive_artifact_id",
+    "artifacts",
+}
+_PROFILE_ARTIFACT_FIELDS = {"path", "kind", "size_bytes", "sha256"}
+_PROFILE_KINDS = {
+    "workflows": "workflow",
+    "bootstrap": "bootstrap_workflow",
+    "settings": "settings",
+    "palettes": "palette",
+    "backgrounds": "background",
+    "assets": "ui_asset",
 }
 _SUSPICIOUS_TEXT = re.compile(
     r"(?i)(authorization|bearer|api[_ -]?key|password|secret|token)"
@@ -387,6 +406,75 @@ def _validated_snapshot(payload, job_id, after_sequence):
         "error": error,
         "created_at": float(payload["created_at"]),
         "updated_at": float(payload["updated_at"]),
+    }
+
+
+def _validated_profile_snapshot(payload, after_revision):
+    if not isinstance(payload, dict) or set(payload) != _PROFILE_SNAPSHOT_FIELDS:
+        raise _client_error()
+    revision = payload.get("revision")
+    base_revision = payload.get("base_revision")
+    archive_size = payload.get("archive_size_bytes")
+    archive_digest = payload.get("archive_sha256")
+    if (
+        not _identifier(payload.get("profile_id"))
+        or isinstance(revision, bool)
+        or not isinstance(revision, int)
+        or revision <= after_revision
+        or (
+            base_revision is not None
+            and (
+                isinstance(base_revision, bool)
+                or not isinstance(base_revision, int)
+                or not 0 < base_revision < revision
+            )
+        )
+        or (revision == 1) != (base_revision is None)
+        or not isinstance(payload.get("bootstrap_digest"), str)
+        or not _HEX_64.fullmatch(payload["bootstrap_digest"])
+        or isinstance(archive_size, bool)
+        or not isinstance(archive_size, int)
+        or not 0 < archive_size <= 128 * 1024 * 1024
+        or not isinstance(archive_digest, str)
+        or not _HEX_64.fullmatch(archive_digest)
+        or payload.get("archive_artifact_id") != "profile-" + archive_digest
+        or not isinstance(payload.get("artifacts"), list)
+        or not 0 < len(payload["artifacts"]) <= 2_000
+    ):
+        raise _client_error()
+    artifacts = []
+    paths = set()
+    for item in payload["artifacts"]:
+        if not isinstance(item, dict) or set(item) != _PROFILE_ARTIFACT_FIELDS:
+            raise _client_error()
+        path = item.get("path")
+        kind = item.get("kind")
+        try:
+            validate_dependency(
+                ProfileFileSpec(
+                    path=path,
+                    size_bytes=item.get("size_bytes"),
+                    sha256=item.get("sha256"),
+                )
+            )
+            root = PurePosixPath(path).parts[0]
+        except (AttributeError, TypeError, ValueError):
+            raise _client_error() from None
+        if kind != _PROFILE_KINDS.get(root) or path in paths:
+            raise _client_error()
+        paths.add(path)
+        artifacts.append(dict(item))
+    if [item["path"] for item in artifacts] != sorted(paths):
+        raise _client_error()
+    return {
+        "profile_id": payload["profile_id"],
+        "revision": revision,
+        "base_revision": base_revision,
+        "bootstrap_digest": payload["bootstrap_digest"],
+        "archive_size_bytes": archive_size,
+        "archive_sha256": archive_digest,
+        "archive_artifact_id": payload["archive_artifact_id"],
+        "artifacts": artifacts,
     }
 
 
@@ -966,6 +1054,74 @@ class WorkerClient:
         )
         return _validated_snapshot(payload, job_id, after_sequence)
 
+    async def apply_profile(self, profile):
+        payload = await self._json(
+            "PUT",
+            "/worker/v1/profile",
+            payload={"profile": profile},
+        )
+        if (
+            not isinstance(payload, dict)
+            or set(payload)
+            != {
+                "profile_id",
+                "revision",
+                "bootstrap_digest",
+                "bootstrap_loaded_at_revision",
+            }
+            or not _identifier(payload.get("profile_id"))
+            or isinstance(payload.get("revision"), bool)
+            or not isinstance(payload.get("revision"), int)
+            or payload["revision"] <= 0
+            or not isinstance(payload.get("bootstrap_digest"), str)
+            or not _HEX_64.fullmatch(payload["bootstrap_digest"])
+            or (
+                payload["bootstrap_loaded_at_revision"] is not None
+                and (
+                    isinstance(payload["bootstrap_loaded_at_revision"], bool)
+                    or not isinstance(
+                        payload["bootstrap_loaded_at_revision"], int
+                    )
+                    or not 0
+                    < payload["bootstrap_loaded_at_revision"]
+                    <= payload["revision"]
+                )
+            )
+        ):
+            raise _client_error()
+        return payload
+
+    async def profile_snapshot(self, after_revision):
+        if (
+            isinstance(after_revision, bool)
+            or not isinstance(after_revision, int)
+            or after_revision < 0
+        ):
+            raise _client_error()
+        path = "/worker/v1/profile?after_revision=" + str(after_revision)
+        request = self._request("GET", path)
+        try:
+            response = await self.transport.request(
+                request,
+                max_bytes=MAX_WORKER_JSON_BYTES,
+            )
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            raise
+        except Exception:
+            raise _client_error() from None
+        if (
+            isinstance(response, WorkerTransportResponse)
+            and response.status == 204
+            and response.body == b""
+            and _response_headers(response.headers).get(
+                "content-encoding", "identity"
+            ).casefold()
+            == "identity"
+        ):
+            return None
+        payload = _parse_json_response(response)
+        return _validated_profile_snapshot(payload, after_revision)
+
     async def preview(self, job_id, preview_id):
         if not _identifier(job_id) or not _identifier(preview_id):
             raise _client_error()
@@ -1006,10 +1162,11 @@ class WorkerClient:
             sha256=hashlib.sha256(response.body).hexdigest(),
         )
 
-    async def download_artifact(
+    async def _download_artifact(
         self,
         artifact_id,
         *,
+        route_prefix,
         start,
         on_chunk,
     ):
@@ -1022,12 +1179,12 @@ class WorkerClient:
             or not callable(getattr(self.transport, "stream", None))
         ):
             raise _client_error()
-        path = (
-            "/worker/v1/artifacts/"
-            + artifact_id
-            + "?start="
-            + str(start)
-        )
+        if route_prefix not in {
+            "/worker/v1/artifacts/",
+            "/worker/v1/profile/artifacts/",
+        }:
+            raise _client_error()
+        path = route_prefix + artifact_id + "?start=" + str(start)
         request = self._request(
             "GET",
             path,
@@ -1105,6 +1262,28 @@ class WorkerClient:
             total_size=metadata["total"],
             sha256=metadata["sha256"],
             mime_type=metadata["mime_type"],
+        )
+
+    async def download_artifact(self, artifact_id, *, start, on_chunk):
+        return await self._download_artifact(
+            artifact_id,
+            route_prefix="/worker/v1/artifacts/",
+            start=start,
+            on_chunk=on_chunk,
+        )
+
+    async def download_profile_artifact(
+        self,
+        artifact_id,
+        *,
+        start,
+        on_chunk,
+    ):
+        return await self._download_artifact(
+            artifact_id,
+            route_prefix="/worker/v1/profile/artifacts/",
+            start=start,
+            on_chunk=on_chunk,
         )
 
     async def upload_artifact(

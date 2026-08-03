@@ -20,6 +20,7 @@ from .native_proxy import (
     NativeComfyProxy,
     NativeProxyResponse,
 )
+from .profile import MAX_PROFILE_REQUEST_BYTES, ProfileStore
 from .provision import (
     MAX_MANIFEST_REQUEST_BYTES,
     DiskReservation,
@@ -80,6 +81,7 @@ def build_worker_runtime(
     wheels_root = _private_directory(data_root / "wheels")
     working_root = _private_directory(data_root / "comfy-work")
     previews_root = _private_directory(data_root / "previews")
+    profile_root = _private_directory(data_root / "profile")
     state_path = Path(state_path)
     try:
         state_parent = state_path.parent.resolve(strict=True)
@@ -116,6 +118,15 @@ def build_worker_runtime(
             else AiohttpRangeClient()
         ),
     )
+    profile_store = ProfileStore(
+        state_root=profile_root,
+        user_root=Path(comfy_root) / "user" / "default",
+        input_root=Path(comfy_root) / "input",
+        custom_nodes_root=Path(comfy_root) / "custom_nodes",
+        archive_resolver=lambda profile: transfer_manager.destination_path(
+            profile.archive
+        ),
+    )
     provisioner = Provisioner(
         state_store=state_store,
         worker_version=worker_version,
@@ -123,6 +134,7 @@ def build_worker_runtime(
         artifacts=artifacts,
         installer=installer,
         disk=DiskReservation(comfy_root),
+        profile_store=profile_store,
     )
     job_manager = JobManager(
         comfy=comfy,
@@ -143,6 +155,7 @@ def build_worker_runtime(
         job_manager=job_manager,
         native_proxy=native_proxy,
         deadline_watchdog=watchdog,
+        profile_store=profile_store,
     )
 
 
@@ -168,6 +181,7 @@ def build_aiohttp_application(
                 MAX_MANIFEST_REQUEST_BYTES,
                 MAX_JOB_REQUEST_BYTES,
                 MAX_NATIVE_BODY_BYTES,
+                MAX_PROFILE_REQUEST_BYTES,
             )
             + 1
         )
@@ -186,6 +200,8 @@ def build_aiohttp_application(
                 status=response.status,
                 headers=response.headers,
             )
+        if response.status == 204 and response.payload is None:
+            return web.Response(status=204, headers=response.headers)
         if isinstance(response.payload, bytes):
             return web.Response(
                 body=response.payload,

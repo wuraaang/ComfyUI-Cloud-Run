@@ -203,6 +203,20 @@ class FakeArtifacts:
         return tuple(self.missing_sequences[0])
 
 
+class FakeProfileStore:
+    def __init__(self, events=None):
+        self.events = events if events is not None else []
+        self.applied = []
+
+    def apply(self, profile):
+        self.events.append("profile")
+        self.applied.append(profile)
+        return {
+            "profile_id": profile.profile_id,
+            "revision": profile.revision,
+        }
+
+
 class FakeInstaller:
     def __init__(self, events=None):
         self.events = events if events is not None else []
@@ -284,6 +298,7 @@ class ProvisionerTests(unittest.TestCase):
         installer=None,
         disk=None,
         clock=None,
+        profile_store=None,
     ):
         from remote_worker.provision import Provisioner
 
@@ -295,6 +310,11 @@ class ProvisionerTests(unittest.TestCase):
             installer=installer or FakeInstaller(),
             disk=disk or FakeDisk(),
             clock=clock or FakeClock(),
+            profile_store=(
+                profile_store
+                if profile_store is not None
+                else FakeProfileStore()
+            ),
         )
 
     def test_initial_manifest_installs_validates_and_records_readiness(self):
@@ -418,10 +438,12 @@ class ProvisionerTests(unittest.TestCase):
         desired = manifest(ui_packages=(panel,), profile=safe_profile)
         artifacts = FakeArtifacts()
         installer = FakeInstaller()
+        profile_store = FakeProfileStore()
         provisioner = self.provisioner(
             comfy=FakeComfy([{"KSampler": {}}]),
             artifacts=artifacts,
             installer=installer,
+            profile_store=profile_store,
         )
 
         result = asyncio.run(
@@ -437,6 +459,7 @@ class ProvisionerTests(unittest.TestCase):
             {"agent-panel-archive", "profile-archive"},
         )
         self.assertEqual(installer.ui_packages, ["comfyui-agent-panel"])
+        self.assertEqual(profile_store.applied, [safe_profile])
         installed = self.state.load()["installed"]
         self.assertEqual(installed["profile_revision"], 3)
         self.assertEqual(
@@ -1266,6 +1289,7 @@ class ComfyProcessTests(unittest.TestCase):
     def test_runtime_builder_wires_real_provisioning_components_offline(self):
         from remote_worker.jobs import JobManager
         from remote_worker.main import build_worker_runtime
+        from remote_worker.profile import ProfileStore
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1322,6 +1346,15 @@ class ComfyProcessTests(unittest.TestCase):
             self.assertIs(
                 worker.job_manager.comfy,
                 worker.provisioner.comfy,
+            )
+            self.assertIsInstance(worker.profile_store, ProfileStore)
+            self.assertIs(
+                worker.profile_store,
+                worker.provisioner.profile_store,
+            )
+            self.assertEqual(
+                worker.profile_store.state_root,
+                (data_root / "profile").resolve(),
             )
 
 

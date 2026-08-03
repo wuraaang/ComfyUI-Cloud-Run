@@ -146,6 +146,15 @@ class LoaderContractTests(unittest.TestCase):
                     "/cloud-run/api/sessions/{session_id}",
                 ),
                 (
+                    "GET",
+                    "/cloud-run/api/sessions/{session_id}/profile",
+                ),
+                (
+                    "POST",
+                    "/cloud-run/api/sessions/{session_id}/profile/conflicts/"
+                    "{conflict_id}",
+                ),
+                (
                     "POST",
                     "/cloud-run/api/sessions/{session_id}/desktop-relay",
                 ),

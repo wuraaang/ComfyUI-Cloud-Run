@@ -14,6 +14,8 @@ from cloud_run.manifest import (
     ArtifactSpec,
     CustomNodeSpec,
     DependencyManifest,
+    ProfileFileSpec,
+    ProfileSpec,
     PythonWheelSpec,
     SourceSpec,
 )
@@ -2921,6 +2923,186 @@ class ReusableSessionTests(unittest.TestCase):
         self.assertEqual(transfer.state.value, "verified")
         self.assertEqual(transfer.offset, len(content))
         self.assertEqual(apply_count, 2)
+
+
+class DesktopProfileSynchronizationTests(unittest.TestCase):
+    def test_refresh_downloads_one_verified_remote_revision_and_advances_cursor(self):
+        archive = b"remote-profile"
+        archive_digest = __import__("hashlib").sha256(archive).hexdigest()
+        bootstrap_digest = __import__("hashlib").sha256(b"{}").hexdigest()
+        profile_archive = ArtifactSpec(
+            artifact_id="profile-" + "a" * 64,
+            kind="profile_archive",
+            logical_name="profile-" + "a" * 64,
+            destination="user/default/cloud-vast-profile",
+            size_bytes=10,
+            sha256="a" * 64,
+            source=SourceSpec(
+                "local-upload",
+                "local-upload:profile-" + "a" * 64,
+            ),
+        )
+        profile = ProfileSpec(
+            profile_id="desktop-profile",
+            revision=1,
+            archive=profile_archive,
+            bootstrap_digest=bootstrap_digest,
+            files=(
+                ProfileFileSpec(
+                    path="bootstrap/current.json",
+                    size_bytes=2,
+                    sha256=bootstrap_digest,
+                ),
+            ),
+        )
+        capture = CompiledCapture.from_payload(capture_payload())
+        manifest = DependencyManifest(
+            schema_version=2,
+            protocol_version="2",
+            comfyui_core_version="0.29.0",
+            comfyui_frontend_version="1.47.10",
+            worker_version="a" * 40,
+            prompt_digest=capture.prompt_digest,
+            custom_nodes=(),
+            artifacts=(),
+            output_allowance_bytes=1024,
+            disk_gb=80,
+            profile=profile,
+        )
+
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        database = Path(temporary.name) / "private" / "sessions.sqlite3"
+        jobs = JobRepository(database)
+        sessions = SessionRepository(database)
+        jobs.save_manifest(
+            manifest.digest,
+            manifest.canonical_bytes().decode("utf-8"),
+            created_at=100.0,
+        )
+        baseline, randomized = certified_execution_baseline(capture)
+        session = CloudSession.new(
+            "profile-key",
+            session_id="profile-session",
+            manifest_digest=manifest.digest,
+            deadline_at=7300.0,
+            deadline_mode="finite",
+            disk_gb=80,
+            now=100.0,
+            state=SessionState.READY,
+            execution_baseline_digest=baseline,
+            randomized_seed_node_ids=randomized,
+        ).transition(
+            SessionState.READY,
+            now=100.0,
+            installed_manifest_digest=manifest.digest,
+            instance_id="77",
+            worker_base_url="http://8.8.8.8:30000",
+            provider_token="a" * 64,
+            session_secret_hex="d" * 64,
+        )
+        sessions.create_or_get(session)
+
+        remote_payload = {
+            "profile_id": "desktop-profile",
+            "revision": 2,
+            "base_revision": 1,
+            "bootstrap_digest": bootstrap_digest,
+            "archive_size_bytes": len(archive),
+            "archive_sha256": archive_digest,
+            "archive_artifact_id": "profile-" + archive_digest,
+            "artifacts": [
+                {
+                    "path": "bootstrap/current.json",
+                    "kind": "bootstrap_workflow",
+                    "size_bytes": 2,
+                    "sha256": bootstrap_digest,
+                }
+            ],
+        }
+
+        class Worker:
+            def __init__(self):
+                self.cursors = []
+
+            async def profile_snapshot(self, cursor):
+                self.cursors.append(cursor)
+                return remote_payload if len(self.cursors) == 1 else None
+
+            async def download_profile_artifact(
+                self,
+                artifact_id,
+                *,
+                start,
+                on_chunk,
+            ):
+                self.artifact_id = artifact_id
+                self.start = start
+                on_chunk(archive)
+                return types.SimpleNamespace(
+                    artifact_id=artifact_id,
+                    start=start,
+                    total_size=len(archive),
+                    sha256=archive_digest,
+                    mime_type="application/gzip",
+                )
+
+        class ProfileStore:
+            profile_id = "desktop-profile"
+
+            def __init__(self):
+                self.applied = []
+                self.current = types.SimpleNamespace(
+                    profile_id="desktop-profile",
+                    revision=1,
+                    archive_sha256="a" * 64,
+                    bootstrap_digest=bootstrap_digest,
+                )
+
+            def latest(self):
+                return self.current
+
+            def apply_remote_payload(self, payload, content):
+                self.applied.append((payload, content))
+                self.current = types.SimpleNamespace(
+                    profile_id="desktop-profile",
+                    revision=2,
+                    archive_sha256=archive_digest,
+                    bootstrap_digest=bootstrap_digest,
+                )
+                return self.current
+
+            def conflicts(self, *, unresolved_only=False):
+                return ()
+
+        worker = Worker()
+        profiles = ProfileStore()
+        service = SessionService(
+            job_repository=jobs,
+            session_repository=sessions,
+            resolver=FakeResolver(resolved_resolution()),
+            release=worker_release(),
+            worker_factory=lambda _session: worker,
+            profile_store=profiles,
+            clock=lambda: 101.0,
+        )
+
+        first = asyncio.run(
+            service.sync_profile("profile-session", worker=worker)
+        )
+        second = asyncio.run(
+            service.sync_profile("profile-session", worker=worker)
+        )
+
+        self.assertEqual(worker.cursors, [1, 2])
+        self.assertEqual(profiles.applied, [(remote_payload, archive)])
+        self.assertEqual(first["state"], "synchronized")
+        self.assertEqual(second["remote_revision"], 2)
+        self.assertIsNone(second["warning"])
+        self.assertEqual(
+            jobs.get_profile_sync_state("profile-session")["remote_revision"],
+            2,
+        )
 
 
 if __name__ == "__main__":

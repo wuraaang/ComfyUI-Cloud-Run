@@ -103,6 +103,7 @@ DEADLINE_ACTION_SECONDS = {
     "add_1_hour": 60 * 60,
 }
 DESTROY_REVIEW_TTL_SECONDS = 5 * 60
+_MAX_PROFILE_ARCHIVE_BYTES = 128 * 1024 * 1024
 
 
 class SessionServiceError(RuntimeError):
@@ -1049,6 +1050,7 @@ class SessionService:
         max_job_polls=86_400,
         orchestrator=None,
         reconciler=None,
+        profile_store=None,
     ):
         self.job_repository = job_repository
         self.resolver = resolver
@@ -1060,6 +1062,7 @@ class SessionService:
         self.relay_factory = relay_factory
         self.source_url_resolver = source_url_resolver
         self.lifecycle = lifecycle
+        self.profile_store = profile_store
         self.clock = clock or time.time
         self.id_factory = id_factory or (lambda: str(uuid.uuid4()))
         self.review_token_factory = (
@@ -1355,6 +1358,199 @@ class SessionService:
         if job is None or job.session_id != session.session_id:
             raise SessionExecutionError("Cloud Run job was not found.")
         return job
+
+    def _profile_manifest(self, session):
+        digest = session.installed_manifest_digest or session.manifest_digest
+        manifest = _stored_manifest(self.job_repository, digest)
+        return manifest, manifest.profile
+
+    def _mark_profile_applied(self, session, profile):
+        if profile is None or self.profile_store is None:
+            return None
+        prior = self.job_repository.get_profile_sync_state(
+            session.session_id
+        )
+        if prior is not None and prior["remote_revision"] > profile.revision:
+            return prior
+        return self.job_repository.save_profile_sync_state(
+            {
+                "session_id": session.session_id,
+                "profile_id": profile.profile_id,
+                "remote_revision": profile.revision,
+                "archive_sha256": profile.archive.sha256,
+                "warning": None,
+                "updated_at": self._now(),
+            }
+        )
+
+    def _profile_status(self, session):
+        if self.profile_store is None:
+            return {
+                "profile_id": None,
+                "local_revision": None,
+                "remote_revision": None,
+                "state": "unavailable",
+                "warning": "Desktop profile synchronization is unavailable.",
+                "conflicts": [],
+            }
+        latest = self.profile_store.latest()
+        sync = self.job_repository.get_profile_sync_state(
+            session.session_id
+        )
+        conflicts = self.profile_store.conflicts(unresolved_only=True)
+        warning = sync["warning"] if sync is not None else None
+        remote_revision = sync["remote_revision"] if sync is not None else None
+        remote_digest = sync["archive_sha256"] if sync is not None else None
+        if conflicts:
+            state = "conflict"
+        elif warning is not None:
+            state = "warning"
+        elif (
+            latest is not None
+            and sync is not None
+            and latest.archive_sha256 == remote_digest
+        ):
+            state = "synchronized"
+        elif latest is not None:
+            state = "local_changes_pending"
+        else:
+            state = "unavailable"
+        return {
+            "profile_id": (
+                latest.profile_id
+                if latest is not None
+                else (sync["profile_id"] if sync is not None else None)
+            ),
+            "local_revision": (
+                latest.revision if latest is not None else None
+            ),
+            "remote_revision": remote_revision,
+            "state": state,
+            "warning": warning,
+            "conflicts": [
+                (
+                    conflict.public_payload()
+                    if callable(getattr(conflict, "public_payload", None))
+                    else {
+                        "conflict_id": conflict.conflict_id,
+                        "profile_id": conflict.profile_id,
+                        "base_revision": conflict.base_revision,
+                        "local_revision": conflict.local_revision,
+                        "remote_revision": conflict.remote_revision,
+                        "resolved_revision": conflict.resolved_revision,
+                        "local_label": conflict.local_label,
+                        "remote_label": conflict.remote_label,
+                    }
+                )
+                for conflict in conflicts
+            ],
+        }
+
+    async def sync_profile(self, session_id, *, worker=None):
+        session = self._stored_session(session_id)
+        if self.profile_store is None:
+            return self._profile_status(session)
+        try:
+            _manifest, manifest_profile = self._profile_manifest(session)
+        except Exception:
+            return self._profile_status(session)
+        if manifest_profile is None:
+            return self._profile_status(session)
+        sync = self.job_repository.get_profile_sync_state(
+            session.session_id
+        )
+        if sync is None:
+            sync = self._mark_profile_applied(session, manifest_profile)
+        warning = "Desktop profile synchronization is temporarily unavailable."
+        try:
+            remote = worker if worker is not None else self._worker(session)
+            snapshot_method = getattr(remote, "profile_snapshot", None)
+            download = getattr(remote, "download_profile_artifact", None)
+            if not callable(snapshot_method) or not callable(download):
+                raise SessionExecutionError(
+                    "Remote Desktop profile is unavailable."
+                )
+            payload = await snapshot_method(sync["remote_revision"])
+            if payload is not None:
+                if payload.get("profile_id") != manifest_profile.profile_id:
+                    raise SessionExecutionError(
+                        "Remote Desktop profile identity changed."
+                    )
+                chunks = []
+                received = 0
+
+                def on_chunk(chunk):
+                    nonlocal received
+                    if not isinstance(chunk, bytes):
+                        raise SessionExecutionError(
+                            "Remote Desktop profile archive is invalid."
+                        )
+                    received += len(chunk)
+                    if received > _MAX_PROFILE_ARCHIVE_BYTES:
+                        raise SessionExecutionError(
+                            "Remote Desktop profile archive is invalid."
+                        )
+                    chunks.append(chunk)
+
+                receipt = await download(
+                    payload["archive_artifact_id"],
+                    start=0,
+                    on_chunk=on_chunk,
+                )
+                archive = b"".join(chunks)
+                if (
+                    getattr(receipt, "artifact_id", None)
+                    != payload["archive_artifact_id"]
+                    or getattr(receipt, "start", None) != 0
+                    or getattr(receipt, "total_size", None) != len(archive)
+                    or getattr(receipt, "sha256", None)
+                    != payload["archive_sha256"]
+                    or getattr(receipt, "mime_type", None)
+                    != "application/gzip"
+                    or len(archive) != payload["archive_size_bytes"]
+                    or hashlib.sha256(archive).hexdigest()
+                    != payload["archive_sha256"]
+                ):
+                    raise SessionExecutionError(
+                        "Remote Desktop profile archive is invalid."
+                    )
+                self.profile_store.apply_remote_payload(payload, archive)
+                sync = self.job_repository.save_profile_sync_state(
+                    {
+                        "session_id": session.session_id,
+                        "profile_id": payload["profile_id"],
+                        "remote_revision": payload["revision"],
+                        "archive_sha256": payload["archive_sha256"],
+                        "warning": None,
+                        "updated_at": self._now(),
+                    }
+                )
+            elif sync["warning"] is not None:
+                sync = self.job_repository.save_profile_sync_state(
+                    {**sync, "warning": None, "updated_at": self._now()}
+                )
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            raise
+        except Exception:
+            self.job_repository.save_profile_sync_state(
+                {**sync, "warning": warning, "updated_at": self._now()}
+            )
+        return self._profile_status(session)
+
+    async def resolve_profile_conflict(
+        self,
+        session_id,
+        conflict_id,
+        *,
+        winner,
+    ):
+        session = self._stored_session(session_id)
+        if self.profile_store is None:
+            raise SessionExecutionError(
+                "Desktop profile synchronization is unavailable."
+            )
+        self.profile_store.resolve_conflict(conflict_id, winner=winner)
+        return self._profile_status(session)
 
     @staticmethod
     def alerts(session, *, now):
@@ -1723,6 +1919,7 @@ class SessionService:
                 raise
             except Exception:
                 pass
+        await self.sync_profile(session.session_id)
         current_unverified = self._unverified_outputs(session.session_id)
         if current_unverified != reviewed.unverified_artifact_ids:
             raise DestroyConfirmationError(
@@ -2505,6 +2702,7 @@ class SessionService:
                 transfer_job_id="bootstrap:" + session.session_id,
                 capture=capture,
             )
+            self._mark_profile_applied(session, manifest.profile)
             session = self._sessions().transition(
                 session.session_id,
                 SessionState.VALIDATING,
@@ -2608,6 +2806,7 @@ class SessionService:
                 transfer_job_id="recovery:" + session.session_id,
                 capture=capture,
             )
+            self._mark_profile_applied(session, manifest.profile)
         policy = (
             {
                 "mode": "finite",
@@ -2642,6 +2841,7 @@ class SessionService:
             installed_manifest_digest=manifest.digest,
             sanitized_error=None,
         )
+        await self.sync_profile(session.session_id, worker=worker)
         if session.state in {
             SessionState.RUNNING,
             SessionState.HARVESTING,
@@ -3011,6 +3211,7 @@ class SessionService:
                     transfer_job_id=job.job_id,
                     capture=capture,
                 )
+                self._mark_profile_applied(session, desired.profile)
             except TerminalProvisioningError as error:
                 diagnostic = str(error)
                 self._transition_job(
@@ -3074,6 +3275,7 @@ class SessionService:
                     transfer_job_id=job.job_id,
                     capture=capture,
                 )
+                self._mark_profile_applied(session, desired.profile)
             except TerminalProvisioningError as error:
                 diagnostic = str(error)
                 self._transition_job(
@@ -3236,6 +3438,7 @@ class SessionService:
                     transfer_job_id=job.job_id,
                     capture=capture,
                 )
+                self._mark_profile_applied(session, desired.profile)
                 session = self._sessions().transition(
                     session.session_id,
                     SessionState.VALIDATING,

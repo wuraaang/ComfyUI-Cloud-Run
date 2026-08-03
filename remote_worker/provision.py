@@ -983,6 +983,7 @@ class Provisioner:
         disk,
         clock=None,
         stall_poll_interval=1,
+        profile_store=None,
     ):
         if (
             not isinstance(worker_version, str)
@@ -995,6 +996,7 @@ class Provisioner:
         self.artifacts = artifacts
         self.installer = installer
         self.disk = disk
+        self.profile_store = profile_store
         self.clock = clock or time.monotonic
         if (
             isinstance(stall_poll_interval, bool)
@@ -1016,6 +1018,10 @@ class Provisioner:
         ):
             if not callable(getattr(dependency, method, None)):
                 raise ValueError("Provisioning dependency is invalid.")
+        if profile_store is not None and not callable(
+            getattr(profile_store, "apply", None)
+        ):
+            raise ValueError("Provisioning profile store is invalid.")
         self._lock = None
         self._lock_loop = None
 
@@ -1531,6 +1537,27 @@ class Provisioner:
                         ),
                         tracker,
                     )
+                    tracker.check()
+
+                if delta.profile_changed:
+                    if (
+                        desired.profile is None
+                        or self.profile_store is None
+                    ):
+                        raise _provision_error()
+                    try:
+                        applied_profile = self.profile_store.apply(
+                            desired.profile
+                        )
+                        if asyncio.iscoroutine(applied_profile):
+                            await self._await_progress(
+                                applied_profile,
+                                tracker,
+                            )
+                    except (asyncio.CancelledError, KeyboardInterrupt):
+                        raise
+                    except Exception:
+                        raise _provision_error() from None
                     tracker.check()
 
                 code_changed = bool(

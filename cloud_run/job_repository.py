@@ -236,6 +236,462 @@ class JobRepository:
         )
 
     @staticmethod
+    def _profile_revision_from_row(row):
+        if row is None:
+            return None
+        return {
+            "profile_id": row["profile_id"],
+            "revision": int(row["revision"]),
+            "base_revision": (
+                int(row["base_revision"])
+                if row["base_revision"] is not None
+                else None
+            ),
+            "bootstrap_digest": row["bootstrap_digest"],
+            "archive_path": row["archive_path"],
+            "archive_size_bytes": int(row["archive_size_bytes"]),
+            "archive_sha256": row["archive_sha256"],
+            "artifacts": json.loads(row["artifacts_json"]),
+            "ui_packages": json.loads(row["ui_packages_json"]),
+            "source": row["source"],
+            "created_at": float(row["created_at"]),
+        }
+
+    def get_profile_revision(self, profile_id, revision):
+        identifier = _require_strict_identifier(profile_id, "profile ID")
+        if (
+            isinstance(revision, bool)
+            or not isinstance(revision, int)
+            or revision <= 0
+        ):
+            raise ValueError("Invalid profile revision.")
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                """
+                SELECT profile_id, revision, base_revision, bootstrap_digest,
+                       archive_path, archive_size_bytes, archive_sha256,
+                       artifacts_json, ui_packages_json, source, created_at
+                FROM profile_revisions
+                WHERE profile_id = ? AND revision = ?
+                """,
+                (identifier, revision),
+            ).fetchone()
+        return self._profile_revision_from_row(row)
+
+    def latest_profile_revision(self, profile_id):
+        identifier = _require_strict_identifier(profile_id, "profile ID")
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                """
+                SELECT profile_id, revision, base_revision, bootstrap_digest,
+                       archive_path, archive_size_bytes, archive_sha256,
+                       artifacts_json, ui_packages_json, source, created_at
+                FROM profile_revisions
+                WHERE profile_id = ?
+                ORDER BY revision DESC
+                LIMIT 1
+                """,
+                (identifier,),
+            ).fetchone()
+        return self._profile_revision_from_row(row)
+
+    def save_profile_revision(self, record):
+        fields = {
+            "profile_id",
+            "revision",
+            "base_revision",
+            "bootstrap_digest",
+            "archive_path",
+            "archive_size_bytes",
+            "archive_sha256",
+            "artifacts",
+            "ui_packages",
+            "source",
+            "created_at",
+        }
+        if not isinstance(record, dict) or set(record) != fields:
+            raise ValueError("Invalid profile revision.")
+        profile_id = _require_strict_identifier(record["profile_id"], "profile ID")
+        revision = record["revision"]
+        base_revision = record["base_revision"]
+        size_bytes = record["archive_size_bytes"]
+        if (
+            isinstance(revision, bool)
+            or not isinstance(revision, int)
+            or revision <= 0
+            or (
+                base_revision is not None
+                and (
+                    isinstance(base_revision, bool)
+                    or not isinstance(base_revision, int)
+                    or not 0 < base_revision < revision
+                )
+            )
+            or not isinstance(record["archive_path"], str)
+            or not record["archive_path"]
+            or isinstance(size_bytes, bool)
+            or not isinstance(size_bytes, int)
+            or size_bytes <= 0
+            or not isinstance(record["artifacts"], list)
+            or not isinstance(record["ui_packages"], list)
+            or record["source"] not in {"local", "remote", "resolution"}
+        ):
+            raise ValueError("Invalid profile revision.")
+        bootstrap_digest = _require_digest(
+            record["bootstrap_digest"], "profile bootstrap digest"
+        )
+        archive_sha256 = _require_digest(
+            record["archive_sha256"], "profile archive digest"
+        )
+        created_at = _require_finite_timestamp(record["created_at"], "profile timestamp")
+        artifacts_json = _canonical_json(record["artifacts"])
+        ui_packages_json = _canonical_json(record["ui_packages"])
+        values = (
+            profile_id,
+            revision,
+            base_revision,
+            bootstrap_digest,
+            record["archive_path"],
+            size_bytes,
+            archive_sha256,
+            artifacts_json,
+            ui_packages_json,
+            record["source"],
+            created_at,
+        )
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                """
+                SELECT profile_id, revision, base_revision, bootstrap_digest,
+                       archive_path, archive_size_bytes, archive_sha256,
+                       artifacts_json, ui_packages_json, source, created_at
+                FROM profile_revisions
+                WHERE profile_id = ? AND revision = ?
+                """,
+                (profile_id, revision),
+            ).fetchone()
+            if existing is not None:
+                stored = self._profile_revision_from_row(existing)
+                candidate = {
+                    **record,
+                    "profile_id": profile_id,
+                    "bootstrap_digest": bootstrap_digest,
+                    "archive_sha256": archive_sha256,
+                    "created_at": created_at,
+                }
+                connection.rollback()
+                if stored != candidate:
+                    raise ValueError("Profile revision identity cannot change.")
+                return stored
+            latest = connection.execute(
+                """
+                SELECT MAX(revision) AS revision
+                FROM profile_revisions
+                WHERE profile_id = ?
+                """,
+                (profile_id,),
+            ).fetchone()["revision"]
+            expected_revision = 1 if latest is None else int(latest) + 1
+            if revision != expected_revision or (
+                revision == 1 and base_revision is not None
+            ) or (
+                revision > 1 and base_revision is None
+            ):
+                connection.rollback()
+                raise ValueError("Profile revision sequence is invalid.")
+            connection.execute(
+                """
+                INSERT INTO profile_revisions(
+                    profile_id, revision, base_revision, bootstrap_digest,
+                    archive_path, archive_size_bytes, archive_sha256,
+                    artifacts_json, ui_packages_json, source, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                values,
+            )
+            row = connection.execute(
+                """
+                SELECT profile_id, revision, base_revision, bootstrap_digest,
+                       archive_path, archive_size_bytes, archive_sha256,
+                       artifacts_json, ui_packages_json, source, created_at
+                FROM profile_revisions
+                WHERE profile_id = ? AND revision = ?
+                """,
+                (profile_id, revision),
+            ).fetchone()
+            connection.commit()
+        return self._profile_revision_from_row(row)
+
+    @staticmethod
+    def _profile_conflict_from_row(row):
+        if row is None:
+            return None
+        return {
+            "conflict_id": row["conflict_id"],
+            "profile_id": row["profile_id"],
+            "base_revision": int(row["base_revision"]),
+            "local_revision": int(row["local_revision"]),
+            "remote_revision": int(row["remote_revision"]),
+            "resolved_revision": (
+                int(row["resolved_revision"])
+                if row["resolved_revision"] is not None
+                else None
+            ),
+            "created_at": float(row["created_at"]),
+        }
+
+    def save_profile_conflict(self, record):
+        fields = {
+            "conflict_id",
+            "profile_id",
+            "base_revision",
+            "local_revision",
+            "remote_revision",
+            "resolved_revision",
+            "created_at",
+        }
+        if not isinstance(record, dict) or set(record) != fields:
+            raise ValueError("Invalid profile conflict.")
+        conflict_id = _require_strict_identifier(record["conflict_id"], "conflict ID")
+        profile_id = _require_strict_identifier(record["profile_id"], "profile ID")
+        revisions = (
+            record["base_revision"],
+            record["local_revision"],
+            record["remote_revision"],
+        )
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in revisions
+        ) or not revisions[0] < revisions[1] < revisions[2] or record[
+            "resolved_revision"
+        ] is not None:
+            raise ValueError("Invalid profile conflict.")
+        created_at = _require_finite_timestamp(record["created_at"], "conflict timestamp")
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT * FROM profile_conflicts WHERE conflict_id = ?",
+                (conflict_id,),
+            ).fetchone()
+            candidate = {
+                **record,
+                "conflict_id": conflict_id,
+                "profile_id": profile_id,
+                "created_at": created_at,
+            }
+            if existing is not None:
+                stored = self._profile_conflict_from_row(existing)
+                connection.rollback()
+                if stored != candidate:
+                    raise ValueError("Profile conflict identity cannot change.")
+                return stored
+            connection.execute(
+                """
+                INSERT INTO profile_conflicts(
+                    conflict_id, profile_id, base_revision, local_revision,
+                    remote_revision, resolved_revision, created_at
+                ) VALUES (?, ?, ?, ?, ?, NULL, ?)
+                """,
+                (
+                    conflict_id,
+                    profile_id,
+                    revisions[0],
+                    revisions[1],
+                    revisions[2],
+                    created_at,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM profile_conflicts WHERE conflict_id = ?",
+                (conflict_id,),
+            ).fetchone()
+            connection.commit()
+        return self._profile_conflict_from_row(row)
+
+    def get_profile_conflict(self, conflict_id):
+        identifier = _require_strict_identifier(conflict_id, "conflict ID")
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT * FROM profile_conflicts WHERE conflict_id = ?",
+                (identifier,),
+            ).fetchone()
+        return self._profile_conflict_from_row(row)
+
+    def list_profile_conflicts(self, profile_id, *, unresolved_only=False):
+        identifier = _require_strict_identifier(profile_id, "profile ID")
+        if not isinstance(unresolved_only, bool):
+            raise ValueError("Invalid profile conflict filter.")
+        query = "SELECT * FROM profile_conflicts WHERE profile_id = ?"
+        if unresolved_only:
+            query += " AND resolved_revision IS NULL"
+        query += " ORDER BY created_at, conflict_id"
+        with closing(self._connect()) as connection:
+            rows = connection.execute(query, (identifier,)).fetchall()
+        return tuple(self._profile_conflict_from_row(row) for row in rows)
+
+    def resolve_profile_conflict(self, conflict_id, resolved_revision):
+        identifier = _require_strict_identifier(conflict_id, "conflict ID")
+        if (
+            isinstance(resolved_revision, bool)
+            or not isinstance(resolved_revision, int)
+            or resolved_revision <= 0
+        ):
+            raise ValueError("Invalid profile conflict resolution.")
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM profile_conflicts WHERE conflict_id = ?",
+                (identifier,),
+            ).fetchone()
+            if row is None or row["resolved_revision"] is not None or (
+                resolved_revision <= int(row["remote_revision"])
+            ):
+                connection.rollback()
+                raise ValueError("Profile conflict cannot be resolved.")
+            updated = connection.execute(
+                """
+                UPDATE profile_conflicts
+                SET resolved_revision = ?
+                WHERE conflict_id = ? AND resolved_revision IS NULL
+                """,
+                (resolved_revision, identifier),
+            )
+            if updated.rowcount != 1:
+                connection.rollback()
+                raise ValueError("Profile conflict cannot be resolved.")
+            result = connection.execute(
+                "SELECT * FROM profile_conflicts WHERE conflict_id = ?",
+                (identifier,),
+            ).fetchone()
+            connection.commit()
+        return self._profile_conflict_from_row(result)
+
+    @staticmethod
+    def _profile_sync_from_row(row):
+        if row is None:
+            return None
+        return {
+            "session_id": row["session_id"],
+            "profile_id": row["profile_id"],
+            "remote_revision": int(row["remote_revision"]),
+            "archive_sha256": row["archive_sha256"],
+            "warning": row["warning"],
+            "updated_at": float(row["updated_at"]),
+        }
+
+    def get_profile_sync_state(self, session_id):
+        identifier = _require_strict_identifier(session_id, "session ID")
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT * FROM profile_sync_state WHERE session_id = ?",
+                (identifier,),
+            ).fetchone()
+        return self._profile_sync_from_row(row)
+
+    def save_profile_sync_state(self, record):
+        fields = {
+            "session_id",
+            "profile_id",
+            "remote_revision",
+            "archive_sha256",
+            "warning",
+            "updated_at",
+        }
+        if not isinstance(record, dict) or set(record) != fields:
+            raise ValueError("Invalid profile synchronization state.")
+        session_id = _require_strict_identifier(record["session_id"], "session ID")
+        profile_id = _require_strict_identifier(record["profile_id"], "profile ID")
+        revision = record["remote_revision"]
+        digest = record["archive_sha256"]
+        warning = record["warning"]
+        if (
+            isinstance(revision, bool)
+            or not isinstance(revision, int)
+            or revision < 0
+            or (revision == 0) != (digest is None)
+            or (
+                digest is not None
+                and (
+                    not isinstance(digest, str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", digest)
+                )
+            )
+            or (
+                warning is not None
+                and (
+                    not isinstance(warning, str)
+                    or not warning
+                    or len(warning) > 500
+                    or any(ord(character) < 32 for character in warning)
+                    or any(
+                        marker in warning.casefold()
+                        for marker in (
+                            "://",
+                            "bearer ",
+                            "token=",
+                            "secret",
+                            "/users/",
+                        )
+                    )
+                )
+            )
+        ):
+            raise ValueError("Invalid profile synchronization state.")
+        updated_at = _require_finite_timestamp(
+            record["updated_at"],
+            "profile synchronization timestamp",
+        )
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT * FROM profile_sync_state WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if existing is not None:
+                prior = self._profile_sync_from_row(existing)
+                if (
+                    prior["profile_id"] != profile_id
+                    or revision < prior["remote_revision"]
+                    or (
+                        revision == prior["remote_revision"]
+                        and digest != prior["archive_sha256"]
+                    )
+                ):
+                    connection.rollback()
+                    raise ValueError(
+                        "Profile synchronization identity cannot regress."
+                    )
+            connection.execute(
+                """
+                INSERT INTO profile_sync_state(
+                    session_id, profile_id, remote_revision,
+                    archive_sha256, warning, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    profile_id = excluded.profile_id,
+                    remote_revision = excluded.remote_revision,
+                    archive_sha256 = excluded.archive_sha256,
+                    warning = excluded.warning,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    session_id,
+                    profile_id,
+                    revision,
+                    digest,
+                    warning,
+                    updated_at,
+                ),
+            )
+            result = connection.execute(
+                "SELECT * FROM profile_sync_state WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            connection.commit()
+        return self._profile_sync_from_row(result)
+
+    @staticmethod
     def _row_to_job(row):
         if row is None:
             return None

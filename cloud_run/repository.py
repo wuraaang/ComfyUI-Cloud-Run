@@ -605,10 +605,53 @@ def _initialize_database(path):
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS profile_revisions (
+                    profile_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    base_revision INTEGER,
+                    bootstrap_digest TEXT NOT NULL,
+                    archive_path TEXT NOT NULL,
+                    archive_size_bytes INTEGER NOT NULL,
+                    archive_sha256 TEXT NOT NULL,
+                    artifacts_json TEXT NOT NULL,
+                    ui_packages_json TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    PRIMARY KEY(profile_id, revision)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS profile_conflicts (
+                    conflict_id TEXT PRIMARY KEY,
+                    profile_id TEXT NOT NULL,
+                    base_revision INTEGER NOT NULL,
+                    local_revision INTEGER NOT NULL,
+                    remote_revision INTEGER NOT NULL,
+                    resolved_revision INTEGER,
+                    created_at REAL NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS profile_sync_state (
+                    session_id TEXT PRIMARY KEY,
+                    profile_id TEXT NOT NULL,
+                    remote_revision INTEGER NOT NULL,
+                    archive_sha256 TEXT,
+                    warning TEXT,
+                    updated_at REAL NOT NULL
+                )
+                """
+            )
             _migrate_legacy_attempts(connection)
             connection.execute(
                 """
-                INSERT INTO schema_meta(key, value) VALUES('schema_version', '9')
+                INSERT INTO schema_meta(key, value) VALUES('schema_version', '10')
                 ON CONFLICT(key) DO UPDATE SET value = excluded.value
                 """
             )
