@@ -437,25 +437,27 @@ class WorkerApplicationTests(unittest.TestCase):
 
         self.assertEqual(WORKER_BIND_HOST, "127.0.0.1")
         self.assertEqual(WORKER_BIND_PORT, 8766)
-        self.assertEqual(
-            caddyfile,
-            (
-                "{\n"
-                "\tadmin off\n"
-                "\tauto_https off\n"
-                "}\n"
-                "\n"
-                ":8765 {\n"
-                '\t@unauthorized not header Authorization "Bearer '
-                '{$CLOUD_RUN_BOUNDARY_TOKEN}"\n'
-                "\trespond @unauthorized 401\n"
-                "\n"
-                "\trequest_header -Authorization\n"
-                "\trequest_header -X-Cloud-Run-Boundary\n"
-                "\trequest_header X-Cloud-Run-Boundary authenticated\n"
-                "\treverse_proxy 127.0.0.1:8766\n"
-                "}\n"
-            ),
+        expected = """{
+    admin off
+    auto_https off
+}
+
+:8765 {
+    route {
+        @unauthorized not header Authorization "Bearer {$CLOUD_RUN_BOUNDARY_TOKEN}"
+        respond @unauthorized 401
+
+        request_header -Authorization
+        request_header -X-Cloud-Run-Boundary
+        request_header X-Cloud-Run-Boundary authenticated
+        reverse_proxy 127.0.0.1:8766
+    }
+}
+"""
+        self.assertEqual(caddyfile, expected)
+        self.assertLess(
+            caddyfile.index("@unauthorized not header Authorization"),
+            caddyfile.index("request_header -Authorization"),
         )
 
 

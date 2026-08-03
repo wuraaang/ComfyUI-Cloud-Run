@@ -1438,6 +1438,60 @@ class ReusableSessionTests(unittest.TestCase):
             "provision-" + manifest.digest,
         )
 
+    def test_ready_transaction_reuse_rejects_a_different_local_job_scope(self):
+        manifest = self.initial_manifest
+        total_bytes = sum(
+            artifact.size_bytes for artifact in manifest.artifacts
+        )
+        ready = {
+            "transaction_id": "provision-" + manifest.digest,
+            "manifest_digest": manifest.digest,
+            "state": "ready",
+            "planned_restarts": 0,
+            "repair_restarts": 0,
+            "missing_class_types": [],
+            "missing_artifacts": [],
+            "progress": {
+                "phase": "ready",
+                "dependency_id": None,
+                "transferred_bytes": total_bytes,
+                "total_bytes": total_bytes,
+            },
+        }
+        self.service._record_provision_progress(
+            ready,
+            session=self.sessions.get("session-1"),
+            manifest=manifest,
+            transfer_job_id="bootstrap:different-job",
+        )
+
+        class Worker:
+            def __init__(inner_self):
+                inner_self.transaction_calls = 0
+
+            async def transaction(inner_self, _transaction_id):
+                inner_self.transaction_calls += 1
+                return ready
+
+            async def apply_manifest(inner_self, _payload):
+                raise AssertionError("mismatched local scope must fail closed")
+
+        worker = Worker()
+        with self.assertRaisesRegex(
+            TerminalProvisioningError,
+            "Stored provisioning transaction is invalid",
+        ):
+            asyncio.run(
+                self.service._apply_manifest(
+                    worker,
+                    self.sessions.get("session-1"),
+                    manifest,
+                    transfer_job_id="bootstrap:session-1",
+                    capture=self.first_capture,
+                )
+            )
+        self.assertEqual(worker.transaction_calls, 0)
+
     def test_legacy_apply_response_without_progress_remains_accepted(self):
         result = asyncio.run(
             self.service._apply_manifest(

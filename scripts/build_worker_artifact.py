@@ -74,14 +74,16 @@ def _source_files(repository_root):
     observed = set()
     try:
         for path in remote_root.rglob("*"):
-            relative = path.relative_to(root).as_posix()
+            relative_path = path.relative_to(root)
+            if "__pycache__" in relative_path.parts or path.suffix == ".pyc":
+                continue
+            relative = relative_path.as_posix()
             metadata = os.lstat(path)
             if stat.S_ISDIR(metadata.st_mode):
                 if path.name in {
                     ".git",
                     ".hg",
                     ".svn",
-                    "__pycache__",
                     "tests",
                 }:
                     raise ArtifactBuildError(

@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest import mock
 
 from remote_worker.bootstrap import MAX_ARCHIVE_BYTES
-from scripts.build_worker_artifact import WorkerArtifact
+from scripts.build_worker_artifact import WorkerArtifact, build_worker_artifact
 from scripts.build_worker_release_bundle import (
     ReleaseBuildError,
     ReleaseMetadata,
@@ -84,6 +84,33 @@ def base_template_audit():
         "use_ssh": True,
         "ssh_direct": True,
     }
+
+
+class WorkerReleaseToolTests(unittest.TestCase):
+    def test_worker_artifact_ignores_generated_bytecode_cache(self):
+        cache = REPOSITORY_ROOT / "remote_worker" / "__pycache__"
+        cache_preexisted = cache.exists()
+        cache.mkdir(exist_ok=True)
+        bytecode = cache / "jobs.cpython-313.pyc"
+        previous = bytecode.read_bytes() if bytecode.exists() else None
+        bytecode.write_bytes(b"generated")
+        try:
+            with tempfile.TemporaryDirectory() as temporary_root:
+                result = build_worker_artifact(
+                    REPOSITORY_ROOT,
+                    Path(temporary_root) / "worker.tar.gz",
+                )
+            self.assertNotIn(
+                "remote_worker/__pycache__/jobs.cpython-313.pyc",
+                result.members,
+            )
+        finally:
+            if previous is None:
+                bytecode.unlink(missing_ok=True)
+            else:
+                bytecode.write_bytes(previous)
+            if not cache_preexisted:
+                cache.rmdir()
 
 
 class ReleaseBundleTests(unittest.TestCase):

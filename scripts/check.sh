@@ -23,7 +23,7 @@ if [ ! -x "$comfyui_python_runner" ]; then
 fi
 
 echo "[check] Python tests"
-PYTHONDONTWRITEBYTECODE=1 "$python_command" -m unittest discover \
+PYTHONDONTWRITEBYTECODE=1 "$comfyui_python_runner" -m unittest discover \
   -s tests/python -p 'test_*.py' -v
 
 echo "[check] fake reusable session"

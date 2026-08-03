@@ -2119,12 +2119,26 @@ class SessionService:
         transfer_job_id,
         capture,
     ):
+        transaction_id = "provision-" + manifest.digest
+        local_transaction = self.job_repository.get_provision_transaction(
+            _stored_provision_transaction_id(
+                session.session_id,
+                manifest.digest,
+            )
+        )
         transaction = getattr(worker, "transaction", None)
-        if callable(transaction):
-            try:
-                existing = await transaction(
-                    "provision-" + manifest.digest
+        if local_transaction is not None:
+            if (
+                local_transaction.session_id != session.session_id
+                or local_transaction.manifest_digest != manifest.digest
+                or local_transaction.job_id != transfer_job_id
+            ):
+                raise TerminalProvisioningError(
+                    "Stored provisioning transaction is invalid."
                 )
+        if local_transaction is not None and callable(transaction):
+            try:
+                existing = await transaction(transaction_id)
             except (asyncio.CancelledError, KeyboardInterrupt):
                 raise
             except WorkerBoundaryAuthenticationError:

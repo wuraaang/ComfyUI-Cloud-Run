@@ -57,7 +57,7 @@ class ProviderMutationSurfaceTests(unittest.TestCase):
         )
 
         self.assertIn(
-            "Current slice: workflow-derived Vast GPU sessions",
+            "Current slice: local Desktop / remote GPU bridge",
             agents,
         )
         self.assertIn("No real Vast.ai rental without a separate human GO", agents)
