@@ -7,8 +7,9 @@ does not expose remote CUDA as local CUDA, and does not replace or intercept
 the local **Run/Exécuter** action.
 
 > **Paid Vast.ai rental:** capture, dependency preflight, offer search, and
-> rental review do not rent hardware. **Confirm & rent GPU** can start hourly
-> billing. Autonomous and repository checks are fake/offline only:
+> rental review do not rent hardware. **Louer et préparer** is the single paid
+> confirmation and can start hourly billing. Autonomous and repository checks
+> are fake/offline only:
 > no real Vast rental or Gold run has occurred.
 
 The official ComfyUI Vast template hash
@@ -36,6 +37,68 @@ or PEP 600 `manylinux_2_5_x86_64` through `manylinux_2_39_x86_64`. The
 selected Ubuntu 24.04/glibc 2.39 runtime rejects future or malformed manylinux
 tags and `musllinux*`; other interpreters, ABIs, operating systems, and CPU
 architectures also fail closed.
+
+## Cloud Vast: the normal Desktop flow
+
+`Cloud Vast` manages the paid GPU lifecycle; it is not a second Run button.
+`ComfyUI Vast` is an independent environment opened inside the existing
+ComfyUI Desktop application. The local environment keeps its ordinary local
+Run behavior, while native Run, queue, and batch actions inside `ComfyUI Vast`
+go only to the pod GPU.
+
+The intended user flow is:
+
+1. Build or open the workflow in the normal local Desktop environment.
+2. Open `Cloud Vast`. Its free background analysis captures the current
+   canvas, finds required models and custom nodes, explains included and
+   excluded offers, and calculates a source-aware readiness estimate.
+3. Review the selected offer, price ceiling, duration, disk, model sources,
+   custom-node compatibility, and transfer estimate. Public model sources use
+   immutable Hugging Face or Civitai identities; local upload is the universal
+   fallback, and an optional R2 cache can accelerate already-known content.
+4. Click the single paid action `Louer et préparer`. The durable intent is
+   saved before Vast is called, and provisioning then runs automatically.
+5. Wait until every readiness check is green: worker, ComfyUI HTTP/WebSocket,
+   node classes, exact model digests, profile, UI assets, and Agent bridge.
+6. On first use only, add the official Remote Connection named `ComfyUI Vast`
+   in Desktop with the stable URL displayed by Cloud Vast. It is a loopback URL
+   such as `http://127.0.0.1:<port>`; it is never a public pod URL.
+7. Open `ComfyUI Vast` inside Desktop. The current canvas, saved workflows,
+   palette, background, approved UI extensions, model menus, previews, active
+   nodes, progress, native errors, and results behave through the usual ComfyUI
+   interface. Use the ordinary Run, queue, and batch controls. Agent Panel
+   remains on the Mac and can edit this active canvas or prepare ordered jobs;
+   only GPU execution crosses the authenticated relay to the pod.
+8. Verified persistent results are copied to
+   `output/cloud-vast/<session>/<job>`. Temporary `PreviewImage` files remain
+   previews and are not misreported as failed final outputs.
+9. When finished, explicitly choose `Destroy GPU — stop all Vast billing` and
+   wait until a fresh provider inventory proves the instance absent and the
+   local state reports `billing_may_continue=false`.
+
+Remember: closing either Desktop window does not destroy a pod. Closing and reopening
+the local environment or `ComfyUI Vast` reconnects to durable state without
+submitting the prompt again. A finite authorized deadline can independently
+stop its own instance; a no-limit session requires manual destruction.
+
+Cold readiness cannot honestly have a universal ten-minute guarantee. The
+live audit transferred 29,347,469,703 bytes (about 27.3 GiB) at roughly
+25–30 MB/s, so transfer alone took about 16–20 minutes. A warm compatible
+session, a real dependency delta, good network/disk ranking, immutable public
+sources, or optional R2 reuse can be much faster. The interface labels the
+estimate as cold, pre-positioned, or warm instead of promising an impossible
+deadline.
+
+V1 deliberately uses SQLite + worker persistent state + atomic snapshots. It
+has no Convex dependency and no TanStack dependency. Convex may later carry
+small orchestration metadata or watchdog state, but it cannot make Vast side
+effects exactly-once and must never carry workflows, models, previews, outputs,
+or Vast keys. TanStack adds no useful layer to this existing ComfyUI surface.
+Upstream compatibility automation is a separate, credential-free PR-opening
+workflow; it may test pinned upstream commits and open a reviewable PR, but it
+has no runtime, merge, release, deployment, credential, or rental authority.
+Every external publication, installation, template change, paid probe, create,
+or destroy still requires a fresh human GO naming its exact bounded scope.
 
 ## From canvas to remote prompt
 

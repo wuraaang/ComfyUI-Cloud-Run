@@ -1,11 +1,14 @@
 # Project state
 
-Status: workflow-derived reusable sessions implemented and fake/offline
-certified on the pinned local ComfyUI environment. The workflow-embedded model
-metadata consumer bridge, native missing-model visibility, and the earlier
-free, read-only metadata preflight are also complete. The official-image remote
-runtime migration is implemented offline. Its post-migration real workflow
-preflight, publication, restart, and every paid activity remain human-gated.
+Status: the local Desktop / remote GPU bridge is implemented and fake/offline
+certified on the pinned ComfyUI environment. `Cloud Vast` owns lifecycle and
+`ComfyUI Vast` is the independent official Desktop Remote Connection whose
+native Run, queue, batch, progress, previews, and outputs use the remote pod.
+The workflow-derived reusable sessions implemented in the earlier slice remain
+the lifecycle foundation of this bridge.
+No real Desktop/pod acceptance campaign has been run for this bridge. Worker
+publication, Desktop restart, external installation, template mutation, offer
+search, instance creation/destruction, and every paid activity remain gated.
 
 Source of truth:
 
@@ -15,13 +18,64 @@ Source of truth:
 - `docs/superpowers/specs/2026-07-31-workflow-embedded-model-metadata-bridge-design.md`;
 - `docs/superpowers/plans/2026-07-31-workflow-embedded-model-metadata-bridge.md`;
 - `docs/superpowers/specs/2026-08-01-official-comfy-worker-runtime-design.md`;
-- `docs/superpowers/plans/2026-08-01-official-comfy-worker-runtime.md`.
+- `docs/superpowers/plans/2026-08-01-official-comfy-worker-runtime.md`;
+- `docs/superpowers/specs/2026-08-03-local-desktop-remote-execution-bridge-design.md`;
+- `docs/superpowers/plans/2026-08-03-local-desktop-remote-execution-bridge.md`;
+- `docs/superpowers/live-tests/2026-08-03-local-desktop-remote-execution-bridge-acceptance.md`.
 
 For the selected image, remote Python, wheel platforms, hardware filters,
 launch/onstart contract, and base-template audit schema, the 2026-08-01
 documents supersede the corresponding Task 8 passages from 2026-07-31. The
 earlier release/bootstrap/security and paid-action boundaries remain
 authoritative.
+
+## 2026-08-03 local Desktop / remote GPU bridge
+
+The implemented V1 keeps the normal local Desktop environment independent and
+adds `ComfyUI Vast` beside it. On first use, the user adds the displayed stable
+`http://127.0.0.1:<port>` URL through Desktop's official Remote Connection
+setup. It opens inside Desktop, not an external browser. Local Run stays local;
+native Run, queue, and Agent Panel batch actions from `ComfyUI Vast` reach only
+the authenticated remote worker. Closing either Desktop environment does not
+destroy an instance.
+
+`Cloud Vast` runs the free analysis and exposes exactly one paid
+`Louer et préparer` confirmation. It persists intent before creation, installs
+the immutable profile, approved UI packages, custom nodes, Hugging Face or
+Civitai model sources, local artifacts, and optional R2 cache hits, then waits
+for the complete readiness matrix. Profile synchronization preserves the local
+and Cloud Vast versions of conflicting workflow/settings changes. Agent Panel
+remains on the Mac and its rewritten loopback bridge can edit the active Vast
+canvas or submit ordered jobs without receiving billing or provider authority.
+
+Durability is SQLite + worker persistent state + atomic snapshots. Cursors,
+idempotent prompt identities, verified transfer offsets, terminal state, safe
+errors, and output digests survive Desktop close/reopen and local-backend
+restart/reconnect without duplicate submission. Persistent outputs are verified
+under `output/cloud-vast/<session>/<job>`; temporary preview descriptors are not
+harvested as final files.
+
+The live audit's 29,347,469,703-byte cold transfer at about 25–30 MB/s measured
+roughly 16–20 minutes, so there is no universal sub-ten-minute claim. Warm
+session reuse, content-addressed caches, and a real delta are the acceleration
+paths; the UI reports cold, pre-positioned, or warm timing honestly.
+
+V1 has no Convex dependency and no TanStack dependency. A future Convex adapter
+may carry bounded metadata/watchdog state, but not models, workflows, previews,
+outputs, signed URLs, or Vast keys, and it does not make provider effects
+exactly-once. TanStack does not improve this existing ComfyUI surface. Watching
+upstream ComfyUI commits remains a separately designed, credential-free
+PR-opening workflow that may open a reviewable compatibility PR but may never
+merge, release, deploy, install, or rent autonomously.
+
+The deterministic fake Desktop campaign proves the local/Vast split, readiness,
+model menus, profile/background, Agent Panel, native events, verified outputs,
+atomic recovery, compatible-job delta, the fourteen typed failure boundaries,
+and both authorized deadline forms. The paid acceptance checklist is marked
+`NOT AUTHORIZED AND NOT RUN`; it is evidence scaffolding, not a command. Any
+publication, install, Desktop restart, template mutation, provider probe,
+create, destroy, or field execution requires a fresh human GO naming the exact
+action, offer/rate cap, maximum instances, duration/cost, and teardown proof.
 
 ## Implemented offline
 

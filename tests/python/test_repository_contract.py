@@ -74,6 +74,105 @@ def _assert_regression_test_exists(case, reference):
 
 
 class RepositoryContractTests(unittest.TestCase):
+    def test_user_docs_explain_the_cloud_vast_desktop_flow(self):
+        documents = {
+            "README.md": (REPOSITORY_ROOT / "README.md").read_text(
+                encoding="utf-8"
+            ),
+            "docs/project-state.md": (
+                REPOSITORY_ROOT / "docs" / "project-state.md"
+            ).read_text(encoding="utf-8"),
+        }
+        combined = "\n".join(documents.values())
+        normalized = " ".join(combined.split())
+        for required_text in (
+            "Cloud Vast",
+            "ComfyUI Vast",
+            "Louer et préparer",
+            "native Run",
+            "127.0.0.1",
+            "Hugging Face",
+            "Civitai",
+            "optional R2",
+            "Agent Panel remains on the Mac",
+            "29,347,469,703",
+            "16–20 minutes",
+            "no Convex dependency",
+            "no TanStack dependency",
+            "fresh human GO",
+        ):
+            with self.subTest(text=required_text):
+                self.assertIn(required_text, normalized)
+
+        readme = " ".join(documents["README.md"].split())
+        for required_text in (
+            "output/cloud-vast/<session>/<job>",
+            "closing either Desktop window does not destroy",
+            "ordinary Run, queue, and batch controls",
+        ):
+            with self.subTest(readme=required_text):
+                self.assertIn(required_text, readme)
+
+        project_state = " ".join(
+            documents["docs/project-state.md"].split()
+        )
+        for required_text in (
+            "SQLite + worker persistent state + atomic snapshots",
+            "credential-free PR-opening workflow",
+            "NOT AUTHORIZED AND NOT RUN",
+        ):
+            with self.subTest(project_state=required_text):
+                self.assertIn(required_text, project_state)
+
+    def test_paid_bridge_acceptance_is_complete_and_non_executing(self):
+        acceptance = (
+            REPOSITORY_ROOT
+            / "docs"
+            / "superpowers"
+            / "live-tests"
+            / "2026-08-03-local-desktop-remote-execution-bridge-acceptance.md"
+        ).read_text(encoding="utf-8")
+        required_opening = (
+            "Status: NOT AUTHORIZED AND NOT RUN.\n\n"
+            "This checklist performs no action by itself. Before any create, "
+            "destroy,\n"
+            "template mutation, worker publication, external install, or paid "
+            "probe, stop\n"
+            "and obtain a new human GO naming the exact action, offer/rate cap, "
+            "maximum\n"
+            "instances, maximum duration/cost, and teardown proof."
+        )
+        self.assertTrue(acceptance.startswith(required_opening))
+        numbered_criteria = re.findall(r"(?m)^(\d+)\. ", acceptance)
+        self.assertEqual(numbered_criteria, [str(index) for index in range(1, 17)])
+
+        for required_text in (
+            "pre-test inventory is exactly zero",
+            "never in an external browser",
+            "local GPU execution remains unused",
+            "native Run and an Agent Panel batch",
+            "close/reopen and local-backend restart/reconnect",
+            "second compatible job",
+            "real dependency delta",
+            "secret-free journal",
+            "explicit destroy",
+            "final inventory is exactly zero",
+            "billing_may_continue=false",
+            "Commit:",
+            "Release:",
+            "Manifest digest:",
+            "Profile digest:",
+            "Session:",
+            "Job:",
+            "Prompt:",
+            "Instance:",
+            "Output digest:",
+            "Timestamps:",
+            "must not be hot-patched or replaced",
+        ):
+            with self.subTest(text=required_text):
+                self.assertIn(required_text, acceptance)
+
     def test_live_audit_regression_map_has_sixteen_resolvable_findings(self):
         regression_map = _load_live_audit_regression_map()
 
