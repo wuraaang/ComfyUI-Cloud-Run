@@ -492,16 +492,47 @@ class RuntimeResolverTests(unittest.TestCase):
             }
             folder_paths.get_filename_list = lambda _category: []
             folder_paths.get_input_directory = lambda: str(input_root)
-            capture = types.SimpleNamespace(
-                executable_class_types=("UNETLoader",),
-                output={
-                    "1": {
-                        "class_type": "UNETLoader",
-                        "inputs": {"model_name": "example.safetensors"},
+            def capture_with_seed(seed):
+                return CompiledCapture.from_payload(
+                    {
+                        "workflow": {
+                            "version": 1,
+                            "nodes": [
+                                {
+                                    "id": 1,
+                                    "type": "UNETLoader",
+                                    "mode": 0,
+                                    "properties": {"cnr_id": "comfy-core"},
+                                    "widgets_values": [
+                                        "example.safetensors"
+                                    ],
+                                },
+                                {
+                                    "id": 3,
+                                    "type": "KSampler",
+                                    "mode": 0,
+                                    "properties": {"cnr_id": "comfy-core"},
+                                    "widgets_values": [seed, "randomize"],
+                                },
+                            ],
+                            "extra": {"frontendVersion": "1.47.10"},
+                        },
+                        "output": {
+                            "1": {
+                                "class_type": "UNETLoader",
+                                "inputs": {
+                                    "model_name": "example.safetensors"
+                                },
+                            },
+                            "3": {
+                                "class_type": "KSampler",
+                                "inputs": {"model": ["1", 0], "seed": seed},
+                            },
+                        },
+                        "queue_options": {},
                     }
-                },
-                workflow={"nodes": []},
-            )
+                )
+
             resolver = _RuntimeResolver(
                 repository,
                 model_source_resolver=model_source_resolver,
@@ -515,9 +546,15 @@ class RuntimeResolverTests(unittest.TestCase):
                 "cloud_run.routes.ComfyHost.from_running_host",
                 return_value=host,
             ):
-                result = asyncio.run(
+                first_result = asyncio.run(
                     resolver.resolve_preflight(
-                        capture,
+                        capture_with_seed(7),
+                        explicit_output_allowance_bytes=1024,
+                    )
+                )
+                second_result = asyncio.run(
+                    resolver.resolve_preflight(
+                        capture_with_seed(999),
                         explicit_output_allowance_bytes=1024,
                     )
                 )
@@ -525,12 +562,21 @@ class RuntimeResolverTests(unittest.TestCase):
                     profile_store.latest()
                 ).is_file()
 
-        self.assertTrue(result.rentable)
-        self.assertEqual(result.artifacts[0].source.kind, "huggingface")
-        self.assertEqual(result.profile.profile_id, "desktop-profile")
-        self.assertEqual(result.profile.revision, 1)
+        self.assertTrue(first_result.rentable)
+        self.assertTrue(second_result.rentable)
+        self.assertEqual(
+            first_result.artifacts[0].source.kind,
+            "huggingface",
+        )
+        self.assertEqual(first_result.profile.profile_id, "desktop-profile")
+        self.assertEqual(first_result.profile.revision, 1)
+        self.assertEqual(second_result.profile.revision, 1)
+        self.assertEqual(
+            first_result.profile.archive.sha256,
+            second_result.profile.archive.sha256,
+        )
         self.assertTrue(profile_archive_exists)
-        model_source_resolver.resolve.assert_awaited_once()
+        self.assertEqual(model_source_resolver.resolve.await_count, 2)
 
 
 class OffersRouteTests(unittest.TestCase):

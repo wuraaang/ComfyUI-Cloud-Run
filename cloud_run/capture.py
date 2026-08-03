@@ -18,6 +18,7 @@ from .worker_protocol import (
 
 
 _RANDOMIZED_SEED_SENTINEL = "__cloud_run_randomized_seed__"
+_CANONICAL_RANDOMIZED_BOOTSTRAP_SEED = 0
 _MAX_KSAMPLER_SEED = 2**64 - 1
 
 
@@ -30,21 +31,19 @@ def _workflow_node_id(node):
     return str(value)
 
 
-def certified_execution_baseline(capture):
-    """Hash executable material while normalizing reviewed random seeds."""
+def _certified_randomized_seed_pairs(capture):
     if not isinstance(capture, CompiledCapture):
         raise CaptureValidationError("Compiled canvas is required.")
 
-    normalized_output = json.loads(canonical_json(capture.output))
-    randomized_node_ids = []
     workflow_nodes = capture.workflow.get("nodes")
+    pairs = []
 
     for node_id, prompt_node in capture.output.items():
         if prompt_node.get("class_type") != "KSampler":
             continue
         matches = [
-            node
-            for node in workflow_nodes
+            (index, node)
+            for index, node in enumerate(workflow_nodes)
             if isinstance(node, dict)
             and type(node.get("mode", 0)) is int
             and node.get("mode", 0) == 0
@@ -56,7 +55,7 @@ def certified_execution_baseline(capture):
             )
         if not matches:
             continue
-        workflow_node = matches[0]
+        workflow_index, workflow_node = matches[0]
         properties = workflow_node.get("properties")
         widgets = workflow_node.get("widgets_values")
         if (
@@ -76,12 +75,21 @@ def certified_execution_baseline(capture):
             raise CaptureValidationError(
                 "Randomized KSampler seed is invalid."
             )
+        pairs.append((node_id, workflow_index))
+
+    return tuple(sorted(pairs, key=lambda item: item[0]))
+
+
+def certified_execution_baseline(capture):
+    """Hash executable material while normalizing reviewed random seeds."""
+    pairs = _certified_randomized_seed_pairs(capture)
+    normalized_output = json.loads(canonical_json(capture.output))
+    for node_id, _workflow_index in pairs:
         normalized_output[node_id]["inputs"]["seed"] = (
             _RANDOMIZED_SEED_SENTINEL
         )
-        randomized_node_ids.append(node_id)
 
-    randomized_node_ids = tuple(sorted(randomized_node_ids))
+    randomized_node_ids = tuple(node_id for node_id, _index in pairs)
     material = canonical_json(
         {
             "output": normalized_output,
@@ -90,6 +98,17 @@ def certified_execution_baseline(capture):
         }
     ).encode("utf-8")
     return hashlib.sha256(material).hexdigest(), randomized_node_ids
+
+
+def certified_bootstrap_workflow(capture):
+    """Return a detached seed-stable workflow for the Desktop bootstrap."""
+    pairs = _certified_randomized_seed_pairs(capture)
+    normalized_workflow = json.loads(canonical_json(capture.workflow))
+    for _node_id, workflow_index in pairs:
+        normalized_workflow["nodes"][workflow_index]["widgets_values"][0] = (
+            _CANONICAL_RANDOMIZED_BOOTSTRAP_SEED
+        )
+    return normalized_workflow
 
 
 __all__ = [
@@ -102,6 +121,7 @@ __all__ = [
     "CompiledCapture",
     "canonical_native_prompt_body",
     "canonical_json",
+    "certified_bootstrap_workflow",
     "certified_execution_baseline",
     "prompt_digest",
 ]

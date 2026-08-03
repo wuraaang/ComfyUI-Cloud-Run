@@ -21,6 +21,12 @@ def certified_execution_baseline(capture):
     return capture_contract.certified_execution_baseline(capture)
 
 
+def certified_bootstrap_workflow(capture):
+    if not hasattr(capture_contract, "certified_bootstrap_workflow"):
+        raise AssertionError("certified_bootstrap_workflow is required")
+    return capture_contract.certified_bootstrap_workflow(capture)
+
+
 def native_capture(
     *,
     frontend_version="1.47.10",
@@ -227,6 +233,98 @@ class CompiledCaptureTests(unittest.TestCase):
             certified_execution_baseline(fixed_first)[1],
             (),
         )
+
+    def test_profile_bootstrap_normalizes_certified_random_seed_without_mutation(self):
+        first_payload = native_capture()
+        first_payload["workflow"]["nodes"][0]["widgets_values"] = [
+            7,
+            "randomize",
+        ]
+        second_payload = copy.deepcopy(first_payload)
+        second_payload["output"]["1"]["inputs"]["seed"] = 999
+        second_payload["workflow"]["nodes"][0]["widgets_values"][0] = 999
+        first = CompiledCapture.from_payload(first_payload)
+        second = CompiledCapture.from_payload(second_payload)
+
+        first_bootstrap = certified_bootstrap_workflow(first)
+        second_bootstrap = certified_bootstrap_workflow(second)
+
+        self.assertEqual(first_bootstrap, second_bootstrap)
+        self.assertEqual(
+            first_bootstrap["nodes"][0]["widgets_values"][0],
+            0,
+        )
+        self.assertEqual(
+            first.workflow["nodes"][0]["widgets_values"][0],
+            7,
+        )
+        self.assertEqual(
+            second.workflow["nodes"][0]["widgets_values"][0],
+            999,
+        )
+
+        from cloud_run.desktop_profile import DesktopProfileStore
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "user" / "default").mkdir(parents=True)
+            (root / "input").mkdir()
+            store = DesktopProfileStore(
+                repository=JobRepository(root / "attempts.sqlite3"),
+                private_root=root / "profiles",
+            )
+            first_profile = store.capture(
+                user_root=root / "user",
+                profile_name="default",
+                input_root=root / "input",
+                bootstrap_workflow=first_bootstrap,
+            )
+            second_profile = store.capture(
+                user_root=root / "user",
+                profile_name="default",
+                input_root=root / "input",
+                bootstrap_workflow=second_bootstrap,
+            )
+
+        self.assertEqual(first_profile.revision, 1)
+        self.assertEqual(
+            first_profile.archive_sha256,
+            second_profile.archive_sha256,
+        )
+        self.assertEqual(
+            first_profile.bootstrap_digest,
+            second_profile.bootstrap_digest,
+        )
+
+    def test_profile_bootstrap_keeps_uncertified_seed_values_significant(self):
+        cases = (
+            {"widgets_values": [7, "fixed"]},
+            {"properties": {"cnr_id": "third-party"}},
+            {"mode": 4},
+            {"type": "KSamplerAdvanced"},
+        )
+        for changes in cases:
+            with self.subTest(changes=changes):
+                first_payload = native_capture()
+                first_payload["workflow"]["nodes"][0]["widgets_values"] = [
+                    7,
+                    "randomize",
+                ]
+                first_payload["workflow"]["nodes"][0].update(changes)
+                second_payload = copy.deepcopy(first_payload)
+                second_payload["output"]["1"]["inputs"]["seed"] = 999
+                second_payload["workflow"]["nodes"][0][
+                    "widgets_values"
+                ][0] = 999
+
+                first = certified_bootstrap_workflow(
+                    CompiledCapture.from_payload(first_payload)
+                )
+                second = certified_bootstrap_workflow(
+                    CompiledCapture.from_payload(second_payload)
+                )
+
+                self.assertNotEqual(first, second)
 
     def test_execution_baseline_changes_for_every_other_prompt_or_queue_edit(self):
         payload = native_capture()

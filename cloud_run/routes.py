@@ -9,7 +9,7 @@ import stat
 
 from .artifacts import GIB
 from .agent_bridge import AgentBridge
-from .capture import CaptureValidationError
+from .capture import CaptureValidationError, certified_bootstrap_workflow
 from .comfy_host import ComfyHost, FORBIDDEN_TREE, HostCompatibilityError
 from .dependency_repository import (
     DependencyRepository,
@@ -233,7 +233,9 @@ class _RuntimeResolver:
                 user_root=host.comfy_root / "user",
                 profile_name="default",
                 input_root=context["input_root"],
-                bootstrap_workflow=observed_capture.workflow,
+                bootstrap_workflow=certified_bootstrap_workflow(
+                    observed_capture
+                ),
             )
             return {
                 "ui_packages": profile.ui_packages,
