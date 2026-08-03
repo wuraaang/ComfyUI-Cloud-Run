@@ -381,10 +381,13 @@ git commit -m "test: restore deterministic bridge baseline"
 - Modify: `cloud_run/repository.py`
 - Modify: `cloud_run/job_repository.py`
 - Modify: `cloud_run/models.py`
+- Modify: `remote_worker/bootstrap.py`
 - Create: `tests/python/test_run_errors.py`
 - Create: `tests/python/test_orchestrator.py`
 - Modify: `tests/python/test_job_repository.py`
 - Modify: `tests/python/test_models.py`
+- Modify: `tests/python/test_repository.py`
+- Modify: `tests/python/test_worker_bootstrap.py`
 - Modify: `tests/python/test_worker_release_tools.py`
 - Modify: `scripts/build_worker_artifact.py`
 
@@ -608,7 +611,7 @@ class LocalOrchestrator:
 
 - [ ] **Step 6: Include only the pure error module in the worker artifact**
 
-Add `cloud_run/run_errors.py` to `SHARED_FILES`; do not add `orchestrator.py`, SQLite repositories, or provider code. Update exact worker member tests.
+Add `cloud_run/run_errors.py` to `SHARED_FILES` and the standalone bootstrap's exact reviewed archive allowlist; do not add `orchestrator.py`, SQLite repositories, or provider code. Update exact worker member tests.
 
 - [ ] **Step 7: Verify and commit**
 
@@ -620,6 +623,8 @@ python3 -m unittest \
   tests.python.test_orchestrator \
   tests.python.test_models \
   tests.python.test_job_repository \
+  tests.python.test_repository \
+  tests.python.test_worker_bootstrap \
   tests.python.test_worker_release_tools -v
 scripts/check.sh
 ```
@@ -628,9 +633,11 @@ Expected: all pass and the artifact member list contains `cloud_run/run_errors.p
 
 ```sh
 git add cloud_run/run_errors.py cloud_run/orchestrator.py cloud_run/repository.py \
-  cloud_run/job_repository.py cloud_run/models.py scripts/build_worker_artifact.py \
+  cloud_run/job_repository.py cloud_run/models.py remote_worker/bootstrap.py \
+  scripts/build_worker_artifact.py \
   tests/python/test_run_errors.py tests/python/test_orchestrator.py \
   tests/python/test_job_repository.py tests/python/test_models.py \
+  tests/python/test_repository.py tests/python/test_worker_bootstrap.py \
   tests/python/test_worker_release_tools.py
 git diff --cached --check
 git commit -m "feat: persist typed Cloud Vast run evidence"
