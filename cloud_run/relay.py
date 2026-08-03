@@ -58,13 +58,32 @@ _EVENT_TYPES = {
     "b_preview_with_metadata",
 }
 _ERROR_MESSAGES = {
-    "validation_failed": "Remote ComfyUI rejected the compiled prompt.",
-    "out_of_memory": "Remote execution ran out of GPU memory.",
-    "execution_failed": "Remote execution failed.",
-    "execution_interrupted": "Remote execution was interrupted.",
-    "worker_restarted": (
-        "Remote execution was interrupted by a worker restart."
+    "validation_error": ("Cloud Vast validation failed.",),
+    "dependency_error": ("A required Cloud Vast dependency is unavailable.",),
+    "transfer_error": ("Cloud Vast data transfer failed.",),
+    "quote_expired": ("The quote expired before confirmation.",),
+    "provider_error": ("The Vast provider request failed.",),
+    "provisioning_error": ("The remote environment could not become ready.",),
+    "comfy_startup_error": ("Remote ComfyUI did not become ready.",),
+    "execution_error": (
+        "Remote workflow execution failed.",
+        "Remote ComfyUI rejected the compiled prompt.",
+        "Remote execution ran out of GPU memory.",
+        "Remote workflow execution was interrupted.",
     ),
+    "synchronization_error": ("Remote job synchronization failed.",),
+    "harvest_error": ("Remote output retrieval failed.",),
+    "invalid_output": ("Remote output metadata was invalid.",),
+    "worker_restart_error": ("The worker restarted during execution.",),
+    "lifecycle_error": ("GPU lifecycle verification failed.",),
+    "internal_error": ("An unexpected Cloud Vast error occurred.",),
+}
+_LEGACY_ERROR_CODES = {
+    "validation_failed": "execution_error",
+    "out_of_memory": "execution_error",
+    "execution_failed": "execution_error",
+    "execution_interrupted": "execution_error",
+    "worker_restarted": "worker_restart_error",
 }
 _SUSPICIOUS_TEXT = re.compile(
     r"(?i)(authorization|bearer|api[_ -]?key|password|secret|token)"
@@ -397,15 +416,21 @@ def _validated_output(descriptor):
 def _sanitize_error(data):
     if not isinstance(data, dict):
         return {
-            "code": "execution_failed",
-            "message": _ERROR_MESSAGES["execution_failed"],
+            "code": "internal_error",
+            "message": _ERROR_MESSAGES["internal_error"][0],
         }
-    code = data.get("code")
+    code = _LEGACY_ERROR_CODES.get(data.get("code"), data.get("code"))
     if code not in _ERROR_MESSAGES:
-        code = "execution_failed"
+        code = "internal_error"
+    allowed_messages = _ERROR_MESSAGES[code]
+    supplied_message = data.get("message")
     result = {
         "code": code,
-        "message": _ERROR_MESSAGES[code],
+        "message": (
+            supplied_message
+            if supplied_message in allowed_messages
+            else allowed_messages[0]
+        ),
     }
     for source, destination in (
         ("node_id", "node_id"),

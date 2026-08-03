@@ -345,7 +345,7 @@ class NativeJobRecorderTests(unittest.IsolatedAsyncioTestCase):
         snapshot = recorder.snapshot("job-1", 0)
 
         self.assertEqual(snapshot.error["code"], "internal_error")
-        self.assertEqual(snapshot.error["phase"], "harvest")
+        self.assertEqual(snapshot.error["phase"], "internal")
         self.assertEqual(
             snapshot.error["correlation_id"],
             "correlation-1",

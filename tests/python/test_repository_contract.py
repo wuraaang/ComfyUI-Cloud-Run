@@ -1,4 +1,7 @@
+import ast
+import importlib
 import os
+import re
 import unittest
 from pathlib import Path
 
@@ -6,7 +9,86 @@ from pathlib import Path
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 
+def _load_live_audit_regression_map():
+    path = (
+        REPOSITORY_ROOT
+        / "tests"
+        / "python"
+        / "test_fake_desktop_bridge_integration.py"
+    )
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    assignments = [
+        node
+        for node in tree.body
+        if isinstance(node, (ast.Assign, ast.AnnAssign))
+        and (
+            any(
+                isinstance(target, ast.Name)
+                and target.id == "LIVE_AUDIT_REGRESSION_MAP"
+                for target in getattr(node, "targets", ())
+            )
+            or (
+                isinstance(getattr(node, "target", None), ast.Name)
+                and node.target.id == "LIVE_AUDIT_REGRESSION_MAP"
+            )
+        )
+    ]
+    if len(assignments) != 1:
+        raise AssertionError("live-audit regression map must be one static assignment")
+    try:
+        value = ast.literal_eval(assignments[0].value)
+    except (TypeError, ValueError, SyntaxError):
+        raise AssertionError("live-audit regression map must be static") from None
+    if not isinstance(value, dict):
+        raise AssertionError("live-audit regression map must be a dictionary")
+    return value
+
+
+def _assert_regression_test_exists(case, reference):
+    case.assertIsInstance(reference, str)
+    if reference.startswith("python:"):
+        module_name, class_name, method_name = reference.removeprefix(
+            "python:"
+        ).rsplit(".", 2)
+        module = importlib.import_module(module_name)
+        test_class = getattr(module, class_name, None)
+        method = getattr(test_class, method_name, None)
+        case.assertTrue(
+            isinstance(test_class, type)
+            and issubclass(test_class, unittest.TestCase)
+            and method_name.startswith("test_")
+            and callable(method),
+            reference + " does not resolve to a unittest method",
+        )
+        return
+    if reference.startswith("node:"):
+        relative, title = reference.removeprefix("node:").split("::", 1)
+        source = (REPOSITORY_ROOT / relative).read_text(encoding="utf-8")
+        case.assertRegex(
+            source,
+            re.compile(r"\btest\(\s*['\"]" + re.escape(title) + r"['\"]"),
+            reference + " does not resolve to a Node test",
+        )
+        return
+    case.fail(reference + " uses an unknown test reference scheme")
+
+
 class RepositoryContractTests(unittest.TestCase):
+    def test_live_audit_regression_map_has_sixteen_resolvable_findings(self):
+        regression_map = _load_live_audit_regression_map()
+
+        self.assertEqual(set(regression_map), set(range(1, 17)))
+        self.assertEqual(
+            len({item["finding"] for item in regression_map.values()}),
+            16,
+        )
+        for finding, item in regression_map.items():
+            with self.subTest(finding=finding):
+                self.assertEqual(set(item), {"finding", "tests"})
+                self.assertTrue(item["tests"])
+                for reference in item["tests"]:
+                    _assert_regression_test_exists(self, reference)
+
     def test_agents_authorizes_only_the_local_desktop_remote_bridge_slice(self):
         text = (REPOSITORY_ROOT / "AGENTS.md").read_text(encoding="utf-8")
         self.assertIn("## Current slice: local Desktop / remote GPU bridge", text)
@@ -139,6 +221,7 @@ class RepositoryContractTests(unittest.TestCase):
         )
         for required_text in (
             "[check] fake reusable session",
+            "[check] fake Desktop bridge",
             "[check] worker protocol and artifact",
             "[check] immutable worker release bundle",
             "[check] secret, origin, route, state, subprocess, and provider boundary scan",
@@ -155,6 +238,7 @@ class RepositoryContractTests(unittest.TestCase):
             "test_worker_template_api.py",
             '("remote_worker/gateway.py", "subprocess.Popen")',
             "secret_patterns",
+            "unset VAST_API_KEY CONTAINER_API_KEY",
             'Path("tests/fixtures/native-model-metadata-workflow.json")',
             'Path("tests/fixtures/cloud-run-core-output-smoke.json")',
         ):

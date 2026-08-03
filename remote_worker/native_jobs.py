@@ -601,14 +601,14 @@ def execution_error(capture, data, *, validation=False):
     message = data.get("exception_message") if isinstance(data, dict) else None
     is_oom = isinstance(message, str) and "out of memory" in message.casefold()
     if validation:
-        code = "validation_failed"
+        code = RunErrorCode.EXECUTION.value
         public_message = "Remote ComfyUI rejected the compiled prompt."
     elif is_oom:
-        code = "out_of_memory"
+        code = RunErrorCode.EXECUTION.value
         public_message = "Remote execution ran out of GPU memory."
     else:
-        code = "execution_failed"
-        public_message = "Remote execution failed."
+        code = RunErrorCode.EXECUTION.value
+        public_message = "Remote workflow execution failed."
     node_id = None
     if isinstance(data, dict):
         node_id = data.get("node_id", data.get("node"))
@@ -746,10 +746,8 @@ class NativeJobRecorder:
             if record["state"] not in {"queued", "running"}:
                 continue
             error = {
-                "code": "worker_restarted",
-                "message": (
-                    "Remote execution was interrupted by a worker restart."
-                ),
+                "code": RunErrorCode.WORKER_RESTART.value,
+                "message": "The worker restarted during execution.",
             }
             self._append_event(
                 record,
@@ -1012,12 +1010,12 @@ class NativeJobRecorder:
             }
         elif event_type == "execution_error":
             if (
-                data.get("code") == "validation_failed"
+                data.get("code") == RunErrorCode.EXECUTION.value
                 and data.get("message")
                 == "Remote ComfyUI rejected the compiled prompt."
             ):
                 error = {
-                    "code": "validation_failed",
+                    "code": RunErrorCode.EXECUTION.value,
                     "message": (
                         "Remote ComfyUI rejected the compiled prompt."
                     ),
@@ -1031,8 +1029,8 @@ class NativeJobRecorder:
             return record, dict(error), error
         elif event_type == "execution_interrupted":
             error = {
-                "code": "execution_interrupted",
-                "message": "Remote execution was interrupted.",
+                "code": RunErrorCode.EXECUTION.value,
+                "message": "Remote workflow execution was interrupted.",
                 **_workflow_context(
                     capture,
                     data.get("node_id", data.get("node")),
@@ -1228,7 +1226,7 @@ class NativeJobRecorder:
             raise _job_error()
         error = self._safe_run_error(
             code=(
-                RunErrorCode.VALIDATION
+                RunErrorCode.EXECUTION
                 if validation
                 else RunErrorCode.SYNCHRONIZATION
             ),
@@ -1459,7 +1457,7 @@ class NativeJobRecorder:
     def _background_failure(self, job_id):
         error = self._safe_run_error(
             code=RunErrorCode.INTERNAL,
-            phase=RunPhase.HARVEST,
+            phase=RunPhase.INTERNAL,
             message="Remote job recording failed.",
             retryable=True,
         )

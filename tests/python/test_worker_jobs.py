@@ -415,7 +415,7 @@ class WorkerJobTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             failed.error,
             {
-                "code": "out_of_memory",
+                "code": "execution_error",
                 "message": "Remote execution ran out of GPU memory.",
                 "node_id": "7",
                 "class_type": "SaveImage",
@@ -478,7 +478,7 @@ class WorkerJobTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             result.error,
             {
-                "code": "validation_failed",
+                "code": "execution_error",
                 "message": "Remote ComfyUI rejected the compiled prompt.",
                 "node_id": "7",
                 "class_type": "SaveImage",
@@ -531,8 +531,8 @@ class WorkerJobTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             result.error,
             {
-                "code": "worker_restarted",
-                "message": "Remote execution was interrupted by a worker restart.",
+                "code": "worker_restart_error",
+                "message": "The worker restarted during execution.",
             },
         )
         self.assertEqual(
@@ -585,13 +585,13 @@ class WorkerJobTests(unittest.IsolatedAsyncioTestCase):
                 {
                     "sequence": 159,
                     "type": "execution_error",
-                    "data": {"code": "execution_failed"},
+                    "data": {"code": "execution_error"},
                     "created_at": 159.0,
                 },
             ],
             "error": {
-                "code": "execution_failed",
-                "message": "Remote execution failed.",
+                "code": "execution_error",
+                "message": "Remote workflow execution failed.",
             },
             "updated_at": 159.0,
         }

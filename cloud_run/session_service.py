@@ -932,11 +932,9 @@ def _installed_records(manifest):
             if package.archive.artifact_id == artifact_id:
                 revision = package.revision
                 break
-        if (
-            manifest.profile is not None
-            and manifest.profile.archive.artifact_id == artifact_id
-        ):
-            revision = str(manifest.profile.revision)
+        # Profile revisions are monotonic integers, not immutable source-code
+        # revisions. Their exact revision is tracked by profile sync state while
+        # this installed set binds the archive by digest.
         records.append(
             {
                 "dependency_id": artifact_id,
@@ -948,18 +946,67 @@ def _installed_records(manifest):
     return records
 
 
-def _safe_remote_error(error):
-    if not isinstance(error, dict):
-        return "Remote execution failed."
-    message = error.get("message")
-    allowed = {
+_REMOTE_ERROR_MESSAGES = {
+    RunErrorCode.VALIDATION: ("Cloud Vast validation failed.",),
+    RunErrorCode.DEPENDENCY: (
+        "A required Cloud Vast dependency is unavailable.",
+    ),
+    RunErrorCode.TRANSFER: ("Cloud Vast data transfer failed.",),
+    RunErrorCode.QUOTE_EXPIRED: ("The quote expired before confirmation.",),
+    RunErrorCode.PROVIDER: ("The Vast provider request failed.",),
+    RunErrorCode.PROVISIONING: (
+        "The remote environment could not become ready.",
+    ),
+    RunErrorCode.COMFY_STARTUP: ("Remote ComfyUI did not become ready.",),
+    RunErrorCode.EXECUTION: (
+        "Remote workflow execution failed.",
         "Remote ComfyUI rejected the compiled prompt.",
         "Remote execution ran out of GPU memory.",
-        "Remote execution failed.",
-        "Remote execution was interrupted.",
-        "Remote execution was interrupted by a worker restart.",
-    }
-    return message if message in allowed else "Remote execution failed."
+        "Remote workflow execution was interrupted.",
+    ),
+    RunErrorCode.SYNCHRONIZATION: ("Remote job synchronization failed.",),
+    RunErrorCode.HARVEST: ("Remote output retrieval failed.",),
+    RunErrorCode.INVALID_OUTPUT: ("Remote output metadata was invalid.",),
+    RunErrorCode.WORKER_RESTART: ("The worker restarted during execution.",),
+    RunErrorCode.LIFECYCLE: ("GPU lifecycle verification failed.",),
+    RunErrorCode.INTERNAL: ("An unexpected Cloud Vast error occurred.",),
+}
+_LEGACY_REMOTE_ERROR_CODES = {
+    "validation_failed": RunErrorCode.EXECUTION,
+    "out_of_memory": RunErrorCode.EXECUTION,
+    "execution_failed": RunErrorCode.EXECUTION,
+    "execution_interrupted": RunErrorCode.EXECUTION,
+    "worker_restarted": RunErrorCode.WORKER_RESTART,
+}
+_REMOTE_ERROR_PHASES = {
+    RunErrorCode.VALIDATION: RunPhase.PREFLIGHT,
+    RunErrorCode.DEPENDENCY: RunPhase.PROVISIONING,
+    RunErrorCode.TRANSFER: RunPhase.TRANSFER,
+    RunErrorCode.QUOTE_EXPIRED: RunPhase.QUOTE,
+    RunErrorCode.PROVIDER: RunPhase.PROVIDER,
+    RunErrorCode.PROVISIONING: RunPhase.PROVISIONING,
+    RunErrorCode.COMFY_STARTUP: RunPhase.READINESS,
+    RunErrorCode.EXECUTION: RunPhase.EXECUTION,
+    RunErrorCode.SYNCHRONIZATION: RunPhase.SYNCHRONIZATION,
+    RunErrorCode.HARVEST: RunPhase.HARVEST,
+    RunErrorCode.INVALID_OUTPUT: RunPhase.HARVEST,
+    RunErrorCode.WORKER_RESTART: RunPhase.EXECUTION,
+    RunErrorCode.LIFECYCLE: RunPhase.TEARDOWN,
+    RunErrorCode.INTERNAL: RunPhase.INTERNAL,
+}
+
+
+def _safe_remote_error(error):
+    raw_code = error.get("code") if isinstance(error, dict) else None
+    code = _LEGACY_REMOTE_ERROR_CODES.get(raw_code)
+    if code is None:
+        try:
+            code = RunErrorCode(raw_code)
+        except (TypeError, ValueError):
+            code = RunErrorCode.INTERNAL
+    allowed = _REMOTE_ERROR_MESSAGES[code]
+    message = error.get("message") if isinstance(error, dict) else None
+    return code, (message if message in allowed else allowed[0])
 
 
 def _deadline_response_matches(response, request):
@@ -4219,12 +4266,35 @@ class SessionService:
                 code=RunErrorCode.SYNCHRONIZATION,
                 message="Remote job synchronization failed.",
             )
+        remote_code, remote_message = _safe_remote_error(result.error)
         job = self._transition_job(
             job,
             JobState.FAILED,
             execution_state=execution_state,
-            sanitized_error=_safe_remote_error(result.error),
-            error_code=RunErrorCode.EXECUTION,
+            sanitized_error=remote_message,
+            error_code=remote_code,
+        )
+        self._record_run_issue(
+            job,
+            phase=_REMOTE_ERROR_PHASES[remote_code],
+            code=remote_code,
+            message=remote_message,
+            retryable=bool(
+                remote_code
+                in {
+                    RunErrorCode.TRANSFER,
+                    RunErrorCode.QUOTE_EXPIRED,
+                    RunErrorCode.PROVIDER,
+                    RunErrorCode.PROVISIONING,
+                    RunErrorCode.COMFY_STARTUP,
+                    RunErrorCode.SYNCHRONIZATION,
+                    RunErrorCode.HARVEST,
+                    RunErrorCode.INVALID_OUTPUT,
+                    RunErrorCode.WORKER_RESTART,
+                    RunErrorCode.LIFECYCLE,
+                    RunErrorCode.INTERNAL,
+                }
+            ),
         )
         current_session = self._stored_session(session.session_id)
         if current_session.state in {

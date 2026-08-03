@@ -9,6 +9,13 @@ cd "$repository_root"
 python_command=${PYTHON_COMMAND:-python3}
 node_command=${NODE_COMMAND:-node}
 
+# The deterministic gate never inherits credentials that could turn an
+# accidental provider/cache request into a real external side effect.
+unset VAST_API_KEY CONTAINER_API_KEY JUPYTER_TOKEN OPEN_BUTTON_TOKEN
+unset R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID
+unset AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN HF_TOKEN
+unset HUGGING_FACE_HUB_TOKEN CIVITAI_API_KEY CIVITAI_TOKEN
+
 command -v "$python_command" >/dev/null 2>&1 || {
   echo "[check] Python command not found" >&2
   exit 1
@@ -29,6 +36,10 @@ PYTHONDONTWRITEBYTECODE=1 "$comfyui_python_runner" -m unittest discover \
 echo "[check] fake reusable session"
 PYTHONDONTWRITEBYTECODE=1 "$python_command" -m unittest \
   tests.python.test_fake_session_integration -v
+
+echo "[check] fake Desktop bridge"
+PYTHONDONTWRITEBYTECODE=1 "$python_command" -m unittest \
+  tests.python.test_fake_desktop_bridge_integration -v
 
 echo "[check] worker protocol and artifact"
 PYTHONDONTWRITEBYTECODE=1 "$python_command" -m unittest \
@@ -214,6 +225,20 @@ if provider_urls != {
     "https://console.vast.ai/api/v1",
 }:
     fail("unexpected Vast provider URL surface")
+
+provider_origin_owners = {
+    str(path)
+    for path in [
+        *sorted(Path("cloud_run").glob("*.py")),
+        *sorted(Path("remote_worker").glob("*.py")),
+    ]
+    if "console.vast.ai" in path.read_text(encoding="utf-8")
+}
+if provider_origin_owners != {
+    "cloud_run/vast.py",
+    "remote_worker/deadline.py",
+}:
+    fail("Vast provider origin escaped reviewed HTTP boundaries")
 
 provider_methods = {
     node.func.attr
@@ -539,6 +564,9 @@ for path in frontend_paths:
     source = path.read_text(encoding="utf-8")
     for forbidden_frontend_value in (
         "console.vast.ai",
+        "bearer ",
+        "signed_url",
+        "signedurl",
         "/" + "asks/",
         "/" + "instances/",
         "http" + "://",
@@ -546,8 +574,9 @@ for path in frontend_paths:
         "local" + "Storage",
         "session" + "Storage",
         ".inner" + "HTML",
+        "Run Vast",
     ):
-        if forbidden_frontend_value in source:
+        if forbidden_frontend_value.casefold() in source.casefold():
             fail("forbidden frontend provider or browser storage surface")
 
 forbidden_response_keys = {

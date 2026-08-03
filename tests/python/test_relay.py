@@ -498,8 +498,8 @@ class LocalRelayTests(unittest.TestCase):
         self.assertEqual(
             events[0].payload,
             {
-                "code": "execution_failed",
-                "message": "Remote execution failed.",
+                "code": "execution_error",
+                "message": "Remote workflow execution failed.",
                 "node_id": "7",
             },
         )

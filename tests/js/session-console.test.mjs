@@ -945,6 +945,35 @@ test("console renders remote node progress previews errors and verified outputs"
 });
 
 
+test("event fallback uses the typed safe workflow error", () => {
+  const document = new FakeDocument();
+  const view = createSessionConsole(document, fakeApi());
+  document.body.appendChild(view.root);
+  view.renderSession(sessionPayload({
+    status: "running",
+    current_job: {
+      job_id: "job-1",
+      session_id: "session-1",
+      status: "running",
+    },
+  }));
+
+  view.applyEvents({
+    job_id: "job-1",
+    last_sequence: 1,
+    events: [{
+      sequence: 1,
+      type: "execution_error",
+      data: { code: "internal_error" },
+      created_at: 1,
+    }],
+  });
+
+  assert.match(view.root.textContent, /Remote workflow execution failed\./);
+  assert.doesNotMatch(view.root.textContent, /Remote execution failed\./);
+});
+
+
 test("provisioning shows the meaningful-progress clock and ten-minute stall", () => {
   const document = new FakeDocument();
   const view = createSessionConsole(document, fakeApi());

@@ -36,6 +36,7 @@ class LoaderContractTests(unittest.TestCase):
     def test_web_only_exports_and_exact_decorator_routes(self):
         entrypoint = REPOSITORY_ROOT / "__init__.py"
         self.assertTrue(entrypoint.is_file(), "root custom-node entrypoint is missing")
+        original_sys_path = tuple(sys.path)
 
         routes = FakeRoutes()
         server_module = types.ModuleType("server")
@@ -110,6 +111,8 @@ class LoaderContractTests(unittest.TestCase):
                 sys.modules.pop("aiohttp", None)
             else:
                 sys.modules["aiohttp"] = prior_aiohttp
+
+        self.assertEqual(tuple(sys.path), original_sys_path)
 
         self.assertEqual(package.WEB_DIRECTORY, "./web")
         self.assertEqual(package.NODE_CLASS_MAPPINGS, {})

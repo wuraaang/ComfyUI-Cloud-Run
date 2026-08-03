@@ -1,19 +1,105 @@
 import unittest
 from pathlib import Path
+import tempfile
 
+from cloud_run.job_repository import JobRepository
+from cloud_run.orchestrator import LocalOrchestrator
 from cloud_run.run_errors import (
     JournalPort,
     MAX_JOURNAL_DETAILS_BYTES,
     MAX_SAFE_TEXT_BYTES,
     RunErrorCode,
+    RunFailureBoundary,
     RunJournalEntry,
     RunPhase,
     SafeRunError,
+    classify_run_error,
+    record_safe_run_error,
     sanitize_text,
 )
 
 
 class RunErrorContractTests(unittest.TestCase):
+    def test_all_run_error_code_mappings(self):
+        cases = (
+            (RunFailureBoundary.VALIDATION, RunErrorCode.VALIDATION, RunPhase.PREFLIGHT),
+            (RunFailureBoundary.DEPENDENCY, RunErrorCode.DEPENDENCY, RunPhase.PROVISIONING),
+            (RunFailureBoundary.TRANSFER, RunErrorCode.TRANSFER, RunPhase.TRANSFER),
+            (RunFailureBoundary.QUOTE, RunErrorCode.QUOTE_EXPIRED, RunPhase.QUOTE),
+            (RunFailureBoundary.PROVIDER, RunErrorCode.PROVIDER, RunPhase.PROVIDER),
+            (RunFailureBoundary.PROVISIONING, RunErrorCode.PROVISIONING, RunPhase.PROVISIONING),
+            (RunFailureBoundary.COMFY_STARTUP, RunErrorCode.COMFY_STARTUP, RunPhase.READINESS),
+            (RunFailureBoundary.EXECUTION, RunErrorCode.EXECUTION, RunPhase.EXECUTION),
+            (RunFailureBoundary.SYNCHRONIZATION, RunErrorCode.SYNCHRONIZATION, RunPhase.SYNCHRONIZATION),
+            (RunFailureBoundary.HARVEST, RunErrorCode.HARVEST, RunPhase.HARVEST),
+            (RunFailureBoundary.INVALID_OUTPUT, RunErrorCode.INVALID_OUTPUT, RunPhase.HARVEST),
+            (RunFailureBoundary.WORKER_RESTART, RunErrorCode.WORKER_RESTART, RunPhase.EXECUTION),
+            (RunFailureBoundary.LIFECYCLE, RunErrorCode.LIFECYCLE, RunPhase.TEARDOWN),
+            (RunFailureBoundary.INTERNAL, RunErrorCode.INTERNAL, RunPhase.INTERNAL),
+        )
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        repository = JobRepository(Path(temporary.name) / "attempts.sqlite3")
+        journal = LocalOrchestrator(repository)
+
+        for index, (boundary, code, phase) in enumerate(cases, start=1):
+            with self.subTest(boundary=boundary):
+                cause = RuntimeError(
+                    "token=private-value " + str(index)
+                )
+                error = classify_run_error(
+                    boundary,
+                    correlation_id="mapping-" + str(index),
+                    phase=phase,
+                    cause=cause,
+                )
+                self.assertEqual(error.code, code)
+                self.assertEqual(error.phase, phase)
+                self.assertIs(error.cause, cause)
+                self.assertEqual(
+                    set(error.public_payload()),
+                    {"code", "message", "action"},
+                )
+                self.assertNotIn("private-value", repr(error))
+                self.assertTrue(
+                    record_safe_run_error(
+                        journal,
+                        error,
+                        session_id="session-1",
+                        manifest_digest="a" * 64,
+                        job_id="job-" + str(index),
+                        created_at=float(index),
+                    )
+                )
+                self.assertFalse(
+                    record_safe_run_error(
+                        journal,
+                        error,
+                        session_id="session-1",
+                        manifest_digest="a" * 64,
+                        job_id="job-" + str(index),
+                        created_at=float(index),
+                    )
+                )
+
+        entries = repository.list_journal("session-1")
+        self.assertEqual(len(entries), 14)
+        self.assertEqual({entry.code for entry in entries}, set(RunErrorCode))
+        rendered = repr(entries)
+        self.assertNotIn("private-value", rendered)
+        self.assertNotIn("token", rendered.casefold())
+
+        unknown_cause = ValueError("password=unknown-private-value")
+        unknown = classify_run_error(
+            "unregistered-boundary",
+            correlation_id="mapping-unknown",
+            cause=unknown_cause,
+        )
+        self.assertEqual(unknown.code, RunErrorCode.INTERNAL)
+        self.assertEqual(unknown.phase, RunPhase.INTERNAL)
+        self.assertIs(unknown.cause, unknown_cause)
+        self.assertNotIn("unknown-private-value", repr(unknown))
+
     def test_codes_and_phases_are_exact(self):
         self.assertEqual(
             {item.value for item in RunErrorCode},

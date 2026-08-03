@@ -1,6 +1,7 @@
 import ast
 import asyncio
 import inspect
+import re
 import unittest
 from pathlib import Path
 
@@ -228,6 +229,109 @@ class ProviderMutationSurfaceTests(unittest.TestCase):
         self.assertEqual(function_names & approved, approved)
         self.assertNotIn("rent_instance", production_source)
         self.assertNotIn("run_command", production_source)
+
+    def test_provider_http_origins_are_confined_to_reviewed_boundaries(self):
+        production = [
+            *sorted((REPOSITORY_ROOT / "cloud_run").glob("*.py")),
+            *sorted((REPOSITORY_ROOT / "remote_worker").glob("*.py")),
+        ]
+        provider_origin_owners = {
+            path.relative_to(REPOSITORY_ROOT).as_posix()
+            for path in production
+            if "console.vast.ai" in path.read_text(encoding="utf-8")
+        }
+        self.assertEqual(
+            provider_origin_owners,
+            {"cloud_run/vast.py", "remote_worker/deadline.py"},
+        )
+
+        deadline_source = (
+            REPOSITORY_ROOT / "remote_worker" / "deadline.py"
+        ).read_text(encoding="utf-8")
+        deadline_tree = ast.parse(deadline_source)
+        provider_methods = {
+            node.func.attr
+            for node in ast.walk(deadline_tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id in {"client", "session"}
+            and node.func.attr in {"delete", "get", "patch", "post", "put"}
+        }
+        self.assertEqual(provider_methods, {"delete"})
+
+    def test_desktop_public_values_have_no_account_credential_fields(self):
+        sensitive = {
+            "api_key",
+            "authorization",
+            "bearer",
+            "container_api_key",
+            "jupyter_token",
+            "open_button_token",
+            "provider_token",
+            "signed_url",
+            "vast_api_key",
+        }
+        for relative in (
+            "cloud_run/desktop_relay.py",
+            "cloud_run/agent_bridge.py",
+        ):
+            path = REPOSITORY_ROOT / relative
+            tree = ast.parse(path.read_text(encoding="utf-8"), str(path))
+            public_keys = set()
+            for function in ast.walk(tree):
+                if not isinstance(
+                    function,
+                    (ast.FunctionDef, ast.AsyncFunctionDef),
+                ) or function.name not in {
+                    "public_payload",
+                    "compatibility",
+                    "_context_response",
+                    "status",
+                }:
+                    continue
+                public_keys.update(
+                    key.value.casefold()
+                    for node in ast.walk(function)
+                    if isinstance(node, ast.Dict)
+                    for key in node.keys
+                    if isinstance(key, ast.Constant)
+                    and isinstance(key.value, str)
+                )
+            self.assertFalse(public_keys.intersection(sensitive), relative)
+
+    def test_frontend_and_native_proxy_have_no_escape_surface(self):
+        frontend = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in sorted((REPOSITORY_ROOT / "web" / "js").glob("*.js"))
+        )
+        folded = frontend.casefold()
+        for forbidden in (
+            "console.vast.ai",
+            "bearer ",
+            "signed_url",
+            "signedurl",
+            "innerhtml",
+            "localstorage",
+            "sessionstorage",
+            "run vast",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, folded)
+        self.assertIsNone(re.search(r"https?://", frontend, flags=re.I))
+
+        from remote_worker.native_proxy import NativeRoutePolicy
+
+        policy = NativeRoutePolicy()
+        for method, path in (
+            ("GET", "/manager"),
+            ("POST", "/v2/manager/update"),
+            ("GET", "/terminal"),
+            ("GET", "/provider/instances"),
+            ("DELETE", "/instances/1"),
+        ):
+            with self.subTest(method=method, path=path):
+                self.assertIsNone(policy.classify(method, path))
 
     def test_worker_exposes_only_the_reviewed_routes_and_own_delete(self):
         self.assertEqual(

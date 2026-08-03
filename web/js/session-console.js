@@ -1296,7 +1296,7 @@ export function createSessionConsole(document, api = {}, options = {}) {
       ) {
         eventState.error = {
           code: safeText(data.code, "execution_error"),
-          message: safeText(data.message, "Remote execution failed."),
+          message: safeText(data.message, "Remote workflow execution failed."),
         };
       }
     }

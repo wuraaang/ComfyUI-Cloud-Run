@@ -9,7 +9,12 @@ import json
 import re
 import uuid
 
-from cloud_run.run_errors import RunErrorCode, RunPhase
+from cloud_run.run_errors import (
+    RunErrorCode,
+    RunFailureBoundary,
+    RunPhase,
+    classify_run_error,
+)
 from cloud_run.worker_protocol import (
     CaptureValidationError,
     CompiledCapture,
@@ -235,6 +240,21 @@ class JobManager:
             retryable=retryable,
         )
 
+    def _classified_error(self, boundary, cause):
+        try:
+            return classify_run_error(
+                boundary,
+                correlation_id=self.recorder.correlation_id(),
+                cause=cause,
+            )
+        except Exception:
+            return self._safe_error(
+                code=RunErrorCode.INTERNAL,
+                phase=RunPhase.INTERNAL,
+                message="An unexpected Cloud Vast error occurred.",
+                retryable=True,
+            )
+
     async def run(self, payload):
         request = (
             payload
@@ -324,37 +344,38 @@ class JobManager:
                 },
                 schedule_harvest=False,
             )
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as error:
             self.recorder.fail(
                 request.job_id,
-                {
-                    "code": "execution_interrupted",
-                    "message": "Remote execution was interrupted.",
-                },
+                self._classified_error(
+                    RunFailureBoundary.EXECUTION,
+                    error,
+                ),
                 execution=True,
                 interrupted=True,
             )
             raise
-        except (JobError, ComfyProcessError):
+        except ComfyProcessError as error:
             self.recorder.fail(
                 request.job_id,
-                {
-                    "code": "execution_failed",
-                    "message": "Remote execution failed.",
-                },
+                self._classified_error(
+                    RunFailureBoundary.EXECUTION,
+                    error,
+                ),
+                execution=True,
+            )
+        except JobError as error:
+            self.recorder.fail(
+                request.job_id,
+                self._classified_error(RunFailureBoundary.INTERNAL, error),
                 execution=True,
             )
         except (KeyboardInterrupt, SystemExit):
             raise
-        except Exception:
+        except Exception as error:
             self.recorder.fail(
                 request.job_id,
-                self._safe_error(
-                    code=RunErrorCode.INTERNAL,
-                    phase=RunPhase.EXECUTION,
-                    message="Remote execution failed.",
-                    retryable=False,
-                ),
+                self._classified_error(RunFailureBoundary.INTERNAL, error),
                 execution=True,
             )
         finally:
@@ -403,15 +424,13 @@ class JobManager:
                     done.result()
                 except (KeyboardInterrupt, SystemExit):
                     raise
-                except BaseException:
+                except BaseException as error:
                     try:
                         self.recorder.fail(
                             request.job_id,
-                            self._safe_error(
-                                code=RunErrorCode.INTERNAL,
-                                phase=RunPhase.EXECUTION,
-                                message="Remote execution failed.",
-                                retryable=False,
+                            self._classified_error(
+                                RunFailureBoundary.INTERNAL,
+                                error,
                             ),
                             execution=True,
                         )

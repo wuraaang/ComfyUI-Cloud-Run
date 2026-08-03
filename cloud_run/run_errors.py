@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 import json
 import math
@@ -46,6 +46,134 @@ class RunErrorCode(str, Enum):
     WORKER_RESTART = "worker_restart_error"
     LIFECYCLE = "lifecycle_error"
     INTERNAL = "internal_error"
+
+
+class RunFailureBoundary(str, Enum):
+    VALIDATION = "validation"
+    DEPENDENCY = "dependency"
+    TRANSFER = "transfer"
+    QUOTE = "quote"
+    PROVIDER = "provider"
+    PROVISIONING = "provisioning"
+    COMFY_STARTUP = "comfy_startup"
+    EXECUTION = "execution"
+    SYNCHRONIZATION = "synchronization"
+    HARVEST = "harvest"
+    INVALID_OUTPUT = "invalid_output"
+    WORKER_RESTART = "worker_restart"
+    LIFECYCLE = "lifecycle"
+    INTERNAL = "internal"
+
+
+@dataclass(frozen=True)
+class _RunErrorPolicy:
+    code: RunErrorCode
+    phases: tuple[RunPhase, ...]
+    message: str
+    action: str
+    retryable: bool
+
+
+_RUN_ERROR_POLICIES = {
+    RunFailureBoundary.VALIDATION: _RunErrorPolicy(
+        RunErrorCode.VALIDATION,
+        (RunPhase.PREFLIGHT, RunPhase.READINESS),
+        "Cloud Vast validation failed.",
+        "Review the canvas and readiness details before retrying.",
+        False,
+    ),
+    RunFailureBoundary.DEPENDENCY: _RunErrorPolicy(
+        RunErrorCode.DEPENDENCY,
+        (RunPhase.PREFLIGHT, RunPhase.PROVISIONING),
+        "A required Cloud Vast dependency is unavailable.",
+        "Resolve the reported dependency before retrying.",
+        False,
+    ),
+    RunFailureBoundary.TRANSFER: _RunErrorPolicy(
+        RunErrorCode.TRANSFER,
+        (RunPhase.TRANSFER,),
+        "Cloud Vast data transfer failed.",
+        "Retry the resumable transfer.",
+        True,
+    ),
+    RunFailureBoundary.QUOTE: _RunErrorPolicy(
+        RunErrorCode.QUOTE_EXPIRED,
+        (RunPhase.QUOTE,),
+        "The quote expired before confirmation.",
+        "Refresh the offer and confirm the new quote.",
+        True,
+    ),
+    RunFailureBoundary.PROVIDER: _RunErrorPolicy(
+        RunErrorCode.PROVIDER,
+        (RunPhase.PROVIDER,),
+        "The Vast provider request failed.",
+        "Check provider availability and inventory before retrying.",
+        True,
+    ),
+    RunFailureBoundary.PROVISIONING: _RunErrorPolicy(
+        RunErrorCode.PROVISIONING,
+        (RunPhase.PROVISIONING,),
+        "The remote environment could not become ready.",
+        "Retry provisioning or choose another verified offer.",
+        True,
+    ),
+    RunFailureBoundary.COMFY_STARTUP: _RunErrorPolicy(
+        RunErrorCode.COMFY_STARTUP,
+        (RunPhase.READINESS,),
+        "Remote ComfyUI did not become ready.",
+        "Review the bounded startup diagnostics before retrying.",
+        True,
+    ),
+    RunFailureBoundary.EXECUTION: _RunErrorPolicy(
+        RunErrorCode.EXECUTION,
+        (RunPhase.EXECUTION,),
+        "Remote workflow execution failed.",
+        "Review the node error and adjust the workflow before retrying.",
+        False,
+    ),
+    RunFailureBoundary.SYNCHRONIZATION: _RunErrorPolicy(
+        RunErrorCode.SYNCHRONIZATION,
+        (RunPhase.SYNCHRONIZATION,),
+        "Remote job synchronization failed.",
+        "Reconnect; durable synchronization will resume automatically.",
+        True,
+    ),
+    RunFailureBoundary.HARVEST: _RunErrorPolicy(
+        RunErrorCode.HARVEST,
+        (RunPhase.HARVEST,),
+        "Remote output retrieval failed.",
+        "Retry output retrieval without rerunning the workflow.",
+        True,
+    ),
+    RunFailureBoundary.INVALID_OUTPUT: _RunErrorPolicy(
+        RunErrorCode.INVALID_OUTPUT,
+        (RunPhase.HARVEST,),
+        "Remote output metadata was invalid.",
+        "Keep the GPU session available and retry after validation.",
+        True,
+    ),
+    RunFailureBoundary.WORKER_RESTART: _RunErrorPolicy(
+        RunErrorCode.WORKER_RESTART,
+        (RunPhase.EXECUTION,),
+        "The worker restarted during execution.",
+        "Reconnect and reconcile the durable job before retrying.",
+        True,
+    ),
+    RunFailureBoundary.LIFECYCLE: _RunErrorPolicy(
+        RunErrorCode.LIFECYCLE,
+        (RunPhase.TEARDOWN,),
+        "GPU lifecycle verification failed.",
+        "Check fresh provider inventory before assuming billing ended.",
+        True,
+    ),
+    RunFailureBoundary.INTERNAL: _RunErrorPolicy(
+        RunErrorCode.INTERNAL,
+        (RunPhase.INTERNAL,),
+        "An unexpected Cloud Vast error occurred.",
+        "Retry once; inspect the safe correlation ID if it persists.",
+        True,
+    ),
+}
 
 
 _AUTHORIZATION = re.compile(
@@ -223,6 +351,12 @@ class SafeRunError:
     correlation_id: str
     node_id: str | None
     retryable: bool
+    action: str = "Review the safe run details before retrying."
+    cause: BaseException | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self):
         try:
@@ -232,9 +366,12 @@ class SafeRunError:
             raise ValueError("Invalid run error classification.") from None
         if not isinstance(self.retryable, bool):
             raise ValueError("Invalid retryable flag.")
+        if self.cause is not None and not isinstance(self.cause, BaseException):
+            raise ValueError("Invalid in-memory run error cause.")
         object.__setattr__(self, "code", code)
         object.__setattr__(self, "phase", phase)
         object.__setattr__(self, "message", _safe_text(self.message, "message"))
+        object.__setattr__(self, "action", _safe_text(self.action, "action"))
         object.__setattr__(
             self,
             "correlation_id",
@@ -245,6 +382,49 @@ class SafeRunError:
             "node_id",
             _identifier(self.node_id, "node ID", optional=True),
         )
+
+    def public_payload(self):
+        return {
+            "code": self.code.value,
+            "message": self.message,
+            "action": self.action,
+        }
+
+
+def classify_run_error(
+    boundary,
+    *,
+    correlation_id,
+    phase=None,
+    node_id=None,
+    cause=None,
+):
+    """Classify one caught boundary without serializing its raw cause."""
+
+    try:
+        selected = RunFailureBoundary(boundary)
+    except (TypeError, ValueError):
+        selected = RunFailureBoundary.INTERNAL
+    policy = _RUN_ERROR_POLICIES[selected]
+    if phase is None:
+        target_phase = policy.phases[0]
+    else:
+        try:
+            target_phase = RunPhase(phase)
+        except (TypeError, ValueError):
+            raise ValueError("Invalid run error phase override.") from None
+        if target_phase not in policy.phases:
+            raise ValueError("Invalid run error phase override.")
+    return SafeRunError(
+        code=policy.code,
+        phase=target_phase,
+        message=policy.message,
+        correlation_id=correlation_id,
+        node_id=node_id,
+        retryable=policy.retryable,
+        action=policy.action,
+        cause=cause,
+    )
 
 
 @dataclass(frozen=True)
@@ -349,3 +529,60 @@ class RunJournalEntry:
 class JournalPort(Protocol):
     def record(self, entry: RunJournalEntry) -> bool:
         ...
+
+
+def record_safe_run_error(
+    journal,
+    error,
+    *,
+    session_id=None,
+    manifest_digest=None,
+    transaction_id=None,
+    job_id=None,
+    process_exit_code=None,
+    restart_count=0,
+    last_probe=None,
+    byte_cursor=0,
+    event_cursor=0,
+    output_state=None,
+    details=None,
+    created_at,
+):
+    """Persist one correlation-keyed, idempotent and secret-safe error row."""
+
+    if not isinstance(error, SafeRunError) or not callable(
+        getattr(journal, "record", None)
+    ):
+        raise TypeError("A safe run error journal is required.")
+    evidence = {
+        "action": error.action,
+        "correlation_id": error.correlation_id,
+        "retryable": error.retryable,
+    }
+    if details is not None:
+        if not isinstance(details, dict):
+            raise ValueError("Invalid safe run error details.")
+        overlap = set(evidence).intersection(details)
+        if overlap:
+            raise ValueError("Invalid safe run error details.")
+        evidence.update(details)
+    entry = RunJournalEntry(
+        entry_id="error-" + error.correlation_id,
+        session_id=session_id,
+        manifest_digest=manifest_digest,
+        transaction_id=transaction_id,
+        job_id=job_id,
+        phase=error.phase,
+        code=error.code,
+        message=error.message,
+        node_id=error.node_id,
+        process_exit_code=process_exit_code,
+        restart_count=restart_count,
+        last_probe=last_probe,
+        byte_cursor=byte_cursor,
+        event_cursor=event_cursor,
+        output_state=output_state,
+        details=evidence,
+        created_at=created_at,
+    )
+    return journal.record(entry)
