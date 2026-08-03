@@ -2,7 +2,7 @@
 
 Date: 2026-08-03 (Europe/Paris)
 
-Status: AWAITING WRITTEN REVIEW
+Status: APPROVED FOR LOCAL IMPLEMENTATION
 
 ## Problem
 
