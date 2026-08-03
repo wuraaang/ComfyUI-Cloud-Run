@@ -224,7 +224,7 @@ def _onstart(bootstrap, remote_lock_bytes, worker_commit):
             "#!/bin/sh",
             "set -eu",
             "umask 077",
-            "mkdir -m 0700 " + BOOTSTRAP_DIRECTORY,
+            "mkdir -p -m 0700 " + BOOTSTRAP_DIRECTORY,
             "printf '%s' '"
             + bootstrap_base64
             + "' | base64 -d | gzip -d > "

@@ -667,9 +667,10 @@ class WorkerArtifactTests(unittest.TestCase):
                 )
             )
 
-    def test_worker_artifact_has_only_the_two_reviewed_shared_imports(self):
+    def test_worker_artifact_has_only_the_three_reviewed_shared_imports(self):
         allowed = {
             "cloud_run.manifest",
+            "cloud_run.run_errors",
             "cloud_run.worker_protocol",
         }
         findings = set()
@@ -879,6 +880,80 @@ class BootstrapTests(unittest.TestCase):
         self.assertTrue(
             (self.destination / "remote_worker" / "gateway.py").is_file()
         )
+
+    def test_bootstrap_reuses_only_an_exact_verified_existing_install(self):
+        lock = release_lock(self.archive, self.destination)
+        first_transport = FakeTransport(self.archive)
+        first_runner = RecordingExec()
+        Bootstrap(
+            transport=first_transport,
+            exec_runner=first_runner,
+            allowed_destination=self.destination,
+        ).run(lock)
+        installed_lock = self.destination / ".cloud-run-release-lock.json"
+        self.assertEqual(
+            json.loads(installed_lock.read_text(encoding="utf-8")),
+            lock,
+        )
+        self.assertEqual(installed_lock.stat().st_mode & 0o777, 0o600)
+        before = {
+            path.relative_to(self.destination).as_posix(): path.read_bytes()
+            for path in self.destination.rglob("*")
+            if path.is_file()
+        }
+
+        class OfflineTransport:
+            def stream(self, _url):
+                raise AssertionError("an exact existing install must not download")
+
+        second_runner = RecordingExec()
+        Bootstrap(
+            transport=OfflineTransport(),
+            exec_runner=second_runner,
+            allowed_destination=self.destination,
+        ).run(lock)
+        after = {
+            path.relative_to(self.destination).as_posix(): path.read_bytes()
+            for path in self.destination.rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(after, before)
+        self.assertEqual(second_runner.argv, first_runner.argv)
+        self.assertEqual(second_runner.cwd, first_runner.cwd)
+
+        mismatched = {
+            **lock,
+            "worker_commit": "b" * 40,
+        }
+        mismatched["archive_url"] = release_asset_url(
+            mismatched["worker_commit"],
+            mismatched["worker_archive_sha256"],
+        )
+        with self.assertRaises(BootstrapError):
+            Bootstrap(
+                transport=OfflineTransport(),
+                exec_runner=RecordingExec(),
+                allowed_destination=self.destination,
+            ).run(mismatched)
+        self.assertEqual(
+            {
+                path.relative_to(self.destination).as_posix(): path.read_bytes()
+                for path in self.destination.rglob("*")
+                if path.is_file()
+            },
+            before,
+        )
+
+        installed_lock.write_text(
+            json.dumps(lock, indent=2),
+            encoding="utf-8",
+        )
+        with self.assertRaises(BootstrapError):
+            Bootstrap(
+                transport=OfflineTransport(),
+                exec_runner=RecordingExec(),
+                allowed_destination=self.destination,
+            ).run(lock)
 
     def test_bootstrap_rejects_mutable_url_wrong_hash_redirect_and_shell_fields(self):
         mutable = release_lock(

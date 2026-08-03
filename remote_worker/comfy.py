@@ -21,6 +21,7 @@ from cloud_run.manifest import (
     PINNED_COMFYUI_CORE_VERSION,
     PINNED_COMFYUI_FRONTEND_VERSION,
 )
+from .diagnostics import BoundedDiagnostics, ProcessDiagnostic
 
 PINNED_PYTHON_VERSION = "3.12"
 COMFY_BIND_HOST = "127.0.0.1"
@@ -54,6 +55,15 @@ _TERMINAL_EVENTS = {
 
 class ComfyProcessError(RuntimeError):
     """A sanitized process, readiness, or internal API failure."""
+
+    def __init__(self, message="Remote ComfyUI is unavailable.", *, diagnostic=None):
+        if diagnostic is not None and not isinstance(
+            diagnostic,
+            ProcessDiagnostic,
+        ):
+            raise ValueError("Invalid ComfyUI process diagnostic.")
+        super().__init__(message)
+        self.diagnostic = diagnostic
 
 
 class ComfyIdentityError(ComfyProcessError):
@@ -97,8 +107,11 @@ class NativeExecution:
             )
 
 
-def _comfy_error():
-    return ComfyProcessError("Remote ComfyUI is unavailable.")
+def _comfy_error(diagnostic=None):
+    return ComfyProcessError(
+        "Remote ComfyUI is unavailable.",
+        diagnostic=diagnostic,
+    )
 
 
 def _finite_clock(clock):
@@ -548,6 +561,19 @@ class ComfyProcess:
             "Invalid ComfyUI stop timeout.",
         )
         self._process = None
+        self._reader_tasks = ()
+        self._diagnostic_buffer = BoundedDiagnostics(
+            local_roots=(
+                self.comfy_root,
+                self.working_root,
+                self.output_root,
+                self.python_executable,
+            )
+        )
+        self._diagnostic_phase = "idle"
+        self._last_probe = None
+        self._last_exit_code = None
+        self._start_count = 0
         self._lock = None
         self._lock_loop = None
 
@@ -576,29 +602,99 @@ class ComfyProcess:
             and getattr(self._process, "returncode", None) is None
         )
 
+    def diagnostics(self):
+        process = self._process
+        exit_code = (
+            getattr(process, "returncode", None)
+            if process is not None
+            else self._last_exit_code
+        )
+        return self._diagnostic_buffer.snapshot(
+            phase=self._diagnostic_phase,
+            exit_code=exit_code,
+            restart_count=max(0, self._start_count - 1),
+            last_probe=self._last_probe,
+        )
+
+    async def _drain_stream(self, name, stream):
+        try:
+            while True:
+                chunk = await stream.read(4096)
+                if not chunk:
+                    return
+                self._diagnostic_buffer.feed(name, chunk)
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            raise
+        except Exception:
+            self._diagnostic_buffer.feed(
+                name,
+                "Diagnostic stream became unavailable.\n",
+            )
+
+    def _start_readers(self, process):
+        tasks = []
+        loop = asyncio.get_running_loop()
+        for name in ("stdout", "stderr"):
+            stream = getattr(process, name, None)
+            if callable(getattr(stream, "read", None)):
+                tasks.append(
+                    loop.create_task(
+                        self._drain_stream(name, stream),
+                        name="cloud-vast-comfy-" + name,
+                    )
+                )
+        self._reader_tasks = tuple(tasks)
+
+    async def _finish_readers(self):
+        tasks = self._reader_tasks
+        self._reader_tasks = ()
+        if not tasks:
+            return
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True),
+                timeout=self.stop_timeout,
+            )
+        except asyncio.TimeoutError:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
     async def _wait_ready(self):
+        self._diagnostic_phase = "readiness"
         deadline = _finite_clock(self.clock) + self.startup_timeout
         while True:
             if not self._running():
-                raise _comfy_error()
+                process = self._process
+                self._last_exit_code = getattr(process, "returncode", None)
+                self._last_probe = "ComfyUI process exited."
+                raise _comfy_error(self.diagnostics())
             try:
                 stats = await self.http.get_json("/system_stats")
                 stats = _validated_system_stats(stats)
+                self._last_probe = "System stats accepted."
+                self._diagnostic_phase = "ready"
                 await self._progress("health")
                 return stats
             except (asyncio.CancelledError, KeyboardInterrupt):
                 raise
             except ComfyIdentityError:
+                self._last_probe = "System identity rejected."
                 raise
             except ComfyProcessError:
+                self._last_probe = "System stats unavailable."
                 if _finite_clock(self.clock) >= deadline:
-                    raise _comfy_error() from None
+                    raise _comfy_error(self.diagnostics()) from None
                 await self.sleeper(1)
 
     async def start(self):
         async with self._process_lock():
             if self._running():
                 return await self._wait_ready()
+            self._diagnostic_phase = "starting"
+            self._last_probe = None
+            self._last_exit_code = None
             argv = (
                 str(self.python_executable),
                 str(self.main_path),
@@ -614,17 +710,20 @@ class ComfyProcess:
                     cwd=str(self.working_root),
                     env=_runtime_environment(),
                     stdin=asyncio.subprocess.DEVNULL,
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
                 )
+                self._start_count += 1
+                self._start_readers(self._process)
             except (asyncio.CancelledError, KeyboardInterrupt):
                 raise
             except Exception:
                 self._process = None
-                raise _comfy_error() from None
+                self._diagnostic_phase = "failed"
+                raise _comfy_error(self.diagnostics()) from None
             try:
                 return await self._wait_ready()
-            except BaseException:
+            except BaseException as error:
                 process = self._process
                 self._process = None
                 if process is not None:
@@ -632,6 +731,22 @@ class ComfyProcess:
                         await self._terminate_process(process)
                     except ComfyProcessError:
                         pass
+                    self._last_exit_code = getattr(
+                        process,
+                        "returncode",
+                        None,
+                    )
+                await self._finish_readers()
+                self._diagnostic_phase = "failed"
+                if isinstance(error, (asyncio.CancelledError, KeyboardInterrupt)):
+                    raise
+                if isinstance(error, ComfyIdentityError):
+                    raise ComfyIdentityError(
+                        "Remote ComfyUI identity does not match.",
+                        diagnostic=self.diagnostics(),
+                    ) from None
+                if isinstance(error, ComfyProcessError):
+                    raise _comfy_error(self.diagnostics()) from None
                 raise
 
     async def ensure_running(self):
@@ -662,12 +777,16 @@ class ComfyProcess:
             process = self._process
             if process is None:
                 return
+            self._diagnostic_phase = "stopping"
             try:
                 await self._terminate_process(process)
             except (asyncio.CancelledError, KeyboardInterrupt):
                 raise
             finally:
+                self._last_exit_code = getattr(process, "returncode", None)
                 self._process = None
+                await self._finish_readers()
+                self._diagnostic_phase = "stopped"
 
     async def restart(self):
         await self.stop()

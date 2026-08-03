@@ -134,7 +134,7 @@ def template_request(
             "#!/bin/sh",
             "set -eu",
             "umask 077",
-            "mkdir -m 0700 /opt/comfyui-cloud-run-bootstrap",
+            "mkdir -p -m 0700 /opt/comfyui-cloud-run-bootstrap",
             "printf '%s' '" + bootstrap + "' | base64 -d | gzip -d > /opt/comfyui-cloud-run-bootstrap/bootstrap.py",
             "chmod 0600 /opt/comfyui-cloud-run-bootstrap/bootstrap.py",
             "printf '%s' '" + lock + "' | base64 -d > /opt/comfyui-cloud-run-bootstrap/release-lock.json",

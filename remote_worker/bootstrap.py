@@ -49,6 +49,7 @@ _REVIEWED_ARCHIVE_FILES = frozenset(
         "remote_worker/bootstrap.py",
         "remote_worker/comfy.py",
         "remote_worker/deadline.py",
+        "remote_worker/diagnostics.py",
         "remote_worker/gateway.py",
         "remote_worker/install.py",
         "remote_worker/jobs.py",
@@ -61,6 +62,7 @@ _REVIEWED_ARCHIVE_FILES = frozenset(
     }
 )
 _REVIEWED_ARCHIVE_DIRECTORIES = frozenset({"cloud_run", "remote_worker"})
+_INSTALLED_LOCK_NAME = ".cloud-run-release-lock.json"
 
 
 class BootstrapError(RuntimeError):
@@ -465,7 +467,7 @@ def _safe_extract(tar_path, destination):
         raise _bootstrap_error() from None
 
 
-def _verify_layout(destination):
+def _verify_exact_layout(destination, expected_files):
     observed = set()
     try:
         for path in destination.rglob("*"):
@@ -479,7 +481,7 @@ def _verify_layout(destination):
                 continue
             if not stat.S_ISREG(metadata.st_mode):
                 raise _bootstrap_error()
-            if relative in _REVIEWED_ARCHIVE_FILES:
+            if relative in expected_files:
                 observed.add(relative)
             else:
                 raise _bootstrap_error()
@@ -487,7 +489,64 @@ def _verify_layout(destination):
         raise
     except (OSError, RuntimeError, ValueError):
         raise _bootstrap_error() from None
-    if observed != _REVIEWED_ARCHIVE_FILES:
+    if observed != expected_files:
+        raise _bootstrap_error()
+
+
+def _verify_layout(destination):
+    _verify_exact_layout(destination, _REVIEWED_ARCHIVE_FILES)
+
+
+def _canonical_lock_bytes(lock):
+    return (
+        json.dumps(
+            lock,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        + b"\n"
+    )
+
+
+def _write_installed_lock(destination, lock):
+    path = Path(destination) / _INSTALLED_LOCK_NAME
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags, 0o600)
+        try:
+            _write_all(descriptor, _canonical_lock_bytes(lock))
+            os.fchmod(descriptor, 0o600)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        directory = os.open(destination, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except OSError:
+        raise _bootstrap_error() from None
+
+
+def _verify_installed_layout(destination):
+    _verify_exact_layout(
+        destination,
+        _REVIEWED_ARCHIVE_FILES | {_INSTALLED_LOCK_NAME},
+    )
+    path = Path(destination) / _INSTALLED_LOCK_NAME
+    try:
+        metadata = os.lstat(path)
+    except OSError:
+        raise _bootstrap_error() from None
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_mode & 0o777 != 0o600
+    ):
         raise _bootstrap_error()
 
 
@@ -600,12 +659,38 @@ class Bootstrap:
             metadata = os.lstat(parent)
         except (OSError, RuntimeError):
             raise _bootstrap_error() from None
-        if (
-            not stat.S_ISDIR(metadata.st_mode)
-            or destination.exists()
-            or destination.is_symlink()
-        ):
+        if not stat.S_ISDIR(metadata.st_mode) or destination.is_symlink():
             raise _bootstrap_error()
+
+        argv = [
+            sys.executable,
+            "-m",
+            "remote_worker.gateway",
+            "--state-directory",
+            STATE_DIRECTORY,
+        ]
+        if destination.exists():
+            _verify_installed_layout(destination)
+            installed_lock_path = destination / _INSTALLED_LOCK_NAME
+            existing = _validated_lock(
+                load_release_lock(installed_lock_path),
+                destination,
+            )
+            try:
+                canonical = installed_lock_path.read_bytes()
+            except OSError:
+                raise _bootstrap_error() from None
+            if existing != lock or canonical != _canonical_lock_bytes(existing):
+                raise BootstrapError(
+                    "Installed worker release does not match its lock."
+                )
+            try:
+                self.exec_runner(argv, cwd=destination)
+            except Exception:
+                raise BootstrapError(
+                    "Reviewed Remote Worker could not be launched."
+                ) from None
+            return destination
 
         staging = None
         installed = False
@@ -624,6 +709,8 @@ class Bootstrap:
             _decompress_gzip(archive_path, tar_path)
             _safe_extract(tar_path, extracted)
             _verify_layout(extracted)
+            _write_installed_lock(extracted, lock)
+            _verify_installed_layout(extracted)
             archive_path.unlink()
             tar_path.unlink()
             os.replace(extracted, destination)
@@ -651,13 +738,6 @@ class Bootstrap:
                     pass
         if not installed:
             raise _bootstrap_error()
-        argv = [
-            sys.executable,
-            "-m",
-            "remote_worker.gateway",
-            "--state-directory",
-            STATE_DIRECTORY,
-        ]
         try:
             self.exec_runner(argv, cwd=destination)
         except Exception:

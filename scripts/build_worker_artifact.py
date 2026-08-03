@@ -24,6 +24,7 @@ ALLOWED_REMOTE_FILES = frozenset(
         "remote_worker/bootstrap.py",
         "remote_worker/comfy.py",
         "remote_worker/deadline.py",
+        "remote_worker/diagnostics.py",
         "remote_worker/gateway.py",
         "remote_worker/install.py",
         "remote_worker/jobs.py",

@@ -115,7 +115,7 @@ _ONSTART = re.compile(
     r"#!/bin/sh\n"
     r"set -eu\n"
     r"umask 077\n"
-    r"mkdir -m 0700 /opt/comfyui-cloud-run-bootstrap\n"
+    r"mkdir -p -m 0700 /opt/comfyui-cloud-run-bootstrap\n"
     r"printf '%s' '([A-Za-z0-9+/]+={0,2})' \| base64 -d \| gzip -d > "
     r"/opt/comfyui-cloud-run-bootstrap/bootstrap\.py\n"
     r"chmod 0600 /opt/comfyui-cloud-run-bootstrap/bootstrap\.py\n"

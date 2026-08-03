@@ -87,6 +87,32 @@ def base_template_audit():
 
 
 class WorkerReleaseToolTests(unittest.TestCase):
+    def test_rendered_onstart_reuses_only_exact_verified_install(self):
+        with tempfile.TemporaryDirectory() as root:
+            output = Path(root) / "render"
+            output.mkdir(mode=0o700)
+            rendered = render_worker_template(
+                REPOSITORY_ROOT,
+                output,
+                release_metadata(),
+                base_template_audit(),
+            )
+
+        self.assertIn(
+            "mkdir -p -m 0700 /opt/comfyui-cloud-run-bootstrap",
+            rendered.onstart,
+        )
+        self.assertNotIn(
+            "mkdir -m 0700 /opt/comfyui-cloud-run-bootstrap",
+            rendered.onstart,
+        )
+        self.assertIn(
+            "exec /venv/main/bin/python "
+            "/opt/comfyui-cloud-run-bootstrap/bootstrap.py "
+            "/opt/comfyui-cloud-run-bootstrap/release-lock.json",
+            rendered.onstart,
+        )
+
     def test_worker_artifact_ignores_generated_bytecode_cache(self):
         cache = REPOSITORY_ROOT / "remote_worker" / "__pycache__"
         cache_preexisted = cache.exists()
@@ -491,7 +517,7 @@ class TemplateRendererTests(unittest.TestCase):
             self.assertEqual(rendered.onstart_path.read_text(), rendered.onstart)
 
         self.assertIn("umask 077", rendered.onstart)
-        self.assertIn("mkdir -m 0700 /opt/comfyui-cloud-run-bootstrap", rendered.onstart)
+        self.assertIn("mkdir -p -m 0700 /opt/comfyui-cloud-run-bootstrap", rendered.onstart)
         self.assertIn("chmod 0600 /opt/comfyui-cloud-run-bootstrap/bootstrap.py", rendered.onstart)
         self.assertIn(
             "chmod 0600 /opt/comfyui-cloud-run-bootstrap/release-lock.json",
