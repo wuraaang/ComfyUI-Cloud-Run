@@ -193,6 +193,41 @@ class SessionRepositoryTests(unittest.TestCase):
             / "sessions.sqlite3"
         )
 
+    def _insert_legacy_terminal_quote(
+        self,
+        sessions,
+        *,
+        session_id="legacy-session",
+    ):
+        legacy = make_session(
+            key="legacy-key-" + session_id,
+            session_id=session_id,
+            now=50.0,
+        ).transition(
+            SessionState.OFFER_SELECTED,
+            now=51.0,
+        ).transition(
+            SessionState.DESTROYED,
+            now=52.0,
+        )
+        sessions.create_or_get(legacy)
+        legacy_quote_json = '{"legacy_offer_id":"42"}'
+        with closing(sqlite3.connect(self.database_path)) as connection:
+            connection.execute(
+                "UPDATE sessions SET quote_json = ? WHERE session_id = ?",
+                (legacy_quote_json, session_id),
+            )
+            connection.commit()
+        return legacy_quote_json
+
+    def _raw_quote_json(self, session_id):
+        with closing(sqlite3.connect(self.database_path)) as connection:
+            row = connection.execute(
+                "SELECT quote_json FROM sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        return row[0]
+
     def _assert_create_claim_blocked(self, blocker):
         sessions = repository.SessionRepository(self.database_path)
         target = make_confirming_session()
@@ -211,6 +246,122 @@ class SessionRepositoryTests(unittest.TestCase):
         self.assertEqual(reopened.state, SessionState.OFFER_SELECTED)
         self.assertIsNone(reopened.provider_token)
         self.assertIsNone(reopened.session_secret_hex)
+
+    def test_legacy_terminal_quote_does_not_block_paid_claim(self):
+        sessions = repository.SessionRepository(self.database_path)
+        target = make_confirming_session()
+        sessions.create_or_get(target)
+        original_quote_json = self._insert_legacy_terminal_quote(sessions)
+
+        claimed = sessions.claim_create_intent(
+            target.session_id,
+            now=110.0,
+            provider_token="a" * 64,
+            session_secret_hex="b" * 64,
+        )
+
+        self.assertEqual(claimed.state, SessionState.CREATING)
+        self.assertEqual(claimed.version, 2)
+        self.assertEqual(claimed.provider_token, "a" * 64)
+        self.assertEqual(claimed.session_secret_hex, "b" * 64)
+        self.assertEqual(
+            self._raw_quote_json("legacy-session"),
+            original_quote_json,
+        )
+
+    def test_legacy_uncertain_billing_fields_still_block_paid_claim(self):
+        cases = (
+            ("provider-token", "provider_token = ?", ("c" * 64,)),
+            ("session-secret", "session_secret_hex = ?", ("d" * 64,)),
+            ("instance", "instance_id = ?", ("instance-legacy",)),
+            (
+                "residual-inventory",
+                "residual_inventory_json = ?",
+                ('["instance-legacy"]',),
+            ),
+            (
+                "malformed-residual-inventory",
+                "residual_inventory_json = ?",
+                ("not-json",),
+            ),
+            (
+                "non-list-residual-inventory",
+                "residual_inventory_json = ?",
+                ('{"instance":"legacy"}',),
+            ),
+            ("active-state", "state = ?", (SessionState.CREATING.value,)),
+            ("unknown-state", "state = ?", ("unknown-legacy-state",)),
+            ("unknown-failure", "failure_code = ?", ("unknown_failure",)),
+            (
+                "unremediated-configuration",
+                (
+                    "failure_code = ?, remediation_verified_at = NULL, "
+                    "remediation_revision = NULL"
+                ),
+                ("configuration_rejected",),
+            ),
+            (
+                "invalid-remediation",
+                (
+                    "failure_code = ?, create_configuration_revision = ?, "
+                    "remediation_verified_at = ?, remediation_revision = ?"
+                ),
+                (
+                    "configuration_rejected",
+                    "typed-env-object-v1",
+                    53.0,
+                    "typed-env-object-v1",
+                ),
+            ),
+        )
+        original_path = self.database_path
+        try:
+            for name, assignment, values in cases:
+                with self.subTest(case=name):
+                    self.database_path = original_path.with_name(
+                        "legacy-" + name + ".sqlite3"
+                    )
+                    sessions = repository.SessionRepository(
+                        self.database_path
+                    )
+                    target = make_confirming_session()
+                    sessions.create_or_get(target)
+                    original_quote_json = self._insert_legacy_terminal_quote(
+                        sessions
+                    )
+                    with closing(
+                        sqlite3.connect(self.database_path)
+                    ) as connection:
+                        connection.execute(
+                            "UPDATE sessions SET "
+                            + assignment
+                            + " WHERE session_id = ?",
+                            (*values, "legacy-session"),
+                        )
+                        connection.commit()
+
+                    with self.assertRaises(repository.PaidRentalConflict):
+                        sessions.claim_create_intent(
+                            target.session_id,
+                            now=110.0,
+                            provider_token="a" * 64,
+                            session_secret_hex="b" * 64,
+                        )
+
+                    reopened = sessions.get(target.session_id)
+                    self.assertEqual(
+                        reopened.state,
+                        SessionState.OFFER_SELECTED,
+                    )
+                    self.assertIsNone(reopened.provider_token)
+                    self.assertIsNone(reopened.session_secret_hex)
+                    self.assertIsNone(reopened.instance_id)
+                    self.assertEqual(
+                        self._raw_quote_json("legacy-session"),
+                        original_quote_json,
+                    )
+        finally:
+            self.database_path = original_path
 
     def test_atomic_create_claim_blocks_another_unknown_session(self):
         blocker = make_confirming_session(

@@ -11,7 +11,9 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import uuid
 
+from .constants import VAST_CREATE_FAILURE_CODES
 from .models import (
     AttemptState,
     CloudAttempt,
@@ -124,6 +126,102 @@ def _canonical_json(value):
         separators=(",", ":"),
         sort_keys=True,
     )
+
+
+_ABSENT_OR_PRE_PROVIDER_STATES = frozenset(
+    {
+        SessionState.PREFLIGHT,
+        SessionState.OFFER_SELECTED,
+        SessionState.CONFIRMING,
+        SessionState.FAILED,
+        SessionState.DESTROYED,
+    }
+)
+_CONFIGURATION_REVISION = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
+)
+_REMEDIATION_FAILURE_CODES = frozenset(
+    {"configuration_rejected", "api_key_rejected"}
+)
+
+
+def _is_canonical_uuid(value):
+    if not isinstance(value, str):
+        return False
+    try:
+        return str(uuid.UUID(value)) == value
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
+def _stored_remediation_is_valid(row, state, failure_code):
+    verified = row["remediation_verified_at"]
+    revision = row["remediation_revision"]
+    if failure_code not in _REMEDIATION_FAILURE_CODES:
+        return verified is None and revision is None
+    created_at = row["created_at"]
+    if (
+        state != SessionState.FAILED
+        or isinstance(created_at, bool)
+        or not isinstance(created_at, (int, float))
+        or not math.isfinite(created_at)
+        or created_at < 0
+        or isinstance(verified, bool)
+        or not isinstance(verified, (int, float))
+        or not math.isfinite(verified)
+        or verified < created_at
+    ):
+        return False
+    if failure_code == "api_key_rejected":
+        original = row["create_settings_revision"]
+        return bool(
+            _is_canonical_uuid(original)
+            and _is_canonical_uuid(revision)
+            and revision != original
+        )
+    original = row["create_configuration_revision"]
+    return bool(
+        isinstance(original, str)
+        and _CONFIGURATION_REVISION.fullmatch(original) is not None
+        and isinstance(revision, str)
+        and _CONFIGURATION_REVISION.fullmatch(revision) is not None
+        and revision != original
+    )
+
+
+def _stored_session_blocks_paid_claim(row):
+    """Fail closed using only durable fields relevant to provider billing."""
+    try:
+        state = SessionState(row["state"])
+        residual_inventory = json.loads(row["residual_inventory_json"])
+        instance_id = row["instance_id"]
+        provider_token = row["provider_token"]
+        session_secret_hex = row["session_secret_hex"]
+        failure_code = row["failure_code"]
+    except (IndexError, KeyError, TypeError, ValueError):
+        return True
+    if not isinstance(residual_inventory, list):
+        return True
+    if (
+        instance_id is not None
+        or provider_token is not None
+        or session_secret_hex is not None
+        or residual_inventory
+        or state not in _ABSENT_OR_PRE_PROVIDER_STATES
+        or (
+            failure_code is not None
+            and failure_code not in VAST_CREATE_FAILURE_CODES
+        )
+    ):
+        return True
+    try:
+        return not _stored_remediation_is_valid(
+            row,
+            state,
+            failure_code,
+        )
+    except (IndexError, KeyError, TypeError, ValueError):
+        return True
 
 
 def _randomized_seed_node_ids(value):
@@ -1586,14 +1684,8 @@ class SessionRepository:
                 (identifier,),
             ).fetchall()
             conflict = any(
-                other.rental_outcome in {"unknown", "active"}
-                or other.instance_id is not None
-                or bool(other.residual_inventory)
-                or other.blocks_new_rental
-                for other in (
-                    self._row_to_session(other_row)
-                    for other_row in other_rows
-                )
+                _stored_session_blocks_paid_claim(other_row)
+                for other_row in other_rows
             )
             if conflict:
                 offered = target.transition(

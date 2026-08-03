@@ -4,6 +4,7 @@ import json
 import tempfile
 import types
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from cloud_run.models import AttemptState, CloudSession, SessionState
@@ -609,6 +610,124 @@ class CloudRunServiceTests(unittest.TestCase):
         self.assertIsNone(reopened.provider_token)
         self.assertIsNone(reopened.session_secret_hex)
         self.assertEqual(provider.create_calls, [])
+
+    def test_pre_provider_claim_failure_returns_offer_for_review(self):
+        provider = FakeProvider(
+            lookups=[offer(price=0.50), offer(price=0.50)]
+        )
+        service = self.service(
+            provider,
+            session_service=FakePreflightService(),
+        )
+        quoted = asyncio.run(
+            service.preview_session(
+                preflight_id="preflight-1",
+                offer_id="42",
+                idempotency_key="pre-provider-claim-failure",
+                deadline={
+                    "mode": "finite",
+                    "duration_seconds": 7_200,
+                },
+                max_instance_creates=1,
+            )
+        )
+
+        with mock.patch.object(
+            self.session_repository,
+            "claim_create_intent",
+            side_effect=ValueError("synthetic pre-provider failure"),
+        ):
+            with self.assertRaisesRegex(
+                ValueError,
+                "synthetic pre-provider failure",
+            ):
+                asyncio.run(
+                    service.confirm_session(
+                        quoted.session_id,
+                        idempotency_key="pre-provider-claim-failure",
+                    )
+                )
+
+        reopened = self.session_repository.get(quoted.session_id)
+        self.assertEqual(reopened.state, SessionState.OFFER_SELECTED)
+        self.assertIsNone(reopened.provider_token)
+        self.assertIsNone(reopened.session_secret_hex)
+        self.assertIsNone(reopened.instance_id)
+        self.assertEqual(provider.create_calls, [])
+        self.assertEqual(provider.inventory_calls, [])
+
+    def test_refresh_recovers_only_quiet_tokenless_confirmation(self):
+        provider = FakeProvider(
+            lookups=[offer(price=0.50), offer(price=0.50)]
+        )
+        preflights = FakePreflightService()
+        quoting_service = self.service(
+            provider,
+            now=100.0,
+            session_service=preflights,
+        )
+        quiet = asyncio.run(
+            quoting_service.preview_session(
+                preflight_id="preflight-1",
+                offer_id="42",
+                idempotency_key="quiet-confirmation",
+                deadline={
+                    "mode": "finite",
+                    "duration_seconds": 7_200,
+                },
+                max_instance_creates=1,
+            )
+        )
+        fresh = asyncio.run(
+            quoting_service.preview_session(
+                preflight_id="preflight-1",
+                offer_id="42",
+                idempotency_key="fresh-confirmation",
+                deadline={
+                    "mode": "finite",
+                    "duration_seconds": 7_200,
+                },
+                max_instance_creates=1,
+            )
+        )
+        self.session_repository.save(
+            quiet.transition(SessionState.CONFIRMING, now=102.0)
+        )
+        self.session_repository.save(
+            fresh.transition(SessionState.CONFIRMING, now=105.0)
+        )
+        provider_calls_before_refresh = (
+            len(provider.lookup_calls),
+            len(provider.create_calls),
+            len(provider.inventory_calls),
+        )
+        refresh_service = self.service(
+            provider,
+            now=108.0,
+            session_service=preflights,
+        )
+
+        recovered = asyncio.run(
+            refresh_service.refresh_session(quiet.session_id)
+        )
+        unchanged = asyncio.run(
+            refresh_service.refresh_session(fresh.session_id)
+        )
+
+        self.assertEqual(recovered.state, SessionState.OFFER_SELECTED)
+        self.assertFalse(recovered.public_payload()["billing_may_continue"])
+        self.assertIsNone(recovered.provider_token)
+        self.assertIsNone(recovered.session_secret_hex)
+        self.assertIsNone(recovered.instance_id)
+        self.assertEqual(unchanged.state, SessionState.CONFIRMING)
+        self.assertEqual(
+            (
+                len(provider.lookup_calls),
+                len(provider.create_calls),
+                len(provider.inventory_calls),
+            ),
+            provider_calls_before_refresh,
+        )
 
     def test_preflight_search_and_reload_never_lift_remediation_block(self):
         provider = FakeProvider(

@@ -41,6 +41,10 @@ from . import vast
 
 
 DEFAULT_QUOTE_TTL_SECONDS = 120
+_CONFIRMING_RECOVERY_GRACE_SECONDS = 5.0
+_PRE_PROVIDER_CONFIRMATION_ERROR = (
+    "Paid confirmation stopped before Vast create; review the offer again."
+)
 
 
 def _strict_json_object(pairs):
@@ -474,6 +478,28 @@ class CloudRunService:
 
     async def refresh_session(self, session_id):
         session = self.get_session(session_id)
+        now = float(self.clock())
+        if (
+            math.isfinite(now)
+            and math.isfinite(session.updated_at)
+            and session.state == SessionState.CONFIRMING
+            and session.provider_token is None
+            and session.session_secret_hex is None
+            and session.instance_id is None
+            and not session.residual_inventory
+            and now - session.updated_at
+            >= _CONFIRMING_RECOVERY_GRACE_SECONDS
+        ):
+            try:
+                session = self._session_repository().transition_if_state(
+                    session.session_id,
+                    SessionState.CONFIRMING,
+                    SessionState.OFFER_SELECTED,
+                    now=now,
+                    sanitized_error=_PRE_PROVIDER_CONFIRMATION_ERROR,
+                )
+            except ConcurrentSessionUpdate:
+                session = self.get_session(session.session_id)
         enforce = getattr(
             self.lifecycle,
             "enforce_session_deadline",
@@ -484,7 +510,7 @@ class CloudRunService:
             and session.deadline_mode == "finite"
             and isinstance(session.deadline_at, (int, float))
             and not isinstance(session.deadline_at, bool)
-            and float(self.clock()) >= session.deadline_at
+            and now >= session.deadline_at
             and session.state != SessionState.DESTROYED
         ):
             session = await enforce(session.session_id)
@@ -1110,6 +1136,18 @@ class CloudRunService:
             )
         except ConcurrentSessionUpdate:
             return self.get_session(session.session_id)
+        except Exception:
+            try:
+                repository.transition_if_state(
+                    session.session_id,
+                    SessionState.CONFIRMING,
+                    SessionState.OFFER_SELECTED,
+                    now=float(self.clock()),
+                    sanitized_error=_PRE_PROVIDER_CONFIRMATION_ERROR,
+                )
+            except ConcurrentSessionUpdate:
+                pass
+            raise
         try:
             instance_id = await self.provider.create_instance(
                 settings["api_key"],
