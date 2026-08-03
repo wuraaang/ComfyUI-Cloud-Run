@@ -7,24 +7,18 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 
 class RepositoryContractTests(unittest.TestCase):
-    def test_agents_authorizes_only_the_workflow_derived_session_slice(self):
+    def test_agents_authorizes_only_the_local_desktop_remote_bridge_slice(self):
         text = (REPOSITORY_ROOT / "AGENTS.md").read_text(encoding="utf-8")
-        self.assertIn(
-            "## Current slice: workflow-derived Vast GPU sessions",
+        self.assertIn("## Current slice: local Desktop / remote GPU bridge", text)
+        self.assertIn("official Remote Connection named `ComfyUI Vast`", text)
+        self.assertIn("There is no `Run Vast` button", text)
+        self.assertIn("Agent Panel orchestrator remains on the Mac", text)
+        self.assertIn("atomic worker snapshots", text)
+        self.assertIn("No real Vast mutation without a fresh human GO", text)
+        self.assertNotIn(
+            "capture the exact prompt compiled by the pinned frontend without posting it",
             text,
         )
-        self.assertIn(
-            "capture the exact prompt compiled by the pinned frontend",
-            text,
-        )
-        self.assertIn(
-            "resolve every dependency before the first paid mutation",
-            text,
-        )
-        self.assertIn("one sequential job at a time", text)
-        self.assertIn("no Vast volume", text)
-        self.assertIn("Destroy GPU — stop all Vast billing", text)
-        self.assertNotIn("No workflow transfer,", text)
 
     def test_required_package_and_gate_files_exist(self):
         for relative_path in (
