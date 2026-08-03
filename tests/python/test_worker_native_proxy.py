@@ -690,6 +690,49 @@ class NativeWorkerAuthenticationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.calls, ["/prompt"])
         self.assertEqual(self.calls, ["/prompt"])
 
+    async def test_valid_hmac_system_stats_body_is_rejected_before_native_transport(
+        self,
+    ):
+        from cloud_run.worker_protocol import native_request_material
+        from remote_worker.native_proxy import NativeComfyProxy
+        from remote_worker.server import WorkerApplication
+
+        transport = RecordingTransport()
+        worker = WorkerApplication(
+            state_path=self.root / "system-stats" / "worker-state.json",
+            clock=lambda: 1000,
+            native_proxy=NativeComfyProxy(
+                recorder=RecordingObserver(),
+                transport=transport,
+            ),
+        )
+        worker.state.claim(
+            session_id="session-1",
+            session_secret_hex="a" * 64,
+        )
+        self.addAsyncCleanup(worker.close)
+        body = b'{"must_not_reach_comfy":true}'
+        envelope = sign_request(
+            SESSION_SECRET,
+            "GET",
+            "/system_stats",
+            native_request_material(body, {}),
+            timestamp=1000,
+            nonce="system-stats-body",
+        )
+
+        response = await worker.handle_native(
+            FakeRequest(
+                "GET",
+                "/system_stats",
+                body=body,
+                envelope=envelope,
+            )
+        )
+
+        self.assertEqual(response.status, 400)
+        self.assertEqual(transport.calls, [])
+
 
 if __name__ == "__main__":
     unittest.main()

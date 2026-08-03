@@ -461,6 +461,8 @@ class NativeComfyProxy:
             identity = _identity(request)
         except NativeProxyValidationError:
             return self._error(400)
+        if route.path_qs == "/system_stats" and body:
+            return self._error(400)
         if route.kind != "prompt" and identity:
             return self._error(400)
         if route.kind == "prompt":
