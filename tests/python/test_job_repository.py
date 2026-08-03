@@ -1,4 +1,5 @@
 from contextlib import closing
+import hashlib
 import json
 import os
 import sqlite3
@@ -30,6 +31,9 @@ def cloud_job(
     execution_state=ExecutionState.PENDING,
     harvest_state=HarvestState.PENDING,
     error_code=None,
+    queue_position=0,
+    native_request_digest=None,
+    native_body_json=None,
 ):
     return CloudJob(
         job_id=job_id,
@@ -51,10 +55,73 @@ def cloud_job(
         execution_state=execution_state,
         harvest_state=harvest_state,
         error_code=error_code,
+        queue_position=queue_position,
+        native_request_digest=native_request_digest,
+        native_body_json=native_body_json,
     )
 
 
 class JobRepositoryTests(unittest.TestCase):
+    def test_native_queue_positions_and_request_material_are_durable_and_idempotent(self):
+        jobs = JobRepository(self.path)
+        body = json.dumps(
+            {
+                "client_id": "desktop-client-1",
+                "extra_data": {
+                    "extra_pnginfo": {
+                        "workflow": {
+                            "extra": {"frontendVersion": "1.47.10"},
+                            "nodes": [],
+                        }
+                    }
+                },
+                "prompt": {
+                    "1": {"class_type": "SaveImage", "inputs": {}}
+                },
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        first, first_created = jobs.create_job(
+            cloud_job(
+                native_request_digest=hashlib.sha256(
+                    body.encode("utf-8")
+                ).hexdigest(),
+                native_body_json=body,
+            )
+        )
+        second, second_created = jobs.create_job(
+            cloud_job(
+                job_id="job-0",
+                idempotency_key="job-key-2",
+                native_request_digest=hashlib.sha256(
+                    body.encode("utf-8")
+                ).hexdigest(),
+                native_body_json=body,
+            )
+        )
+        duplicate, duplicate_created = jobs.create_job(
+            cloud_job(
+                job_id="job-retry",
+                idempotency_key="job-key-1",
+                native_request_digest=hashlib.sha256(
+                    body.encode("utf-8")
+                ).hexdigest(),
+                native_body_json=body,
+            )
+        )
+
+        self.assertTrue(first_created)
+        self.assertTrue(second_created)
+        self.assertFalse(duplicate_created)
+        self.assertEqual(first.queue_position, 1)
+        self.assertEqual(second.queue_position, 2)
+        self.assertEqual(duplicate.job_id, first.job_id)
+        self.assertEqual(duplicate.queue_position, 1)
+        reopened = JobRepository(self.path)
+        self.assertEqual(reopened.get_job("job-1"), first)
+        self.assertEqual(reopened.get_job("job-0"), second)
+
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary_directory.cleanup)
@@ -325,7 +392,7 @@ class JobRepositoryTests(unittest.TestCase):
         for forbidden in ("bearer", "secret", "token", "worker_url"):
             self.assertNotIn(forbidden, rendered.casefold())
 
-    def test_legacy_schema_is_migrated_idempotently_to_profile_sync_v10(self):
+    def test_legacy_schema_is_migrated_idempotently_to_native_queue_v11(self):
         self.path.parent.mkdir(parents=True)
         with closing(sqlite3.connect(self.path)) as connection:
             connection.execute(
@@ -446,7 +513,10 @@ class JobRepositoryTests(unittest.TestCase):
             set(),
         )
         self.assertIsNotNone(journal_exists)
-        self.assertEqual(schema_version, "10")
+        self.assertEqual(schema_version, "11")
+        self.assertIn("queue_position", job_columns)
+        self.assertIn("native_request_digest", job_columns)
+        self.assertIn("native_body_json", job_columns)
 
     def test_execution_success_survives_an_independent_harvest_failure(self):
         jobs = JobRepository(self.path)

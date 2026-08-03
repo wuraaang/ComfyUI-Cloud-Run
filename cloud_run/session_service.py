@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import inspect
 import json
@@ -19,6 +19,7 @@ from .artifacts import ArtifactPathError, hash_file
 from .capture import (
     CaptureValidationError,
     CompiledCapture,
+    canonical_native_prompt_body,
     certified_execution_baseline,
 )
 from .manifest import (
@@ -53,7 +54,12 @@ from .run_errors import (
     RunJournalEntry,
     RunPhase,
 )
-from .worker_client import WorkerBoundaryAuthenticationError
+from .worker_client import (
+    MAX_WORKER_NATIVE_RESPONSE_BYTES,
+    WorkerBoundaryAuthenticationError,
+    WorkerRequest,
+    WorkerTransportResponse,
+)
 from .worker_release import WorkerRelease
 
 
@@ -155,6 +161,44 @@ class DeadlineSynchronizationError(SessionServiceError):
 
 class DestroyConfirmationError(SessionServiceError):
     pass
+
+
+@dataclass(frozen=True, repr=False)
+class NativePromptForward:
+    job_id: str
+    request_id: str
+    manifest_digest: str
+    body: bytes = field(repr=False)
+    response_callback: object = field(repr=False, compare=False)
+
+    def __post_init__(self):
+        _strict_identifier(self.job_id, "native job ID")
+        _strict_identifier(self.request_id, "native request ID")
+        if (
+            not isinstance(self.manifest_digest, str)
+            or _HEX_64.fullmatch(self.manifest_digest) is None
+            or not isinstance(self.body, bytes)
+            or not self.body
+            or not callable(self.response_callback)
+        ):
+            raise SessionServiceError("Invalid native prompt forward.")
+
+    def server_identity(self):
+        return {
+            "job_id": self.job_id,
+            "request_id": self.request_id,
+            "manifest_digest": self.manifest_digest,
+        }
+
+    async def bind_response(self, status, body):
+        result = self.response_callback(
+            self.job_id,
+            status=status,
+            body=body,
+        )
+        if inspect.isawaitable(result):
+            result = await result
+        return result
 
 
 @dataclass(frozen=True, repr=False)
@@ -1106,6 +1150,16 @@ class SessionService:
             orchestrator=self.orchestrator,
             clock=self.clock,
         )
+        self._native_prompt_locks = {}
+
+    def _native_prompt_lock(self, session_id):
+        loop = asyncio.get_running_loop()
+        key = (loop, session_id)
+        lock = self._native_prompt_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._native_prompt_locks[key] = lock
+        return lock
 
     async def preflight(
         self,
@@ -2143,7 +2197,16 @@ class SessionService:
             raise SessionExecutionError("Local relay is unavailable.")
         return relay
 
-    def _new_job(self, session, capture, manifest_digest, key):
+    def _new_job(
+        self,
+        session,
+        capture,
+        manifest_digest,
+        key,
+        *,
+        native_request_digest=None,
+        native_body_json=None,
+    ):
         now = self._now()
         return CloudJob(
             job_id=_strict_identifier(self.id_factory(), "job ID"),
@@ -2161,7 +2224,374 @@ class SessionService:
             created_at=now,
             updated_at=now,
             version=1,
+            native_request_digest=native_request_digest,
+            native_body_json=native_body_json,
         )
+
+    def _native_forward(self, job):
+        if (
+            job.native_request_digest is None
+            or job.native_body_json is None
+        ):
+            raise SessionExecutionError(
+                "Native prompt identity is unavailable."
+            )
+        return NativePromptForward(
+            job_id=job.job_id,
+            request_id=job.idempotency_key,
+            manifest_digest=job.manifest_digest,
+            body=job.native_body_json.encode("utf-8"),
+            response_callback=self.bind_native_prompt_response,
+        )
+
+    def _fail_native_dependency(
+        self,
+        job,
+        message="Native prompt dependency validation failed.",
+    ):
+        failed = self._transition_job(
+            job,
+            JobState.FAILED,
+            sanitized_error=message,
+            error_code=RunErrorCode.DEPENDENCY,
+        )
+        self._record_run_issue(
+            failed,
+            phase=RunPhase.PREFLIGHT,
+            code=RunErrorCode.DEPENDENCY,
+            message=message,
+            retryable=False,
+        )
+        return failed
+
+    async def bind_native_prompt_response(self, job_id, *, status, body):
+        job = self.job_repository.get_job(
+            _strict_identifier(job_id, "native job ID")
+        )
+        if job is None or job.native_request_digest is None:
+            raise SessionExecutionError(
+                "Native prompt identity is unavailable."
+            )
+        if (
+            isinstance(status, bool)
+            or not isinstance(status, int)
+            or status != 200
+            or not isinstance(body, bytes)
+            or not 0 < len(body) <= 2 * 1024 * 1024
+        ):
+            raise SessionExecutionError(
+                "Native prompt response is unavailable."
+            )
+        try:
+            response = json.loads(body.decode("utf-8"))
+            prompt_id = response.get("prompt_id")
+            if (
+                not isinstance(response, dict)
+                or set(response) != {"prompt_id", "number", "node_errors"}
+                or str(uuid.UUID(prompt_id)) != prompt_id
+                or isinstance(response["number"], bool)
+                or not isinstance(response["number"], (int, float))
+                or not math.isfinite(response["number"])
+                or not isinstance(response["node_errors"], dict)
+            ):
+                raise ValueError("invalid response")
+        except (AttributeError, KeyError, TypeError, UnicodeError, ValueError):
+            raise SessionExecutionError(
+                "Native prompt response is unavailable."
+            ) from None
+        if job.remote_prompt_id is not None:
+            if job.remote_prompt_id != prompt_id:
+                raise SessionExecutionError(
+                    "Native prompt response identity changed."
+                )
+            return job
+        if job.state != JobState.QUEUED:
+            raise SessionExecutionError(
+                "Native prompt response arrived out of order."
+            )
+        return self._transition_job(
+            job,
+            JobState.RUNNING,
+            remote_prompt_id=prompt_id,
+            execution_state=ExecutionState.QUEUED,
+            sanitized_error=None,
+            error_code=None,
+        )
+
+    async def _submit_native_worker_request(self, worker, job):
+        if job.native_body_json is None:
+            raise SessionExecutionError(
+                "Native prompt identity is unavailable."
+            )
+        native_envelope = getattr(worker, "native_envelope", None)
+        transport = getattr(worker, "transport", None)
+        request_method = getattr(transport, "request", None)
+        if not callable(native_envelope) or not callable(request_method):
+            raise SessionExecutionError(
+                "Native prompt recovery is unavailable."
+            )
+        body = job.native_body_json.encode("utf-8")
+        try:
+            request = native_envelope(
+                "POST",
+                "/prompt",
+                body,
+                identity={
+                    "job_id": job.job_id,
+                    "request_id": job.idempotency_key,
+                    "manifest_digest": job.manifest_digest,
+                },
+                headers={"Content-Type": "application/json"},
+            )
+            if not isinstance(request, WorkerRequest):
+                raise SessionExecutionError(
+                    "Native prompt recovery is unavailable."
+                )
+            response = await request_method(
+                request,
+                max_bytes=MAX_WORKER_NATIVE_RESPONSE_BYTES,
+            )
+            if not isinstance(response, WorkerTransportResponse):
+                raise SessionExecutionError(
+                    "Native prompt recovery is unavailable."
+                )
+            return await self.bind_native_prompt_response(
+                job.job_id,
+                status=response.status,
+                body=response.body,
+            )
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            raise
+        except SessionServiceError:
+            raise
+        except Exception:
+            raise SessionExecutionError(
+                "Native prompt recovery is unavailable."
+            ) from None
+
+    async def prepare_native_prompt(
+        self,
+        session_id,
+        *,
+        request_id,
+        body,
+    ):
+        identifier = _strict_identifier(session_id, "session ID")
+        key = _strict_identifier(request_id, "native request identity")
+        try:
+            canonical_body = canonical_native_prompt_body(body)
+            capture = CompiledCapture.from_native_prompt(canonical_body)
+        except CaptureValidationError:
+            raise SessionServiceError("Invalid native prompt.") from None
+        request_digest = hashlib.sha256(canonical_body).hexdigest()
+        native_body_json = canonical_body.decode("utf-8")
+
+        async with self._native_prompt_lock(identifier):
+            session = self._stored_session(identifier)
+            existing = self.job_repository.get_job_by_idempotency_key(
+                identifier,
+                key,
+            )
+            job = existing
+            if existing is not None:
+                if (
+                    existing.native_request_digest != request_digest
+                    or existing.native_body_json != native_body_json
+                ):
+                    raise SessionServiceError(
+                        "Native prompt identity was already used."
+                    )
+                if existing.state == JobState.FAILED:
+                    raise IncompatibleSession(
+                        existing.sanitized_error
+                        or "Native prompt dependency validation failed."
+                    )
+                if existing.state in {
+                    JobState.QUEUED,
+                    JobState.RUNNING,
+                    JobState.HARVESTING,
+                    JobState.SUCCEEDED,
+                }:
+                    return self._native_forward(existing)
+                if (
+                    existing.state == JobState.RESOLVING
+                    and session.state
+                    in {SessionState.PROVISIONING, SessionState.VALIDATING}
+                ):
+                    await self.resume_session(identifier)
+                    resumed = self.job_repository.get_job(existing.job_id)
+                    if resumed is None:
+                        raise SessionExecutionError(
+                            "Native prompt identity is unavailable."
+                        )
+                    return self._native_forward(resumed)
+
+            if existing is None:
+                active = [
+                    item
+                    for item in self.job_repository.list_jobs(identifier)
+                    if item.state
+                    in {
+                        JobState.CAPTURED,
+                        JobState.RESOLVING,
+                        JobState.QUEUED,
+                        JobState.RUNNING,
+                        JobState.HARVESTING,
+                    }
+                ]
+                if session.state == SessionState.READY:
+                    pass
+                elif session.state in {
+                    SessionState.RUNNING,
+                    SessionState.HARVESTING,
+                } and active:
+                    pass
+                else:
+                    raise SessionBusy("Cloud Run session is busy.")
+            installed_digest = session.installed_manifest_digest
+            if (
+                not isinstance(installed_digest, str)
+                or _HEX_64.fullmatch(installed_digest) is None
+            ):
+                raise SessionExecutionError(
+                    "The ComfyUI Vast environment is not validated."
+                )
+
+            self.job_repository.save_capture(
+                capture,
+                created_at=self._now(),
+            )
+            if job is None:
+                candidate = self._new_job(
+                    session,
+                    capture,
+                    installed_digest,
+                    key,
+                    native_request_digest=request_digest,
+                    native_body_json=native_body_json,
+                )
+                job, created = self.job_repository.create_job(candidate)
+                if not created:
+                    if (
+                        job.native_request_digest != request_digest
+                        or job.native_body_json != native_body_json
+                    ):
+                        raise SessionServiceError(
+                            "Native prompt identity was already used."
+                        )
+                    return self._native_forward(job)
+
+            try:
+                installed, desired = await self._fresh_manifest(
+                    session,
+                    capture,
+                )
+                delta = ManifestDelta.between(installed, desired)
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                raise
+            except Exception:
+                self._fail_native_dependency(job)
+                raise IncompatibleSession(
+                    "Native prompt dependency validation failed."
+                ) from None
+            if not delta.compatible:
+                message = (
+                    "The native canvas requires a new Cloud Vast session."
+                )
+                self._fail_native_dependency(job, message)
+                raise IncompatibleSession(message)
+
+            if desired.digest != job.manifest_digest:
+                job = self._transition_job(
+                    job,
+                    job.state,
+                    manifest_digest=desired.digest,
+                )
+            job = self._transition_job(job, JobState.RESOLVING)
+            session = await self._wait_for_native_turn(job)
+            current = self.job_repository.get_job(job.job_id)
+            if current is not None and current.state in {
+                JobState.RUNNING,
+                JobState.HARVESTING,
+            }:
+                return self._native_forward(current)
+            worker = self._worker(session)
+            if desired.digest != installed.digest:
+                try:
+                    session = self._sessions().transition_if_state(
+                        session.session_id,
+                        SessionState.READY,
+                        SessionState.PROVISIONING,
+                        now=self._now(),
+                    )
+                    await self._apply_manifest(
+                        worker,
+                        session,
+                        desired,
+                        transfer_job_id=job.job_id,
+                        capture=capture,
+                    )
+                    self._mark_profile_applied(session, desired.profile)
+                    session = self._sessions().transition(
+                        session.session_id,
+                        SessionState.VALIDATING,
+                        now=self._now(),
+                    )
+                    self.job_repository.replace_installed_set(
+                        session.session_id,
+                        _installed_records(desired),
+                    )
+                    session = self._sessions().transition(
+                        session.session_id,
+                        SessionState.READY,
+                        now=self._now(),
+                        manifest_digest=desired.digest,
+                        installed_manifest_digest=desired.digest,
+                        sanitized_error=None,
+                    )
+                except (asyncio.CancelledError, KeyboardInterrupt):
+                    raise
+                except Exception:
+                    failed = self._transition_job(
+                        job,
+                        JobState.FAILED,
+                        sanitized_error="Native prompt provisioning failed.",
+                        error_code=RunErrorCode.PROVISIONING,
+                    )
+                    self._record_run_issue(
+                        failed,
+                        phase=RunPhase.PROVISIONING,
+                        code=RunErrorCode.PROVISIONING,
+                        message="Native prompt provisioning failed.",
+                        retryable=True,
+                    )
+                    raise SessionExecutionError(
+                        "Native prompt provisioning failed."
+                    ) from None
+
+            try:
+                session = self._sessions().transition_if_state(
+                    session.session_id,
+                    SessionState.READY,
+                    SessionState.RUNNING,
+                    now=self._now(),
+                )
+            except ConcurrentSessionUpdate:
+                self._transition_job(
+                    job,
+                    JobState.FAILED,
+                    sanitized_error="Cloud Run session is busy.",
+                    error_code=RunErrorCode.SYNCHRONIZATION,
+                )
+                raise SessionBusy("Cloud Run session is busy.") from None
+            job = self._transition_job(
+                job,
+                JobState.QUEUED,
+                execution_state=ExecutionState.QUEUED,
+                sanitized_error=None,
+                error_code=None,
+            )
+            return self._native_forward(job)
 
     def _transition_job(self, job, state, **changes):
         return self.job_repository.save_job(
@@ -2185,11 +2615,106 @@ class SessionService:
                 JobState.HARVESTING,
             }
         ]
-        if len(active) > 1:
+        executing = [
+            job
+            for job in active
+            if job.state in {JobState.RUNNING, JobState.HARVESTING}
+        ]
+        if len(executing) > 1:
             raise SessionExecutionError(
-                "Multiple active jobs were found for one session."
+                "Multiple GPU executions were found for one session."
             )
+        if executing:
+            return executing[0]
         return active[0] if active else None
+
+    async def _wait_for_native_turn(self, job):
+        active_states = {
+            JobState.CAPTURED,
+            JobState.RESOLVING,
+            JobState.QUEUED,
+            JobState.RUNNING,
+            JobState.HARVESTING,
+        }
+        for _attempt in range(self.max_job_polls):
+            current = self.job_repository.get_job(job.job_id)
+            if (
+                current is not None
+                and current.state
+                in {JobState.RUNNING, JobState.HARVESTING}
+                and current.remote_prompt_id is not None
+            ):
+                return self._stored_session(job.session_id)
+            predecessors = [
+                item
+                for item in self.job_repository.list_jobs(job.session_id)
+                if item.queue_position < job.queue_position
+                and item.state in active_states
+            ]
+            if not predecessors:
+                session = self._stored_session(job.session_id)
+                if session.state == SessionState.READY:
+                    return session
+            else:
+                predecessor = predecessors[0]
+                if predecessor.state in {
+                    JobState.RUNNING,
+                    JobState.HARVESTING,
+                }:
+                    try:
+                        await self.reconcile_session_once(job.session_id)
+                    except (asyncio.CancelledError, KeyboardInterrupt):
+                        raise
+                    except Exception:
+                        pass
+                elif predecessor.state in {
+                    JobState.CAPTURED,
+                    JobState.RESOLVING,
+                    JobState.QUEUED,
+                }:
+                    try:
+                        await self.resume_session(job.session_id)
+                    except (asyncio.CancelledError, KeyboardInterrupt):
+                        raise
+                    except Exception:
+                        pass
+            await self.sleep(self.job_poll_interval_seconds)
+        raise SessionBusy("The native GPU queue did not advance.")
+
+    async def _advance_native_queue(self, session_id, queue_position):
+        pending = [
+            item
+            for item in self.job_repository.list_jobs(session_id)
+            if item.queue_position > queue_position
+            and item.native_body_json is not None
+            and item.state
+            in {JobState.CAPTURED, JobState.RESOLVING, JobState.QUEUED}
+        ]
+        if not pending:
+            return None
+        next_job = pending[0]
+        try:
+            worker = self._worker(self._stored_session(session_id))
+        except Exception:
+            return None
+        if (
+            not callable(getattr(worker, "native_envelope", None))
+            or not callable(
+                getattr(getattr(worker, "transport", None), "request", None)
+            )
+        ):
+            return None
+        try:
+            return await self.resume_session(session_id)
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            raise
+        except Exception:
+            return self._retryable_job_issue(
+                next_job,
+                phase=RunPhase.SYNCHRONIZATION,
+                code=RunErrorCode.SYNCHRONIZATION,
+                message="Native GPU queue recovery failed.",
+            )
 
     def reconciliation_context(self, session_id):
         identifier = _strict_identifier(session_id, "session ID")
@@ -3223,6 +3748,10 @@ class SessionService:
                 now=self._now(),
                 sanitized_error=None,
             )
+            await self._advance_native_queue(
+                current_session.session_id,
+                job.queue_position,
+            )
             return job
 
         execution_state = (
@@ -3276,6 +3805,10 @@ class SessionService:
                 now=self._now(),
                 sanitized_error=None,
             )
+        await self._advance_native_queue(
+            current_session.session_id,
+            job.queue_position,
+        )
         return job
 
     async def submit_job(
@@ -3566,23 +4099,45 @@ class SessionService:
                 JobState.HARVESTING,
             }
         ]
-        if len(active) != 1:
-            if not active:
-                return session
+        if not active:
+            return session
+        executing = [
+            item
+            for item in active
+            if item.state in {JobState.RUNNING, JobState.HARVESTING}
+        ]
+        if len(executing) > 1:
             raise SessionExecutionError(
-                "Multiple active jobs were found for one session."
+                "Multiple GPU executions were found for one session."
             )
-        job = active[0]
+        job = executing[0] if executing else active[0]
+        if job.native_body_json is not None and job.state == JobState.CAPTURED:
+            await self.prepare_native_prompt(
+                session.session_id,
+                request_id=job.idempotency_key,
+                body=job.native_body_json.encode("utf-8"),
+            )
+            session = self._stored_session(session.session_id)
+            job = self.job_repository.get_job(job.job_id)
+            if job is None:
+                raise SessionExecutionError(
+                    "Native prompt identity is unavailable."
+                )
         worker = self._worker(session)
         if session.state in {
             SessionState.PROVISIONING,
             SessionState.VALIDATING,
         }:
-            capture = CompiledCapture.from_record(
-                job.job_id,
-                job.capture_json,
-                job.prompt_digest,
-            )
+            if job.native_body_json is not None:
+                capture = CompiledCapture.from_native_prompt(
+                    job.native_body_json.encode("utf-8")
+                )
+            else:
+                capture = CompiledCapture.from_record(
+                    job.job_id,
+                    job.capture_json,
+                    job.prompt_digest,
+                )
             desired = _stored_manifest(
                 self.job_repository,
                 job.manifest_digest,
@@ -3618,6 +4173,60 @@ class SessionService:
                 SessionState.RUNNING,
                 now=self._now(),
             )
+        elif (
+            session.state == SessionState.READY
+            and job.native_body_json is not None
+            and job.state == JobState.RESOLVING
+            and session.installed_manifest_digest != job.manifest_digest
+        ):
+            capture = CompiledCapture.from_native_prompt(
+                job.native_body_json.encode("utf-8")
+            )
+            desired = _stored_manifest(
+                self.job_repository,
+                job.manifest_digest,
+            )
+            session = self._sessions().transition_if_state(
+                session.session_id,
+                SessionState.READY,
+                SessionState.PROVISIONING,
+                now=self._now(),
+            )
+            await self._apply_manifest(
+                worker,
+                session,
+                desired,
+                transfer_job_id=job.job_id,
+                capture=capture,
+            )
+            self._mark_profile_applied(session, desired.profile)
+            session = self._sessions().transition(
+                session.session_id,
+                SessionState.VALIDATING,
+                now=self._now(),
+            )
+            self.job_repository.replace_installed_set(
+                session.session_id,
+                _installed_records(desired),
+            )
+            session = self._sessions().transition(
+                session.session_id,
+                SessionState.READY,
+                now=self._now(),
+                manifest_digest=desired.digest,
+                installed_manifest_digest=desired.digest,
+                sanitized_error=None,
+            )
+        if (
+            session.state == SessionState.READY
+            and job.state in {JobState.RESOLVING, JobState.QUEUED}
+        ):
+            session = self._sessions().transition_if_state(
+                session.session_id,
+                SessionState.READY,
+                SessionState.RUNNING,
+                now=self._now(),
+            )
         if session.state not in {
             SessionState.RUNNING,
             SessionState.HARVESTING,
@@ -3632,6 +4241,10 @@ class SessionService:
                 execution_state=ExecutionState.QUEUED,
             )
         if job.state == JobState.QUEUED:
+            if job.native_body_json is not None:
+                job = await self._submit_native_worker_request(worker, job)
+                self.reconciler.schedule(session.session_id)
+                return job
             payload = json.loads(job.capture_json)
             remote = await worker.start_job(
                 {

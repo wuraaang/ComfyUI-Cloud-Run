@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -56,6 +57,65 @@ def native_capture(
 
 
 class CompiledCaptureTests(unittest.TestCase):
+    def test_native_prompt_uses_the_shared_capture_boundary(self):
+        payload = native_capture(queue_options={})
+        body = {
+            "client_id": "desktop-client-1",
+            "prompt": payload["output"],
+            "extra_data": {
+                "comfy_usage_source": "desktop",
+                "extra_pnginfo": {"workflow": payload["workflow"]},
+                "preview_method": "latent2rgb",
+            },
+            "front": False,
+            "number": 7,
+            "partial_execution_targets": ["1"],
+        }
+
+        capture = CompiledCapture.from_native_prompt(
+            json.dumps(body, separators=(",", ":")).encode("utf-8")
+        )
+
+        self.assertEqual(capture.workflow, payload["workflow"])
+        self.assertEqual(capture.output, payload["output"])
+        self.assertEqual(
+            capture.queue_options,
+            {
+                "front": False,
+                "number": 7,
+                "partial_execution_targets": ["1"],
+                "preview_method": "latent2rgb",
+            },
+        )
+
+    def test_native_prompt_rejects_duplicate_fields_credentials_and_reconstruction(self):
+        payload = native_capture(queue_options={})
+        valid = {
+            "client_id": "desktop-client-1",
+            "prompt": payload["output"],
+            "extra_data": {
+                "extra_pnginfo": {"workflow": payload["workflow"]},
+            },
+        }
+        rejected = (
+            b'{"client_id":"a","client_id":"b","prompt":{},"extra_data":{}}',
+            json.dumps({**valid, "provider_token": "private"}).encode("utf-8"),
+            json.dumps(
+                {
+                    **valid,
+                    "extra_data": {
+                        **valid["extra_data"],
+                        "api_key": "private",
+                    },
+                }
+            ).encode("utf-8"),
+            json.dumps({**valid, "prompt": {}}).encode("utf-8"),
+        )
+        for body in rejected:
+            with self.subTest(body=body[:80]):
+                with self.assertRaises(CaptureValidationError):
+                    CompiledCapture.from_native_prompt(body)
+
     def test_capture_accepts_native_shape_and_hashes_only_execution_material(self):
         first = CompiledCapture.from_payload(native_capture())
         second = CompiledCapture.from_payload(

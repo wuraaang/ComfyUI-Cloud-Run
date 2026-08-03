@@ -340,6 +340,9 @@ def _initialize_database(path):
                     execution_state TEXT NOT NULL DEFAULT 'pending',
                     harvest_state TEXT NOT NULL DEFAULT 'pending',
                     error_code TEXT,
+                    queue_position INTEGER NOT NULL DEFAULT 0,
+                    native_request_digest TEXT,
+                    native_body_json TEXT,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
                     version INTEGER NOT NULL,
@@ -392,6 +395,44 @@ def _initialize_database(path):
                     WHERE state = 'failed'
                     """
                 )
+            queue_position_added = "queue_position" not in job_columns
+            if queue_position_added:
+                connection.execute(
+                    "ALTER TABLE jobs ADD COLUMN queue_position "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+            if "native_request_digest" not in job_columns:
+                connection.execute(
+                    "ALTER TABLE jobs ADD COLUMN native_request_digest TEXT"
+                )
+            if "native_body_json" not in job_columns:
+                connection.execute(
+                    "ALTER TABLE jobs ADD COLUMN native_body_json TEXT"
+                )
+            if queue_position_added:
+                session_ids = connection.execute(
+                    "SELECT DISTINCT session_id FROM jobs"
+                ).fetchall()
+                for session_row in session_ids:
+                    rows = connection.execute(
+                        """
+                        SELECT job_id FROM jobs
+                        WHERE session_id = ?
+                        ORDER BY created_at, job_id
+                        """,
+                        (session_row["session_id"],),
+                    ).fetchall()
+                    for position, row in enumerate(rows, start=1):
+                        connection.execute(
+                            "UPDATE jobs SET queue_position = ? WHERE job_id = ?",
+                            (position, row["job_id"]),
+                        )
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS jobs_session_queue_position
+                ON jobs(session_id, queue_position)
+                """
+            )
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS manifests (
@@ -651,7 +692,7 @@ def _initialize_database(path):
             _migrate_legacy_attempts(connection)
             connection.execute(
                 """
-                INSERT INTO schema_meta(key, value) VALUES('schema_version', '10')
+                INSERT INTO schema_meta(key, value) VALUES('schema_version', '11')
                 ON CONFLICT(key) DO UPDATE SET value = excluded.value
                 """
             )

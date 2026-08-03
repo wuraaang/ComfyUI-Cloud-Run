@@ -1,4 +1,6 @@
 import asyncio
+from dataclasses import replace
+import hashlib
 import json
 import tempfile
 import types
@@ -76,6 +78,23 @@ def capture_payload():
         },
         "queue_options": {},
     }
+
+
+def native_prompt_body(capture, *, client_id="desktop-client-1"):
+    return json.dumps(
+        {
+            "client_id": client_id,
+            "prompt": capture.output,
+            "extra_data": {
+                "extra_pnginfo": {"workflow": capture.workflow},
+            },
+            **capture.queue_options,
+        },
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
 
 
 def worker_release():
@@ -2941,6 +2960,403 @@ class ReusableSessionTests(unittest.TestCase):
         self.assertEqual(transfer.state.value, "verified")
         self.assertEqual(transfer.offset, len(content))
         self.assertEqual(apply_count, 2)
+
+
+class NativeDesktopPromptTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        ReusableSessionTests.setUp(self)
+        self.identities = iter(
+            (
+                "native-job-1",
+                "native-preflight-1",
+                "native-job-2",
+                "native-preflight-2",
+                "native-job-3",
+                "native-preflight-3",
+            )
+        )
+        self.service.id_factory = lambda: next(self.identities)
+        self.service.resolver = FakeResolver(self.first_resolution)
+
+    async def test_intent_precedes_resolution_and_retry_keeps_exact_identity(self):
+        body = native_prompt_body(self.first_capture)
+        observed = []
+        service = self.service
+
+        class IntentAwareResolver(FakeResolver):
+            async def resolve_preflight(inner_self, capture, **kwargs):
+                intent = self.jobs.get_job_by_idempotency_key(
+                    "session-1",
+                    "request-1",
+                )
+                observed.append(intent)
+                return await super().resolve_preflight(capture, **kwargs)
+
+        service.resolver = IntentAwareResolver(self.first_resolution)
+
+        first = await service.prepare_native_prompt(
+            "session-1",
+            request_id="request-1",
+            body=body,
+        )
+        retry = await service.prepare_native_prompt(
+            "session-1",
+            request_id="request-1",
+            body=body,
+        )
+
+        self.assertIsNotNone(observed[0])
+        self.assertEqual(first, retry)
+        self.assertEqual(first.job_id, "native-job-1")
+        self.assertEqual(first.request_id, "request-1")
+        self.assertEqual(first.body, body)
+        self.assertEqual(
+            first.server_identity(),
+            {
+                "job_id": "native-job-1",
+                "request_id": "request-1",
+                "manifest_digest": self.initial_manifest.digest,
+            },
+        )
+        jobs = self.jobs.list_jobs("session-1")
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0].queue_position, 1)
+        self.assertEqual(jobs[0].state, JobState.QUEUED)
+
+        changed = native_prompt_body(
+            self.first_capture,
+            client_id="desktop-client-2",
+        )
+        with self.assertRaisesRegex(SessionServiceError, "identity"):
+            await service.prepare_native_prompt(
+                "session-1",
+                request_id="request-1",
+                body=changed,
+            )
+
+    async def test_sequential_batch_intents_receive_monotonic_positions(self):
+        body = native_prompt_body(self.first_capture)
+        first = await self.service.prepare_native_prompt(
+            "session-1",
+            request_id="request-1",
+            body=body,
+        )
+        await first.bind_response(
+            200,
+            json.dumps(
+                {
+                    "prompt_id": "11111111-1111-4111-8111-111111111111",
+                    "number": 1,
+                    "node_errors": {},
+                },
+                separators=(",", ":"),
+            ).encode("utf-8"),
+        )
+        first_job = self.jobs.get_job(first.job_id)
+        first_job = self.jobs.save_job(
+            first_job.transition(
+                JobState.HARVESTING,
+                now=101.0,
+                execution_state=ExecutionState.SUCCEEDED,
+                harvest_state=HarvestState.RUNNING,
+            )
+        )
+        self.jobs.save_job(
+            first_job.transition(
+                JobState.SUCCEEDED,
+                now=102.0,
+                execution_state=ExecutionState.SUCCEEDED,
+                harvest_state=HarvestState.SUCCEEDED,
+            )
+        )
+        self.sessions.transition_if_state(
+            "session-1",
+            SessionState.RUNNING,
+            SessionState.READY,
+            now=101.0,
+        )
+
+        second = await self.service.prepare_native_prompt(
+            "session-1",
+            request_id="request-2",
+            body=body,
+        )
+
+        self.assertNotEqual(first.job_id, second.job_id)
+        jobs = self.jobs.list_jobs("session-1")
+        self.assertEqual(
+            [(job.idempotency_key, job.queue_position) for job in jobs],
+            [("request-1", 1), ("request-2", 2)],
+        )
+
+    async def test_second_batch_intent_persists_then_waits_for_the_gpu_turn(self):
+        body = native_prompt_body(self.first_capture)
+        first = await self.service.prepare_native_prompt(
+            "session-1",
+            request_id="request-1",
+            body=body,
+        )
+        await first.bind_response(
+            200,
+            json.dumps(
+                {
+                    "prompt_id": "11111111-1111-4111-8111-111111111111",
+                    "number": 1,
+                    "node_errors": {},
+                },
+                separators=(",", ":"),
+            ).encode("utf-8"),
+        )
+        self.worker.terminal_state = "running"
+        self.service.sleep = lambda _seconds: asyncio.sleep(0)
+
+        second_task = asyncio.create_task(
+            self.service.prepare_native_prompt(
+                "session-1",
+                request_id="request-2",
+                body=body,
+            )
+        )
+        for _attempt in range(20):
+            queued = self.jobs.get_job_by_idempotency_key(
+                "session-1",
+                "request-2",
+            )
+            if queued is not None:
+                break
+            await asyncio.sleep(0)
+
+        self.assertIsNotNone(queued)
+        self.assertEqual(queued.queue_position, 2)
+        self.assertFalse(second_task.done())
+        self.worker.terminal_state = "succeeded"
+        second = await asyncio.wait_for(second_task, timeout=1)
+
+        self.assertEqual(second.request_id, "request-2")
+        self.assertEqual(
+            self.jobs.get_job(second.job_id).state,
+            JobState.QUEUED,
+        )
+        self.assertEqual(self.sessions.get("session-1").state, SessionState.RUNNING)
+
+    async def test_compatible_delta_is_applied_after_persisting_the_same_job(self):
+        body = native_prompt_body(self.second_capture)
+        self.service.resolver = FakeResolver(self.second_resolution)
+
+        forward = await self.service.prepare_native_prompt(
+            "session-1",
+            request_id="request-delta",
+            body=body,
+        )
+
+        job = self.jobs.get_job(forward.job_id)
+        self.assertEqual(job.job_id, "native-job-1")
+        self.assertEqual(job.manifest_digest, forward.manifest_digest)
+        self.assertNotEqual(job.manifest_digest, self.initial_manifest.digest)
+        self.assertEqual(len(self.worker.manifest_calls), 1)
+        self.assertEqual(
+            self.sessions.get("session-1").installed_manifest_digest,
+            forward.manifest_digest,
+        )
+
+    async def test_unresolved_native_prompt_fails_before_any_worker_effect(self):
+        class BrokenResolver:
+            async def resolve_preflight(inner_self, *_args, **_kwargs):
+                raise RuntimeError("private resolver detail")
+
+        self.service.resolver = BrokenResolver()
+        with self.assertRaisesRegex(SessionServiceError, "dependency"):
+            await self.service.prepare_native_prompt(
+                "session-1",
+                request_id="request-broken",
+                body=native_prompt_body(self.first_capture),
+            )
+
+        job = self.jobs.get_job_by_idempotency_key(
+            "session-1",
+            "request-broken",
+        )
+        self.assertIsNotNone(job)
+        self.assertEqual(job.state, JobState.FAILED)
+        self.assertEqual(job.error_code, RunErrorCode.DEPENDENCY)
+        self.assertEqual(self.worker.manifest_calls, [])
+        self.assertEqual(self.worker.job_calls, [])
+        self.assertEqual(self.sessions.get("session-1").state, SessionState.READY)
+
+    async def test_runtime_change_requires_a_new_session_without_touching_the_pod(self):
+        installed = replace(
+            self.initial_manifest,
+            custom_nodes=(custom_node("d"),),
+        )
+        incompatible = replace(
+            self.initial_manifest,
+            custom_nodes=(custom_node("e"),),
+        )
+        self.jobs.save_manifest(
+            installed.digest,
+            installed.canonical_bytes().decode("utf-8"),
+            created_at=100.0,
+        )
+        self.jobs.save_manifest(
+            incompatible.digest,
+            incompatible.canonical_bytes().decode("utf-8"),
+            created_at=100.0,
+        )
+        self.sessions.transition(
+            "session-1",
+            SessionState.READY,
+            now=100.0,
+            manifest_digest=installed.digest,
+            installed_manifest_digest=installed.digest,
+        )
+        self.service._fresh_manifest = mock.AsyncMock(
+            return_value=(installed, incompatible)
+        )
+
+        with self.assertRaisesRegex(IncompatibleSession, "new Cloud Vast"):
+            await self.service.prepare_native_prompt(
+                "session-1",
+                request_id="request-runtime-change",
+                body=native_prompt_body(self.first_capture),
+            )
+
+        job = self.jobs.get_job_by_idempotency_key(
+            "session-1",
+            "request-runtime-change",
+        )
+        self.assertEqual(job.state, JobState.FAILED)
+        self.assertEqual(job.error_code, RunErrorCode.DEPENDENCY)
+        self.assertEqual(self.worker.manifest_calls, [])
+        self.assertEqual(self.worker.job_calls, [])
+        self.assertEqual(self.sessions.get("session-1").state, SessionState.READY)
+
+    async def test_restart_forwards_a_queued_native_intent_without_headless_submission(self):
+        forward = await self.service.prepare_native_prompt(
+            "session-1",
+            request_id="request-restart",
+            body=native_prompt_body(self.first_capture),
+        )
+
+        class NativeRecoveryWorker(SequentialWorker):
+            def __init__(inner_self):
+                super().__init__(terminal_state="running")
+                inner_self.native_calls = []
+                inner_self.transport = inner_self
+
+            async def start_job(inner_self, _payload):
+                raise AssertionError("native recovery used the headless route")
+
+            def native_envelope(
+                inner_self,
+                method,
+                path_qs,
+                body,
+                *,
+                identity=None,
+                headers=None,
+            ):
+                from cloud_run.worker_client import WorkerRequest
+
+                inner_self.native_calls.append(
+                    (method, path_qs, body, identity, headers)
+                )
+                return WorkerRequest(
+                    method=method,
+                    url="http://worker.invalid" + path_qs,
+                    headers={},
+                    body=body,
+                )
+
+            async def request(inner_self, _request, *, max_bytes):
+                from cloud_run.worker_client import WorkerTransportResponse
+
+                return WorkerTransportResponse(
+                    status=200,
+                    headers={"Content-Type": "application/json"},
+                    body=json.dumps(
+                        {
+                            "prompt_id": (
+                                "22222222-2222-4222-8222-222222222222"
+                            ),
+                            "number": 1,
+                            "node_errors": {},
+                        },
+                        separators=(",", ":"),
+                    ).encode("utf-8"),
+                )
+
+        worker = NativeRecoveryWorker()
+        restarted = SessionService(
+            job_repository=self.jobs,
+            session_repository=self.sessions,
+            resolver=FakeResolver(self.first_resolution),
+            release=worker_release(),
+            worker_factory=lambda _session: worker,
+            relay_factory=lambda observed, _session: SequentialRelay(observed),
+            clock=lambda: 103.0,
+            id_factory=lambda: "unused-recovery-id",
+        )
+
+        recovered = await restarted.resume_session("session-1")
+
+        self.assertEqual(recovered.job_id, forward.job_id)
+        self.assertEqual(recovered.state, JobState.RUNNING)
+        self.assertEqual(len(worker.native_calls), 1)
+        self.assertEqual(worker.native_calls[0][0:2], ("POST", "/prompt"))
+        self.assertEqual(
+            worker.native_calls[0][3],
+            forward.server_identity(),
+        )
+        self.assertEqual(worker.job_calls, [])
+
+    async def test_restart_revalidates_a_captured_native_intent_before_forwarding(self):
+        body = native_prompt_body(self.first_capture)
+        installed = replace(
+            self.initial_manifest,
+            custom_nodes=(custom_node("d"),),
+        )
+        incompatible = replace(
+            self.initial_manifest,
+            custom_nodes=(custom_node("e"),),
+        )
+        self.jobs.save_manifest(
+            installed.digest,
+            installed.canonical_bytes().decode("utf-8"),
+            created_at=100.0,
+        )
+        session = self.sessions.transition(
+            "session-1",
+            SessionState.READY,
+            now=100.0,
+            manifest_digest=installed.digest,
+            installed_manifest_digest=installed.digest,
+        )
+        candidate = self.service._new_job(
+            session,
+            self.first_capture,
+            installed.digest,
+            "request-captured-restart",
+            native_request_digest=hashlib.sha256(body).hexdigest(),
+            native_body_json=body.decode("utf-8"),
+        )
+        captured, created = self.jobs.create_job(candidate)
+        self.assertTrue(created)
+        self.assertEqual(captured.state, JobState.CAPTURED)
+
+        self.service._fresh_manifest = mock.AsyncMock(
+            return_value=(installed, incompatible)
+        )
+
+        with self.assertRaisesRegex(IncompatibleSession, "new Cloud Vast"):
+            await self.service.resume_session("session-1")
+
+        self.service._fresh_manifest.assert_awaited_once()
+        recovered = self.jobs.get_job(captured.job_id)
+        self.assertEqual(recovered.state, JobState.FAILED)
+        self.assertEqual(recovered.error_code, RunErrorCode.DEPENDENCY)
+        self.assertEqual(self.worker.job_calls, [])
+        self.assertEqual(self.worker.manifest_calls, [])
+        self.assertEqual(self.sessions.get("session-1").state, SessionState.READY)
 
 
 class AgentPanelSessionBridgeTests(unittest.TestCase):

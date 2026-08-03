@@ -11,6 +11,7 @@ from .worker_protocol import (
     PINNED_FRONTEND_VERSION,
     CaptureValidationError,
     CompiledCapture,
+    canonical_native_prompt_body,
     canonical_json,
     prompt_digest,
 )
@@ -99,6 +100,7 @@ __all__ = [
     "PINNED_FRONTEND_VERSION",
     "CaptureValidationError",
     "CompiledCapture",
+    "canonical_native_prompt_body",
     "canonical_json",
     "certified_execution_baseline",
     "prompt_digest",

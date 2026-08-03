@@ -11,7 +11,8 @@ import unittest
 import uuid
 
 from cloud_run.artifacts import ArtifactResolution, FileInputMetadata
-from cloud_run.capture import certified_execution_baseline
+from cloud_run.capture import CompiledCapture, certified_execution_baseline
+from cloud_run.desktop_relay import DesktopRelay
 from cloud_run.dependency_repository import (
     DependencyRepository,
     MappingValidationError,
@@ -19,8 +20,14 @@ from cloud_run.dependency_repository import (
 from cloud_run.job_repository import JobRepository
 from cloud_run.huggingface import HuggingFaceClient
 from cloud_run.lifecycle import CloudRunLifecycle
-from cloud_run.manifest import ArtifactSpec, CustomNodeSpec, SourceSpec
+from cloud_run.manifest import (
+    ArtifactSpec,
+    CustomNodeSpec,
+    DependencyManifest,
+    SourceSpec,
+)
 from cloud_run.models import (
+    CloudSession,
     ExecutionState,
     HarvestState,
     JobState,
@@ -42,6 +49,7 @@ from cloud_run.session_service import (
 )
 from cloud_run.settings import SettingsStore
 from cloud_run.worker_client import ArtifactDownload
+from cloud_run.worker_client import WorkerRequest, WorkerTransportResponse
 from cloud_run.worker_release import WorkerRelease
 
 
@@ -2006,6 +2014,259 @@ class FakeReusableSessionIntegrationTests(unittest.TestCase):
             system.agent_suggestion(unsafe)
         self.assertEqual(system.vast.mutations, [])
 
+
+class NativeDesktopIsolationIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_local_and_vast_desktops_reopen_without_duplicate_prompt_effect(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        database = Path(temporary.name) / "private" / "sessions.sqlite3"
+        jobs = JobRepository(database)
+        sessions = SessionRepository(database)
+        capture = CompiledCapture.from_payload(
+            {
+                "workflow": {
+                    "version": 1,
+                    "nodes": [
+                        {"id": 1, "type": "EmptyImage"},
+                        {"id": 2, "type": "SaveImage"},
+                    ],
+                    "extra": {"frontendVersion": "1.47.10"},
+                },
+                "output": {
+                    "1": {
+                        "class_type": "EmptyImage",
+                        "inputs": {
+                            "width": 64,
+                            "height": 64,
+                            "batch_size": 1,
+                            "color": 0,
+                        },
+                    },
+                    "2": {
+                        "class_type": "SaveImage",
+                        "inputs": {
+                            "filename_prefix": "cloud-vast-offline",
+                            "images": ["1", 0],
+                        },
+                    },
+                },
+                "queue_options": {},
+            }
+        )
+        manifest = DependencyManifest(
+            schema_version=2,
+            protocol_version="2",
+            comfyui_core_version="0.29.0",
+            comfyui_frontend_version="1.47.10",
+            worker_version="a" * 40,
+            prompt_digest=capture.prompt_digest,
+            custom_nodes=(),
+            artifacts=(),
+            output_allowance_bytes=1024,
+            disk_gb=80,
+        )
+        jobs.save_capture(capture, created_at=100.0)
+        jobs.save_manifest(
+            manifest.digest,
+            manifest.canonical_bytes().decode("utf-8"),
+            created_at=100.0,
+        )
+        baseline, randomized = certified_execution_baseline(capture)
+        session = CloudSession.new(
+            "session-key",
+            session_id="session-1",
+            manifest_digest=manifest.digest,
+            deadline_at=7300.0,
+            deadline_mode="finite",
+            disk_gb=80,
+            now=100.0,
+            state=SessionState.READY,
+            execution_baseline_digest=baseline,
+            randomized_seed_node_ids=randomized,
+        ).transition(
+            SessionState.READY,
+            now=100.0,
+            installed_manifest_digest=manifest.digest,
+            instance_id="77",
+            worker_base_url="http://8.8.8.8:30000",
+            provider_token="a" * 64,
+            session_secret_hex="d" * 64,
+        )
+        sessions.create_or_get(session)
+
+        resolution = types.SimpleNamespace(
+            node_rows=(
+                NodeResolution("EmptyImage", "resolved", "core"),
+                NodeResolution("SaveImage", "resolved", "core"),
+            ),
+            artifact_rows=(),
+            custom_nodes=(),
+            artifacts=(),
+            output_allowance_bytes=1024,
+            disk_gb=80,
+            rentable=True,
+        )
+
+        class Resolver:
+            async def resolve_preflight(inner_self, _capture, **_kwargs):
+                return resolution
+
+        class PodTransport:
+            def __init__(inner_self):
+                inner_self.requests = []
+                inner_self.effects = {}
+
+            async def request(inner_self, request, *, max_bytes):
+                del max_bytes
+                inner_self.requests.append(request)
+                request_id = request.headers.get("request-id")
+                if request.url.endswith("/prompt"):
+                    digest = hashlib.sha256(request.body).hexdigest()
+                    prior = inner_self.effects.get(request_id)
+                    if prior is not None and prior != digest:
+                        raise AssertionError("changed retry reached fake pod")
+                    inner_self.effects[request_id] = digest
+                    body = json.dumps(
+                        {
+                            "prompt_id": (
+                                "33333333-3333-4333-8333-333333333333"
+                            ),
+                            "number": 1,
+                            "node_errors": {},
+                        },
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                    content_type = "application/json"
+                else:
+                    body = b"remote-root"
+                    content_type = "application/octet-stream"
+                return WorkerTransportResponse(
+                    status=200,
+                    headers={"Content-Type": content_type},
+                    body=body,
+                )
+
+        class PodWorker:
+            def __init__(inner_self):
+                inner_self.transport = PodTransport()
+
+            async def apply_manifest(inner_self, _payload):
+                raise AssertionError("covered manifest was reprovisioned")
+
+            async def start_job(inner_self, _payload):
+                raise AssertionError("native run used the headless route")
+
+            def native_envelope(
+                inner_self,
+                method,
+                path_qs,
+                body,
+                *,
+                identity=None,
+                headers=None,
+            ):
+                del headers
+                return WorkerRequest(
+                    method=method,
+                    url="http://worker.invalid" + path_qs,
+                    headers={
+                        "request-id": (identity or {}).get("request_id", "")
+                    },
+                    body=body,
+                )
+
+        class Listener:
+            async def start(inner_self, _host, port, _handler):
+                return 32145 if port == 0 else port
+
+            async def close(inner_self):
+                return None
+
+        class Request:
+            def __init__(inner_self, method, path, *, body=b"", headers=None):
+                inner_self.method = method
+                inner_self.path_qs = path
+                inner_self.path = path
+                inner_self.body = body
+                inner_self.headers = headers or {}
+
+        pod = PodWorker()
+        identities = iter(("native-job", "native-preflight"))
+        session_service = SessionService(
+            job_repository=jobs,
+            session_repository=sessions,
+            resolver=Resolver(),
+            release=reviewed_release(),
+            worker_factory=lambda _session: pod,
+            clock=lambda: 100.0,
+            id_factory=lambda: next(identities),
+        )
+        local_effects = []
+        body = json.dumps(
+            {
+                "client_id": "desktop-client-1",
+                "prompt": capture.output,
+                "extra_data": {
+                    "extra_pnginfo": {"workflow": capture.workflow}
+                },
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+
+        def local_prompt(value):
+            local_effects.append(value)
+            return {"prompt_id": "local-only"}
+
+        local_prompt(body)
+
+        async def run_vast(relay):
+            await relay.start()
+            await relay.activate("session-1", pod, profile_revision=1)
+            navigation = await relay.handle(
+                Request("GET", "/", headers={"Host": "127.0.0.1:32145"})
+            )
+            capability = navigation.headers["Set-Cookie"].split(";", 1)[0]
+            return await relay.handle(
+                Request(
+                    "POST",
+                    "/prompt",
+                    body=body,
+                    headers={
+                        "Host": "127.0.0.1:32145",
+                        "Cookie": capability,
+                        "Content-Type": "application/json",
+                        "X-Cloud-Vast-Request-Id": "request-1",
+                    },
+                )
+            )
+
+        first_relay = DesktopRelay(
+            repository=jobs,
+            listener_factory=lambda _handler: Listener(),
+            worker_factory=lambda _session: pod,
+            native_prompt=session_service.prepare_native_prompt,
+            capability_factory=lambda: "c" * 48,
+            clock=lambda: 100.0,
+        )
+        first = await run_vast(first_relay)
+        await first_relay.close()
+        second_relay = DesktopRelay(
+            repository=jobs,
+            listener_factory=lambda _handler: Listener(),
+            worker_factory=lambda _session: pod,
+            native_prompt=session_service.prepare_native_prompt,
+            capability_factory=lambda: "d" * 48,
+            clock=lambda: 101.0,
+        )
+        second = await run_vast(second_relay)
+        await second_relay.close()
+
+        self.assertEqual(first.status, 200)
+        self.assertEqual(second.status, 200)
+        self.assertEqual(local_effects, [body])
+        self.assertEqual(len(pod.transport.effects), 1)
+        self.assertEqual(len(jobs.list_jobs("session-1")), 1)
 
 if __name__ == "__main__":
     unittest.main()

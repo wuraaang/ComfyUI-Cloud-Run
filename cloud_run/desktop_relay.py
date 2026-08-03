@@ -672,14 +672,62 @@ class DesktopRelay:
         except Exception:
             return self._response(400)
         identity = None
+        response_callback = None
         if route.kind == "prompt":
+            request_ids = _header_values(
+                request,
+                "x-cloud-vast-request-id",
+            )
+            if (
+                len(request_ids) != 1
+                or _IDENTIFIER.fullmatch(request_ids[0]) is None
+            ):
+                return self._response(409)
             try:
-                identity = self.native_prompt(
+                prepared = self.native_prompt(
                     self._config.active_session_id,
-                    body,
+                    request_id=request_ids[0],
+                    body=body,
                 )
-                if asyncio.iscoroutine(identity):
-                    identity = await identity
+                if asyncio.iscoroutine(prepared):
+                    prepared = await prepared
+                server_identity = getattr(
+                    prepared,
+                    "server_identity",
+                    None,
+                )
+                if callable(server_identity):
+                    identity = server_identity()
+                    body = getattr(prepared, "body", None)
+                    response_callback = getattr(
+                        prepared,
+                        "bind_response",
+                        None,
+                    )
+                elif isinstance(prepared, dict):
+                    prepared = dict(prepared)
+                    body = prepared.pop("body", body)
+                    identity = prepared
+                if (
+                    not isinstance(identity, dict)
+                    or set(identity)
+                    != {"job_id", "request_id", "manifest_digest"}
+                    or identity.get("request_id") != request_ids[0]
+                    or any(
+                        not isinstance(identity.get(name), str)
+                        for name in identity
+                    )
+                    or not isinstance(body, bytes)
+                    or not body
+                    or len(body) > MAX_WORKER_JSON_BYTES
+                    or (
+                        response_callback is not None
+                        and not callable(response_callback)
+                    )
+                ):
+                    raise DesktopRelayError(
+                        "Native prompt preparation was rejected."
+                    )
             except (asyncio.CancelledError, KeyboardInterrupt):
                 raise
             except Exception:
@@ -711,6 +759,10 @@ class DesktopRelay:
                     "Desktop upstream response was rejected."
                 )
             headers = self._upstream_headers(response)
+            if response_callback is not None and response.status == 200:
+                bound = response_callback(response.status, response.body)
+                if asyncio.iscoroutine(bound):
+                    await bound
             if set_cookie:
                 headers["Set-Cookie"] = self._cookie_header()
             return self._response(

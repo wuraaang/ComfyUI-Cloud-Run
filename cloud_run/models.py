@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
+import hashlib
+import json
 import math
 import re
 import time
@@ -15,7 +17,11 @@ from .constants import (
     VAST_CREATE_FAILURE_CODES,
 )
 from .run_errors import RunErrorCode
-from .worker_protocol import PROTOCOL_VERSION, is_boundary_token
+from .worker_protocol import (
+    PROTOCOL_VERSION,
+    canonical_native_prompt_body,
+    is_boundary_token,
+)
 
 
 class SessionState(str, Enum):
@@ -1125,6 +1131,9 @@ class CloudJob:
     execution_state: ExecutionState = ExecutionState.PENDING
     harvest_state: HarvestState = HarvestState.PENDING
     error_code: RunErrorCode | None = None
+    queue_position: int = 0
+    native_request_digest: str | None = None
+    native_body_json: str | None = field(default=None, repr=False)
 
     def __post_init__(self):
         object.__setattr__(
@@ -1142,6 +1151,40 @@ class CloudJob:
             "error_code",
             None if self.error_code is None else RunErrorCode(self.error_code),
         )
+        if (
+            isinstance(self.queue_position, bool)
+            or not isinstance(self.queue_position, int)
+            or self.queue_position < 0
+        ):
+            raise ValueError("Invalid job queue position.")
+        native_values = (
+            self.native_request_digest,
+            self.native_body_json,
+        )
+        if (native_values[0] is None) != (native_values[1] is None):
+            raise ValueError("Invalid native prompt identity.")
+        if self.native_request_digest is not None:
+            if (
+                not isinstance(self.native_request_digest, str)
+                or re.fullmatch(r"[0-9a-f]{64}", self.native_request_digest)
+                is None
+                or not isinstance(self.native_body_json, str)
+            ):
+                raise ValueError("Invalid native prompt identity.")
+            try:
+                canonical = canonical_native_prompt_body(
+                    self.native_body_json.encode("utf-8")
+                ).decode("utf-8")
+                parsed = json.loads(canonical)
+            except (UnicodeError, ValueError):
+                raise ValueError("Invalid native prompt identity.") from None
+            if (
+                canonical != self.native_body_json
+                or not isinstance(parsed, dict)
+                or hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+                != self.native_request_digest
+            ):
+                raise ValueError("Invalid native prompt identity.")
 
     def transition(self, state, *, now=None, **changes):
         target = JobState(state)
@@ -1150,6 +1193,7 @@ class CloudJob:
                 f"Cannot transition from {self.state.value} to {target.value}."
             )
         unknown = set(changes) - {
+            "manifest_digest",
             "remote_prompt_id",
             "sanitized_error",
             "execution_state",
@@ -1182,6 +1226,7 @@ class CloudJob:
             "error": self.sanitized_error,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            "queue_position": self.queue_position,
         }
 
 

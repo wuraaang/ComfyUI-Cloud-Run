@@ -365,7 +365,7 @@ def build_service():
     service.desktop_relay = DesktopRelay(
         repository=job_repository,
         worker_factory=worker_factory,
-        native_prompt=service.prepare_native_prompt,
+        native_prompt=service.session_service.prepare_native_prompt,
         agent_bridge=agent_bridge,
         local_comfy_root=lambda: str(
             ComfyHost.from_running_host().comfy_root

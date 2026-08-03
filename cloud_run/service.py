@@ -343,7 +343,7 @@ class CloudRunService:
             harvest_state=HarvestState.PENDING,
         )
         saved, created = self.job_repository.create_job(job)
-        if not created or saved != job:
+        if not created or saved.job_id != job.job_id:
             raise CloudRunValidationError(
                 "Native prompt identity could not be persisted."
             )

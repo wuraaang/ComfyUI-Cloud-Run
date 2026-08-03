@@ -252,12 +252,13 @@ class DesktopRelayBoundaryTests(unittest.IsolatedAsyncioTestCase):
         self.capability_calls = 0
         self.now = 100.0
 
-        async def native_prompt(session_id, body):
-            self.prompt_calls.append((session_id, body))
+        async def native_prompt(session_id, *, request_id, body):
+            self.prompt_calls.append((session_id, request_id, body))
             return {
                 "job_id": "job-1",
-                "request_id": "request-1",
+                "request_id": request_id,
                 "manifest_digest": "b" * 64,
+                "body": body,
             }
 
         def capability():
@@ -415,6 +416,7 @@ class DesktopRelayBoundaryTests(unittest.IsolatedAsyncioTestCase):
             "Cookie": "comfy_vast_session=" + capability,
             "Authorization": "must-not-cross",
             "X-Forwarded-For": "must-not-cross",
+            "X-Cloud-Vast-Request-Id": "request-1",
             "Content-Type": "application/json",
         }
         body = b'{"client_id":"desktop-client-1","prompt":{}}'
@@ -424,7 +426,10 @@ class DesktopRelayBoundaryTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(response.status, 200)
-        self.assertEqual(self.prompt_calls, [("session-1", body)])
+        self.assertEqual(
+            self.prompt_calls,
+            [("session-1", "request-1", body)],
+        )
         envelope = self.worker.envelopes[-1]
         self.assertEqual(envelope[0:3], ("POST", "/prompt", body))
         self.assertEqual(
@@ -437,6 +442,7 @@ class DesktopRelayBoundaryTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("Authorization", envelope[4])
         self.assertNotIn("X-Forwarded-For", envelope[4])
+        self.assertNotIn("X-Cloud-Vast-Request-Id", envelope[4])
 
         await self.relay.deactivate("session-1")
         denied = await self.relay.handle(
@@ -497,7 +503,7 @@ class DesktopRelayBoundaryTests(unittest.IsolatedAsyncioTestCase):
         )
         capability = cookie_value(navigation)
 
-        async def reject_prompt(_session_id, _body):
+        async def reject_prompt(_session_id, *, request_id, body):
             raise RuntimeError("private validation detail")
 
         self.relay.native_prompt = reject_prompt
@@ -509,6 +515,7 @@ class DesktopRelayBoundaryTests(unittest.IsolatedAsyncioTestCase):
                 headers={
                     **self.host,
                     "Cookie": "comfy_vast_session=" + capability,
+                    "X-Cloud-Vast-Request-Id": "request-1",
                     "Content-Type": "application/json",
                 },
             )
@@ -517,6 +524,42 @@ class DesktopRelayBoundaryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 409)
         self.assertEqual(len(self.worker.envelopes), 1)
         self.assertEqual(self.worker.envelopes[0][1], "/")
+
+    async def test_prompt_requires_one_client_identity_before_preparation(self):
+        await self.relay.activate(
+            "session-1",
+            self.worker,
+            profile_revision=3,
+        )
+        navigation = await self.relay.handle(
+            FakeRequest("GET", "/", headers=self.host)
+        )
+        capability = cookie_value(navigation)
+        base = {
+            **self.host,
+            "Cookie": "comfy_vast_session=" + capability,
+            "Content-Type": "application/json",
+        }
+
+        missing = await self.relay.handle(
+            FakeRequest("POST", "/prompt", body=b"{}", headers=base)
+        )
+        malformed = await self.relay.handle(
+            FakeRequest(
+                "POST",
+                "/prompt",
+                body=b"{}",
+                headers={
+                    **base,
+                    "X-Cloud-Vast-Request-Id": " request-1 ",
+                },
+            )
+        )
+
+        self.assertEqual(missing.status, 409)
+        self.assertEqual(malformed.status, 409)
+        self.assertEqual(self.prompt_calls, [])
+        self.assertEqual(len(self.worker.envelopes), 1)
 
     async def test_agent_panel_routes_are_local_scoped_and_revoked_with_session(self):
         await self.relay.activate(

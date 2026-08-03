@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import math
 from pathlib import Path
@@ -103,7 +103,8 @@ class StoredPreflight:
 _JOB_COLUMNS = """
     job_id, session_id, idempotency_key, state, prompt_digest, capture_json,
     manifest_digest, remote_prompt_id, sanitized_error, execution_state,
-    harvest_state, error_code, created_at, updated_at, version
+    harvest_state, error_code, queue_position, native_request_digest,
+    native_body_json, created_at, updated_at, version
 """
 _JOURNAL_COLUMNS = """
     entry_id, session_id, manifest_digest, transaction_id, job_id, phase, code,
@@ -715,6 +716,9 @@ class JobRepository:
                 if row["error_code"] is not None
                 else None
             ),
+            queue_position=int(row["queue_position"]),
+            native_request_digest=row["native_request_digest"],
+            native_body_json=row["native_body_json"],
         )
 
     @staticmethod
@@ -738,6 +742,9 @@ class JobRepository:
             job.execution_state.value,
             job.harvest_state.value,
             job.error_code.value if job.error_code is not None else None,
+            job.queue_position,
+            job.native_request_digest,
+            job.native_body_json,
             job.created_at,
             job.updated_at,
             job.version,
@@ -770,7 +777,7 @@ class JobRepository:
                 SELECT {_JOB_COLUMNS}
                 FROM jobs
                 WHERE session_id = ?
-                ORDER BY created_at, job_id
+                ORDER BY queue_position, created_at, job_id
                 """,
                 (str(session_id),),
             ).fetchall()
@@ -790,11 +797,25 @@ class JobRepository:
             if row is not None:
                 connection.commit()
                 return self._row_to_job(row), False
+            next_position = int(
+                connection.execute(
+                    """
+                    SELECT COALESCE(MAX(queue_position), 0) + 1
+                    FROM jobs WHERE session_id = ?
+                    """,
+                    (job.session_id,),
+                ).fetchone()[0]
+            )
+            if job.queue_position == 0:
+                job = replace(job, queue_position=next_position)
+            elif job.queue_position != next_position:
+                connection.rollback()
+                raise ValueError("Invalid job queue position.")
             try:
                 connection.execute(
                     f"""
                     INSERT INTO jobs ({_JOB_COLUMNS})
-                    VALUES ({",".join("?" for _ in range(15))})
+                    VALUES ({",".join("?" for _ in range(18))})
                     """,
                     self._job_values(job),
                 )
