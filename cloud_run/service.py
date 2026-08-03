@@ -582,6 +582,18 @@ class CloudRunService:
             )
         return self.session_service.get_job(session_id, job_id)
 
+    async def retry_harvest(self, session_id, job_id):
+        if self.session_service is None or not callable(
+            getattr(self.session_service, "retry_harvest", None)
+        ):
+            raise CloudRunValidationError(
+                "Cloud Vast output retrieval is unavailable."
+            )
+        return await self.session_service.retry_harvest(
+            session_id,
+            job_id,
+        )
+
     async def update_session_deadline(self, session_id, payload):
         update = getattr(self.session_service, "update_deadline", None)
         if not callable(update):

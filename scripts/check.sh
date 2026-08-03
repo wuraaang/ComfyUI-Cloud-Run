@@ -307,6 +307,10 @@ allowed_cloud_run_routes = {
     ("POST", "/cloud-run/api/sessions/{session_id}/jobs"),
     ("GET", "/cloud-run/api/sessions/{session_id}/jobs/{job_id}"),
     (
+        "POST",
+        "/cloud-run/api/sessions/{session_id}/jobs/{job_id}/harvest",
+    ),
+    (
         "GET",
         "/cloud-run/api/sessions/{session_id}/jobs/{job_id}/events",
     ),

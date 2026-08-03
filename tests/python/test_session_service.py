@@ -31,7 +31,11 @@ from cloud_run.models import (
     SessionState,
     TransferState,
 )
-from cloud_run.relay import ArtifactVerificationError, RelaySyncResult
+from cloud_run.relay import (
+    ArtifactVerificationError,
+    RelaySyncResult,
+    RelayValidationError,
+)
 from cloud_run.run_errors import RunErrorCode
 from cloud_run.repository import SessionRepository
 from cloud_run.resolver import NodeResolution
@@ -2778,12 +2782,10 @@ class ReusableSessionTests(unittest.TestCase):
                     repr(failed_harvest),
                 )
 
-                self.service.get_job("session-1", running.job_id)
-                for _attempt in range(20):
-                    recovered = self.jobs.get_job(running.job_id)
-                    if recovered.state == JobState.SUCCEEDED:
-                        break
-                    await asyncio.sleep(0)
+                recovered = await self.service.retry_harvest(
+                    "session-1",
+                    running.job_id,
+                )
                 self.assertEqual(recovered.state, JobState.SUCCEEDED)
                 self.assertEqual(
                     recovered.execution_state,
@@ -2805,6 +2807,69 @@ class ReusableSessionTests(unittest.TestCase):
                 reconciler = getattr(self.service, "reconciler", None)
                 if reconciler is not None:
                     await reconciler.close()
+
+        asyncio.run(scenario())
+
+    def test_invalid_persistent_output_preserves_execution_success(self):
+        async def scenario():
+            self.worker.terminal_state = "running"
+
+            async def snapshot(job_id, after_sequence):
+                return {
+                    "job_id": job_id,
+                    "state": "succeeded",
+                    "prompt_id": "11111111-1111-1111-1111-111111111111",
+                    "events": [],
+                    "last_sequence": after_sequence,
+                    "outputs": [
+                        {
+                            "artifact_id": "output-1",
+                            "node_id": "9",
+                            "filename": "wallpaper.png",
+                            "subfolder": "../outside",
+                            "mime_type": "image/png",
+                            "size_bytes": 10,
+                            "sha256": "a" * 64,
+                        }
+                    ],
+                    "error": None,
+                    "created_at": 100.0,
+                    "updated_at": 101.0,
+                }
+
+            self.worker.snapshot = snapshot
+
+            class InvalidOutputRelay:
+                async def sync_snapshot(inner_self, _job_id, _snapshot):
+                    raise RelayValidationError(
+                        "private invalid path detail"
+                    )
+
+            self.service.relay_factory = (
+                lambda _worker, _session: InvalidOutputRelay()
+            )
+            try:
+                running = await self.service.submit_job(
+                    "session-1",
+                    capture_id=self.first_capture.capture_id,
+                    idempotency_key="invalid-output-key",
+                )
+                for _attempt in range(20):
+                    failed = self.jobs.get_job(running.job_id)
+                    if failed.harvest_state == HarvestState.FAILED:
+                        break
+                    await asyncio.sleep(0)
+
+                self.assertEqual(
+                    failed.execution_state,
+                    ExecutionState.SUCCEEDED,
+                )
+                self.assertEqual(failed.harvest_state, HarvestState.FAILED)
+                self.assertEqual(failed.error_code, RunErrorCode.INVALID_OUTPUT)
+                self.assertEqual(len(self.worker.job_calls), 1)
+                self.assertNotIn("private invalid", repr(failed))
+            finally:
+                await self.service.reconciler.close()
 
         asyncio.run(scenario())
 

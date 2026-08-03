@@ -37,6 +37,29 @@ class FailingReconciliationService(BlockingReconciliationService):
         raise RuntimeError("private transport failure")
 
 
+class BlockingHarvestService(BlockingReconciliationService):
+    def __init__(self):
+        super().__init__()
+        self.context_calls = []
+        self.start_job_calls = 0
+        self.prompt_calls = 0
+
+    def harvest_retry_context(self, job_id):
+        self.context_calls.append(job_id)
+        return {
+            "session_id": "session-1",
+            "job_id": job_id,
+        }
+
+    async def start_job(self, *_args, **_kwargs):
+        self.start_job_calls += 1
+        raise AssertionError("Harvest retry must not start a GPU job.")
+
+    async def prompt(self, *_args, **_kwargs):
+        self.prompt_calls += 1
+        raise AssertionError("Harvest retry must not submit a prompt.")
+
+
 class SessionReconcilerTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -105,6 +128,44 @@ class SessionReconcilerTests(unittest.IsolatedAsyncioTestCase):
             {"correlation_id": "correlation-1", "retryable": True},
         )
         self.assertNotIn("private transport", repr(entries))
+
+
+class ReconcilerOutputTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.repository = JobRepository(
+            Path(temporary.name) / "attempts.sqlite3"
+        )
+        self.orchestrator = LocalOrchestrator(self.repository)
+
+    async def test_harvest_retry_is_single_flight_and_never_starts_execution(self):
+        from cloud_run.reconciler import SessionReconciler
+
+        service = BlockingHarvestService()
+        reconciler = SessionReconciler(
+            service=service,
+            orchestrator=self.orchestrator,
+            max_retries=0,
+        )
+        self.addAsyncCleanup(reconciler.close)
+
+        retries = [
+            asyncio.create_task(reconciler.retry_harvest("job-1"))
+            for _attempt in range(5)
+        ]
+        await service.started.wait()
+
+        self.assertEqual(service.calls, 1)
+        self.assertEqual(service.start_job_calls, 0)
+        self.assertEqual(service.prompt_calls, 0)
+        service.release.set()
+        self.assertEqual(
+            await asyncio.gather(*retries),
+            ["session-1"] * 5,
+        )
+        self.assertEqual(service.start_job_calls, 0)
+        self.assertEqual(service.prompt_calls, 0)
 
 
 if __name__ == "__main__":

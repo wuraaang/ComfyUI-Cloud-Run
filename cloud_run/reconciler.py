@@ -160,6 +160,26 @@ class SessionReconciler:
         identifier = self._session_id(session_id)
         return await self.service.reconcile_session_once(identifier)
 
+    async def retry_harvest(self, job_id):
+        if not isinstance(job_id, str) or not _IDENTIFIER.fullmatch(job_id):
+            raise ValueError("Cloud Vast job identity is invalid.")
+        context_method = getattr(
+            self.service,
+            "harvest_retry_context",
+            None,
+        )
+        if not callable(context_method):
+            raise ValueError("Cloud Vast harvest retry is unavailable.")
+        context = context_method(job_id)
+        if (
+            not isinstance(context, dict)
+            or set(context) != {"session_id", "job_id"}
+            or context.get("job_id") != job_id
+        ):
+            raise ValueError("Cloud Vast harvest retry is invalid.")
+        session_id = self._session_id(context.get("session_id"))
+        return await asyncio.shield(self.schedule(session_id))
+
     def schedule(self, session_id):
         identifier = self._session_id(session_id)
         existing = self._tasks.get(identifier)

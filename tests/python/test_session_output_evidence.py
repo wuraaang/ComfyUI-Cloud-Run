@@ -138,11 +138,19 @@ class SessionOutputEvidenceTests(unittest.TestCase):
             format="PNG",
         )
         self.source_sha256 = _sha256(self.source_path)
-        self.output_path = self.output_root / "private-output-name.png"
+        self.output_path = (
+            self.output_root
+            / "cloud-vast"
+            / self.session_id
+            / self.job_id
+            / "private-output-name.png"
+        )
+        self.output_path.parent.mkdir(mode=0o700, parents=True)
         Image.new("RGB", (512, 512), (18, 103, 163)).save(
             self.output_path,
             format="PNG",
         )
+        os.chmod(self.output_path, 0o600)
         self._build_database("smoke")
 
     def _manifest(self, kind, *, artifacts=None):

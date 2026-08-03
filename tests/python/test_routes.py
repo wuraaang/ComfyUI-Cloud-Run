@@ -30,6 +30,8 @@ from cloud_run.models import (
     CloudAttempt,
     CloudJob,
     CloudSession,
+    ExecutionState,
+    HarvestState,
     JobState,
     OfferQuote,
     SessionState,
@@ -860,6 +862,67 @@ class LegacyRouteRemovalTests(unittest.TestCase):
 
 
 class PaidSessionRouteTests(unittest.TestCase):
+    def test_harvest_retry_route_accepts_only_an_empty_control_payload(self):
+        job = CloudJob(
+            job_id="job-1",
+            session_id="session-1",
+            idempotency_key="private-job-key",
+            state=JobState.HARVESTING,
+            prompt_digest="d" * 64,
+            capture_json='{"output":{},"queue_options":{},"workflow":{}}',
+            manifest_digest="e" * 64,
+            remote_prompt_id="11111111-1111-1111-1111-111111111111",
+            sanitized_error="Remote output retrieval failed.",
+            created_at=101.0,
+            updated_at=102.0,
+            version=5,
+            execution_state=ExecutionState.SUCCEEDED,
+            harvest_state=HarvestState.FAILED,
+        )
+        service = mock.Mock()
+        service.retry_harvest = mock.AsyncMock(return_value=job)
+        handlers = captured_handlers(service_factory=lambda: service)
+        route = (
+            "POST",
+            (
+                "/cloud-run/api/sessions/{session_id}/jobs/{job_id}/"
+                "harvest"
+            ),
+        )
+
+        response = asyncio.run(
+            handlers[route](
+                FakeRequest(
+                    {},
+                    match_info={
+                        "session_id": "session-1",
+                        "job_id": "job-1",
+                    },
+                )
+            )
+        )
+        rejected = asyncio.run(
+            handlers[route](
+                FakeRequest(
+                    {"provider_token": "forbidden"},
+                    match_info={
+                        "session_id": "session-1",
+                        "job_id": "job-1",
+                    },
+                )
+            )
+        )
+
+        service.retry_harvest.assert_awaited_once_with(
+            "session-1",
+            "job-1",
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.payload["execution_status"], "succeeded")
+        self.assertEqual(response.payload["harvest_status"], "failed")
+        self.assertEqual(rejected.status, 400)
+        self.assertNotIn("private-job-key", repr(response.payload))
+
     def test_paid_rental_conflict_maps_to_static_http_409(self):
         service = mock.Mock()
         service.confirm_session = mock.AsyncMock(
@@ -1471,6 +1534,9 @@ class RelayMediaRouteTests(unittest.TestCase):
         self.assertEqual(
             response.payload["outputs"][0]["state"],
             "local_verified",
+        )
+        self.assertTrue(
+            response.payload["outputs"][0]["local_verified"]
         )
         self.assertEqual(
             response.payload["outputs"][0]["filename"],

@@ -1635,6 +1635,45 @@ class SessionService:
             raise SessionExecutionError("Cloud Run job was not found.")
         return job
 
+    def harvest_retry_context(self, job_id):
+        identifier = _strict_identifier(job_id, "job ID")
+        job = self.job_repository.get_job(identifier)
+        if job is None:
+            raise SessionExecutionError("Cloud Run job was not found.")
+        session = self._stored_session(job.session_id)
+        if (
+            session.state != SessionState.HARVESTING
+            or job.state != JobState.HARVESTING
+            or job.execution_state != ExecutionState.SUCCEEDED
+            or job.harvest_state
+            not in {HarvestState.FAILED, HarvestState.PENDING}
+        ):
+            raise SessionBusy(
+                "Cloud Vast output retrieval is not retryable."
+            )
+        return {
+            "session_id": session.session_id,
+            "job_id": job.job_id,
+        }
+
+    async def retry_harvest(self, session_id, job_id):
+        session = self._stored_session(session_id)
+        identifier = _strict_identifier(job_id, "job ID")
+        job = self.job_repository.get_job(identifier)
+        if job is None or job.session_id != session.session_id:
+            raise SessionExecutionError("Cloud Run job was not found.")
+        self.harvest_retry_context(job.job_id)
+        retry = getattr(self.reconciler, "retry_harvest", None)
+        if not callable(retry):
+            raise SessionExecutionError(
+                "Cloud Vast output retrieval is unavailable."
+            )
+        await retry(job.job_id)
+        current = self.job_repository.get_job(job.job_id)
+        if current is None or current.session_id != session.session_id:
+            raise SessionExecutionError("Cloud Run job was not found.")
+        return current
+
     def _profile_manifest(self, session):
         digest = session.installed_manifest_digest or session.manifest_digest
         manifest = _stored_manifest(self.job_repository, digest)

@@ -856,6 +856,7 @@ class SourceFirstFakeWorker(FakeWorkerClient):
 class CertifiedOutput:
     artifact_id: str
     local_verified: bool
+    local_path: Path
 
 
 @dataclass(frozen=True)
@@ -1149,6 +1150,7 @@ class FakeCloudRunSystem:
                     transfer.direction == "download"
                     and transfer.state == TransferState.VERIFIED
                 ),
+                local_path=Path(transfer.private_path),
             )
             for transfer in self.jobs.list_transfers(job.job_id)
             if transfer.direction == "download"
@@ -1560,6 +1562,16 @@ class FakeReusableSessionIntegrationTests(unittest.TestCase):
         first = system.run_job(session, first_capture, "job-key-1")
         self.assertEqual(first.state, JobState.SUCCEEDED)
         self.assertTrue(all(output.local_verified for output in first.outputs))
+        self.assertTrue(
+            all(
+                output.local_path.parent
+                == system.output_root.resolve()
+                / "cloud-vast"
+                / session.session_id
+                / first.job_id
+                for output in first.outputs
+            )
+        )
 
         second_capture = system.capture(
             native_capture(

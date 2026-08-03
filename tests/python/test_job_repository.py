@@ -592,6 +592,34 @@ class JobRepositoryTests(unittest.TestCase):
                         ),
                     )
 
+    def test_identical_verified_output_is_one_durable_transfer_record(self):
+        jobs = JobRepository(self.path)
+        record = {
+            "job_id": "job-1",
+            "artifact_id": "output-1",
+            "direction": "download",
+            "expected_size": 10,
+            "sha256": "b" * 64,
+            "offset": 10,
+            "state": TransferState.VERIFIED,
+            "private_path": (
+                "/output/cloud-vast/session-1/job-1/output.png"
+            ),
+            "source_node_id": "2",
+            "published_device": 101,
+            "published_inode": 202,
+        }
+
+        jobs.save_transfer(**record)
+        jobs.save_transfer(**record)
+        reopened = JobRepository(self.path)
+
+        self.assertEqual(len(reopened.list_transfers("job-1")), 1)
+        self.assertEqual(
+            reopened.get_transfer("job-1", "output-1").private_path,
+            record["private_path"],
+        )
+
     def test_duplicate_job_key_returns_original_and_stale_save_is_rejected(self):
         jobs = JobRepository(self.path)
         first, first_created = jobs.create_job(cloud_job())

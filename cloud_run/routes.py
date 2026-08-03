@@ -479,6 +479,7 @@ def _job_payload(service, job):
                 "transferred_bytes": transfer.offset,
                 "sha256": transfer.sha256,
                 "node_id": transfer.source_node_id,
+                "local_verified": transfer.state.value == "verified",
             }
         )
     payload["previews"] = previews
@@ -1329,6 +1330,28 @@ def register_routes(service_factory=None):
         service = make_service()
         try:
             job = service.get_job(
+                request.match_info.get("session_id", ""),
+                request.match_info.get("job_id", ""),
+            )
+        except Exception as error:
+            return service_error(error)
+        return web.json_response(_job_payload(service, job))
+
+    @routes.post(
+        (
+            "/cloud-run/api/sessions/{session_id}/jobs/{job_id}/"
+            "harvest"
+        )
+    )
+    async def post_session_job_harvest(request):
+        service = make_service()
+        try:
+            await _request_payload(
+                request,
+                allowed=set(),
+                required=set(),
+            )
+            job = await service.retry_harvest(
                 request.match_info.get("session_id", ""),
                 request.match_info.get("job_id", ""),
             )

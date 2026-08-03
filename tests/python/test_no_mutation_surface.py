@@ -119,6 +119,10 @@ class ProviderMutationSurfaceTests(unittest.TestCase):
                     "/cloud-run/api/sessions/{session_id}/jobs/{job_id}",
                 ),
                 (
+                    "POST",
+                    "/cloud-run/api/sessions/{session_id}/jobs/{job_id}/harvest",
+                ),
+                (
                     "PUT",
                     "/cloud-run/api/sessions/{session_id}/deadline",
                 ),

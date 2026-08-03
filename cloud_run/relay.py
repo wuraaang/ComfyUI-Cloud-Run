@@ -83,6 +83,10 @@ class ArtifactVerificationError(RelayError):
     pass
 
 
+class InvalidOutputError(ArtifactVerificationError, RelayValidationError):
+    """A persistent-output contract or publication path was unsafe."""
+
+
 @dataclass(frozen=True)
 class RelayArtifactResult:
     job_id: str
@@ -241,6 +245,40 @@ def _fsync_directory(path):
             os.close(descriptor)
 
 
+def _fsync_file(path):
+    descriptor = None
+    try:
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(path, flags)
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+        ):
+            raise OSError("Unsafe local artifact.")
+        os.fsync(descriptor)
+    except OSError:
+        raise ArtifactVerificationError(
+            "Local artifact durability failed."
+        ) from None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _lstat_or_none(path):
+    try:
+        return os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise ArtifactVerificationError(
+            "Local artifact verification failed."
+        ) from None
+
+
 def _hash_path_identity(path, *, maximum):
     descriptor = None
     try:
@@ -251,6 +289,7 @@ def _hash_path_identity(path, *, maximum):
         metadata = os.fstat(descriptor)
         if (
             not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
             or metadata.st_size < 0
             or metadata.st_size > maximum
         ):
@@ -324,7 +363,7 @@ def _validated_output(descriptor):
         or "/" in filename
         or "\\" in filename
         or any(ord(character) < 32 for character in filename)
-        or len(filename.encode("utf-8")) > 1024
+        or len(filename.encode("utf-8")) > 255
         or not isinstance(subfolder, str)
         or "\\" in subfolder
         or any(ord(character) < 32 for character in subfolder)
@@ -346,6 +385,8 @@ def _validated_output(descriptor):
             raise _relay_error()
         parts = ()
     else:
+        if any(len(part.encode("utf-8")) > 255 for part in relative.parts):
+            raise _relay_error()
         parts = relative.parts
     return {
         **descriptor,
@@ -552,9 +593,21 @@ class LocalRelay:
         directory = _private_directory(self.previews_root / job_id)
         return directory / (preview_id + ".preview")
 
-    def _output_parent(self, job_id, parts):
+    def _output_parent(self, job, parts):
+        if (
+            not _identifier(getattr(job, "session_id", None))
+            or not _identifier(getattr(job, "job_id", None))
+        ):
+            raise InvalidOutputError(
+                "Local output publication failed."
+            )
         current = self.output_root
-        for part in (job_id, *parts):
+        for part in (
+            "cloud-vast",
+            job.session_id,
+            job.job_id,
+            *parts,
+        ):
             current = current / part
             try:
                 current.mkdir(mode=0o700, exist_ok=True)
@@ -565,11 +618,342 @@ class LocalRelay:
                     or metadata.st_uid != os.getuid()
                 ):
                     raise OSError("Unsafe output directory.")
+                os.chmod(current, 0o700)
             except OSError:
-                raise ArtifactVerificationError(
+                raise InvalidOutputError(
                     "Local output publication failed."
                 ) from None
         return current
+
+    def _candidate_paths(self, job, output, desktop_candidates):
+        if desktop_candidates is None:
+            supplied = ()
+        elif (
+            isinstance(desktop_candidates, (tuple, list))
+            and len(desktop_candidates) <= 16
+        ):
+            supplied = tuple(desktop_candidates)
+        else:
+            raise _relay_error("Desktop output candidates were rejected.")
+        conventional = self.output_root.joinpath(
+            *output["subfolder_parts"],
+            output["filename"],
+        )
+        deterministic = self.output_root.joinpath(
+            "cloud-vast",
+            job.session_id,
+            job.job_id,
+            *output["subfolder_parts"],
+            output["filename"],
+        )
+        result = []
+        seen = set()
+        candidates = (
+            (deterministic, False),
+            (conventional, False),
+            *((raw, True) for raw in supplied),
+        )
+        for raw, explicit in candidates:
+            try:
+                candidate = Path(raw)
+                if not candidate.is_absolute():
+                    raise ValueError("Relative candidate.")
+                metadata = _lstat_or_none(candidate)
+                if metadata is not None and stat.S_ISLNK(metadata.st_mode):
+                    raise InvalidOutputError(
+                        "Desktop output candidate was rejected."
+                    )
+                lexical_parent = candidate.parent
+                parent = lexical_parent.resolve(strict=True)
+                if parent != lexical_parent:
+                    raise InvalidOutputError(
+                        "Desktop output candidate was rejected."
+                    )
+                relative_parent = parent.relative_to(self.output_root)
+                current = self.output_root
+                for part in relative_parent.parts:
+                    current = current / part
+                    directory = os.lstat(current)
+                    if (
+                        not stat.S_ISDIR(directory.st_mode)
+                        or stat.S_ISLNK(directory.st_mode)
+                        or directory.st_uid != os.getuid()
+                    ):
+                        raise InvalidOutputError(
+                            "Desktop output candidate was rejected."
+                        )
+            except FileNotFoundError:
+                continue
+            except InvalidOutputError:
+                raise
+            except (OSError, RuntimeError, TypeError, ValueError):
+                if explicit:
+                    raise _relay_error(
+                        "Desktop output candidates were rejected."
+                    ) from None
+                continue
+            key = str(candidate)
+            if key not in seen:
+                seen.add(key)
+                result.append(candidate)
+        return tuple(result)
+
+    def _candidate_identity(self, candidate, output):
+        try:
+            resolved = candidate.resolve(strict=True)
+            resolved.relative_to(self.output_root)
+            metadata = os.lstat(candidate)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or stat.S_ISLNK(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+            ):
+                raise OSError("Unsafe Desktop output candidate.")
+            if metadata.st_size != output["size_bytes"]:
+                return None
+            return _hash_path_identity(
+                candidate,
+                maximum=output["size_bytes"],
+            )
+        except FileNotFoundError:
+            return None
+        except (OSError, RuntimeError, ValueError, ArtifactVerificationError):
+            raise InvalidOutputError(
+                "Desktop output candidate was rejected."
+            ) from None
+
+    @staticmethod
+    def _digest_collision_filename(filename, digest):
+        suffix = Path(filename).suffix
+        stem = filename[: -len(suffix)] if suffix else filename
+        marker = "-" + digest
+        maximum = 255 - len((marker + suffix).encode("utf-8"))
+        while stem and len(stem.encode("utf-8")) > maximum:
+            stem = stem[:-1]
+        if not stem or maximum < 1:
+            raise InvalidOutputError(
+                "Local output publication failed."
+            )
+        return stem + marker + suffix
+
+    def _output_destination(self, parent, output):
+        destination = parent / output["filename"]
+        metadata = _lstat_or_none(destination)
+        if metadata is None:
+            return destination
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+        ):
+            raise InvalidOutputError(
+                "Local output destination was rejected."
+            )
+        if metadata.st_size == output["size_bytes"]:
+            size, digest = _hash_path(
+                destination,
+                maximum=output["size_bytes"],
+            )
+            if size == output["size_bytes"] and hmac.compare_digest(
+                digest,
+                output["sha256"],
+            ):
+                return destination
+        alternate = parent / self._digest_collision_filename(
+            output["filename"],
+            output["sha256"],
+        )
+        metadata = _lstat_or_none(alternate)
+        if metadata is None:
+            return alternate
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_size != output["size_bytes"]
+        ):
+            raise ArtifactVerificationError(
+                "Local output destination already exists."
+            )
+        size, digest = _hash_path(
+            alternate,
+            maximum=output["size_bytes"],
+        )
+        if size == output["size_bytes"] and hmac.compare_digest(
+            digest,
+            output["sha256"],
+        ):
+            return alternate
+        raise ArtifactVerificationError(
+            "Local output destination already exists."
+        )
+
+    def _stage_candidate(self, candidate, part, output):
+        try:
+            part.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            raise ArtifactVerificationError(
+                "Desktop output adoption failed."
+            ) from None
+        source = None
+        target = None
+        try:
+            source_flags = os.O_RDONLY
+            if hasattr(os, "O_NOFOLLOW"):
+                source_flags |= os.O_NOFOLLOW
+            source = os.open(candidate, source_flags)
+            before = os.fstat(source)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_uid != os.getuid()
+                or before.st_size != output["size_bytes"]
+            ):
+                raise OSError("Unsafe Desktop output candidate.")
+            target_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            if hasattr(os, "O_NOFOLLOW"):
+                target_flags |= os.O_NOFOLLOW
+            target = os.open(part, target_flags, 0o600)
+            os.fchmod(target, 0o600)
+            digest = hashlib.sha256()
+            copied = 0
+            while True:
+                chunk = os.read(source, 1024 * 1024)
+                if not chunk:
+                    break
+                copied += len(chunk)
+                if copied > output["size_bytes"]:
+                    raise OSError("Desktop output changed.")
+                digest.update(chunk)
+                _write_all(target, chunk)
+            after = os.fstat(source)
+            if (
+                copied != output["size_bytes"]
+                or not hmac.compare_digest(
+                    digest.hexdigest(),
+                    output["sha256"],
+                )
+                or (before.st_dev, before.st_ino, before.st_size)
+                != (after.st_dev, after.st_ino, after.st_size)
+                or before.st_mtime_ns != after.st_mtime_ns
+            ):
+                raise OSError("Desktop output changed.")
+            os.fsync(target)
+        except OSError:
+            if target is not None:
+                os.close(target)
+                target = None
+            try:
+                part.unlink()
+            except OSError:
+                pass
+            raise ArtifactVerificationError(
+                "Desktop output adoption failed."
+            ) from None
+        finally:
+            if source is not None:
+                os.close(source)
+            if target is not None:
+                os.close(target)
+        _fsync_directory(part.parent)
+        return part
+
+    def _record_verified_output(self, job_id, output, published):
+        (
+            published_size,
+            published_digest,
+            published_device,
+            published_inode,
+        ) = _hash_path_identity(
+            published,
+            maximum=output["size_bytes"],
+        )
+        if (
+            published_size != output["size_bytes"]
+            or not hmac.compare_digest(
+                published_digest,
+                output["sha256"],
+            )
+        ):
+            raise ArtifactVerificationError(
+                "Local output verification failed."
+            )
+        os.chmod(published, 0o600)
+        _fsync_file(published)
+        _fsync_directory(published.parent)
+        self.repository.save_transfer(
+            job_id=job_id,
+            artifact_id=output["artifact_id"],
+            direction="download",
+            expected_size=output["size_bytes"],
+            sha256=output["sha256"],
+            offset=output["size_bytes"],
+            state=TransferState.VERIFIED,
+            private_path=str(published),
+            source_node_id=output["node_id"],
+            published_device=published_device,
+            published_inode=published_inode,
+        )
+        return RelayArtifactResult(
+            job_id=job_id,
+            artifact_id=output["artifact_id"],
+            node_id=output["node_id"],
+            state=TransferState.VERIFIED,
+            local_path=published,
+            size_bytes=output["size_bytes"],
+            sha256=output["sha256"],
+            mime_type=output["mime_type"],
+        )
+
+    def _adopt_desktop_candidate(
+        self,
+        job,
+        output,
+        desktop_candidates,
+    ):
+        for candidate in self._candidate_paths(
+            job,
+            output,
+            desktop_candidates,
+        ):
+            identity = self._candidate_identity(candidate, output)
+            if identity is None:
+                continue
+            size, digest, _device, _inode = identity
+            if size != output["size_bytes"] or not hmac.compare_digest(
+                digest,
+                output["sha256"],
+            ):
+                continue
+            parent = self._output_parent(
+                job,
+                output["subfolder_parts"],
+            )
+            destination = self._output_destination(parent, output)
+            try:
+                same_file = os.path.samefile(candidate, destination)
+            except (FileNotFoundError, OSError):
+                same_file = False
+            if same_file:
+                published = destination
+            elif _lstat_or_none(destination) is not None:
+                published = destination
+            else:
+                part = self._part_path(job.job_id, output["artifact_id"])
+                self._stage_candidate(candidate, part, output)
+                published = self._publish(
+                    part,
+                    destination,
+                    expected_size=output["size_bytes"],
+                    sha256=output["sha256"],
+                )
+            return self._record_verified_output(
+                job.job_id,
+                output,
+                published,
+            )
+        return None
 
     def _existing_part(self, path, expected_size):
         if not path.exists():
@@ -615,7 +999,17 @@ class LocalRelay:
         return size, hasher
 
     def _publish(self, part, destination, *, expected_size, sha256):
-        if destination.exists():
+        metadata = _lstat_or_none(destination)
+        if metadata is not None:
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or stat.S_ISLNK(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or metadata.st_size != expected_size
+            ):
+                raise ArtifactVerificationError(
+                    "Local output destination already exists."
+                )
             size, digest = _hash_path(
                 destination,
                 maximum=expected_size,
@@ -631,6 +1025,9 @@ class LocalRelay:
                 part.unlink()
             except FileNotFoundError:
                 pass
+            os.chmod(destination, 0o600)
+            _fsync_file(destination)
+            _fsync_directory(destination.parent)
             return destination
         try:
             os.link(part, destination)
@@ -727,17 +1124,14 @@ class LocalRelay:
         job_id,
         descriptor,
         output_root=None,
+        desktop_candidates=(),
     ):
-        self._job(job_id)
+        job = self._job(job_id)
         output = _validated_output(descriptor)
         if output_root is not None and _output_root(output_root) != (
             self.output_root
         ):
             raise _relay_error("Local output directory changed.")
-        if self.worker is None or not callable(
-            getattr(self.worker, "download_artifact", None)
-        ):
-            raise RelayError("Remote output transfer is unavailable.")
         artifact_id = output["artifact_id"]
         existing = self.repository.get_transfer(job_id, artifact_id)
         if existing is not None and (
@@ -802,6 +1196,17 @@ class LocalRelay:
                 sha256=output["sha256"],
                 mime_type=output["mime_type"],
             )
+        adopted = self._adopt_desktop_candidate(
+            job,
+            output,
+            desktop_candidates,
+        )
+        if adopted is not None:
+            return adopted
+        if self.worker is None or not callable(
+            getattr(self.worker, "download_artifact", None)
+        ):
+            raise RelayError("Remote output transfer is unavailable.")
         part = self._part_path(job_id, artifact_id)
         offset, digest = self._existing_part(
             part,
@@ -837,6 +1242,7 @@ class LocalRelay:
                 file_descriptor = os.open(part, flags, 0o600)
                 os.fchmod(file_descriptor, 0o600)
                 os.lseek(file_descriptor, offset, os.SEEK_SET)
+                _fsync_directory(part.parent)
 
                 async def on_chunk(chunk):
                     nonlocal current
@@ -897,57 +1303,20 @@ class LocalRelay:
                     "Remote output verification failed."
                 )
             parent = self._output_parent(
-                job_id,
+                job,
                 output["subfolder_parts"],
             )
-            destination = parent / output["filename"]
+            destination = self._output_destination(parent, output)
             published = self._publish(
                 part,
                 destination,
                 expected_size=output["size_bytes"],
                 sha256=output["sha256"],
             )
-            (
-                published_size,
-                published_digest,
-                published_device,
-                published_inode,
-            ) = _hash_path_identity(
+            return self._record_verified_output(
+                job_id,
+                output,
                 published,
-                maximum=output["size_bytes"],
-            )
-            if (
-                published_size != output["size_bytes"]
-                or not hmac.compare_digest(
-                    published_digest,
-                    output["sha256"],
-                )
-            ):
-                raise ArtifactVerificationError(
-                    "Local output verification failed."
-                )
-            self.repository.save_transfer(
-                job_id=job_id,
-                artifact_id=artifact_id,
-                direction="download",
-                expected_size=output["size_bytes"],
-                sha256=output["sha256"],
-                offset=output["size_bytes"],
-                state=TransferState.VERIFIED,
-                private_path=str(published),
-                source_node_id=output["node_id"],
-                published_device=published_device,
-                published_inode=published_inode,
-            )
-            return RelayArtifactResult(
-                job_id=job_id,
-                artifact_id=artifact_id,
-                node_id=output["node_id"],
-                state=TransferState.VERIFIED,
-                local_path=published,
-                size_bytes=output["size_bytes"],
-                sha256=output["sha256"],
-                mime_type=output["mime_type"],
             )
         except asyncio.CancelledError:
             raise
