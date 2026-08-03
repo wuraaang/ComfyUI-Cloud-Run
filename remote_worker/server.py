@@ -14,6 +14,7 @@ from cloud_run.worker_protocol import (
     NonceCache,
     PROTOCOL_VERSION,
     ProtocolAuthenticationError,
+    native_request_material,
     verify_request,
 )
 from .state import (
@@ -43,6 +44,11 @@ from .jobs import (
     JobSnapshot,
     JobValidationError,
     parse_job_request,
+)
+from .native_proxy import (
+    MAX_NATIVE_BODY_BYTES,
+    NativeProxyResponse,
+    NativeRoutePolicy,
 )
 
 
@@ -155,6 +161,28 @@ def _headers(request):
         return {}
 
 
+def _header_values(request, name):
+    raw = getattr(request, "headers", {})
+    getter = getattr(raw, "getall", None)
+    if callable(getter):
+        try:
+            values = getter(name)
+        except (KeyError, TypeError, ValueError):
+            values = []
+        try:
+            return tuple(str(value) for value in values)
+        except (TypeError, ValueError):
+            return ()
+    try:
+        return tuple(
+            str(value)
+            for key, value in raw.items()
+            if str(key).casefold() == name.casefold()
+        )
+    except (AttributeError, TypeError, ValueError):
+        return ()
+
+
 def _has_boundary(request):
     if hasattr(request, "boundary_authenticated"):
         return getattr(request, "boundary_authenticated") is True
@@ -251,6 +279,7 @@ class WorkerApplication:
         upload_artifacts=(),
         provisioner=None,
         job_manager=None,
+        native_proxy=None,
         deadline_watchdog=None,
     ):
         self.state = WorkerStateStore(
@@ -264,6 +293,8 @@ class WorkerApplication:
         self.transfer_manager = transfer_manager
         self.provisioner = provisioner
         self.job_manager = job_manager
+        self.native_proxy = native_proxy
+        self.native_route_policy = NativeRoutePolicy()
         self.deadline_watchdog = deadline_watchdog
         self.upload_artifacts = {}
         self._manifest_lock = None
@@ -796,7 +827,110 @@ class WorkerApplication:
             return await self._deadline(body)
         return _error(501, "Worker route is not implemented.")
 
+    @staticmethod
+    def _native_identity(request):
+        headers = _headers(request)
+        mapping = {
+            "x-cloud-vast-job-id": "job_id",
+            "x-cloud-vast-request-id": "request_id",
+            "x-cloud-vast-manifest": "manifest_digest",
+        }
+        if {
+            name for name in headers if name.startswith("x-cloud-vast-")
+        } - set(mapping):
+            raise ProtocolAuthenticationError(
+                "Worker request authentication failed."
+            )
+        identity = {}
+        for header, field in mapping.items():
+            values = _header_values(request, header)
+            if len(values) > 1:
+                raise ProtocolAuthenticationError(
+                    "Worker request authentication failed."
+                )
+            if values:
+                identity[field] = values[0]
+        return identity
+
+    @staticmethod
+    def _native_error(status):
+        return NativeProxyResponse(
+            status=status,
+            body=b'{"error":"Native ComfyUI request was rejected."}',
+            headers={"Content-Type": "application/json"},
+        )
+
+    async def handle_native(self, request):
+        method = getattr(request, "method", None)
+        path = _authentication_path(request)
+        if (
+            self.native_proxy is None
+            or self.native_route_policy.classify(method, path) is None
+        ):
+            return self._native_error(404)
+        duplicate_authentication = any(
+            len(_header_values(request, name)) > 1
+            for name in (
+                "x-cloud-run-protocol-version",
+                "x-cloud-run-timestamp",
+                "x-cloud-run-nonce",
+                "x-cloud-run-signature",
+            )
+        )
+        if (
+            not _has_boundary(request)
+            or _header_values(request, "authorization")
+            or duplicate_authentication
+        ):
+            return self._native_error(401)
+        try:
+            body = await _body(request)
+            if len(body) > MAX_NATIVE_BODY_BYTES:
+                raise ProtocolAuthenticationError(
+                    "Worker request authentication failed."
+                )
+            identity = self._native_identity(request)
+            signed_body = native_request_material(body, identity)
+            secret = self.state.secret_bytes()
+            verify_request(
+                secret,
+                method,
+                path,
+                signed_body,
+                _auth_envelope(request),
+                now=self.clock(),
+                seen_nonces=self.nonce_cache,
+            )
+        except (
+            ValueError,
+            WorkerStateError,
+            ProtocolAuthenticationError,
+        ):
+            return self._native_error(401)
+        try:
+            setattr(request, "_cloud_vast_authenticated_body", body)
+        except (AttributeError, TypeError):
+            pass
+        try:
+            response = await self.native_proxy.handle(request)
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            raise
+        except Exception:
+            return self._native_error(502)
+        if not isinstance(response, NativeProxyResponse):
+            try:
+                from aiohttp.web_ws import WebSocketResponse
+            except ImportError:
+                WebSocketResponse = ()
+            if not isinstance(response, WebSocketResponse):
+                return self._native_error(502)
+        return response
+
     async def close(self):
+        if self.native_proxy is not None:
+            close = getattr(self.native_proxy, "close", None)
+            if callable(close):
+                await close()
         if self.job_manager is not None:
             close = getattr(self.job_manager, "close", None)
             if callable(close):

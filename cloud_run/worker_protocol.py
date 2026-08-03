@@ -300,6 +300,12 @@ _ENVELOPE_FIELDS = {
     "nonce",
     "signature",
 }
+_NATIVE_IDENTITY_FIELDS = {
+    "job_id",
+    "request_id",
+    "manifest_digest",
+}
+_NATIVE_DIGEST = re.compile(r"[0-9a-f]{64}")
 
 
 class ProtocolAuthenticationError(ValueError):
@@ -310,6 +316,34 @@ def _authentication_error():
     return ProtocolAuthenticationError(
         "Worker request authentication failed."
     )
+
+
+def native_request_material(body, identity):
+    """Bind server-only native prompt identity to one HTTP body digest."""
+
+    if not isinstance(body, bytes) or not isinstance(identity, dict):
+        raise _authentication_error()
+    if identity:
+        if set(identity) != _NATIVE_IDENTITY_FIELDS:
+            raise _authentication_error()
+        if (
+            not is_worker_session_id(identity.get("job_id"))
+            or not is_worker_session_id(identity.get("request_id"))
+            or not isinstance(identity.get("manifest_digest"), str)
+            or _NATIVE_DIGEST.fullmatch(identity["manifest_digest"])
+            is None
+        ):
+            raise _authentication_error()
+    try:
+        metadata = canonical_json(
+            {
+                "body_sha256": hashlib.sha256(body).hexdigest(),
+                "identity": dict(identity),
+            }
+        ).encode("utf-8")
+    except CaptureValidationError:
+        raise _authentication_error() from None
+    return b"cloud-vast-native-v2\n" + metadata
 
 
 def _secret(value):

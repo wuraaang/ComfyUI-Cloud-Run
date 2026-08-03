@@ -4,6 +4,42 @@ import unittest
 
 
 class WorkerProtocolTests(unittest.TestCase):
+    def test_native_material_binds_body_and_exact_server_identity(self):
+        from cloud_run.worker_protocol import (
+            ProtocolAuthenticationError,
+            native_request_material,
+        )
+
+        body = b'{"prompt":{}}'
+        identity = {
+            "job_id": "job-1",
+            "request_id": "request-1",
+            "manifest_digest": "a" * 64,
+        }
+        baseline = native_request_material(body, identity)
+        self.assertEqual(baseline, native_request_material(body, identity))
+        self.assertNotEqual(
+            baseline,
+            native_request_material(body + b" ", identity),
+        )
+        self.assertNotEqual(
+            baseline,
+            native_request_material(body, {**identity, "job_id": "job-2"}),
+        )
+        self.assertNotIn(body, baseline)
+
+        invalid = (
+            None,
+            {"job_id": "job-1"},
+            {**identity, "extra": "field"},
+            {**identity, "manifest_digest": "A" * 64},
+            {**identity, "request_id": "../request"},
+        )
+        for value in invalid:
+            with self.subTest(identity=value):
+                with self.assertRaises(ProtocolAuthenticationError):
+                    native_request_material(body, value)
+
     def test_controller_boundary_values_have_strict_shapes(self):
         from cloud_run.worker_protocol import (
             BOUNDARY_TOKEN_ENVIRONMENT,

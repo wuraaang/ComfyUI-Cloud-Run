@@ -1179,6 +1179,63 @@ class NativeJobRecorder:
             self._observe_record(record, event)
         return None
 
+    def record_synchronization_failure(self, client_id):
+        if not isinstance(client_id, str) or not _IDENTIFIER.fullmatch(client_id):
+            raise _job_error()
+        try:
+            correlation = self.correlation_id()
+        except Exception:
+            correlation = None
+        if not isinstance(correlation, str) or not _IDENTIFIER.fullmatch(
+            correlation
+        ):
+            correlation = "correlation-unavailable"
+        transaction_id = "native-sync-" + correlation
+        if len(transaction_id) > 200:
+            transaction_id = "native-sync-" + hashlib.sha256(
+                correlation.encode("utf-8")
+            ).hexdigest()
+        try:
+            self.state.record_transaction(
+                transaction_id,
+                {
+                    "kind": "native_sync_error",
+                    "transaction_id": transaction_id,
+                    "client_id": client_id,
+                    "code": "synchronization_error",
+                    "phase": "synchronization",
+                    "message": "Native event recording was interrupted.",
+                    "correlation_id": correlation,
+                    "updated_at": self._now(),
+                },
+            )
+        except WorkerStateError:
+            raise JobError("Remote worker job state is unavailable.") from None
+        return transaction_id
+
+    def fail_native_submission(self, job_id, *, validation):
+        if not isinstance(validation, bool):
+            raise _job_error()
+        error = self._safe_run_error(
+            code=(
+                RunErrorCode.VALIDATION
+                if validation
+                else RunErrorCode.SYNCHRONIZATION
+            ),
+            phase=(
+                RunPhase.EXECUTION
+                if validation
+                else RunPhase.SYNCHRONIZATION
+            ),
+            message=(
+                "Remote ComfyUI rejected the compiled prompt."
+                if validation
+                else "Native prompt submission failed."
+            ),
+            retryable=not validation,
+        )
+        return self.fail(job_id, error, execution=True)
+
     def _history_outputs(self, prompt_id, history):
         if (
             not isinstance(history, dict)

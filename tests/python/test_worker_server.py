@@ -557,7 +557,11 @@ class WorkerApplicationTests(unittest.TestCase):
         respond @unauthorized 401
 
         request_header -Authorization
+        request_header -Cookie
         request_header -X-Cloud-Run-Boundary
+        request_header -X-Forwarded-For
+        request_header -X-Forwarded-Host
+        request_header -X-Forwarded-Proto
         request_header X-Cloud-Run-Boundary authenticated
         reverse_proxy 127.0.0.1:8766
     }

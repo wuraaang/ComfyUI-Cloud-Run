@@ -130,6 +130,7 @@ class WorkerReleaseToolTests(unittest.TestCase):
                 "remote_worker/__pycache__/jobs.cpython-313.pyc",
                 result.members,
             )
+            self.assertIn("remote_worker/native_proxy.py", result.members)
         finally:
             if previous is None:
                 bytecode.unlink(missing_ok=True)

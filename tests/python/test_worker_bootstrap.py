@@ -642,6 +642,7 @@ class WorkerArtifactTests(unittest.TestCase):
             self.assertIn("remote_worker/main.py", names)
             self.assertIn("remote_worker/gateway.py", names)
             self.assertIn("remote_worker/bootstrap.py", names)
+            self.assertIn("remote_worker/native_proxy.py", names)
             self.assertIn("cloud_run/manifest.py", names)
             self.assertIn("cloud_run/run_errors.py", names)
             self.assertIn("cloud_run/worker_protocol.py", names)

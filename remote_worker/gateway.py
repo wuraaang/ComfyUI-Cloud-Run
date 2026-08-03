@@ -42,6 +42,9 @@ _WORKER_ENVIRONMENT_ALLOWLIST = (
     "PYTHONUNBUFFERED",
     "TMPDIR",
 )
+_NETWORK_PROXY_ENVIRONMENT = frozenset(
+    {"ALL_PROXY", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"}
+)
 
 
 class GatewayError(RuntimeError):
@@ -183,6 +186,8 @@ def _run_gateway_unsafe(*, environ, popen_factory, wait_timeout_seconds):
             for name in _WORKER_ENVIRONMENT_ALLOWLIST
             if name in environ and isinstance(environ[name], str)
         }
+        if set(worker_environment).intersection(_NETWORK_PROXY_ENVIRONMENT):
+            raise _gateway_error()
         caddy_argv = [
             caddy,
             "run",

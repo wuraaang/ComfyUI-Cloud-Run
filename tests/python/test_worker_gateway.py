@@ -274,6 +274,10 @@ class GatewayProcessTests(unittest.TestCase):
             "PYTHONUNBUFFERED": "1",
             "TMPDIR": "/tmp",
             "VAST_API_KEY": "must-not-cross",
+            "HTTP_PROXY": "http://must-not-cross.example",
+            "HTTPS_PROXY": "https://must-not-cross.example",
+            "ALL_PROXY": "socks5://must-not-cross.example",
+            "NO_PROXY": "127.0.0.1",
             "UNRELATED": "must-not-cross",
         }
         self.config_directory = STATE_DIRECTORY / "caddy-config"
@@ -386,6 +390,8 @@ class GatewayProcessTests(unittest.TestCase):
         self.assertNotIn(BOUNDARY_TOKEN_ENVIRONMENT, worker_environment)
         self.assertNotIn("JUPYTER_TOKEN", worker_environment)
         self.assertNotIn("OPEN_BUTTON_TOKEN", worker_environment)
+        for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"):
+            self.assertNotIn(name, worker_environment)
 
     def test_filtered_environment_builds_real_deadline_armed_worker_runtime(self):
         from remote_worker.deadline import (
@@ -519,7 +525,11 @@ class GatewayConfigurationTests(unittest.TestCase):
         respond @unauthorized 401
 
         request_header -Authorization
+        request_header -Cookie
         request_header -X-Cloud-Run-Boundary
+        request_header -X-Forwarded-For
+        request_header -X-Forwarded-Host
+        request_header -X-Forwarded-Proto
         request_header X-Cloud-Run-Boundary authenticated
         reverse_proxy 127.0.0.1:8766
     }

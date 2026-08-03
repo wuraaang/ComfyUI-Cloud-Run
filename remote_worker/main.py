@@ -15,6 +15,11 @@ from .comfy import ComfyProcess
 from .deadline import deadline_watchdog
 from .install import CustomNodeInstaller
 from .jobs import MAX_JOB_REQUEST_BYTES, JobManager
+from .native_proxy import (
+    MAX_NATIVE_BODY_BYTES,
+    NativeComfyProxy,
+    NativeProxyResponse,
+)
 from .provision import (
     MAX_MANIFEST_REQUEST_BYTES,
     DiskReservation,
@@ -124,6 +129,7 @@ def build_worker_runtime(
         state=state_store,
         preview_root=previews_root,
     )
+    native_proxy = NativeComfyProxy(recorder=job_manager.recorder)
     watchdog = (
         deadline_factory(state=state_store)
         if deadline_factory is not None
@@ -135,6 +141,7 @@ def build_worker_runtime(
         transfer_manager=transfer_manager,
         provisioner=provisioner,
         job_manager=job_manager,
+        native_proxy=native_proxy,
         deadline_watchdog=watchdog,
     )
 
@@ -157,12 +164,28 @@ def build_aiohttp_application(
         )
     application = web.Application(
         client_max_size=(
-            max(MAX_MANIFEST_REQUEST_BYTES, MAX_JOB_REQUEST_BYTES) + 1
+            max(
+                MAX_MANIFEST_REQUEST_BYTES,
+                MAX_JOB_REQUEST_BYTES,
+                MAX_NATIVE_BODY_BYTES,
+            )
+            + 1
         )
     )
 
     async def handle(request):
-        response = await worker.handle(request)
+        if request.path.startswith("/worker/v1/"):
+            response = await worker.handle(request)
+        else:
+            response = await worker.handle_native(request)
+        if isinstance(response, web.StreamResponse):
+            return response
+        if isinstance(response, NativeProxyResponse):
+            return web.Response(
+                body=response.body,
+                status=response.status,
+                headers=response.headers,
+            )
         if isinstance(response.payload, bytes):
             return web.Response(
                 body=response.payload,
