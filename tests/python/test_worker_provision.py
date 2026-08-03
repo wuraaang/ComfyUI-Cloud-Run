@@ -360,6 +360,25 @@ class ProvisionerTests(unittest.TestCase):
         self.assertEqual(result.repair_restarts, 0)
         self.assertEqual(result.missing_class_types, ())
         self.assertEqual(result.missing_artifacts, ())
+        self.assertEqual(
+            result.readiness,
+            {
+                "protocol_version": desired.protocol_version,
+                "comfyui_core_version": desired.comfyui_core_version,
+                "comfyui_frontend_version": (
+                    desired.comfyui_frontend_version
+                ),
+                "worker_version": desired.worker_version,
+                "validated_class_types": ["Fancy", "KSampler"],
+                "validated_artifacts": ["source-image", "upscaler"],
+                "profile_revision": None,
+                "profile_digest": None,
+                "bootstrap_digest": None,
+                "ui_package_digests": {},
+                "comfy_process_healthy": True,
+                "completed_at": result.readiness["completed_at"],
+            },
+        )
         self.assertEqual(events[0], "disk")
         self.assertEqual(events[1], "transfer")
         self.assertEqual(
@@ -394,6 +413,10 @@ class ProvisionerTests(unittest.TestCase):
         self.assertEqual(
             persisted["transactions"][result.transaction_id]["state"],
             "ready",
+        )
+        self.assertEqual(
+            provisioner.transaction(result.transaction_id).readiness,
+            result.readiness,
         )
 
     def test_ui_package_and_profile_are_transferred_without_graph_authority(self):
@@ -469,6 +492,19 @@ class ProvisionerTests(unittest.TestCase):
         self.assertEqual(
             installed["required_class_types"],
             ["KSampler"],
+        )
+        self.assertEqual(result.readiness["profile_revision"], 3)
+        self.assertEqual(
+            result.readiness["profile_digest"],
+            profile_archive.sha256,
+        )
+        self.assertEqual(
+            result.readiness["bootstrap_digest"],
+            safe_profile.bootstrap_digest,
+        )
+        self.assertEqual(
+            result.readiness["ui_package_digests"],
+            {"comfyui-agent-panel": "b" * 64},
         )
 
     def test_progress_is_bounded_monotonic_sanitized_and_reaches_ready(self):

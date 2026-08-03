@@ -237,6 +237,164 @@ class JobRepository:
         )
 
     @staticmethod
+    def _readiness_report_from_row(row):
+        if row is None:
+            return None
+        from .readiness import ReadinessReport
+
+        try:
+            checks = json.loads(row["checks_json"])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raise ValueError("Stored readiness report is invalid.") from None
+        report = ReadinessReport.from_record(
+            {
+                "report_digest": row["report_digest"],
+                "session_id": row["session_id"],
+                "instance_id": row["instance_id"],
+                "worker_release_digest": row["worker_release_digest"],
+                "manifest_digest": row["manifest_digest"],
+                "profile_revision": int(row["profile_revision"]),
+                "relay_origin": row["relay_origin"],
+                "inventory_observed_at": float(row["inventory_observed_at"]),
+                "created_at": float(row["created_at"]),
+                "checks": checks,
+            }
+        )
+        if bool(row["ready"]) != report.ready:
+            raise ValueError("Stored readiness report is invalid.")
+        return report
+
+    @staticmethod
+    def _readiness_columns():
+        return (
+            "report_digest, session_id, instance_id, worker_release_digest, "
+            "manifest_digest, profile_revision, relay_origin, "
+            "inventory_observed_at, created_at, checks_json, ready"
+        )
+
+    def get_readiness_report(self, report_digest):
+        from .readiness import ReadinessReport
+
+        if (
+            not isinstance(report_digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", report_digest) is None
+        ):
+            raise ValueError("Invalid readiness report digest.")
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT "
+                + self._readiness_columns()
+                + " FROM readiness_reports WHERE report_digest = ?",
+                (report_digest,),
+            ).fetchone()
+        report = self._readiness_report_from_row(row)
+        if report is not None and not isinstance(report, ReadinessReport):
+            raise ValueError("Stored readiness report is invalid.")
+        return report
+
+    def current_readiness_report(
+        self,
+        *,
+        session_id,
+        instance_id,
+        worker_release_digest,
+        manifest_digest,
+        profile_revision,
+        relay_origin,
+    ):
+        from .readiness import _relay_origin
+
+        if (
+            not isinstance(session_id, str)
+            or _IDENTIFIER.fullmatch(session_id) is None
+            or not isinstance(instance_id, str)
+            or _IDENTIFIER.fullmatch(instance_id) is None
+            or not isinstance(worker_release_digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", worker_release_digest) is None
+            or not isinstance(manifest_digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", manifest_digest) is None
+            or isinstance(profile_revision, bool)
+            or not isinstance(profile_revision, int)
+            or profile_revision < 0
+        ):
+            raise ValueError("Invalid readiness report identity.")
+        _relay_origin(relay_origin)
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT "
+                + self._readiness_columns()
+                + " FROM readiness_reports WHERE "
+                "session_id = ? AND instance_id = ? AND "
+                "worker_release_digest = ? AND manifest_digest = ? AND "
+                "profile_revision = ? AND relay_origin = ?",
+                (
+                    session_id,
+                    instance_id,
+                    worker_release_digest,
+                    manifest_digest,
+                    profile_revision,
+                    relay_origin,
+                ),
+            ).fetchone()
+        return self._readiness_report_from_row(row)
+
+    def save_readiness_report(self, report):
+        from .readiness import ReadinessReport
+
+        if not isinstance(report, ReadinessReport):
+            raise ValueError("Invalid readiness report.")
+        values = (
+            report.report_digest,
+            report.session_id,
+            report.instance_id,
+            report.worker_release_digest,
+            report.manifest_digest,
+            report.profile_revision,
+            report.relay_origin,
+            report.inventory_observed_at,
+            report.created_at,
+            _canonical_json([item.to_record() for item in report.checks]),
+            int(report.ready),
+        )
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT "
+                + self._readiness_columns()
+                + " FROM readiness_reports WHERE "
+                "session_id = ? AND instance_id = ? AND "
+                "worker_release_digest = ? AND manifest_digest = ? AND "
+                "profile_revision = ? AND relay_origin = ?",
+                values[1:7],
+            ).fetchone()
+            if existing is not None:
+                connection.commit()
+                return self._readiness_report_from_row(existing)
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO readiness_reports(
+                        report_digest, session_id, instance_id,
+                        worker_release_digest, manifest_digest,
+                        profile_revision, relay_origin,
+                        inventory_observed_at, created_at, checks_json, ready
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    values,
+                )
+            except sqlite3.IntegrityError:
+                connection.rollback()
+                raise ValueError("Readiness report identity already exists.") from None
+            row = connection.execute(
+                "SELECT "
+                + self._readiness_columns()
+                + " FROM readiness_reports WHERE report_digest = ?",
+                (report.report_digest,),
+            ).fetchone()
+            connection.commit()
+        return self._readiness_report_from_row(row)
+
+    @staticmethod
     def _profile_revision_from_row(row):
         if row is None:
             return None

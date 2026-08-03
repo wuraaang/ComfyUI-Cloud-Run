@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+import hashlib
 import hmac
 import json
 import math
@@ -11,6 +12,7 @@ import re
 import secrets
 
 from .agent_bridge import AgentBridgeSession
+from .readiness import ReadinessCheck, evidence_digest
 from .repository import DesktopRelayConfig
 from .worker_client import (
     MAX_WORKER_JSON_BYTES,
@@ -398,6 +400,226 @@ class DesktopRelay:
             self._capability_expires_at = None
             self._error = None
             return self.status()
+
+    async def probe_readiness(
+        self,
+        session_id,
+        worker,
+        profile_revision,
+        *,
+        agent_required,
+    ):
+        """Probe the exact relay data plane without exposing an active Desktop."""
+        if (
+            not isinstance(session_id, str)
+            or _IDENTIFIER.fullmatch(session_id) is None
+            or isinstance(profile_revision, bool)
+            or not isinstance(profile_revision, int)
+            or profile_revision < 0
+            or not isinstance(agent_required, bool)
+            or not callable(getattr(worker, "native_envelope", None))
+            or not callable(
+                getattr(getattr(worker, "transport", None), "request", None)
+            )
+        ):
+            raise DesktopRelayError("Desktop readiness probe was rejected.")
+
+        def check(name, status, proof, message):
+            return ReadinessCheck(
+                name=name,
+                status=status,
+                evidence_digest=evidence_digest(proof),
+                message=message,
+            )
+
+        async with self._lock():
+            config = self._config
+            binding_ok = bool(
+                self._bound
+                and config is not None
+                and config.bind_host == "127.0.0.1"
+                and 1 <= config.port <= 65535
+                and config.active_session_id in {None, session_id}
+                and (
+                    getattr(worker, "session_id", session_id)
+                    == session_id
+                )
+            )
+            binding = check(
+                "loopback_session_binding",
+                "passed" if binding_ok else "failed",
+                {
+                    "bound": binding_ok,
+                    "session_id": session_id,
+                    "profile_revision": profile_revision,
+                },
+                (
+                    "Loopback session binding passed."
+                    if binding_ok
+                    else "Loopback session binding failed."
+                ),
+            )
+
+            http_ok = False
+            http_proof = {"status": "unavailable"}
+            if binding_ok:
+                try:
+                    request = worker.native_envelope(
+                        "GET",
+                        "/system_stats",
+                        b"",
+                        headers={"Accept": "application/json"},
+                    )
+                    if not isinstance(request, WorkerRequest):
+                        raise DesktopRelayError(
+                            "Native HTTP readiness probe failed."
+                        )
+                    response = await worker.transport.request(
+                        request,
+                        max_bytes=MAX_RELAY_RESPONSE_BYTES,
+                    )
+                    http_ok = bool(
+                        isinstance(response, WorkerTransportResponse)
+                        and response.status == 200
+                        and isinstance(response.body, bytes)
+                        and len(response.body) <= MAX_RELAY_RESPONSE_BYTES
+                    )
+                    http_proof = {
+                        "status": response.status,
+                        "body_sha256": (
+                            hashlib.sha256(response.body).hexdigest()
+                            if http_ok
+                            else None
+                        ),
+                    }
+                except (asyncio.CancelledError, KeyboardInterrupt):
+                    raise
+                except Exception:
+                    http_ok = False
+            http = check(
+                "native_http_probe",
+                "passed" if http_ok else "failed",
+                http_proof,
+                (
+                    "Native HTTP readiness probe passed."
+                    if http_ok
+                    else "Native HTTP readiness probe failed."
+                ),
+            )
+
+            websocket_ok = False
+            websocket_proof = {"status": "unavailable"}
+            open_socket = getattr(worker, "native_websocket", None)
+            if binding_ok and callable(open_socket):
+                upstream = None
+                try:
+                    request = worker.native_envelope(
+                        "GET",
+                        "/ws?clientId=cloud-vast-readiness",
+                        b"",
+                    )
+                    if not isinstance(request, WorkerRequest):
+                        raise DesktopRelayError(
+                            "Native WebSocket readiness probe failed."
+                        )
+                    upstream = await open_socket(request)
+                    close = getattr(upstream, "close", None)
+                    if not callable(close):
+                        raise DesktopRelayError(
+                            "Native WebSocket readiness probe failed."
+                        )
+                    closed = close(code=1000)
+                    if asyncio.iscoroutine(closed):
+                        await closed
+                    websocket_ok = True
+                    websocket_proof = {
+                        "status": "opened_and_closed",
+                        "session_id": session_id,
+                    }
+                except (asyncio.CancelledError, KeyboardInterrupt):
+                    raise
+                except Exception:
+                    websocket_ok = False
+                    if upstream is not None:
+                        try:
+                            closed = upstream.close(code=1011)
+                            if asyncio.iscoroutine(closed):
+                                await closed
+                        except Exception:
+                            pass
+            websocket = check(
+                "native_websocket_probe",
+                "passed" if websocket_ok else "failed",
+                websocket_proof,
+                (
+                    "Native WebSocket readiness probe passed."
+                    if websocket_ok
+                    else "Native WebSocket readiness probe failed."
+                ),
+            )
+
+            agent_status = "not_required"
+            agent_ok = not agent_required
+            agent_proof = {"required": agent_required}
+            if agent_required:
+                bridge = self.agent_bridge
+                probe = getattr(bridge, "probe", None)
+                allow = getattr(bridge, "allow", None)
+                revoke = getattr(bridge, "revoke", None)
+                if all(callable(item) for item in (probe, allow, revoke)):
+                    try:
+                        capability = self.capability_factory()
+                        now = self._now()
+                        root = self.local_comfy_root
+                        if callable(root):
+                            root = root()
+                        bridge_session = AgentBridgeSession(
+                            session_id=session_id,
+                            relay_origin=(
+                                "http://127.0.0.1:" + str(config.port)
+                            ),
+                            capability=capability,
+                            capability_expires_at=now + COOKIE_TTL_SECONDS,
+                            local_comfy_root=(
+                                str(root) if root is not None else None
+                            ),
+                        )
+                        allowed = allow(session_id)
+                        if asyncio.iscoroutine(allowed):
+                            await allowed
+                        result = probe(bridge_session)
+                        if asyncio.iscoroutine(result):
+                            result = await result
+                        agent_ok = bool(getattr(result, "ready", None) is True)
+                        agent_proof = (
+                            result.public_payload()
+                            if agent_ok
+                            and callable(getattr(result, "public_payload", None))
+                            else {"required": True, "ready": False}
+                        )
+                    except (asyncio.CancelledError, KeyboardInterrupt):
+                        raise
+                    except Exception:
+                        agent_ok = False
+                    finally:
+                        try:
+                            revoked = revoke(session_id)
+                            if asyncio.iscoroutine(revoked):
+                                await revoked
+                        except Exception:
+                            agent_ok = False
+                agent_status = "passed" if agent_ok else "failed"
+            agent = check(
+                "agent_panel_capabilities",
+                agent_status,
+                agent_proof,
+                (
+                    "Agent Panel readiness probe passed."
+                    if agent_ok
+                    else "Agent Panel readiness probe failed."
+                ),
+            )
+            return (binding, http, websocket, agent)
 
     async def deactivate(self, session_id):
         if not isinstance(session_id, str) or _IDENTIFIER.fullmatch(session_id) is None:

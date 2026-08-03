@@ -176,6 +176,7 @@ class ProvisionResult:
     missing_class_types: tuple[str, ...]
     missing_artifacts: tuple[str, ...]
     progress: dict | None = None
+    readiness: dict | None = None
 
     def __post_init__(self):
         if (
@@ -211,6 +212,13 @@ class ProvisionResult:
             "progress",
             _validated_progress(self.progress),
         )
+        object.__setattr__(
+            self,
+            "readiness",
+            _validated_worker_readiness(self.readiness),
+        )
+        if self.readiness is not None and self.state != "ready":
+            raise ProvisionError("Provisioning readiness is invalid.")
 
     def payload(self):
         payload = {
@@ -224,7 +232,89 @@ class ProvisionResult:
         }
         if self.progress is not None:
             payload["progress"] = dict(self.progress)
+        if self.readiness is not None:
+            payload["readiness"] = dict(self.readiness)
         return payload
+
+
+def _validated_worker_readiness(value):
+    if value is None:
+        return None
+    fields = {
+        "protocol_version",
+        "comfyui_core_version",
+        "comfyui_frontend_version",
+        "worker_version",
+        "validated_class_types",
+        "validated_artifacts",
+        "profile_revision",
+        "profile_digest",
+        "bootstrap_digest",
+        "ui_package_digests",
+        "comfy_process_healthy",
+        "completed_at",
+    }
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ProvisionError("Provisioning readiness is invalid.")
+    class_types = value["validated_class_types"]
+    artifacts = value["validated_artifacts"]
+    profile_revision = value["profile_revision"]
+    if (
+        not isinstance(class_types, list)
+        or class_types != sorted(set(class_types))
+        or not isinstance(artifacts, list)
+        or len(artifacts) != len(set(artifacts))
+        or not all(
+            isinstance(item, str) and _IDENTIFIER.fullmatch(item)
+            for item in (*class_types, *artifacts)
+        )
+        or (
+            profile_revision is not None
+            and (
+                isinstance(profile_revision, bool)
+                or not isinstance(profile_revision, int)
+                or profile_revision <= 0
+            )
+        )
+        or (profile_revision is None)
+        != (value["profile_digest"] is None)
+        or (profile_revision is None)
+        != (value["bootstrap_digest"] is None)
+        or any(
+            digest is not None
+            and (
+                not isinstance(digest, str)
+                or not _HEX_64.fullmatch(digest)
+            )
+            for digest in (
+                value["profile_digest"],
+                value["bootstrap_digest"],
+            )
+        )
+        or not isinstance(value["ui_package_digests"], dict)
+        or any(
+            not isinstance(package_id, str)
+            or not _IDENTIFIER.fullmatch(package_id)
+            or not isinstance(digest, str)
+            or not _HEX_64.fullmatch(digest)
+            for package_id, digest in value["ui_package_digests"].items()
+        )
+        or value["comfy_process_healthy"] is not True
+        or isinstance(value["completed_at"], bool)
+        or not isinstance(value["completed_at"], (int, float))
+        or not math.isfinite(value["completed_at"])
+        or value["completed_at"] < 0
+    ):
+        raise ProvisionError("Provisioning readiness is invalid.")
+    return json.loads(
+        json.dumps(
+            value,
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    )
 
 
 def _provision_error():
@@ -1361,6 +1451,7 @@ class Provisioner:
             missing_class_types=(),
             missing_artifacts=(),
             progress=tracker.snapshot,
+            readiness=self.readiness(desired.digest),
         )
 
     async def _validate(self, desired, required, tracker):
@@ -1788,6 +1879,40 @@ class Provisioner:
                 )
                 raise _provision_error() from None
 
+    def readiness(self, manifest_digest):
+        if (
+            not isinstance(manifest_digest, str)
+            or not _HEX_64.fullmatch(manifest_digest)
+        ):
+            raise _provision_error()
+        state = self.state_store.load()
+        installed = state.get("installed")
+        if (
+            not isinstance(installed, dict)
+            or installed.get("manifest_digest") != manifest_digest
+            or not isinstance(installed.get("manifest"), dict)
+        ):
+            return None
+        try:
+            desired = dependency_manifest_from_record(installed["manifest"])
+            self._installed_manifest(state, desired)
+            persisted = installed["readiness"]
+            profile = desired.profile
+            return _validated_worker_readiness(
+                {
+                    **persisted,
+                    "profile_digest": (
+                        profile.archive.sha256 if profile is not None else None
+                    ),
+                    "bootstrap_digest": (
+                        profile.bootstrap_digest if profile is not None else None
+                    ),
+                    "comfy_process_healthy": True,
+                }
+            )
+        except (KeyError, TypeError, ValueError, ProvisionError):
+            raise _provision_error() from None
+
     def transaction(self, transaction_id):
         if (
             not isinstance(transaction_id, str)
@@ -1815,6 +1940,11 @@ class Provisioner:
                 ),
                 missing_artifacts=tuple(record["missing_artifacts"]),
                 progress=record.get("progress"),
+                readiness=(
+                    self.readiness(record["manifest_digest"])
+                    if record["state"] == "ready"
+                    else None
+                ),
             )
         except (KeyError, TypeError, ValueError):
             raise _provision_error() from None

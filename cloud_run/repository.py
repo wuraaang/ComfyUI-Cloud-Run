@@ -689,10 +689,31 @@ def _initialize_database(path):
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS readiness_reports (
+                    report_digest TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    instance_id TEXT NOT NULL,
+                    worker_release_digest TEXT NOT NULL,
+                    manifest_digest TEXT NOT NULL,
+                    profile_revision INTEGER NOT NULL,
+                    relay_origin TEXT NOT NULL,
+                    inventory_observed_at REAL NOT NULL,
+                    created_at REAL NOT NULL,
+                    checks_json TEXT NOT NULL,
+                    ready INTEGER NOT NULL CHECK(ready IN (0, 1)),
+                    UNIQUE(
+                        session_id, instance_id, worker_release_digest,
+                        manifest_digest, profile_revision, relay_origin
+                    )
+                )
+                """
+            )
             _migrate_legacy_attempts(connection)
             connection.execute(
                 """
-                INSERT INTO schema_meta(key, value) VALUES('schema_version', '11')
+                INSERT INTO schema_meta(key, value) VALUES('schema_version', '12')
                 ON CONFLICT(key) DO UPDATE SET value = excluded.value
                 """
             )

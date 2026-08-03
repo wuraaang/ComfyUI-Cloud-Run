@@ -2042,6 +2042,182 @@ class ReusableSessionTests(unittest.TestCase):
             ["input-a.jpg", "model-a.safetensors"],
         )
 
+    def test_failed_readiness_is_durable_blocks_activation_and_never_mutates_provider(self):
+        from cloud_run.readiness import (
+            REQUIRED_READINESS_CHECKS,
+            ReadinessCheck,
+            ReadinessValidator,
+            evidence_digest,
+        )
+
+        class Relay:
+            def __init__(inner_self):
+                inner_self.activations = 0
+
+            async def start(inner_self):
+                return types.SimpleNamespace(
+                    bound=True,
+                    url="http://127.0.0.1:32145",
+                )
+
+            async def activate(inner_self, *_args):
+                inner_self.activations += 1
+                raise AssertionError("failed readiness must not activate")
+
+            def status(inner_self):
+                return types.SimpleNamespace(
+                    ready=False,
+                    active_session_id=None,
+                    profile_revision=None,
+                    url="http://127.0.0.1:32145",
+                )
+
+        class ProviderLifecycle:
+            def __init__(inner_self):
+                inner_self.create_calls = 0
+                inner_self.destroy_calls = 0
+
+            async def create_session(inner_self, *_args, **_kwargs):
+                inner_self.create_calls += 1
+
+            async def destroy_session(inner_self, *_args, **_kwargs):
+                inner_self.destroy_calls += 1
+
+        probe_calls = []
+
+        async def probe(_session, _manifest, _profile):
+            probe_calls.append(True)
+            return tuple(
+                ReadinessCheck(
+                    name=name,
+                    status=(
+                        "failed"
+                        if name == "native_websocket_probe"
+                        else "passed"
+                    ),
+                    evidence_digest=evidence_digest(name),
+                    message=(
+                        "Native WebSocket readiness probe failed."
+                        if name == "native_websocket_probe"
+                        else "Readiness proof passed."
+                    ),
+                )
+                for name in REQUIRED_READINESS_CHECKS
+            )
+
+        relay = Relay()
+        lifecycle = ProviderLifecycle()
+        self.service.desktop_relay = relay
+        self.service.lifecycle = lifecycle
+        self.service.readiness_validator = ReadinessValidator(
+            probe=probe,
+            worker_release_digest=worker_release().worker_archive_sha256,
+            relay_origin="http://127.0.0.1:32145",
+            clock=lambda: 100.0,
+        )
+        self._save_bootstrapping_session()
+
+        first = asyncio.run(self.service.bootstrap_session("session-boot"))
+        second = asyncio.run(self.service.bootstrap_session("session-boot"))
+
+        self.assertEqual(first.state, SessionState.VALIDATING)
+        self.assertEqual(second.state, SessionState.VALIDATING)
+        self.assertEqual(probe_calls, [True])
+        self.assertEqual(relay.activations, 0)
+        self.assertEqual(lifecycle.create_calls, 0)
+        self.assertEqual(lifecycle.destroy_calls, 0)
+        self.assertEqual(len(self.worker.manifest_calls), 1)
+        entries = self.jobs.list_journal(session_id="session-boot")
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].phase.value, "readiness")
+        self.assertEqual(entries[0].code.value, "validation_error")
+        self.assertEqual(entries[0].last_probe, "native_websocket_probe")
+
+    def test_complete_report_commits_before_ready_relay_activation(self):
+        from cloud_run.readiness import (
+            REQUIRED_READINESS_CHECKS,
+            ReadinessCheck,
+            ReadinessValidator,
+            evidence_digest,
+        )
+
+        outer = self
+
+        class Relay:
+            def __init__(inner_self):
+                inner_self.active = False
+
+            async def start(inner_self):
+                return inner_self.status()
+
+            async def activate(
+                inner_self,
+                session_id,
+                _worker,
+                profile_revision,
+            ):
+                session = outer.sessions.get(session_id)
+                report = outer.jobs.current_readiness_report(
+                    session_id=session_id,
+                    instance_id=session.instance_id,
+                    worker_release_digest=(
+                        worker_release().worker_archive_sha256
+                    ),
+                    manifest_digest=outer.initial_manifest.digest,
+                    profile_revision=profile_revision,
+                    relay_origin="http://127.0.0.1:32145",
+                )
+                if report is None or session.state != SessionState.READY:
+                    raise AssertionError("activation preceded durable readiness")
+                inner_self.active = True
+                return inner_self.status()
+
+            def status(inner_self):
+                return types.SimpleNamespace(
+                    bound=True,
+                    ready=inner_self.active,
+                    active_session_id=(
+                        "session-boot" if inner_self.active else None
+                    ),
+                    profile_revision=(0 if inner_self.active else None),
+                    url="http://127.0.0.1:32145",
+                )
+
+        async def probe(_session, _manifest, _profile):
+            return tuple(
+                ReadinessCheck(
+                    name=name,
+                    status=(
+                        "not_required"
+                        if name == "agent_panel_capabilities"
+                        else "passed"
+                    ),
+                    evidence_digest=evidence_digest(name),
+                    message="Readiness proof passed.",
+                )
+                for name in REQUIRED_READINESS_CHECKS
+            )
+
+        relay = Relay()
+        self.service.desktop_relay = relay
+        self.service.readiness_validator = ReadinessValidator(
+            probe=probe,
+            worker_release_digest=worker_release().worker_archive_sha256,
+            relay_origin="http://127.0.0.1:32145",
+            clock=lambda: 100.0,
+        )
+        self._save_bootstrapping_session()
+
+        ready = asyncio.run(self.service.bootstrap_session("session-boot"))
+
+        self.assertEqual(ready.state, SessionState.READY)
+        self.assertTrue(relay.active)
+        self.assertTrue(
+            self.service.desktop_readiness("session-boot")[
+                "desktop_ready"
+            ]
+        )
+
     def test_bootstrap_boundary_401_is_terminal(self):
         from cloud_run.worker_client import (
             WorkerBoundaryAuthenticationError,

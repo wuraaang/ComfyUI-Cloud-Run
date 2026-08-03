@@ -36,6 +36,11 @@ from .relay import (
     LocalRelay,
     RelayError,
 )
+from .readiness import (
+    ControllerReadinessProbe,
+    LocalExecutionGuard,
+    ReadinessValidator,
+)
 from .service import (
     AttemptNotFound,
     CloudRunService,
@@ -371,6 +376,46 @@ def build_service():
             ComfyHost.from_running_host().comfy_root
         ),
     )
+    service.session_service.desktop_relay = service.desktop_relay
+    if release is not None:
+        local_execution_guard = LocalExecutionGuard()
+
+        async def inventory_probe(session):
+            settings = settings_store.load()
+            api_key = (
+                settings.get("api_key")
+                if isinstance(settings, dict)
+                else None
+            )
+            if not api_key or session.instance_id is None:
+                return None
+            return await provider.get_instance(api_key, session.instance_id)
+
+        def required_class_types(manifest):
+            capture = job_repository.get_capture_by_prompt_digest(
+                manifest.prompt_digest
+            )
+            if capture is None:
+                return ()
+            required = set(capture.executable_class_types)
+            for node in manifest.custom_nodes:
+                required.update(node.provided_class_types)
+            return tuple(sorted(required))
+
+        readiness_probe = ControllerReadinessProbe(
+            worker_factory=worker_factory,
+            inventory_probe=inventory_probe,
+            desktop_relay=service.desktop_relay,
+            release=release,
+            required_class_types=required_class_types,
+            local_execution_counter=local_execution_guard.count,
+        )
+        service.session_service.readiness_validator = ReadinessValidator(
+            probe=readiness_probe,
+            worker_release_digest=release.worker_archive_sha256,
+            relay_origin=lambda: service.desktop_relay.status().url,
+        )
+        service.local_execution_guard = local_execution_guard
     return service
 
 
@@ -585,6 +630,30 @@ def _session_payload(session, service=None):
         )
     except Exception:
         payload["deadline_alerts"] = []
+
+    readiness = getattr(
+        getattr(service, "session_service", None),
+        "desktop_readiness",
+        None,
+    )
+    try:
+        desktop = (
+            readiness(session.session_id)
+            if callable(readiness)
+            else {
+                "desktop_ready": False,
+                "readiness_report": None,
+            }
+        )
+        if not isinstance(desktop, dict) or set(desktop) != {
+            "desktop_ready",
+            "readiness_report",
+        }:
+            raise ValueError("Invalid readiness payload.")
+        payload.update(desktop)
+    except Exception:
+        payload["desktop_ready"] = False
+        payload["readiness_report"] = None
 
     repository = getattr(service, "job_repository", None)
     if not isinstance(repository, JobRepository):

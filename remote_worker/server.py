@@ -151,6 +151,11 @@ def _provision_result_payload(result):
             if result.progress is not None
             else None
         ),
+        readiness=(
+            dict(result.readiness)
+            if result.readiness is not None
+            else None
+        ),
     )
     return validated.payload()
 

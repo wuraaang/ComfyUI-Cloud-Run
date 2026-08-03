@@ -392,7 +392,7 @@ class JobRepositoryTests(unittest.TestCase):
         for forbidden in ("bearer", "secret", "token", "worker_url"):
             self.assertNotIn(forbidden, rendered.casefold())
 
-    def test_legacy_schema_is_migrated_idempotently_to_native_queue_v11(self):
+    def test_legacy_schema_is_migrated_idempotently_to_readiness_v12(self):
         self.path.parent.mkdir(parents=True)
         with closing(sqlite3.connect(self.path)) as connection:
             connection.execute(
@@ -479,6 +479,12 @@ class JobRepositoryTests(unittest.TestCase):
                 WHERE type = 'table' AND name = 'run_journal'
                 """
             ).fetchone()
+            readiness_exists = connection.execute(
+                """
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'readiness_reports'
+                """
+            ).fetchone()
 
         self.assertIsNotNone(jobs)
         self.assertEqual(
@@ -513,7 +519,8 @@ class JobRepositoryTests(unittest.TestCase):
             set(),
         )
         self.assertIsNotNone(journal_exists)
-        self.assertEqual(schema_version, "11")
+        self.assertIsNotNone(readiness_exists)
+        self.assertEqual(schema_version, "12")
         self.assertIn("queue_position", job_columns)
         self.assertIn("native_request_digest", job_columns)
         self.assertIn("native_body_json", job_columns)

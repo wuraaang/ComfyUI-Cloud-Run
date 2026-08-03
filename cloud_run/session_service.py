@@ -1067,17 +1067,12 @@ def _provision_payload_valid(payload, manifest):
         "missing_class_types",
         "missing_artifacts",
     }
-    optional = {"required_uploads", "progress"}
-    allowed = {
-        frozenset(required | subset)
-        for subset in (
-            set(),
-            {"required_uploads"},
-            {"progress"},
-            optional,
-        )
-    }
-    if not isinstance(payload, dict) or frozenset(payload) not in allowed:
+    optional = {"required_uploads", "progress", "readiness"}
+    if (
+        not isinstance(payload, dict)
+        or not required.issubset(payload)
+        or not set(payload).issubset(required | optional)
+    ):
         return False
     if (
         not isinstance(payload.get("transaction_id"), str)
@@ -1117,7 +1112,90 @@ def _provision_payload_valid(payload, manifest):
         != (payload["state"] == "ready")
     ):
         return False
+    readiness = payload.get("readiness")
+    if readiness is not None and (
+        payload["state"] != "ready"
+        or not _worker_readiness_payload_valid(readiness, manifest)
+    ):
+        return False
     return True
+
+
+def _worker_readiness_payload_valid(payload, manifest):
+    fields = {
+        "protocol_version",
+        "comfyui_core_version",
+        "comfyui_frontend_version",
+        "worker_version",
+        "validated_class_types",
+        "validated_artifacts",
+        "profile_revision",
+        "profile_digest",
+        "bootstrap_digest",
+        "ui_package_digests",
+        "comfy_process_healthy",
+        "completed_at",
+    }
+    if not isinstance(payload, dict) or set(payload) != fields:
+        return False
+    class_types = payload.get("validated_class_types")
+    artifacts = payload.get("validated_artifacts")
+    expected_artifacts = [
+        item.artifact_id
+        for item in sorted(
+            (
+                *manifest.artifacts,
+                *(package.archive for package in manifest.ui_packages),
+                *((manifest.profile.archive,) if manifest.profile is not None else ()),
+            ),
+            key=lambda item: (
+                item.destination,
+                item.artifact_id,
+                item.sha256,
+            ),
+        )
+    ]
+    expected_ui = {
+        item.package_id: item.web_sha256
+        for item in sorted(
+            manifest.ui_packages,
+            key=lambda item: item.package_id,
+        )
+    }
+    profile = manifest.profile
+    completed_at = payload.get("completed_at")
+    return bool(
+        payload.get("protocol_version") == manifest.protocol_version
+        and payload.get("comfyui_core_version")
+        == manifest.comfyui_core_version
+        and payload.get("comfyui_frontend_version")
+        == manifest.comfyui_frontend_version
+        and payload.get("worker_version") == manifest.worker_version
+        and isinstance(class_types, list)
+        and class_types == sorted(set(class_types))
+        and all(
+            isinstance(item, str) and _IDENTIFIER.fullmatch(item)
+            for item in class_types
+        )
+        and all(
+            class_type in class_types
+            for node in manifest.custom_nodes
+            for class_type in node.provided_class_types
+        )
+        and artifacts == expected_artifacts
+        and payload.get("profile_revision")
+        == (profile.revision if profile is not None else None)
+        and payload.get("profile_digest")
+        == (profile.archive.sha256 if profile is not None else None)
+        and payload.get("bootstrap_digest")
+        == (profile.bootstrap_digest if profile is not None else None)
+        and payload.get("ui_package_digests") == expected_ui
+        and payload.get("comfy_process_healthy") is True
+        and not isinstance(completed_at, bool)
+        and isinstance(completed_at, (int, float))
+        and math.isfinite(completed_at)
+        and completed_at >= 0
+    )
 
 
 def _stored_provision_transaction_id(session_id, manifest_digest):
@@ -1158,6 +1236,8 @@ class SessionService:
         reconciler=None,
         profile_store=None,
         agent_bridge=None,
+        readiness_validator=None,
+        desktop_relay=None,
     ):
         self.job_repository = job_repository
         self.resolver = resolver
@@ -1176,6 +1256,13 @@ class SessionService:
         ):
             raise ValueError("Invalid Agent Panel bridge.")
         self.agent_bridge = agent_bridge
+        if readiness_validator is not None and not all(
+            callable(getattr(readiness_validator, method, None))
+            for method in ("identity", "validate")
+        ):
+            raise ValueError("Invalid readiness validator.")
+        self.readiness_validator = readiness_validator
+        self.desktop_relay = desktop_relay
         self.clock = clock or time.time
         self.id_factory = id_factory or (lambda: str(uuid.uuid4()))
         self.review_token_factory = (
@@ -1552,6 +1639,183 @@ class SessionService:
         digest = session.installed_manifest_digest or session.manifest_digest
         manifest = _stored_manifest(self.job_repository, digest)
         return manifest, manifest.profile
+
+    def _current_readiness_report(self, session, manifest=None):
+        validator = self.readiness_validator
+        if validator is None:
+            return None
+        if manifest is None:
+            manifest, profile = self._profile_manifest(session)
+        else:
+            profile = manifest.profile
+        try:
+            identity = validator.identity(session, manifest, profile)
+            return self.job_repository.current_readiness_report(**identity)
+        except Exception:
+            return None
+
+    def desktop_readiness(self, session_id):
+        session = self._stored_session(session_id)
+        if self.readiness_validator is None:
+            return {
+                "desktop_ready": session.state
+                in {
+                    SessionState.READY,
+                    SessionState.RUNNING,
+                    SessionState.HARVESTING,
+                },
+                "readiness_report": None,
+            }
+        report = self._current_readiness_report(session)
+        relay_ready = False
+        relay = self.desktop_relay
+        status = getattr(relay, "status", None)
+        if report is not None and callable(status):
+            try:
+                current = status()
+                relay_ready = bool(
+                    getattr(current, "ready", None) is True
+                    and getattr(current, "active_session_id", None)
+                    == session.session_id
+                    and getattr(current, "url", None) == report.relay_origin
+                    and getattr(current, "profile_revision", None)
+                    == report.profile_revision
+                )
+            except Exception:
+                relay_ready = False
+        desktop_ready = bool(
+            report is not None
+            and report.ready
+            and relay_ready
+            and session.state
+            in {
+                SessionState.READY,
+                SessionState.RUNNING,
+                SessionState.HARVESTING,
+            }
+        )
+        payload = report.public_payload() if report is not None else None
+        if payload is not None:
+            payload["desktop_ready"] = desktop_ready
+        return {
+            "desktop_ready": desktop_ready,
+            "readiness_report": payload,
+        }
+
+    def readiness_certified(self, session_id):
+        session = self._stored_session(session_id)
+        if self.readiness_validator is None:
+            return session.state in {
+                SessionState.READY,
+                SessionState.RUNNING,
+                SessionState.HARVESTING,
+            }
+        report = self._current_readiness_report(session)
+        return bool(report is not None and report.ready)
+
+    def _record_readiness_failure(self, session, report, *, relay=False):
+        failed = tuple(
+            item.name for item in report.checks if item.status == "failed"
+        )
+        entry = RunJournalEntry(
+            entry_id=(
+                "readiness-relay-" if relay else "readiness-"
+            )
+            + report.report_digest,
+            session_id=session.session_id,
+            manifest_digest=report.manifest_digest,
+            transaction_id=None,
+            job_id=None,
+            phase=RunPhase.READINESS,
+            code=(
+                RunErrorCode.SYNCHRONIZATION
+                if relay or "agent_panel_capabilities" in failed
+                else RunErrorCode.VALIDATION
+            ),
+            message=(
+                "ComfyUI Vast Desktop activation failed."
+                if relay
+                else "ComfyUI Vast readiness validation failed."
+            ),
+            node_id=None,
+            process_exit_code=None,
+            restart_count=0,
+            last_probe=(failed[0] if failed else "loopback_session_binding"),
+            byte_cursor=0,
+            event_cursor=0,
+            output_state=None,
+            details={
+                "failed_checks": list(failed),
+                "retryable": True,
+            },
+            created_at=self._now(),
+        )
+        return self.orchestrator.record(entry)
+
+    async def _certify_readiness(self, session, manifest):
+        validator = self.readiness_validator
+        if validator is None:
+            return None
+        relay = self.desktop_relay
+        start = getattr(relay, "start", None)
+        if not callable(start):
+            raise SessionExecutionError(
+                "ComfyUI Vast Desktop readiness is unavailable."
+            )
+        try:
+            await start()
+            identity = validator.identity(session, manifest, manifest.profile)
+            report = self.job_repository.current_readiness_report(**identity)
+            if report is None:
+                report = await validator.validate(
+                    session,
+                    manifest,
+                    manifest.profile,
+                )
+                report = self.job_repository.save_readiness_report(report)
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            raise
+        except Exception:
+            raise SessionExecutionError(
+                "ComfyUI Vast readiness validation failed."
+            ) from None
+        if not report.ready:
+            self._record_readiness_failure(session, report)
+        return report
+
+    async def _activate_committed_readiness(self, session, worker, report):
+        if report is None:
+            return True
+        if not report.ready:
+            return False
+        relay = self.desktop_relay
+        activate = getattr(relay, "activate", None)
+        if not callable(activate):
+            self._record_readiness_failure(session, report, relay=True)
+            return False
+        try:
+            status = await activate(
+                session.session_id,
+                worker,
+                report.profile_revision,
+            )
+            if not (
+                getattr(status, "ready", None) is True
+                and getattr(status, "active_session_id", None)
+                == session.session_id
+                and getattr(status, "profile_revision", None)
+                == report.profile_revision
+                and getattr(status, "url", None) == report.relay_origin
+            ):
+                raise SessionExecutionError(
+                    "ComfyUI Vast Desktop activation failed."
+                )
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            raise
+        except Exception:
+            self._record_readiness_failure(session, report, relay=True)
+            return False
+        return True
 
     def _agent_panel_package(self, session):
         manifest, _profile = self._profile_manifest(session)
@@ -3538,13 +3802,18 @@ class SessionService:
             session.session_id,
             _installed_records(manifest),
         )
-        return self._sessions().transition(
+        report = await self._certify_readiness(session, manifest)
+        if report is not None and not report.ready:
+            return self._stored_session(session.session_id)
+        ready = self._sessions().transition(
             session.session_id,
             SessionState.READY,
             now=self._now(),
             installed_manifest_digest=manifest.digest,
             sanitized_error=None,
         )
+        await self._activate_committed_readiness(ready, worker, report)
+        return ready
 
     async def recover_session(self, session_id):
         try:
@@ -3654,6 +3923,10 @@ class SessionService:
             await self.resume_session(session.session_id)
             await self.reconciler.schedule(session.session_id)
             return self._stored_session(session.session_id)
+        report = self._current_readiness_report(session, manifest)
+        if self.readiness_validator is not None and report is None:
+            report = await self._certify_readiness(session, manifest)
+        await self._activate_committed_readiness(session, worker, report)
         return session
 
     async def reconcile_session_once(self, session_id):

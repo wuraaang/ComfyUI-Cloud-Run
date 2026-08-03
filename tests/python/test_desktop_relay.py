@@ -298,6 +298,52 @@ class DesktopRelayBoundaryTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(active.updated_at, initial.updated_at)
         self.assertGreater(inactive.updated_at, active.updated_at)
 
+    async def test_readiness_probes_data_plane_without_activating_or_prompting(self):
+        class Socket:
+            def __init__(inner_self):
+                inner_self.closed = False
+
+            async def close(inner_self, *, code):
+                self.assertEqual(code, 1000)
+                inner_self.closed = True
+
+        socket = Socket()
+
+        async def native_websocket(_request):
+            return socket
+
+        self.worker.native_websocket = native_websocket
+
+        checks = await self.relay.probe_readiness(
+            "session-1",
+            self.worker,
+            profile_revision=3,
+            agent_required=False,
+        )
+
+        self.assertEqual(
+            {item.name: item.status for item in checks},
+            {
+                "loopback_session_binding": "passed",
+                "native_http_probe": "passed",
+                "native_websocket_probe": "passed",
+                "agent_panel_capabilities": "not_required",
+            },
+        )
+        self.assertTrue(socket.closed)
+        self.assertEqual(
+            [(item[0], item[1]) for item in self.worker.envelopes],
+            [
+                ("GET", "/system_stats"),
+                ("GET", "/ws?clientId=cloud-vast-readiness"),
+            ],
+        )
+        self.assertEqual(self.prompt_calls, [])
+        self.assertFalse(self.relay.status().ready)
+        self.assertIsNone(
+            self.repository.get_desktop_relay().active_session_id
+        )
+
     async def test_inactive_wrong_origin_and_non_native_paths_fail_closed(self):
         inactive = await self.relay.handle(
             FakeRequest("GET", "/", headers=self.host)

@@ -247,6 +247,15 @@ class CloudRunService:
             raise CloudRunValidationError(
                 "The ComfyUI Vast session is not ready."
             )
+        certified = getattr(
+            self.session_service,
+            "readiness_certified",
+            None,
+        )
+        if callable(certified) and certified(session.session_id) is not True:
+            raise CloudRunValidationError(
+                "The ComfyUI Vast readiness report is incomplete."
+            )
         await relay.start()
         try:
             worker = self.desktop_worker_factory(session)
