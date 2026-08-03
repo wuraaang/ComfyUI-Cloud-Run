@@ -12,11 +12,13 @@ live test.
 Vast.ai pod feel like the GPU backend of ComfyUI Desktop without moving the
 user's normal desktop experience into a separate browser application.
 
-The selected architecture uses ComfyUI Desktop's official Remote Connection
-support. The existing local Desktop window remains the controller and source
-of truth. Once a user has explicitly rented and prepared a pod, a second
-window inside the same ComfyUI Desktop application opens the `Cloud Vast`
-connection. That window is a functional, sanitized copy of the user's ComfyUI
+The selected architecture uses ComfyUI Desktop's official support for
+independent managed environments and Remote Connections. The existing local
+Desktop environment remains the controller and source of truth. Once a user
+has explicitly rented and prepared a pod, they launch an independent managed
+environment named `ComfyUI Vast` beside the local one. It stays inside the
+ComfyUI Desktop experience and is never opened as a Brave, Chrome, or other
+browser tab. It is a functional, sanitized copy of the user's ComfyUI
 environment:
 
 - the current canvas and saved workflows are available;
@@ -26,13 +28,20 @@ environment:
 - Agent Panel remains usable through a narrowly scoped local bridge;
 - the normal node menus, model selectors, progress, previews, history, errors,
   and outputs are the native ComfyUI experience;
-- every prompt submitted in that window executes on the pod GPU, never on the
-  Mac GPU.
+- every prompt submitted in that environment executes on the pod GPU, never
+  on the Mac GPU.
 
-When readiness is proven, the remote window exposes a clear `Run Vast` action
-that uses the native ComfyUI queue path. This is an execution action inside an
-already-rented environment, not another paid confirmation. The ordinary local
-Run action remains unchanged and continues to execute locally.
+There is no special `Run Vast` action. Once readiness is proven, the ordinary
+native Run, queue, and batch controls in `ComfyUI Vast` use the pod backend.
+The same native controls in the local environment remain unchanged and use the
+local backend. `Cloud Vast` is only the lifecycle control used to analyze,
+rent, prepare, open, monitor, and destroy the remote environment.
+
+Whether Desktop implements the two environments as two windows in one process
+or as separate operating-system processes and Dock entries is not a product
+requirement. The user contract is two independently usable ComfyUI Desktop
+surfaces side by side, with no external browser and no separately packaged
+Cloud Vast application.
 
 The copy is functional rather than byte-for-byte. Databases, long-lived
 credentials, account tokens, caches, absolute Mac paths, and unrelated user
@@ -41,12 +50,19 @@ profile allowlist and the dependencies needed by the selected workflows are
 mirrored. A gated artifact may separately use a narrowly scoped, short-lived
 download capability under the artifact-source contract below.
 
+The names are intentionally distinct:
+
+- `Cloud Vast` is the lifecycle control in the local environment;
+- `ComfyUI Vast` is the independent Desktop environment attached to the pod;
+- `Run`, queue shortcuts, and batch actions are the unchanged native execution
+  controls inside either environment.
+
 ## User outcome
 
 The intended flow is:
 
 1. The user builds or opens a workflow in the normal local ComfyUI Desktop
-   window.
+   environment.
 2. The user opens the renamed `Cloud Vast` control.
 3. A free, read-only preflight analyzes the exact current canvas, its nodes,
    models, inputs, UI profile, compatible offers, and expected preparation
@@ -58,11 +74,11 @@ The intended flow is:
 6. The controller persists the intent before creating anything, revalidates
    the quote, creates at most one Vast instance, provisions it, mirrors the
    safe profile, and verifies the resulting environment.
-7. When all readiness checks pass, the `Cloud Vast` Remote Connection can be
-   opened inside ComfyUI Desktop. Its `Run Vast` action becomes available.
-8. The user edits and runs normally in that window. Nodes illuminate,
-   samplers advance, previews appear, native errors are visible, and completed
-   images appear in the normal interface.
+7. When all readiness checks pass, the independent `ComfyUI Vast` environment
+   can be opened inside ComfyUI Desktop beside the local environment.
+8. The user edits, runs, queues, or launches a batch with the ordinary native
+   controls. Nodes illuminate, samplers advance, previews appear, native
+   errors are visible, and completed images appear in the normal interface.
 9. Persistent outputs are also downloaded, verified, and saved on the Mac.
    Workflow and safe settings changes are synchronized back to a versioned
    local copy.
@@ -80,8 +96,8 @@ manual model copy, or hand-edited path.
 ### Local-first, not SaaS
 
 The product remains one `ComfyUI-Cloud-Run` custom-node package containing a
-ComfyUI backend extension and web extension. It adds no graph node, separate
-desktop application, hosted frontend, or SaaS control plane.
+ComfyUI backend extension and web extension. It adds no graph node, separately
+packaged desktop application, hosted frontend, or SaaS control plane.
 
 Each user supplies their own Vast API key and, when relevant, their own
 Hugging Face, Civitai, or R2 configuration. The project does not operate a
@@ -100,11 +116,11 @@ explicit human `GO`, even if a test or previous session was already approved.
 
 ### Native ComfyUI behavior
 
-The remote window uses the official Desktop Remote Connection path and the
-native ComfyUI frontend against the remote backend. It does not reproduce the
-canvas in a custom dashboard. The remote backend is therefore the authority
-for node definitions, model lists, queue state, history, previews, and native
-execution events.
+The `ComfyUI Vast` environment uses the official Desktop Remote Connection
+path and the native ComfyUI frontend against the remote backend. It does not
+reproduce the canvas in a custom dashboard. The remote backend is therefore
+the authority for node definitions, model lists, queue state, history,
+previews, and native execution events.
 
 ### Reproducible dependencies
 
@@ -135,16 +151,18 @@ the provisioned pod without a much broader emulation layer.
 This remains useful as a possible lightweight headless mode, but it is not the
 selected “like local” experience.
 
-### Official Desktop Remote Connection
+### Official Desktop managed environment
 
 This is the selected design. It lets the real remote backend drive the real
-ComfyUI frontend while keeping the experience in the ComfyUI Desktop
-application. A safe profile mirror supplies the user's canvas and appearance,
+ComfyUI frontend while keeping the experience in ComfyUI Desktop. Desktop's
+independent-environment model lets the local and Vast environments remain open
+side by side. A safe profile mirror supplies the user's canvas and appearance,
 and a loopback relay keeps remote authentication out of the renderer.
 
-The tradeoff is a second Desktop window and a one-time official Remote
-Connection setup. That tradeoff is accepted because node definitions, model
-selectors, previews, progress, history, and outputs then behave natively.
+The tradeoff is one additional managed Desktop environment and a one-time
+official Remote Connection setup. It is accepted because node definitions,
+model selectors, Agent Panel, batches, previews, progress, history, and
+outputs then behave natively.
 
 ### Direct public URL or transparent local-origin proxy
 
@@ -162,7 +180,7 @@ session and never mixes local and remote ComfyUI APIs.
 The first version includes:
 
 - `Cloud Run` renamed to `Cloud Vast` in the local interface;
-- one official Desktop Remote Connection named `Cloud Vast`;
+- one official Desktop managed Remote Connection named `ComfyUI Vast`;
 - a local loopback data-plane relay with no browser-visible remote secret;
 - current-canvas bootstrap and safe profile mirroring;
 - deterministic custom-node, model, and input provisioning;
@@ -174,7 +192,7 @@ The first version includes:
 
 The first version does not include:
 
-- a separate web or desktop application;
+- a separately packaged web or desktop application;
 - TanStack Start, a hosted portal, or a multi-user service;
 - Convex as a runtime dependency;
 - automatic selection of a single GPU without user review;
@@ -190,12 +208,12 @@ slice described near the end of this document.
 
 ## Meaning of “like local”
 
-The remote window must provide the same user-facing capabilities that depend
-on the active ComfyUI backend:
+The `ComfyUI Vast` environment must provide the same user-facing capabilities
+that depend on the active ComfyUI backend:
 
-| Capability | Source in `Cloud Vast` |
+| Capability | Source in `ComfyUI Vast` |
 | --- | --- |
-| Canvas and current workflow | Mirrored local workflow, then the active remote window |
+| Canvas and current workflow | Mirrored local workflow, then the active Vast environment |
 | Saved workflows | Versioned safe profile synchronization |
 | Node types and node metadata | Pod `/object_info` and pinned custom nodes |
 | Model dropdowns | Pod model directories and native ComfyUI APIs |
@@ -207,16 +225,16 @@ on the active ComfyUI backend:
 | History and errors | Native remote history plus durable worker snapshot |
 | Final images and video | Native display plus verified Mac download |
 
-This contract does not mean that the original local window dynamically gains
-the pod's node definitions or remote model lists. Those belong to the
-`Cloud Vast` remote window inside the same Desktop application. The local
-window continues to control rental, lifecycle, costs, and recovery.
+This contract does not mean that the original local environment dynamically
+gains the pod's node definitions or remote model lists. Those belong to the
+independent `ComfyUI Vast` environment inside Desktop. The local environment
+continues to control rental, lifecycle, costs, and recovery.
 
 ## Architecture
 
 The system has five cooperating boundaries:
 
-1. the local ComfyUI Desktop window and `Cloud Vast` controller extension;
+1. the local ComfyUI Desktop environment and `Cloud Vast` controller extension;
 2. the local ComfyUI backend and its SQLite control state;
 3. a loopback-only session relay used by the official Remote Connection;
 4. an authenticated, persistent worker gateway on the Vast pod;
@@ -230,7 +248,7 @@ Local Desktop controller
   -> explicit paid confirmation
   -> Vast lifecycle + pod provisioning
 
-Cloud Vast Desktop window
+ComfyUI Vast Desktop environment
   -> 127.0.0.1 session relay
   -> authenticated worker gateway
   -> pod ComfyUI
@@ -257,18 +275,20 @@ local and remote routes cannot be mixed accidentally.
 
 ### Official Remote Connection
 
-ComfyUI Desktop already supports an editable remote URL and opens it in an
-application window. The current official implementation uses a remote source
-with window launch mode, a shared browser partition, and automatic output
+ComfyUI Desktop already manages multiple independent ComfyUI environments and
+supports an editable remote URL as one source type. It opens the selected
+source as a Desktop application surface. The current official implementation
+uses window launch mode, a shared browser partition, and automatic output
 download support. Its content script observes remote execution and skips
 temporary output descriptors during automatic download.
 
 The extension does not rely on Desktop's private JSON installation registry.
 The first version has one honest, one-time setup step: the user creates an
-official Remote Connection named `Cloud Vast` and points it at the stable
-loopback relay URL shown by the local controller. That entry persists across
-sessions. Each future rental reuses the same entry; the relay changes its
-authenticated upstream only after a session is ready.
+official managed Remote Connection named `ComfyUI Vast` and points it at the
+stable loopback relay URL shown by the local controller. That environment
+persists beside the user's local environment across sessions. Each future
+rental reuses it; the relay changes its authenticated upstream only after a
+session is ready.
 
 On first setup the controller selects and persists one available loopback port.
 It binds that same port on later launches so the saved Desktop connection stays
@@ -284,30 +304,45 @@ one-time setup without changing the architecture.
 
 The local controller uses Desktop's official backend lifecycle. It never
 starts a second local ComfyUI backend against the same `comfyui.db`. Opening a
-Remote Connection creates a remote application window and does not require a
-second local backend.
+Remote Connection launches the independent remote Desktop environment and does
+not require a second local backend.
 
-Closing either Desktop window must not destroy the paid instance or lose its
-state. Reopening the local controller or `Cloud Vast` window reconnects to the
-persisted session. Only an explicit destroy request or a previously authorized
-deadline controls teardown.
+Closing either Desktop surface must not destroy the paid instance or lose its
+state. Reopening the local controller or `ComfyUI Vast` environment reconnects
+to the persisted session. Only an explicit destroy request or a previously
+authorized deadline controls teardown.
 
-### `Run Vast`
+The first version binds exactly one `ComfyUI Vast` environment to at most one
+active paid session. Desktop's ability to manage more environments does not
+authorize multiple simultaneous pods or rentals.
+
+### Native Run, queue, and batches
 
 The mirrored web extension detects the signed remote-session role. In that
-role it does not display rental controls and cannot create another instance.
-It exposes `Run Vast`, which invokes the native frontend queue preparation and
-submission path for the active remote canvas.
+role it does not display rental controls, relabel Run, or create another
+instance. The ordinary native Run button, queue shortcuts, and Agent Panel
+batch actions invoke the frontend's normal preparation and submission path for
+the active Vast canvas.
 
-The relay observes every remote `/prompt` submission, including native
-keyboard shortcuts. It binds the returned remote prompt ID to a durable local
-job intent and the worker's persistent record. The Cloud Vast action supplies
-a client job identity before submission so retries can reconcile rather than
-blindly enqueue twice.
+The relay observes every `/prompt` submission from that environment, including
+native keyboard shortcuts and batch entries. Before forwarding each distinct
+prompt it persists a client job identity, then binds the returned remote prompt
+ID to the durable local intent and the worker's persistent record. A retry
+reconciles that identity rather than blindly enqueueing twice.
 
-The ordinary native queue mechanism remains available for compatibility, but
-all prompt traffic in the `Cloud Vast` origin necessarily reaches the pod.
-There is no route from that origin to local `/prompt`.
+The submitted prompt is compared with the session's validated dependency
+manifest before it reaches the remote queue. A prompt already covered by the
+manifest proceeds immediately. A compatible new model, input, or pinned node
+with an approved source enters visible delta provisioning and the same durable
+job intent is submitted automatically after validation. An unresolved,
+untrusted, or runtime-incompatible dependency is rejected with a precise
+preflight error and cannot bypass readiness. This applies equally to Agent
+Panel edits and every prompt in a batch.
+
+All prompt traffic in the `ComfyUI Vast` origin necessarily reaches the pod.
+There is no route from that origin to local `/prompt`. A ComfyUI batch becomes
+an ordered set of durable remote jobs and executes sequentially under the
+session's existing one-at-a-time GPU rule.
 
 ## Canvas and profile synchronization
 
@@ -328,8 +363,8 @@ captures again; a changed dependency manifest invalidates the quote and
 returns to free analysis.
 
 This local capture is for dependency resolution and the bootstrap revision. A
-ready remote window recompiles its current canvas natively at `Run Vast`, so
-later remote edits and seed behavior are authoritative for execution.
+ready `ComfyUI Vast` environment recompiles its current canvas through native
+Run, so later remote edits and seed behavior are authoritative for execution.
 
 ### Initial profile snapshot
 
@@ -358,15 +393,17 @@ source of truth for durable user data.
 ### Current canvas bootstrap
 
 The exact current canvas, including unsaved changes, is stored as a session
-bootstrap revision. On the first open of the ready `Cloud Vast` window, the
-mirrored extension loads that revision through the supported frontend graph
-loading path. It never overwrites a remote canvas that already has a newer
-user edit.
+bootstrap revision. On the first open of the ready `ComfyUI Vast` environment,
+the mirrored extension loads that revision through the supported frontend
+graph loading path. It never overwrites a remote canvas that already has a
+newer user edit.
 
-The executable prompt is compiled only in the window that will execute it.
+The executable prompt is compiled only in the environment that will execute
+it.
 Consequently native widget serialization, seed changes, virtual-node
 transforms, bypass state, subgraphs, and frontend queue behavior match the
-installed remote frontend at the moment the user presses `Run Vast`.
+installed remote frontend at the moment the user presses native Run or starts
+a batch.
 
 ### Saved workflow and settings return path
 
@@ -433,10 +470,10 @@ readiness.
 
 The installed `comfyui-agent-panel` package is UI-only: it contributes web
 assets and no executable graph node. The same approved release is present in
-the `Cloud Vast` UI profile so the panel looks and behaves as it does locally.
+the `ComfyUI Vast` UI profile so the panel looks and behaves as it does locally.
 
-Its actual agent/orchestrator remains on the Mac. The remote window reaches it
-through a per-session bridge that:
+Its actual agent/orchestrator remains on the Mac. The `ComfyUI Vast`
+environment reaches it through a per-session bridge that:
 
 - binds only to loopback;
 - uses an unguessable, expiring session capability;
@@ -447,10 +484,12 @@ through a per-session bridge that:
 - expires when the session is destroyed or revoked.
 
 Remote ComfyUI events remain native, so Agent Panel can observe the active
-remote canvas and run. If the scoped bridge cannot be established safely,
-readiness reports Agent Panel as unavailable and keeps the panel in the local
-controller window; the system does not weaken loopback or credential security
-to make it appear remotely.
+remote canvas, modify or improve its workflow, submit a normal run, and launch
+a batch. When Agent Panel is present in the source profile, these capabilities
+are mandatory readiness checks. If the scoped bridge cannot be established
+safely, `ComfyUI Vast` remains not ready and reports the exact safe failure;
+the system does not weaken loopback or credential security to make it appear
+remotely.
 
 ## Dependency manifest and artifact sources
 
@@ -529,8 +568,8 @@ Instead, paid readiness uses the following measurable service objective:
 - if the estimate exceeds ten minutes, the UI requires the user to prepare a
   cache or explicitly accept the longer estimate before rental;
 - for a source-ready manifest accepted under the ten-minute objective, the
-  target from successful Vast creation to `Run Vast` enabled is at most ten
-  minutes;
+  target from successful Vast creation to the `ComfyUI Vast` environment being
+  ready for native Run is at most ten minutes;
 - warm-session and cold-session measurements are reported separately.
 
 If actual preparation misses the accepted estimate, the UI shows the exact
@@ -572,13 +611,14 @@ An expired quote never falls through to a different offer. Refresh, restart,
 or timeout reconciliation uses the durable intent and Vast inventory to avoid
 a second create call.
 
-There is one paid confirmation. `Run Vast` is intentionally a later execution
-button because the user may inspect or edit the ready remote canvas; it does
-not authorize or trigger another rental.
+There is one paid confirmation. After readiness, ordinary native Run, queue,
+and batch actions submit work to the already-rented pod; they do not authorize
+or trigger another rental.
 
-This supersedes the earlier brainstorm idea of submitting the workflow
-automatically as soon as provisioning finishes. The approved experience waits
-for readiness, then lets the user press `Run Vast` in the native remote canvas.
+This supersedes both earlier brainstorm ideas: the workflow is not submitted
+automatically when provisioning finishes, and no special `Run Vast` control is
+added. The user opens the ready `ComfyUI Vast` environment, inspects or edits
+the canvas, and uses the same native controls as in any Desktop environment.
 
 ## Provisioning and readiness
 
@@ -592,8 +632,8 @@ manifest digest. A controller timeout retrieves and validates the existing
 transaction before considering a replay. Progress is monotonic and an already
 ready transaction cannot regress to zero transferred bytes.
 
-`Run Vast` remains disabled until one consistent readiness result proves all
-of the following:
+The `ComfyUI Vast` environment remains unavailable for execution until one
+consistent readiness result proves all of the following:
 
 - the intended Vast instance exists and matches the durable session;
 - the authenticated worker gateway is reachable;
@@ -606,8 +646,8 @@ of the following:
 - the current canvas bootstrap revision is available;
 - the loopback relay is bound to the intended session and upstream;
 - native HTTP and WebSocket probes succeed through the relay;
-- the Agent Panel scoped bridge is either verified or explicitly reported as
-  unavailable under its safe fallback;
+- when Agent Panel is present in the source profile, its scoped bridge and
+  edit, run, and batch capabilities are verified;
 - local execution has not been invoked.
 
 Readiness is persisted. A refresh reports the same validated record rather
@@ -617,8 +657,8 @@ than restarting provisioning.
 
 ### Two complementary event paths
 
-The `Cloud Vast` window consumes native ComfyUI HTTP and WebSocket behavior
-through the relay. This provides immediate `executing`, `progress`,
+The `ComfyUI Vast` environment consumes native ComfyUI HTTP and WebSocket
+behavior through the relay. This provides immediate `executing`, `progress`,
 `progress_state`, `progress_text`, preview, `executed`,
 `execution_success`, and `execution_error` behavior in the normal canvas.
 
@@ -653,7 +693,7 @@ A backend-owned, single-flight reconciler runs:
 - while a session or job is active;
 - on every relevant controller status read or refresh;
 - after the local backend starts;
-- after the Desktop window reconnects;
+- after the Vast Desktop environment reconnects;
 - before teardown and after output recovery.
 
 A transient transport failure creates a sanitized synchronization warning and
@@ -765,9 +805,9 @@ have a regression test or an explicit field-test assertion.
 | 10 | Local synchronization froze at event 94. | The relay read `/events` and `/job` separately; a new event changed `last_sequence`, `_finish_remote_job` stopped, a scheduled task exception was swallowed, and ordinary refresh did not reconcile durable active states. | Add the atomic snapshot, idempotent cursor reconciliation, startup/refresh recovery, and visible sanitized synchronization errors. |
 | 11 | A real success became a reported failure when history contained `SaveImage` and `PreviewImage`. | All outputs reached `ComfyProcess.output_path`, which accepts only `type == "output"`; the legitimate preview was `type == "temp"`. | Ignore temporary descriptors during final harvest, verify persistent outputs strictly, and never rewrite remote success as execution failure. |
 | 12 | Worker failures all appeared as “Remote execution failed.” | `JobError`, `ComfyProcessError`, and unknown exceptions collapsed into one message. | Preserve typed safe error codes for validation, execution, synchronization, harvest, transfer, output, worker, and provider phases. |
-| 13 | The Cloud Run panel showed almost no live information. | `_job_payload` forced `current_node`, `progress`, and `progress_text` to `None`, and the canvas was not fed native remote state. | Use native events in the Cloud Vast remote window and mirror durable current state in the local controller panel. |
+| 13 | The Cloud Run panel showed almost no live information. | `_job_payload` forced `current_node`, `progress`, and `progress_text` to `None`, and the canvas was not fed native remote state. | Use native events in the `ComfyUI Vast` Desktop environment and mirror durable current state in the local controller panel. |
 | 14 | Offer filters were confusing and could favor weak cheap GPUs. | Optional-filter behavior and ranking intent were not explicit. | Use workflow hard minima, optional user preferences, a hard price cap, performance/network/disk/reliability ranking, and visible exclusion reasons. |
-| 15 | The path was preflight, search, selection, confirmation, wait, then a second Cloud Run action. | Provisioning and execution were exposed as one long controller wizard. | Run free preflight in the background, use one paid `Louer et préparer`, then expose the native `Run Vast` action in the ready environment with no second paid confirmation. |
+| 15 | The path was preflight, search, selection, confirmation, wait, then a second Cloud Run action. | Provisioning and execution were exposed as one long controller wizard. | Run free preflight in the background, use one paid `Louer et préparer`, then open the ready `ComfyUI Vast` environment and use native Run or batch with no second paid confirmation. |
 | 16 | Launch took much longer than expected. | Most delay was the real 27.3 GiB transfer at about 25–30 MB/s, not GPU execution; control-plane bugs added avoidable delay. | Pre-position sources, use content cache and delta transfer, rank network/disk, reuse healthy sessions, and report cold versus warm timing honestly. |
 
 Earlier paid diagnostics also encountered authentication and reconciliation
@@ -868,7 +908,8 @@ The Vast host is treated as untrusted. Security requirements are:
 
 The local relay must fail closed. If upstream identity, session identity,
 certificate validation, or authorization cannot be proven, it exposes no
-remote ComfyUI API and `Run Vast` remains disabled.
+remote ComfyUI API and the Vast Desktop environment remains unavailable for
+execution.
 
 ## Testing strategy
 
@@ -891,7 +932,9 @@ Required automated coverage includes:
 - current-canvas bootstrap and conflict-safe profile synchronization;
 - background image copy and remote-only path rewrite;
 - executable-node and UI-only-package manifest separation;
-- Agent Panel capability scope and expiry;
+- Agent Panel capability scope, expiry, workflow edit, native run, and
+  multi-prompt batch behavior;
+- compatible dependency delta preparation after a local or Agent Panel edit;
 - source selection, digest mismatch, resumable transfer, and R2 opt-in;
 - reboot-idempotent worker bootstrap;
 - readiness validation for classes, models, profile, HTTP, and WebSocket;
@@ -918,19 +961,22 @@ One accepted field campaign must prove:
 2. the displayed offer, rate, disk, duration, and intent match the created
    instance;
 3. no instance exists before `Louer et préparer` is confirmed;
-4. the official `Cloud Vast` Remote Connection opens inside Desktop;
+4. the official independent `ComfyUI Vast` environment opens inside Desktop,
+   beside the local environment and never in an external browser;
 5. the current canvas, saved workflows, palette, background image, approved UI
-   extensions, and Agent Panel are visible under their safe contracts;
+   extensions, and Agent Panel are visible; Agent Panel can safely modify the
+   active canvas and prepare a batch;
 6. expected custom-node classes and exact model digests are present on the
    pod, and model selectors show them;
 7. local prompt submission and local GPU execution remain unused;
-8. `Run Vast` executes the current remote canvas on the pod GPU;
+8. native Run and an Agent Panel batch execute the current Vast canvas on the
+   pod GPU;
 9. active nodes, sampler progress, progress text, previews, native errors, and
    `execution_success` behave in the normal interface;
 10. a `SaveImage` persistent output is verified on the Mac while a
     `PreviewImage` temporary output is ignored by final harvesting;
-11. closing and reopening the remote window catches up without a duplicate
-    prompt;
+11. closing and reopening the Vast Desktop environment catches up without a
+    duplicate prompt;
 12. restarting the local backend reconciles the active or completed job from
     the atomic worker snapshot;
 13. a second compatible job reuses the healthy session and transfers only a
@@ -976,7 +1022,7 @@ rollback-safe commits. It must preserve these boundaries:
 - all control routes remain under `/cloud-run/api/`;
 - the loopback Remote Connection origin is a scoped data plane only;
 - local Run is untouched;
-- `Cloud Vast` can never queue locally;
+- a native Run or batch from `ComfyUI Vast` can never queue locally;
 - no provider mutation occurs without explicit confirmation and durable
   intent;
 - no implementation or live paid test begins merely because this design was
@@ -992,6 +1038,7 @@ rollback-safe commits. It must preserve these boundaries:
 
 Official integration references:
 
+- [ComfyUI Desktop and independent environments](https://github.com/Comfy-Org/Comfy-Desktop)
 - [ComfyUI Desktop remote sources](https://github.com/Comfy-Org/Comfy-Desktop/blob/main/src/main/sources/remote.ts)
 - [ComfyUI Desktop remote content script](https://github.com/Comfy-Org/Comfy-Desktop/blob/main/src/main/lib/comfyContentScript.ts)
 - [ComfyUI frontend API](https://github.com/Comfy-Org/ComfyUI_frontend/blob/main/src/scripts/api.ts)
