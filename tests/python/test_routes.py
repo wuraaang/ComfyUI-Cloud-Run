@@ -1216,7 +1216,15 @@ class RelayMediaRouteTests(unittest.TestCase):
                 prompt_digest="c" * 64,
                 capture_json=json.dumps(
                     {
-                        "workflow": {},
+                        "workflow": {
+                            "nodes": [
+                                {
+                                    "id": 9,
+                                    "type": "SaveImage",
+                                    "title": "Wallpaper output",
+                                }
+                            ]
+                        },
                         "output": {},
                         "queue_options": {},
                     }
@@ -1431,6 +1439,67 @@ class RelayMediaRouteTests(unittest.TestCase):
         self.assertEqual(response.payload["outputs"][0]["node_id"], "9")
         self.assertNotIn("node_id", response.payload["transfers"][1])
         self.assertNotIn(str(self.root), repr(response.payload))
+
+    def test_job_status_folds_native_events_into_current_node_and_progress(self):
+        repository = self.service.job_repository
+        repository.append_event(
+            "job-1",
+            2,
+            "executing",
+            {"node_id": "9", "display_node_id": "9"},
+            created_at=16.0,
+        )
+        repository.append_event(
+            "job-1",
+            3,
+            "progress",
+            {"value": 20, "max": 20, "node_id": "9"},
+            created_at=17.0,
+        )
+        repository.append_event(
+            "job-1",
+            4,
+            "progress_text",
+            {"node_id": "9", "text": "Sampling complete"},
+            created_at=18.0,
+        )
+
+        response = asyncio.run(
+            self.handlers[
+                (
+                    "GET",
+                    (
+                        "/cloud-run/api/sessions/{session_id}/jobs/"
+                        "{job_id}"
+                    ),
+                )
+            ](
+                FakeRequest(
+                    match_info={
+                        "session_id": "session-1",
+                        "job_id": "job-1",
+                    }
+                )
+            )
+        )
+
+        self.assertEqual(
+            response.payload["current_node"],
+            {"id": "9", "title": "Wallpaper output"},
+        )
+        self.assertEqual(
+            response.payload["progress"],
+            {"value": 20, "max": 20},
+        )
+        self.assertEqual(
+            response.payload["progress_text"],
+            "Sampling complete",
+        )
+        self.assertEqual(response.payload["last_sequence"], 4)
+        self.assertEqual(response.payload["execution_state"], "pending")
+        self.assertEqual(response.payload["harvest_state"], "pending")
+        self.assertEqual(response.payload["execution_status"], "pending")
+        self.assertEqual(response.payload["harvest_status"], "pending")
 
     def test_session_status_aggregates_cost_alerts_job_and_local_history(self):
         response = asyncio.run(

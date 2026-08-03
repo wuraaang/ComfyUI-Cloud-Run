@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import math
 import secrets
 import time
@@ -303,7 +304,8 @@ class CloudRunService:
             and float(self.clock()) >= session.deadline_at
             and session.state != SessionState.DESTROYED
         ):
-            return await enforce(session.session_id)
+            session = await enforce(session.session_id)
+            return session
         refresh = getattr(self.lifecycle, "reconcile_session_once", None)
         if callable(refresh) and session.state in {
             SessionState.CREATING,
@@ -313,7 +315,23 @@ class CloudRunService:
             SessionState.DESTROY_REQUESTED,
             SessionState.DESTROYING,
         }:
-            return await refresh(session.session_id)
+            session = await refresh(session.session_id)
+        reconciler = getattr(
+            self.session_service,
+            "reconciler",
+            None,
+        )
+        schedule = getattr(reconciler, "schedule", None)
+        if callable(schedule) and session.state in {
+            SessionState.RUNNING,
+            SessionState.HARVESTING,
+        }:
+            try:
+                schedule(session.session_id)
+                await asyncio.sleep(0)
+            except (RuntimeError, ValueError):
+                pass
+            session = self.get_session(session.session_id)
         return session
 
     async def submit_job(
@@ -1093,21 +1111,42 @@ class CloudRunService:
         return await self.lifecycle.destroy(attempt_id)
 
     async def recover(self):
-        if self.lifecycle is None:
-            return []
-        recover_sessions = getattr(
-            self.lifecycle,
-            "recover_sessions",
+        recovered = []
+        if self.lifecycle is not None:
+            recover_sessions = getattr(
+                self.lifecycle,
+                "recover_sessions",
+                None,
+            )
+            if (
+                getattr(self.lifecycle, "session_repository", None)
+                is not None
+                and callable(recover_sessions)
+            ):
+                recovered = await recover_sessions()
+            else:
+                recovered = await self.lifecycle.recover()
+                for attempt in recovered:
+                    if attempt.state == AttemptState.STARTING:
+                        self.lifecycle.schedule_watchdog(
+                            attempt.attempt_id
+                        )
+        reconciler = getattr(
+            self.session_service,
+            "reconciler",
             None,
         )
-        if (
-            getattr(self.lifecycle, "session_repository", None)
-            is not None
-            and callable(recover_sessions)
-        ):
-            return await recover_sessions()
-        attempts = await self.lifecycle.recover()
-        for attempt in attempts:
-            if attempt.state == AttemptState.STARTING:
-                self.lifecycle.schedule_watchdog(attempt.attempt_id)
-        return attempts
+        recover_jobs = getattr(reconciler, "recover", None)
+        if callable(recover_jobs):
+            await recover_jobs()
+        return recovered
+
+    async def close(self):
+        reconciler = getattr(
+            self.session_service,
+            "reconciler",
+            None,
+        )
+        close = getattr(reconciler, "close", None)
+        if callable(close):
+            await close()

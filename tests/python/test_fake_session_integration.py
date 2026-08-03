@@ -20,7 +20,13 @@ from cloud_run.job_repository import JobRepository
 from cloud_run.huggingface import HuggingFaceClient
 from cloud_run.lifecycle import CloudRunLifecycle
 from cloud_run.manifest import ArtifactSpec, CustomNodeSpec, SourceSpec
-from cloud_run.models import JobState, SessionState, TransferState
+from cloud_run.models import (
+    ExecutionState,
+    HarvestState,
+    JobState,
+    SessionState,
+    TransferState,
+)
 from cloud_run.model_sources import WorkflowModelSourceResolver
 from cloud_run.offers import HostBlacklist
 from cloud_run.relay import LocalRelay
@@ -1796,9 +1802,17 @@ class FakeReusableSessionIntegrationTests(unittest.TestCase):
         self.assertEqual(system.vast.create_count, 1)
 
         system.worker.fail_next_output = True
-        with self.assertRaises(SessionExecutionError):
-            system.run_job(recovered, capture, "resume-output-key")
+        system.run_job(recovered, capture, "resume-output-key")
         running_job = system.jobs.list_jobs(recovered.session_id)[-1]
+        self.assertEqual(running_job.state, JobState.HARVESTING)
+        self.assertEqual(
+            running_job.execution_state,
+            ExecutionState.SUCCEEDED,
+        )
+        self.assertEqual(
+            running_job.harvest_state,
+            HarvestState.FAILED,
+        )
         output_id = "output-" + running_job.job_id
         partial_output = system.worker.output_offsets[output_id]
         self.assertGreater(partial_output, 0)
@@ -1837,9 +1851,11 @@ class FakeReusableSessionIntegrationTests(unittest.TestCase):
             duration_seconds=7200,
         )
         system.worker.fail_next_output = True
-        with self.assertRaises(SessionExecutionError):
-            system.run_job(session, capture, "deadline-job-key")
+        system.run_job(session, capture, "deadline-job-key")
         job = system.jobs.list_jobs(session.session_id)[-1]
+        self.assertEqual(job.state, JobState.HARVESTING)
+        self.assertEqual(job.execution_state, ExecutionState.SUCCEEDED)
+        self.assertEqual(job.harvest_state, HarvestState.FAILED)
         output_id = "output-" + job.job_id
         system.worker.unavailable = True
 

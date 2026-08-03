@@ -32,10 +32,27 @@ from .manifest import (
     SourceSpec,
     validate_dependency,
 )
-from .models import CloudJob, JobState, SessionState, TransferState
+from .models import (
+    CloudJob,
+    ExecutionState,
+    HarvestState,
+    JobState,
+    SessionState,
+    TransferState,
+)
 from .offers import estimated_transfer_seconds
-from .relay import RelaySyncResult
+from .orchestrator import LocalOrchestrator
+from .reconciler import SessionReconciler
+from .relay import (
+    RelaySyncResult,
+    RelayValidationError,
+)
 from .repository import ConcurrentSessionUpdate, SessionRepository
+from .run_errors import (
+    RunErrorCode,
+    RunJournalEntry,
+    RunPhase,
+)
 from .worker_client import WorkerBoundaryAuthenticationError
 from .worker_release import WorkerRelease
 
@@ -81,7 +98,6 @@ _MAPPING_CANDIDATE_FIELDS = {
     "source_kind",
     "wheels_complete",
 }
-_JOB_TASKS = {}
 DEADLINE_ACTION_SECONDS = {
     "add_30_minutes": 30 * 60,
     "add_1_hour": 60 * 60,
@@ -980,6 +996,8 @@ class SessionService:
         sleep=None,
         job_poll_interval_seconds=1,
         max_job_polls=86_400,
+        orchestrator=None,
+        reconciler=None,
     ):
         self.job_repository = job_repository
         self.resolver = resolver
@@ -1012,6 +1030,14 @@ class SessionService:
             job_poll_interval_seconds
         )
         self.max_job_polls = max_job_polls
+        self.orchestrator = orchestrator or LocalOrchestrator(
+            self.job_repository
+        )
+        self.reconciler = reconciler or SessionReconciler(
+            service=self,
+            orchestrator=self.orchestrator,
+            clock=self.clock,
+        )
 
     async def preflight(
         self,
@@ -1240,13 +1266,25 @@ class SessionService:
             )
         return self.session_repository
 
-    def session(self, session_id):
+    def _stored_session(self, session_id):
         identifier = _strict_identifier(session_id, "session ID")
         session = self._sessions().get(identifier)
         if session is None:
             raise SessionExecutionError(
                 "Cloud Run session was not found."
             )
+        return session
+
+    def session(self, session_id):
+        session = self._stored_session(session_id)
+        if session.state in {
+            SessionState.RUNNING,
+            SessionState.HARVESTING,
+        } and self._reconciliation_job(session.session_id) is not None:
+            try:
+                self.reconciler.schedule(session.session_id)
+            except RuntimeError:
+                pass
         return session
 
     def get_job(self, session_id, job_id):
@@ -1358,7 +1396,7 @@ class SessionService:
             SessionState.HARVESTING,
         }
         for _attempt in range(8):
-            session = self.session(session_id)
+            session = self._stored_session(session_id)
             if session.state not in synchronized_states:
                 raise DeadlineValidationError(
                     "The remote worker cannot synchronize a deadline update."
@@ -1451,7 +1489,7 @@ class SessionService:
         return tuple(sorted(artifact_ids))
 
     async def review_destroy(self, session_id):
-        session = self.session(session_id)
+        session = self._stored_session(session_id)
         if session.state == SessionState.DESTROYED:
             raise DestroyConfirmationError(
                 "The Cloud Run session is already destroyed."
@@ -1535,7 +1573,7 @@ class SessionService:
                 )
 
     def confirmed_deadline_destroy(self, session_id):
-        session = self.session(session_id)
+        session = self._stored_session(session_id)
         if session.state != SessionState.DESTROYED:
             raise SessionExecutionError(
                 "Deadline destruction is not inventory verified."
@@ -1543,7 +1581,7 @@ class SessionService:
         self._abandon_session_work(session.session_id)
 
     def confirmed_terminal_destroy(self, session_id):
-        session = self.session(session_id)
+        session = self._stored_session(session_id)
         if session.state != SessionState.DESTROYED:
             raise SessionExecutionError(
                 "Terminal destruction is not inventory verified."
@@ -1551,7 +1589,7 @@ class SessionService:
         self._abandon_session_work(session.session_id)
 
     async def prepare_deadline_destroy(self, session_id):
-        session = self.session(session_id)
+        session = self._stored_session(session_id)
         active = [
             job
             for job in self.job_repository.list_jobs(session.session_id)
@@ -1570,38 +1608,24 @@ class SessionService:
         }:
             return
         job = active[0]
-        try:
-            worker = self._worker(session)
-            relay = self._relay(worker, session)
-        except SessionExecutionError:
-            return
         for attempt in range(3):
             try:
-                result = await relay.sync_job(job.job_id)
+                await self.reconciler.before_teardown(session.session_id)
             except (asyncio.CancelledError, KeyboardInterrupt):
                 raise
             except Exception:
-                result = None
-            if (
-                isinstance(result, RelaySyncResult)
-                and result.job_id == job.job_id
-                and result.state
-                in {"succeeded", "failed", "interrupted"}
-            ):
-                try:
-                    await self._finish_remote_job(
-                        self.session(session.session_id),
-                        self.job_repository.get_job(job.job_id),
-                        worker,
-                    )
-                except SessionExecutionError:
-                    pass
+                pass
+            current = self.job_repository.get_job(job.job_id)
+            if current is not None and current.state in {
+                JobState.SUCCEEDED,
+                JobState.FAILED,
+            }:
                 return
             if attempt < 2:
                 await self.sleep(self.job_poll_interval_seconds)
 
     async def destroy(self, session_id, confirmation):
-        session = self.session(session_id)
+        session = self._stored_session(session_id)
         if (
             not isinstance(confirmation, dict)
             or set(confirmation)
@@ -1627,6 +1651,18 @@ class SessionService:
             raise DestroyConfirmationError(
                 "The destruction review is invalid or expired."
             )
+        if session.state in {
+            SessionState.RUNNING,
+            SessionState.HARVESTING,
+        }:
+            try:
+                await self.reconciler.before_teardown(
+                    session.session_id
+                )
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                raise
+            except Exception:
+                pass
         current_unverified = self._unverified_outputs(session.session_id)
         if current_unverified != reviewed.unverified_artifact_ids:
             raise DestroyConfirmationError(
@@ -1689,7 +1725,7 @@ class SessionService:
             relay = self.relay_factory(worker, session)
         except Exception:
             raise SessionExecutionError("Local relay is unavailable.") from None
-        if not callable(getattr(relay, "sync_job", None)):
+        if not callable(getattr(relay, "sync_snapshot", None)):
             raise SessionExecutionError("Local relay is unavailable.")
         return relay
 
@@ -1721,6 +1757,103 @@ class SessionService:
                 **changes,
             )
         )
+
+    def _reconciliation_job(self, session_id):
+        active = [
+            job
+            for job in self.job_repository.list_jobs(session_id)
+            if job.state
+            in {
+                JobState.CAPTURED,
+                JobState.RESOLVING,
+                JobState.QUEUED,
+                JobState.RUNNING,
+                JobState.HARVESTING,
+            }
+        ]
+        if len(active) > 1:
+            raise SessionExecutionError(
+                "Multiple active jobs were found for one session."
+            )
+        return active[0] if active else None
+
+    def reconciliation_context(self, session_id):
+        identifier = _strict_identifier(session_id, "session ID")
+        job = self._reconciliation_job(identifier)
+        session = self._sessions().get(identifier)
+        return {
+            "session_id": identifier,
+            "manifest_digest": (
+                job.manifest_digest
+                if job is not None
+                else (
+                    session.manifest_digest
+                    if session is not None
+                    else None
+                )
+            ),
+            "job_id": job.job_id if job is not None else None,
+            "event_cursor": (
+                self.job_repository.last_event_sequence(job.job_id)
+                if job is not None
+                else 0
+            ),
+            "output_state": (
+                job.harvest_state.value if job is not None else None
+            ),
+        }
+
+    def recoverable_session_ids(self):
+        return tuple(
+            session.session_id
+            for session in self._sessions().list_recoverable()
+            if self._reconciliation_job(session.session_id) is not None
+        )
+
+    def _record_run_issue(self, job, *, phase, code, message, retryable):
+        correlation_id = uuid.uuid4().hex
+        self.orchestrator.record(
+            RunJournalEntry(
+                entry_id=uuid.uuid4().hex,
+                session_id=job.session_id,
+                manifest_digest=job.manifest_digest,
+                transaction_id=None,
+                job_id=job.job_id,
+                phase=phase,
+                code=code,
+                message=message,
+                node_id=None,
+                process_exit_code=None,
+                restart_count=0,
+                last_probe=None,
+                byte_cursor=0,
+                event_cursor=self.job_repository.last_event_sequence(
+                    job.job_id
+                ),
+                output_state=job.harvest_state.value,
+                details={
+                    "correlation_id": correlation_id,
+                    "retryable": retryable,
+                },
+                created_at=self._now(),
+            )
+        )
+
+    def _retryable_job_issue(self, job, *, phase, code, message):
+        updated = self._transition_job(
+            job,
+            job.state,
+            sanitized_error=message,
+            error_code=code,
+        )
+        self._record_run_issue(
+            updated,
+            phase=phase,
+            code=code,
+            message=message,
+            retryable=True,
+        )
+        return updated
 
     async def _fresh_manifest(self, session, capture):
         installed = _stored_manifest(
@@ -2253,7 +2386,7 @@ class SessionService:
             ) from None
 
     async def _bootstrap_session(self, session_id):
-        session = self.session(session_id)
+        session = self._stored_session(session_id)
         if session.state not in {
             SessionState.BOOTSTRAPPING,
             SessionState.PROVISIONING,
@@ -2361,7 +2494,7 @@ class SessionService:
             ) from None
 
     async def _recover_session(self, session_id):
-        session = self.session(session_id)
+        session = self._stored_session(session_id)
         if session.state not in {
             SessionState.READY,
             SessionState.RUNNING,
@@ -2456,106 +2589,277 @@ class SessionService:
             SessionState.VALIDATING,
         }:
             await self.resume_session(session.session_id)
-            return self.session(session.session_id)
+            await self.reconciler.schedule(session.session_id)
+            return self._stored_session(session.session_id)
         return session
 
-    async def _finish_remote_job(self, session, job, worker):
-        relay = self._relay(worker, session)
-        for poll in range(self.max_job_polls):
+    async def reconcile_session_once(self, session_id):
+        session = self._stored_session(session_id)
+        job = self._reconciliation_job(session.session_id)
+        if job is None:
+            return session
+        if job.state in {
+            JobState.CAPTURED,
+            JobState.RESOLVING,
+            JobState.QUEUED,
+        }:
+            return await self.resume_session(session.session_id)
+        try:
+            worker = self._worker(session)
+            snapshot_method = getattr(worker, "snapshot", None)
+            if not callable(snapshot_method):
+                raise SessionExecutionError(
+                    "Remote worker snapshot is unavailable."
+                )
+            relay = self._relay(worker, session)
+            cursor = self.job_repository.last_event_sequence(job.job_id)
+            snapshot = await snapshot_method(job.job_id, cursor)
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            raise
+        except Exception:
+            return self._retryable_job_issue(
+                job,
+                phase=RunPhase.SYNCHRONIZATION,
+                code=RunErrorCode.SYNCHRONIZATION,
+                message="Remote job synchronization failed.",
+            )
+        if (
+            not isinstance(snapshot, dict)
+            or set(snapshot)
+            != {
+                "job_id",
+                "state",
+                "prompt_id",
+                "events",
+                "last_sequence",
+                "outputs",
+                "error",
+                "created_at",
+                "updated_at",
+            }
+            or snapshot.get("job_id") != job.job_id
+            or snapshot.get("state")
+            not in {
+                "queued",
+                "running",
+                "succeeded",
+                "failed",
+                "interrupted",
+            }
+        ):
+            return self._retryable_job_issue(
+                job,
+                phase=RunPhase.SYNCHRONIZATION,
+                code=RunErrorCode.SYNCHRONIZATION,
+                message="Remote job synchronization failed.",
+            )
+        prompt_id = snapshot.get("prompt_id")
+        if prompt_id is not None:
             try:
-                result = await relay.sync_job(job.job_id)
+                if str(uuid.UUID(prompt_id)) != prompt_id:
+                    raise ValueError("Non-canonical remote prompt ID.")
+            except (AttributeError, TypeError, ValueError):
+                return self._retryable_job_issue(
+                    job,
+                    phase=RunPhase.SYNCHRONIZATION,
+                    code=RunErrorCode.SYNCHRONIZATION,
+                    message="Remote job synchronization failed.",
+                )
+        remote_prompt_id = prompt_id or job.remote_prompt_id
+        remote_state = snapshot["state"]
+
+        if remote_state in {"queued", "running"}:
+            if job.state != JobState.RUNNING:
+                return self._retryable_job_issue(
+                    job,
+                    phase=RunPhase.SYNCHRONIZATION,
+                    code=RunErrorCode.SYNCHRONIZATION,
+                    message="Remote job synchronization failed.",
+                )
+            job = self._transition_job(
+                job,
+                job.state,
+                remote_prompt_id=remote_prompt_id,
+                execution_state=(
+                    ExecutionState.QUEUED
+                    if remote_state == "queued"
+                    else ExecutionState.RUNNING
+                ),
+                sanitized_error=None,
+                error_code=None,
+            )
+            try:
+                result = await relay.sync_snapshot(job.job_id, snapshot)
+                if (
+                    not isinstance(result, RelaySyncResult)
+                    or result.job_id != job.job_id
+                    or result.state != remote_state
+                ):
+                    raise RelayValidationError(
+                        "Remote snapshot did not match the local job."
+                    )
             except (asyncio.CancelledError, KeyboardInterrupt):
                 raise
-            except WorkerBoundaryAuthenticationError:
-                raise
             except Exception:
-                raise SessionExecutionError(
-                    "Remote job synchronization failed."
-                ) from None
+                return self._retryable_job_issue(
+                    job,
+                    phase=RunPhase.SYNCHRONIZATION,
+                    code=RunErrorCode.SYNCHRONIZATION,
+                    message="Remote job synchronization failed.",
+                )
+            return self.job_repository.get_job(job.job_id)
+
+        if remote_state == "succeeded":
+            if job.state == JobState.RUNNING:
+                job = self._transition_job(
+                    job,
+                    JobState.HARVESTING,
+                    remote_prompt_id=remote_prompt_id,
+                    execution_state=ExecutionState.SUCCEEDED,
+                    harvest_state=HarvestState.RUNNING,
+                    sanitized_error=None,
+                    error_code=None,
+                )
+            elif job.state == JobState.HARVESTING:
+                job = self._transition_job(
+                    job,
+                    job.state,
+                    remote_prompt_id=remote_prompt_id,
+                    execution_state=ExecutionState.SUCCEEDED,
+                    harvest_state=HarvestState.RUNNING,
+                    sanitized_error=None,
+                    error_code=None,
+                )
+            else:
+                return job
+            current_session = self._stored_session(session.session_id)
+            if current_session.state == SessionState.READY:
+                current_session = self._sessions().transition_if_state(
+                    current_session.session_id,
+                    SessionState.READY,
+                    SessionState.RUNNING,
+                    now=self._now(),
+                )
+            if current_session.state == SessionState.RUNNING:
+                current_session = self._sessions().transition_if_state(
+                    current_session.session_id,
+                    SessionState.RUNNING,
+                    SessionState.HARVESTING,
+                    now=self._now(),
+                )
+            try:
+                result = await relay.sync_snapshot(job.job_id, snapshot)
+                if (
+                    not isinstance(result, RelaySyncResult)
+                    or result.job_id != job.job_id
+                    or result.state != "succeeded"
+                ):
+                    raise RelayValidationError(
+                        "Remote output metadata was invalid."
+                    )
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                raise
+            except RelayValidationError:
+                failed = self._transition_job(
+                    job,
+                    job.state,
+                    harvest_state=HarvestState.FAILED,
+                    sanitized_error="Remote output metadata was invalid.",
+                    error_code=RunErrorCode.INVALID_OUTPUT,
+                )
+                self._record_run_issue(
+                    failed,
+                    phase=RunPhase.HARVEST,
+                    code=RunErrorCode.INVALID_OUTPUT,
+                    message="Remote output metadata was invalid.",
+                    retryable=True,
+                )
+                return failed
+            except Exception:
+                failed = self._transition_job(
+                    job,
+                    job.state,
+                    harvest_state=HarvestState.FAILED,
+                    sanitized_error="Remote output retrieval failed.",
+                    error_code=RunErrorCode.HARVEST,
+                )
+                self._record_run_issue(
+                    failed,
+                    phase=RunPhase.HARVEST,
+                    code=RunErrorCode.HARVEST,
+                    message="Remote output retrieval failed.",
+                    retryable=True,
+                )
+                return failed
+            job = self._transition_job(
+                job,
+                JobState.SUCCEEDED,
+                execution_state=ExecutionState.SUCCEEDED,
+                harvest_state=HarvestState.SUCCEEDED,
+                sanitized_error=None,
+                error_code=None,
+            )
+            self._sessions().transition_if_state(
+                current_session.session_id,
+                SessionState.HARVESTING,
+                SessionState.READY,
+                now=self._now(),
+                sanitized_error=None,
+            )
+            return job
+
+        execution_state = (
+            ExecutionState.FAILED
+            if remote_state == "failed"
+            else ExecutionState.INTERRUPTED
+        )
+        job = self._transition_job(
+            job,
+            job.state,
+            remote_prompt_id=remote_prompt_id,
+            execution_state=execution_state,
+            sanitized_error=None,
+            error_code=None,
+        )
+        try:
+            result = await relay.sync_snapshot(job.job_id, snapshot)
             if (
                 not isinstance(result, RelaySyncResult)
                 or result.job_id != job.job_id
+                or result.state != remote_state
             ):
-                raise SessionExecutionError(
-                    "Remote job synchronization failed."
+                raise RelayValidationError(
+                    "Remote failure snapshot did not match the local job."
                 )
-            if result.state in {"queued", "running"}:
-                if poll + 1 >= self.max_job_polls:
-                    break
-                await self.sleep(self.job_poll_interval_seconds)
-                continue
-            if result.state == "succeeded":
-                if session.state == SessionState.RUNNING:
-                    session = self._sessions().transition_if_state(
-                        session.session_id,
-                        SessionState.RUNNING,
-                        SessionState.HARVESTING,
-                        now=self._now(),
-                    )
-                if job.state == JobState.RUNNING:
-                    job = self._transition_job(
-                        job,
-                        JobState.HARVESTING,
-                    )
-                if (
-                    session.state != SessionState.HARVESTING
-                    or job.state != JobState.HARVESTING
-                ):
-                    raise SessionExecutionError(
-                        "Local harvesting state is inconsistent."
-                    )
-                job = self._transition_job(job, JobState.SUCCEEDED)
-                self._sessions().transition_if_state(
-                    session.session_id,
-                    SessionState.HARVESTING,
-                    SessionState.READY,
-                    now=self._now(),
-                    sanitized_error=None,
-                )
-                return job
-            if result.state in {"failed", "interrupted"}:
-                job = self._transition_job(
-                    job,
-                    JobState.FAILED,
-                    sanitized_error=_safe_remote_error(result.error),
-                )
-                self._sessions().transition_if_state(
-                    session.session_id,
-                    session.state,
-                    SessionState.READY,
-                    now=self._now(),
-                    sanitized_error=None,
-                )
-                return job
-            raise SessionExecutionError(
-                "Remote job state was invalid."
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            raise
+        except Exception:
+            return self._retryable_job_issue(
+                job,
+                phase=RunPhase.SYNCHRONIZATION,
+                code=RunErrorCode.SYNCHRONIZATION,
+                message="Remote job synchronization failed.",
             )
-        raise SessionExecutionError("Remote job polling limit was reached.")
-
-    def _schedule_remote_job(self, session, job, worker):
-        existing = _JOB_TASKS.get(job.job_id)
-        if existing is not None and not existing.done():
-            return existing
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return None
-        task = loop.create_task(
-            self._finish_remote_job(session, job, worker)
+        job = self._transition_job(
+            job,
+            JobState.FAILED,
+            execution_state=execution_state,
+            sanitized_error=_safe_remote_error(result.error),
+            error_code=RunErrorCode.EXECUTION,
         )
-        _JOB_TASKS[job.job_id] = task
-
-        def completed(done):
-            if _JOB_TASKS.get(job.job_id) is done:
-                _JOB_TASKS.pop(job.job_id, None)
-            if not done.cancelled():
-                try:
-                    done.exception()
-                except (asyncio.CancelledError, Exception):
-                    pass
-
-        task.add_done_callback(completed)
-        return task
+        current_session = self._stored_session(session.session_id)
+        if current_session.state in {
+            SessionState.RUNNING,
+            SessionState.HARVESTING,
+        }:
+            self._sessions().transition_if_state(
+                current_session.session_id,
+                current_session.state,
+                SessionState.READY,
+                now=self._now(),
+                sanitized_error=None,
+            )
+        return job
 
     async def submit_job(
         self,
@@ -2564,7 +2868,7 @@ class SessionService:
         capture_id,
         idempotency_key,
     ):
-        session = self.session(session_id)
+        session = self._stored_session(session_id)
         key = _strict_identifier(
             idempotency_key,
             "job idempotency key",
@@ -2574,6 +2878,11 @@ class SessionService:
             key,
         )
         if duplicate is not None:
+            if duplicate.state in {
+                JobState.RUNNING,
+                JobState.HARVESTING,
+            }:
+                self.reconciler.schedule(session.session_id)
             return duplicate
         if session.state != SessionState.READY:
             raise SessionBusy("Cloud Run session is busy.")
@@ -2748,7 +3057,11 @@ class SessionService:
                 installed_manifest_digest=desired.digest,
                 sanitized_error=None,
             )
-        job = self._transition_job(job, JobState.QUEUED)
+        job = self._transition_job(
+            job,
+            JobState.QUEUED,
+            execution_state=ExecutionState.QUEUED,
+        )
         payload = json.loads(job.capture_json)
         request = {
             "job_id": job.job_id,
@@ -2802,18 +3115,26 @@ class SessionService:
             job,
             JobState.RUNNING,
             remote_prompt_id=prompt_id,
+            execution_state=(
+                ExecutionState.QUEUED
+                if remote["state"] == "queued"
+                else (
+                    ExecutionState.RUNNING
+                    if remote["state"] == "running"
+                    else job.execution_state
+                )
+            ),
         )
         if remote["state"] in {"queued", "running"}:
-            self._schedule_remote_job(session, job, worker)
+            self.reconciler.schedule(session.session_id)
             return job
-        return await self._finish_remote_job(
-            session,
-            job,
-            worker,
+        await self.reconciler.reconcile(session.session_id)
+        return self.job_repository.get_job(
+            job.job_id
         )
 
     async def resume_session(self, session_id):
-        session = self.session(session_id)
+        session = self._stored_session(session_id)
         active = [
             job
             for job in self.job_repository.list_jobs(session.session_id)
@@ -2885,9 +3206,12 @@ class SessionService:
         if job.state == JobState.CAPTURED:
             job = self._transition_job(job, JobState.RESOLVING)
         if job.state == JobState.RESOLVING:
-            job = self._transition_job(job, JobState.QUEUED)
-        remote = None
-        if session.state != SessionState.HARVESTING:
+            job = self._transition_job(
+                job,
+                JobState.QUEUED,
+                execution_state=ExecutionState.QUEUED,
+            )
+        if job.state == JobState.QUEUED:
             payload = json.loads(job.capture_json)
             remote = await worker.start_job(
                 {
@@ -2898,13 +3222,39 @@ class SessionService:
                     "queue_options": payload["queue_options"],
                 }
             )
-            if job.state == JobState.QUEUED:
-                job = self._transition_job(job, JobState.RUNNING)
-        if (
-            session.state == SessionState.HARVESTING
-            or not isinstance(remote, dict)
-            or remote.get("state") in {"queued", "running"}
-        ):
-            self._schedule_remote_job(session, job, worker)
+            if (
+                not isinstance(remote, dict)
+                or remote.get("job_id") != job.job_id
+                or remote.get("state")
+                not in {
+                    "queued",
+                    "running",
+                    "succeeded",
+                    "failed",
+                    "interrupted",
+                }
+            ):
+                raise SessionExecutionError(
+                    "Remote job submission response was invalid."
+                )
+            job = self._transition_job(
+                job,
+                JobState.RUNNING,
+                remote_prompt_id=remote.get("prompt_id"),
+                execution_state=(
+                    ExecutionState.QUEUED
+                    if remote["state"] == "queued"
+                    else (
+                        ExecutionState.RUNNING
+                        if remote["state"] == "running"
+                        else job.execution_state
+                    )
+                ),
+            )
+            if remote["state"] not in {"queued", "running"}:
+                await self.reconciler.reconcile(session.session_id)
+                return self.job_repository.get_job(job.job_id)
+        if job.state in {JobState.RUNNING, JobState.HARVESTING}:
+            self.reconciler.schedule(session.session_id)
             return job
-        return await self._finish_remote_job(session, job, worker)
+        return job

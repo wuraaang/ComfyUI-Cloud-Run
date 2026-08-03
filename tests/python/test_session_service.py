@@ -20,11 +20,14 @@ from cloud_run.manifest import (
 from cloud_run.models import (
     CloudJob,
     CloudSession,
+    ExecutionState,
+    HarvestState,
     JobState,
     SessionState,
     TransferState,
 )
-from cloud_run.relay import RelaySyncResult
+from cloud_run.relay import ArtifactVerificationError, RelaySyncResult
+from cloud_run.run_errors import RunErrorCode
 from cloud_run.repository import SessionRepository
 from cloud_run.resolver import NodeResolution
 from cloud_run.session_service import (
@@ -728,6 +731,19 @@ class SequentialWorker:
             "error": self.error,
         }
 
+    async def snapshot(self, job_id, after_sequence):
+        return {
+            "job_id": job_id,
+            "state": self.terminal_state,
+            "prompt_id": "11111111-1111-1111-1111-111111111111",
+            "events": [],
+            "last_sequence": after_sequence,
+            "outputs": [],
+            "error": self.error,
+            "created_at": 100.0,
+            "updated_at": 100.0,
+        }
+
 
 class SequentialRelay:
     def __init__(self, worker):
@@ -743,6 +759,17 @@ class SequentialRelay:
             events=(),
             outputs=(),
             error=self.worker.error,
+        )
+
+    async def sync_snapshot(self, job_id, snapshot):
+        self.calls.append(job_id)
+        return RelaySyncResult(
+            job_id=job_id,
+            state=snapshot["state"],
+            last_sequence=snapshot["last_sequence"],
+            events=(),
+            outputs=(),
+            error=snapshot["error"],
         )
 
 
@@ -2214,7 +2241,7 @@ class ReusableSessionTests(unittest.TestCase):
             self.jobs.get_job("recover-job").state,
             JobState.SUCCEEDED,
         )
-        self.assertEqual(len(self.worker.job_calls), 1)
+        self.assertEqual(len(self.worker.job_calls), 0)
         self.assertEqual(self.worker.manifest_calls, [])
 
     def test_execution_failure_returns_the_healthy_session_to_ready(self):
@@ -2288,6 +2315,22 @@ class ReusableSessionTests(unittest.TestCase):
             released = asyncio.Event()
             self.worker.terminal_state = "running"
 
+            async def terminal_snapshot(job_id, after_sequence):
+                await released.wait()
+                return {
+                    "job_id": job_id,
+                    "state": "succeeded",
+                    "prompt_id": "11111111-1111-1111-1111-111111111111",
+                    "events": [],
+                    "last_sequence": after_sequence,
+                    "outputs": [],
+                    "error": None,
+                    "created_at": 100.0,
+                    "updated_at": 100.0,
+                }
+
+            self.worker.snapshot = terminal_snapshot
+
             class PendingRelay:
                 async def sync_job(inner_self, job_id):
                     await released.wait()
@@ -2295,6 +2338,21 @@ class ReusableSessionTests(unittest.TestCase):
                         job_id=job_id,
                         state="succeeded",
                         last_sequence=1,
+                        events=(),
+                        outputs=(),
+                        error=None,
+                    )
+
+                async def sync_snapshot(
+                    inner_self,
+                    job_id,
+                    snapshot,
+                ):
+                    await released.wait()
+                    return RelaySyncResult(
+                        job_id=job_id,
+                        state="succeeded",
+                        last_sequence=snapshot["last_sequence"],
                         events=(),
                         outputs=(),
                         error=None,
@@ -2334,6 +2392,123 @@ class ReusableSessionTests(unittest.TestCase):
             self.sessions.get("session-1").state,
             SessionState.READY,
         )
+
+    def test_harvest_failure_preserves_execution_success_and_retries_without_resubmit(
+        self,
+    ):
+        async def scenario():
+            unhandled = []
+            loop = asyncio.get_running_loop()
+            previous_handler = loop.get_exception_handler()
+            loop.set_exception_handler(
+                lambda _loop, context: unhandled.append(context)
+            )
+            self.worker.terminal_state = "running"
+            snapshot_calls = []
+
+            async def snapshot(job_id, after_sequence):
+                snapshot_calls.append((job_id, after_sequence))
+                return {
+                    "job_id": job_id,
+                    "state": "succeeded",
+                    "prompt_id": "11111111-1111-1111-1111-111111111111",
+                    "events": [],
+                    "last_sequence": after_sequence,
+                    "outputs": [],
+                    "error": None,
+                    "created_at": 100.0,
+                    "updated_at": 101.0,
+                }
+
+            self.worker.snapshot = snapshot
+
+            class FailingOnceRelay:
+                def __init__(inner_self):
+                    inner_self.calls = 0
+
+                async def sync_snapshot(inner_self, job_id, remote):
+                    inner_self.calls += 1
+                    if inner_self.calls == 1:
+                        raise ArtifactVerificationError(
+                            "private output transport detail"
+                        )
+                    return RelaySyncResult(
+                        job_id=job_id,
+                        state=remote["state"],
+                        last_sequence=remote["last_sequence"],
+                        events=(),
+                        outputs=(),
+                        error=None,
+                    )
+
+            relay = FailingOnceRelay()
+            self.service.relay_factory = (
+                lambda _worker, _session: relay
+            )
+            try:
+                running = await self.service.submit_job(
+                    "session-1",
+                    capture_id=self.first_capture.capture_id,
+                    idempotency_key="harvest-retry-key",
+                )
+                for _attempt in range(20):
+                    current = self.jobs.get_job(running.job_id)
+                    if current.harvest_state == HarvestState.FAILED:
+                        break
+                    await asyncio.sleep(0)
+
+                failed_harvest = self.jobs.get_job(running.job_id)
+                self.assertEqual(
+                    failed_harvest.execution_state,
+                    ExecutionState.SUCCEEDED,
+                )
+                self.assertEqual(
+                    failed_harvest.harvest_state,
+                    HarvestState.FAILED,
+                )
+                self.assertEqual(failed_harvest.state, JobState.HARVESTING)
+                self.assertEqual(
+                    failed_harvest.error_code,
+                    RunErrorCode.HARVEST,
+                )
+                self.assertEqual(
+                    self.sessions.get("session-1").state,
+                    SessionState.HARVESTING,
+                )
+                self.assertNotIn(
+                    "private output transport detail",
+                    repr(failed_harvest),
+                )
+
+                self.service.get_job("session-1", running.job_id)
+                for _attempt in range(20):
+                    recovered = self.jobs.get_job(running.job_id)
+                    if recovered.state == JobState.SUCCEEDED:
+                        break
+                    await asyncio.sleep(0)
+                self.assertEqual(recovered.state, JobState.SUCCEEDED)
+                self.assertEqual(
+                    recovered.execution_state,
+                    ExecutionState.SUCCEEDED,
+                )
+                self.assertEqual(
+                    recovered.harvest_state,
+                    HarvestState.SUCCEEDED,
+                )
+                self.assertEqual(len(self.worker.job_calls), 1)
+                self.assertEqual(len(snapshot_calls), 2)
+                self.assertEqual(unhandled, [])
+                entries = self.jobs.list_journal("session-1")
+                self.assertEqual(len(entries), 1)
+                self.assertEqual(entries[0].code, RunErrorCode.HARVEST)
+                self.assertNotIn("private output", repr(entries))
+            finally:
+                loop.set_exception_handler(previous_handler)
+                reconciler = getattr(self.service, "reconciler", None)
+                if reconciler is not None:
+                    await reconciler.close()
+
+        asyncio.run(scenario())
 
     def test_deadline_alerts_extensions_and_no_limit_acknowledgement(self):
         self.assertEqual(

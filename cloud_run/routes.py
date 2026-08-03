@@ -1,5 +1,6 @@
 """Allowlisted same-origin routes for the managed Cloud Run lifecycle."""
 
+import json
 import os
 from pathlib import Path
 import math
@@ -330,6 +331,8 @@ def _public_filename(path, fallback):
 
 def _job_payload(service, job):
     payload = job.public_payload()
+    payload["execution_status"] = payload.get("execution_state")
+    payload["harvest_status"] = payload.get("harvest_state")
     repository = getattr(service, "job_repository", None)
     if not isinstance(repository, JobRepository):
         return payload
@@ -385,9 +388,89 @@ def _job_payload(service, job):
         }
         for transfer in transfers
     ]
-    payload["current_node"] = None
-    payload["progress"] = None
-    payload["progress_text"] = None
+    node_titles = {}
+    try:
+        capture = json.loads(job.capture_json)
+        workflow = capture.get("workflow", {})
+        nodes = workflow.get("nodes", [])
+        if isinstance(nodes, list) and len(nodes) <= 100_000:
+            for node in nodes:
+                if not isinstance(node, dict):
+                    continue
+                node_id = node.get("id")
+                if not isinstance(node_id, (str, int)):
+                    continue
+                identifier = str(node_id)
+                if not _MODEL_CATEGORY.fullmatch(identifier):
+                    continue
+                title = node.get("title")
+                if (
+                    isinstance(title, str)
+                    and title
+                    and len(title.encode("utf-8")) <= 512
+                    and not any(ord(character) < 32 for character in title)
+                ):
+                    node_titles[identifier] = title
+    except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+        node_titles = {}
+    current_node_id = None
+    progress = None
+    progress_text = None
+    for event in repository.list_events(job.job_id, 0):
+        if event.event_type == "executing":
+            node_id = event.payload.get("node_id")
+            if isinstance(node_id, str) and _MODEL_CATEGORY.fullmatch(node_id):
+                current_node_id = node_id
+        elif event.event_type == "progress":
+            value = event.payload.get("value")
+            maximum = event.payload.get(
+                "max",
+                event.payload.get("total"),
+            )
+            progress = {
+                "value": (
+                    value
+                    if isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    and math.isfinite(value)
+                    else None
+                ),
+                "max": (
+                    maximum
+                    if isinstance(maximum, (int, float))
+                    and not isinstance(maximum, bool)
+                    and math.isfinite(maximum)
+                    else None
+                ),
+            }
+        elif event.event_type == "progress_text":
+            text = event.payload.get("text")
+            if isinstance(text, str):
+                progress_text = text
+        elif event.event_type in {
+            "execution_success",
+            "execution_error",
+            "execution_interrupted",
+        }:
+            current_node_id = None
+    payload["current_node"] = (
+        {
+            "id": current_node_id,
+            "title": node_titles.get(current_node_id),
+        }
+        if current_node_id is not None
+        else None
+    )
+    payload["progress"] = progress
+    payload["progress_text"] = (
+        progress_text
+        or (
+            "Execution succeeded — retrieving outputs."
+            if job.execution_state.value == "succeeded"
+            and job.harvest_state.value in {"running", "failed"}
+            else None
+        )
+    )
     payload["last_sequence"] = repository.last_event_sequence(
         job.job_id
     )
@@ -664,7 +747,16 @@ def register_routes(service_factory=None):
 
     prompt_server = PromptServer.instance
     routes = prompt_server.routes
-    make_service = service_factory or build_service
+    if service_factory is not None:
+        make_service = service_factory
+    else:
+        shared_service = None
+
+        def make_service():
+            nonlocal shared_service
+            if shared_service is None:
+                shared_service = build_service()
+            return shared_service
 
     def service_error(error):
         if isinstance(
@@ -1192,3 +1284,20 @@ def register_routes(service_factory=None):
 
         startup.append(recover_managed_attempts)
         setattr(prompt_server, marker, True)
+    cleanup = getattr(app, "on_cleanup", None)
+    cleanup_marker = "_comfyui_cloud_run_cleanup_registered"
+    if (
+        cleanup is not None
+        and hasattr(cleanup, "append")
+        and not getattr(prompt_server, cleanup_marker, False)
+    ):
+        async def close_managed_service(_app):
+            try:
+                close = getattr(make_service(), "close", None)
+                if callable(close):
+                    await close()
+            except Exception:
+                return
+
+        cleanup.append(close_managed_service)
+        setattr(prompt_server, cleanup_marker, True)
