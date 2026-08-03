@@ -69,7 +69,7 @@ class WorkerStateTests(unittest.TestCase):
             self.assertEqual(
                 reopened,
                 {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "protocol_version": "1",
                     "session_id": "session-1",
                     "session_secret_hex": "a" * 64,
@@ -93,6 +93,52 @@ class WorkerStateTests(unittest.TestCase):
                 sorted(item.name for item in path.parent.iterdir()),
                 ["worker-state.json"],
             )
+
+    def test_schema_one_job_migrates_created_at_and_persists_schema_two(self):
+        from remote_worker.state import WorkerStateStore
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "worker-state.json"
+            legacy = {
+                "schema_version": 1,
+                "protocol_version": "1",
+                "session_id": "session-1",
+                "session_secret_hex": "a" * 64,
+                "claimed": True,
+                "deadline_at": 0,
+                "deadline_mode": "finite",
+                "installed": {},
+                "transactions": {},
+                "jobs": {
+                    "job-1": {
+                        "kind": "job",
+                        "job_id": "job-1",
+                        "request_digest": "c" * 64,
+                        "manifest_digest": "d" * 64,
+                        "state": "queued",
+                        "client_id": "client-1",
+                        "prompt_id": None,
+                        "sequence": 0,
+                        "events": [],
+                        "previews": {},
+                        "outputs": {},
+                        "error": None,
+                        "updated_at": 11.0,
+                    }
+                },
+            }
+            path.write_text(json.dumps(legacy), encoding="utf-8")
+            os.chmod(path, 0o600)
+
+            migrated = WorkerStateStore(path).load()
+
+            self.assertEqual(migrated["schema_version"], 2)
+            self.assertEqual(
+                migrated["jobs"]["job-1"]["created_at"],
+                11.0,
+            )
+            persisted = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(persisted, migrated)
 
     def test_corrupt_or_world_readable_state_fails_closed(self):
         from remote_worker.state import WorkerStateError, WorkerStateStore
@@ -311,6 +357,10 @@ class WorkerApplicationTests(unittest.TestCase):
                 ("POST", "/worker/v1/jobs"),
                 ("GET", "/worker/v1/jobs/{job_id}"),
                 ("GET", "/worker/v1/jobs/{job_id}/events"),
+                (
+                    "GET",
+                    "/worker/v1/jobs/{job_id}/snapshot",
+                ),
                 (
                     "GET",
                     "/worker/v1/jobs/{job_id}/previews/{preview_id}",

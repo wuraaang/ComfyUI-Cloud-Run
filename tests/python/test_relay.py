@@ -81,8 +81,35 @@ class FakeWorker:
         self.remote_events = list(events or [])
         self.previews = dict(previews or {})
         self.ranges = []
+        self.snapshot_calls = []
+        self.events_calls = 0
+        self.job_calls = 0
+
+    async def snapshot(self, job_id, after_sequence):
+        self.snapshot_calls.append((job_id, after_sequence))
+        last_sequence = (
+            self.remote_events[-1]["sequence"]
+            if self.remote_events
+            else 0
+        )
+        return {
+            "job_id": job_id,
+            "state": "succeeded",
+            "prompt_id": "11111111-1111-4111-8111-111111111111",
+            "events": [
+                event
+                for event in self.remote_events
+                if event["sequence"] > after_sequence
+            ],
+            "last_sequence": last_sequence,
+            "outputs": self.descriptors,
+            "error": None,
+            "created_at": 10.0,
+            "updated_at": 20.0,
+        }
 
     async def events(self, job_id, after_sequence):
+        self.events_calls += 1
         return {
             "job_id": job_id,
             "events": [
@@ -98,6 +125,7 @@ class FakeWorker:
         }
 
     async def job(self, job_id):
+        self.job_calls += 1
         return {
             "job_id": job_id,
             "state": "succeeded",
@@ -322,6 +350,90 @@ class LocalRelayTests(unittest.TestCase):
         )
         self.assertNotIn("provider-key", repr(events))
         self.assertEqual(list(self.output_root.iterdir()), [])
+
+    def test_sync_catches_up_from_event_94_using_only_atomic_snapshot(self):
+        remote_events = [
+            {
+                "sequence": sequence,
+                "type": (
+                    "execution_success"
+                    if sequence == 158
+                    else "progress"
+                ),
+                "data": (
+                    {"timestamp": 158.0}
+                    if sequence == 158
+                    else {"value": sequence, "max": 158}
+                ),
+                "created_at": float(sequence),
+            }
+            for sequence in range(1, 159)
+        ]
+        for event in remote_events[:93]:
+            self.repository.append_event(
+                "job-1",
+                event["sequence"],
+                event["type"],
+                event["data"],
+                created_at=event["created_at"],
+            )
+        worker = FakeWorker(descriptors=[], events=remote_events)
+        relay = self.relay(worker)
+
+        result = asyncio.run(relay.sync_job("job-1"))
+
+        self.assertEqual(result.last_sequence, 158)
+        self.assertEqual(
+            self.repository.last_event_sequence("job-1"),
+            158,
+        )
+        self.assertEqual(worker.snapshot_calls, [("job-1", 93)])
+        self.assertEqual(worker.events_calls, 0)
+        self.assertEqual(worker.job_calls, 0)
+
+    def test_snapshot_replay_is_idempotent_but_gap_or_change_is_rejected(self):
+        from cloud_run.relay import RelayValidationError
+
+        relay = self.relay(FakeWorker(descriptors=[]))
+        event = {
+            "sequence": 1,
+            "type": "progress",
+            "data": {"value": 1, "max": 2},
+            "created_at": 11.0,
+        }
+        snapshot = {
+            "job_id": "job-1",
+            "state": "running",
+            "prompt_id": "11111111-1111-4111-8111-111111111111",
+            "events": [event],
+            "last_sequence": 1,
+            "outputs": [],
+            "error": None,
+            "created_at": 10.0,
+            "updated_at": 12.0,
+        }
+
+        first = asyncio.run(relay.sync_snapshot("job-1", snapshot))
+        replay = asyncio.run(relay.sync_snapshot("job-1", snapshot))
+
+        self.assertEqual(len(first.events), 1)
+        self.assertEqual(replay.events, ())
+        self.assertEqual(len(self.repository.list_events("job-1", 0)), 1)
+
+        changed = {
+            **snapshot,
+            "events": [{**event, "data": {"value": 2, "max": 2}}],
+        }
+        with self.assertRaises(RelayValidationError):
+            asyncio.run(relay.sync_snapshot("job-1", changed))
+
+        gap = {
+            **snapshot,
+            "events": [{**event, "sequence": 3}],
+            "last_sequence": 3,
+        }
+        with self.assertRaises(RelayValidationError):
+            asyncio.run(relay.sync_snapshot("job-1", gap))
 
     def test_preview_is_verified_into_private_cache(self):
         preview = b"\x89PNG\r\n\x1a\npreview"

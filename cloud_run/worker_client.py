@@ -11,9 +11,11 @@ import json
 import math
 import os
 from pathlib import Path
+from pathlib import PurePosixPath
 import re
 import secrets
 import stat
+import uuid
 from urllib.parse import urlsplit
 
 from .manifest import PROTOCOL_VERSION
@@ -35,6 +37,59 @@ _HEX_64 = re.compile(r"[0-9a-f]{64}")
 _CONTENT_RANGE = re.compile(
     r"bytes (0|[1-9][0-9]*)-(0|[1-9][0-9]*)/"
     r"(0|[1-9][0-9]*)"
+)
+_MIME_TYPE = re.compile(r"[a-z0-9.+-]+/[a-z0-9.+-]+")
+_SNAPSHOT_FIELDS = {
+    "job_id",
+    "state",
+    "prompt_id",
+    "events",
+    "last_sequence",
+    "outputs",
+    "error",
+    "created_at",
+    "updated_at",
+}
+_SNAPSHOT_STATES = {
+    "queued",
+    "running",
+    "succeeded",
+    "failed",
+    "interrupted",
+}
+_SNAPSHOT_EVENT_TYPES = {
+    "execution_start",
+    "status",
+    "progress",
+    "progress_text",
+    "progress_state",
+    "executing",
+    "executed",
+    "execution_cached",
+    "execution_success",
+    "execution_error",
+    "execution_interrupted",
+    "b_preview",
+    "b_preview_with_metadata",
+}
+_SNAPSHOT_OUTPUT_FIELDS = {
+    "artifact_id",
+    "node_id",
+    "filename",
+    "subfolder",
+    "mime_type",
+    "size_bytes",
+    "sha256",
+}
+_SNAPSHOT_ERROR_FIELDS = {
+    "code",
+    "message",
+    "node_id",
+    "class_type",
+    "title",
+}
+_SUSPICIOUS_TEXT = re.compile(
+    r"(?i)(authorization|bearer|api[_ -]?key|password|secret|token)"
 )
 
 
@@ -158,6 +213,171 @@ def _parse_json_response(response, *, maximum=MAX_WORKER_JSON_BYTES):
     if not isinstance(payload, dict):
         raise _client_error()
     return payload
+
+
+def _finite_number(value):
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(value)
+    )
+
+
+def _canonical_uuid(value):
+    if not isinstance(value, str):
+        return False
+    try:
+        return str(uuid.UUID(value)) == value
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
+def _validated_snapshot_output(value):
+    if not isinstance(value, dict) or set(value) != _SNAPSHOT_OUTPUT_FIELDS:
+        raise _client_error()
+    filename = value.get("filename")
+    subfolder = value.get("subfolder")
+    size_bytes = value.get("size_bytes")
+    if (
+        not _identifier(value.get("artifact_id"))
+        or not _identifier(value.get("node_id"))
+        or not isinstance(filename, str)
+        or not filename
+        or filename in {".", ".."}
+        or "/" in filename
+        or "\\" in filename
+        or any(ord(character) < 32 for character in filename)
+        or len(filename.encode("utf-8")) > 1024
+        or not isinstance(subfolder, str)
+        or "\\" in subfolder
+        or any(ord(character) < 32 for character in subfolder)
+        or len(subfolder.encode("utf-8")) > 4096
+        or not isinstance(value.get("mime_type"), str)
+        or not _MIME_TYPE.fullmatch(value["mime_type"])
+        or isinstance(size_bytes, bool)
+        or not isinstance(size_bytes, int)
+        or not 0 < size_bytes <= MAX_WORKER_ARTIFACT_BYTES
+        or not isinstance(value.get("sha256"), str)
+        or not _HEX_64.fullmatch(value["sha256"])
+    ):
+        raise _client_error()
+    relative = PurePosixPath(subfolder)
+    if relative.is_absolute() or any(
+        part in {"", ".", ".."} for part in relative.parts
+    ):
+        if subfolder:
+            raise _client_error()
+    return dict(value)
+
+
+def _validated_snapshot_error(value):
+    if value is None:
+        return None
+    if (
+        not isinstance(value, dict)
+        or not {"code", "message"}.issubset(value)
+        or not set(value).issubset(_SNAPSHOT_ERROR_FIELDS)
+        or not _identifier(value.get("code"))
+        or not isinstance(value.get("message"), str)
+        or not value["message"]
+        or len(value["message"].encode("utf-8")) > 1024
+        or any(ord(character) < 32 for character in value["message"])
+        or _SUSPICIOUS_TEXT.search(value["message"])
+    ):
+        raise _client_error()
+    for key in ("node_id", "class_type"):
+        if key in value and not _identifier(value[key]):
+            raise _client_error()
+    if "title" in value and (
+        not isinstance(value["title"], str)
+        or not value["title"]
+        or len(value["title"].encode("utf-8")) > 512
+        or any(ord(character) < 32 for character in value["title"])
+        or _SUSPICIOUS_TEXT.search(value["title"])
+    ):
+        raise _client_error()
+    return dict(value)
+
+
+def _validated_snapshot(payload, job_id, after_sequence):
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != _SNAPSHOT_FIELDS
+        or payload.get("job_id") != job_id
+        or payload.get("state") not in _SNAPSHOT_STATES
+        or not isinstance(payload.get("events"), list)
+        or len(payload["events"]) > 20_000
+        or not isinstance(payload.get("outputs"), list)
+        or len(payload["outputs"]) > 100_000
+        or isinstance(payload.get("last_sequence"), bool)
+        or not isinstance(payload.get("last_sequence"), int)
+        or payload["last_sequence"] < after_sequence
+        or not _finite_number(payload.get("created_at"))
+        or payload["created_at"] < 0
+        or not _finite_number(payload.get("updated_at"))
+        or payload["updated_at"] < payload["created_at"]
+    ):
+        raise _client_error()
+    prompt_id = payload.get("prompt_id")
+    if prompt_id is not None and not _canonical_uuid(prompt_id):
+        raise _client_error()
+    events = []
+    expected_sequence = after_sequence + 1
+    for event in payload["events"]:
+        if (
+            not isinstance(event, dict)
+            or set(event) != {"sequence", "type", "data", "created_at"}
+            or event.get("sequence") != expected_sequence
+            or event["sequence"] > payload["last_sequence"]
+            or event.get("type") not in _SNAPSHOT_EVENT_TYPES
+            or not isinstance(event.get("data"), dict)
+            or not _finite_number(event.get("created_at"))
+            or event["created_at"] < 0
+            or event["created_at"] > payload["updated_at"]
+        ):
+            raise _client_error()
+        events.append(
+            {
+                "sequence": event["sequence"],
+                "type": event["type"],
+                "data": dict(event["data"]),
+                "created_at": float(event["created_at"]),
+            }
+        )
+        expected_sequence += 1
+    if (
+        events
+        and events[-1]["sequence"] != payload["last_sequence"]
+    ) or (
+        not events and payload["last_sequence"] != after_sequence
+    ):
+        raise _client_error()
+    outputs = [
+        _validated_snapshot_output(output)
+        for output in payload["outputs"]
+    ]
+    if len({output["artifact_id"] for output in outputs}) != len(outputs):
+        raise _client_error()
+    error = _validated_snapshot_error(payload["error"])
+    state = payload["state"]
+    if (
+        state in {"queued", "running", "succeeded"}
+        and error is not None
+    ) or (state in {"queued", "running"} and outputs) or (
+        state in {"failed", "interrupted"} and error is None
+    ):
+        raise _client_error()
+    return {
+        "job_id": job_id,
+        "state": state,
+        "prompt_id": prompt_id,
+        "events": events,
+        "last_sequence": payload["last_sequence"],
+        "outputs": outputs,
+        "error": error,
+        "created_at": float(payload["created_at"]),
+        "updated_at": float(payload["updated_at"]),
+    }
 
 
 def _validated_base_url(value):
@@ -523,6 +743,25 @@ class WorkerClient:
                 + str(after_sequence)
             ),
         )
+
+    async def snapshot(self, job_id, after_sequence):
+        if (
+            not _identifier(job_id)
+            or isinstance(after_sequence, bool)
+            or not isinstance(after_sequence, int)
+            or after_sequence < 0
+        ):
+            raise _client_error()
+        payload = await self._json(
+            "GET",
+            (
+                "/worker/v1/jobs/"
+                + job_id
+                + "/snapshot?after_sequence="
+                + str(after_sequence)
+            ),
+        )
+        return _validated_snapshot(payload, job_id, after_sequence)
 
     async def preview(self, job_id, preview_id):
         if not _identifier(job_id) or not _identifier(preview_id):

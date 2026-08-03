@@ -131,6 +131,42 @@ class SuccessfulComfy:
         return self.output
 
 
+class SuccessfulComfyWithTemporaryPreview(SuccessfulComfy):
+    def __init__(self, output_root):
+        super().__init__(output_root)
+        self.output_path_descriptors = []
+
+    async def history(self, prompt_id):
+        return {
+            prompt_id: {
+                "outputs": {
+                    "9": {
+                        "images": [
+                            {
+                                "filename": "wallpaper.png",
+                                "subfolder": "",
+                                "type": "output",
+                            }
+                        ]
+                    },
+                    "66": {
+                        "images": [
+                            {
+                                "filename": "preview.png",
+                                "subfolder": "",
+                                "type": "temp",
+                            }
+                        ]
+                    },
+                }
+            }
+        }
+
+    def output_path(self, descriptor):
+        self.output_path_descriptors.append(dict(descriptor))
+        return super().output_path(descriptor)
+
+
 class BlockingComfy(SuccessfulComfy):
     def __init__(self, output_root):
         super().__init__(output_root)
@@ -187,6 +223,40 @@ class ValidationFailingComfy(SuccessfulComfy):
             error_type="prompt_outputs_failed_validation",
             node_ids=("7",),
         )
+
+
+class MutatingSnapshotState:
+    def __init__(self, path, record, replacement):
+        from remote_worker.state import WorkerStateStore
+
+        class Store(WorkerStateStore):
+            def __init__(nested_self):
+                super().__init__(path)
+                nested_self.record = record
+                nested_self.replacement = replacement
+                nested_self.job_calls = 0
+
+            def load(nested_self):
+                return {
+                    "schema_version": 1,
+                    "protocol_version": "1",
+                    "session_id": None,
+                    "session_secret_hex": None,
+                    "claimed": False,
+                    "deadline_at": 0,
+                    "deadline_mode": "finite",
+                    "installed": {},
+                    "transactions": {},
+                    "jobs": {},
+                }
+
+            def job(nested_self, job_id):
+                nested_self.job_calls += 1
+                captured = nested_self.record
+                nested_self.record = nested_self.replacement
+                return captured
+
+        self.store = Store()
 
 
 class WorkerJobTests(unittest.IsolatedAsyncioTestCase):
@@ -278,6 +348,37 @@ class WorkerJobTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(saved["state"], "succeeded")
         self.assertEqual(saved["sequence"], 4)
         self.assertNotIn("must-not-survive", repr(saved))
+
+    async def test_success_ignores_previewimage_temp_descriptor_during_harvest(
+        self,
+    ):
+        from remote_worker.jobs import JobManager
+
+        comfy = SuccessfulComfyWithTemporaryPreview(
+            self.directory / "output"
+        )
+        jobs = JobManager(
+            comfy=comfy,
+            state=self.state,
+            preview_root=self.directory / "previews",
+            token=lambda: "output-random-id",
+            clock=lambda: 10.0,
+        )
+
+        result = await jobs.run(job_request())
+
+        self.assertEqual(result.state, "succeeded")
+        self.assertEqual(len(result.outputs), 1)
+        self.assertEqual(
+            comfy.output_path_descriptors,
+            [
+                {
+                    "filename": "wallpaper.png",
+                    "subfolder": "",
+                    "type": "output",
+                }
+            ],
+        )
 
     async def test_second_concurrent_job_is_rejected_without_touching_comfy(self):
         from remote_worker.jobs import JobBusyError, JobManager
@@ -432,6 +533,81 @@ class WorkerJobTests(unittest.IsolatedAsyncioTestCase):
             result.events[-1]["type"],
             "execution_interrupted",
         )
+
+    async def test_snapshot_uses_exactly_one_detached_persisted_record(self):
+        from remote_worker.jobs import JobManager
+
+        events = [
+            {
+                "sequence": sequence,
+                "type": (
+                    "execution_success"
+                    if sequence == 158
+                    else "progress"
+                ),
+                "data": (
+                    {"timestamp": 158.0}
+                    if sequence == 158
+                    else {"value": sequence, "max": 158}
+                ),
+                "created_at": float(sequence),
+            }
+            for sequence in range(1, 159)
+        ]
+        captured = {
+            "kind": "job",
+            "job_id": "job-1",
+            "request_digest": "c" * 64,
+            "manifest_digest": MANIFEST_DIGEST,
+            "state": "succeeded",
+            "client_id": "client-1",
+            "prompt_id": "11111111-1111-4111-8111-111111111111",
+            "sequence": 158,
+            "events": events,
+            "previews": {},
+            "outputs": {},
+            "error": None,
+            "created_at": 1.0,
+            "updated_at": 158.0,
+        }
+        replacement = {
+            **captured,
+            "state": "failed",
+            "sequence": 159,
+            "events": [
+                *events,
+                {
+                    "sequence": 159,
+                    "type": "execution_error",
+                    "data": {"code": "execution_failed"},
+                    "created_at": 159.0,
+                },
+            ],
+            "error": {
+                "code": "execution_failed",
+                "message": "Remote execution failed.",
+            },
+            "updated_at": 159.0,
+        }
+        racing = MutatingSnapshotState(
+            self.directory / "racing-state.json",
+            captured,
+            replacement,
+        ).store
+        manager = JobManager(
+            comfy=SuccessfulComfy(self.directory / "snapshot-output"),
+            state=racing,
+            preview_root=self.directory / "snapshot-previews",
+        )
+
+        snapshot = manager.snapshot("job-1", 93)
+
+        self.assertEqual(racing.job_calls, 1)
+        self.assertEqual(snapshot.last_sequence, 158)
+        self.assertEqual(snapshot.events[0]["sequence"], 94)
+        self.assertEqual(snapshot.events[-1]["sequence"], 158)
+        self.assertEqual(snapshot.state, "succeeded")
+        self.assertIsNone(snapshot.error)
 
 
 class NativeComfyBoundaryTests(unittest.TestCase):
@@ -670,6 +846,13 @@ class WorkerJobRouteTests(unittest.IsolatedAsyncioTestCase):
                 query={"after_sequence": "1"},
             )
         )
+        snapshot = await self.worker.handle(
+            self.request(
+                "GET",
+                "/worker/v1/jobs/job-1/snapshot",
+                query={"after_sequence": "1"},
+            )
+        )
         preview = await self.worker.handle(
             self.request(
                 "GET",
@@ -689,6 +872,27 @@ class WorkerJobRouteTests(unittest.IsolatedAsyncioTestCase):
             [event["sequence"] for event in events.payload["events"]],
             [2, 3, 4],
         )
+        self.assertEqual(snapshot.status, 200)
+        self.assertEqual(
+            set(snapshot.payload),
+            {
+                "job_id",
+                "state",
+                "prompt_id",
+                "events",
+                "last_sequence",
+                "outputs",
+                "error",
+                "created_at",
+                "updated_at",
+            },
+        )
+        self.assertEqual(
+            [event["sequence"] for event in snapshot.payload["events"]],
+            [2, 3, 4],
+        )
+        self.assertEqual(snapshot.payload["last_sequence"], 4)
+        self.assertEqual(snapshot.payload["state"], "succeeded")
         self.assertEqual(preview.status, 200)
         self.assertEqual(preview.payload, b"\x89PNG\r\n\x1a\npreview")
         self.assertEqual(preview.headers["Content-Type"], "image/png")

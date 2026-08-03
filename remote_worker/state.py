@@ -12,7 +12,7 @@ import tempfile
 
 from cloud_run.worker_protocol import PROTOCOL_VERSION
 
-STATE_SCHEMA_VERSION = 1
+STATE_SCHEMA_VERSION = 2
 MAX_STATE_BYTES = 16 * 1024 * 1024
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}")
 _HEX_64 = re.compile(r"[0-9a-f]{64}")
@@ -36,8 +36,10 @@ _JOB_RECORD_FIELDS = {
     "previews",
     "outputs",
     "error",
+    "created_at",
     "updated_at",
 }
+_LEGACY_JOB_RECORD_FIELDS = _JOB_RECORD_FIELDS - {"created_at"}
 _PROVISION_STATES = {
     "applying",
     "awaiting_upload",
@@ -147,8 +149,11 @@ def _validate_job_record(job_id, record):
             record.get("error") is not None
             and not isinstance(record["error"], dict)
         )
+        or not _finite_number(record.get("created_at"))
+        or record["created_at"] < 0
         or not _finite_number(record.get("updated_at"))
         or record["updated_at"] < 0
+        or record["updated_at"] < record["created_at"]
     ):
         raise WorkerStateError("Worker job state is invalid.")
     if len(record["events"]) != record["sequence"]:
@@ -283,6 +288,33 @@ def _default_state(expected_session_id):
     }
 
 
+def _migrate_state(state):
+    if not isinstance(state, dict) or state.get("schema_version") != 1:
+        return state, False
+    if set(state) != _STATE_FIELDS or not isinstance(state.get("jobs"), dict):
+        raise WorkerStateError("Worker state is invalid.")
+    jobs = {}
+    for job_id, record in state["jobs"].items():
+        if (
+            not isinstance(record, dict)
+            or set(record) != _LEGACY_JOB_RECORD_FIELDS
+            or not _finite_number(record.get("updated_at"))
+            or record["updated_at"] < 0
+        ):
+            raise WorkerStateError("Worker job state is invalid.")
+        migrated = {
+            **record,
+            "created_at": float(record["updated_at"]),
+        }
+        _validate_job_record(job_id, migrated)
+        jobs[job_id] = migrated
+    return {
+        **state,
+        "schema_version": STATE_SCHEMA_VERSION,
+        "jobs": jobs,
+    }, True
+
+
 def _validate_state(state):
     if (
         not isinstance(state, dict)
@@ -320,6 +352,8 @@ def _validate_state(state):
             raise WorkerStateError("Worker state is invalid.")
     elif deadline is not None:
         raise WorkerStateError("Worker state is invalid.")
+    for job_id, record in state["jobs"].items():
+        _validate_job_record(job_id, record)
     try:
         encoded = json.dumps(
             state,
@@ -349,6 +383,8 @@ class WorkerStateStore:
         if not self.path.exists():
             return _default_state(self.expected_session_id)
         descriptor = None
+        migrated = False
+        state = None
         try:
             parent_metadata = os.lstat(self.path.parent)
             if (
@@ -373,6 +409,7 @@ class WorkerStateStore:
             if len(content) != metadata.st_size:
                 raise WorkerStateError("Worker state is unavailable.")
             state = json.loads(content.decode("utf-8"))
+            state, migrated = _migrate_state(state)
             _validate_state(state)
             if (
                 self.expected_session_id is not None
@@ -380,7 +417,6 @@ class WorkerStateStore:
                 != self.expected_session_id
             ):
                 raise WorkerStateError("Worker state is unavailable.")
-            return state
         except WorkerStateError:
             raise
         except (OSError, UnicodeError, json.JSONDecodeError):
@@ -388,6 +424,9 @@ class WorkerStateStore:
         finally:
             if descriptor is not None:
                 os.close(descriptor)
+        if migrated:
+            return self.save(state)
+        return state
 
     def save(self, state):
         encoded = _validate_state(state)

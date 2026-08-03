@@ -734,6 +734,26 @@ class FakeWorkerClient:
             "last_sequence": after_sequence,
         }
 
+    async def snapshot(self, job_id, after_sequence):
+        if self.unavailable:
+            raise RuntimeError("synthetic worker unavailable")
+        job = self._jobs[job_id]
+        return {
+            "job_id": job_id,
+            "state": job["state"],
+            "prompt_id": job["prompt_id"],
+            "events": [],
+            "last_sequence": 0,
+            "outputs": [dict(output) for output in job["outputs"]],
+            "error": (
+                dict(job["error"])
+                if job["error"] is not None
+                else None
+            ),
+            "created_at": 1.0,
+            "updated_at": 2.0,
+        }
+
     async def job(self, job_id):
         return dict(self._jobs[job_id])
 

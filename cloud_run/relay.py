@@ -510,8 +510,7 @@ class LocalRelay:
         clock=None,
     ):
         if worker is not None and (
-            not callable(getattr(worker, "events", None))
-            or not callable(getattr(worker, "job", None))
+            not callable(getattr(worker, "snapshot", None))
         ):
             raise ValueError("Local relay worker boundary is invalid.")
         if not isinstance(repository, JobRepository):
@@ -1128,48 +1127,99 @@ class LocalRelay:
             raise RelayError("Remote worker is unavailable.")
         cursor = self.repository.last_event_sequence(job_id)
         try:
-            response = await self.worker.events(job_id, cursor)
+            snapshot = await self.worker.snapshot(job_id, cursor)
         except (asyncio.CancelledError, KeyboardInterrupt):
             raise
         except Exception:
-            raise RelayError("Remote worker events are unavailable.") from None
+            raise RelayError("Remote worker snapshot is unavailable.") from None
+        return await self.sync_snapshot(job_id, snapshot)
+
+    async def sync_snapshot(self, job_id, snapshot):
+        self._job(job_id)
         if (
-            not isinstance(response, dict)
-            or set(response) != {
+            not isinstance(snapshot, dict)
+            or set(snapshot) != {
                 "job_id",
+                "state",
+                "prompt_id",
                 "events",
                 "last_sequence",
+                "outputs",
+                "error",
+                "created_at",
+                "updated_at",
             }
-            or response.get("job_id") != job_id
-            or not isinstance(response.get("events"), list)
-            or isinstance(response.get("last_sequence"), bool)
-            or not isinstance(response.get("last_sequence"), int)
+            or snapshot.get("job_id") != job_id
+            or snapshot.get("state")
+            not in {
+                "queued",
+                "running",
+                "succeeded",
+                "failed",
+                "interrupted",
+            }
+            or not isinstance(snapshot.get("events"), list)
+            or not isinstance(snapshot.get("outputs"), list)
+            or isinstance(snapshot.get("last_sequence"), bool)
+            or not isinstance(snapshot.get("last_sequence"), int)
+            or snapshot["last_sequence"] < 0
+            or not _finite_number(snapshot.get("created_at"))
+            or snapshot["created_at"] < 0
+            or not _finite_number(snapshot.get("updated_at"))
+            or snapshot["updated_at"] < snapshot["created_at"]
         ):
             raise _relay_error()
+        prompt_id = snapshot.get("prompt_id")
+        if prompt_id is not None:
+            try:
+                if str(uuid.UUID(prompt_id)) != prompt_id:
+                    raise ValueError("Non-canonical prompt ID.")
+            except (AttributeError, TypeError, ValueError):
+                raise _relay_error() from None
+        starting_cursor = self.repository.last_event_sequence(job_id)
+        cursor = starting_cursor
         sanitized_events = []
-        for raw_event in response["events"]:
-            event = _sanitize_event(raw_event, cursor + 1)
-            stored = self.repository.append_event(
-                job_id,
-                event["sequence"],
-                event["type"],
-                event["data"],
-                created_at=event["created_at"],
+        for raw_event in snapshot["events"]:
+            raw_sequence = (
+                raw_event.get("sequence")
+                if isinstance(raw_event, dict)
+                else None
             )
-            cursor = event["sequence"]
+            if (
+                isinstance(raw_sequence, bool)
+                or not isinstance(raw_sequence, int)
+                or raw_sequence < 1
+                or raw_sequence > cursor + 1
+            ):
+                raise _relay_error()
+            event = _sanitize_event(raw_event, raw_sequence)
+            try:
+                stored = self.repository.append_event(
+                    job_id,
+                    event["sequence"],
+                    event["type"],
+                    event["data"],
+                    created_at=event["created_at"],
+                )
+            except ValueError:
+                raise _relay_error() from None
+            if stored.created_at != event["created_at"]:
+                raise _relay_error()
+            cursor = max(cursor, event["sequence"])
             material = {
                 "sequence": stored.sequence,
                 "type": stored.event_type,
                 "data": stored.payload,
                 "created_at": stored.created_at,
             }
-            sanitized_events.append(material)
+            if stored.sequence > starting_cursor:
+                sanitized_events.append(material)
             if event["type"] in {
                 "b_preview",
                 "b_preview_with_metadata",
             }:
                 await self._cache_preview(job_id, event["data"])
-        if response["last_sequence"] != cursor:
+        if snapshot["last_sequence"] != cursor:
             raise _relay_error()
         for stored_event in self.repository.list_events(job_id, 0):
             if stored_event.event_type not in {
@@ -1190,48 +1240,10 @@ class LocalRelay:
                     job_id,
                     stored_event.payload,
                 )
-        try:
-            remote = await self.worker.job(job_id)
-        except (asyncio.CancelledError, KeyboardInterrupt):
-            raise
-        except Exception:
-            raise RelayError("Remote worker job is unavailable.") from None
-        if (
-            not isinstance(remote, dict)
-            or set(remote) != {
-                "job_id",
-                "state",
-                "prompt_id",
-                "last_sequence",
-                "outputs",
-                "error",
-            }
-            or remote.get("job_id") != job_id
-            or remote.get("state")
-            not in {
-                "queued",
-                "running",
-                "succeeded",
-                "failed",
-                "interrupted",
-            }
-            or not isinstance(remote.get("outputs"), list)
-            or isinstance(remote.get("last_sequence"), bool)
-            or not isinstance(remote.get("last_sequence"), int)
-            or remote["last_sequence"] != cursor
-        ):
-            raise _relay_error()
-        prompt_id = remote.get("prompt_id")
-        if prompt_id is not None:
-            try:
-                if str(uuid.UUID(prompt_id)) != prompt_id:
-                    raise ValueError("Non-canonical prompt ID.")
-            except (AttributeError, TypeError, ValueError):
-                raise _relay_error() from None
         outputs = []
-        if remote["state"] == "succeeded":
+        if snapshot["state"] == "succeeded":
             seen_artifacts = set()
-            for output in remote["outputs"]:
+            for output in snapshot["outputs"]:
                 validated = _validated_output(output)
                 if validated["artifact_id"] in seen_artifacts:
                     raise _relay_error()
@@ -1242,14 +1254,16 @@ class LocalRelay:
                         descriptor=output,
                     )
                 )
+        elif snapshot["outputs"]:
+            raise _relay_error()
         error = (
-            _sanitize_error(remote["error"])
-            if remote["error"] is not None
+            _sanitize_error(snapshot["error"])
+            if snapshot["error"] is not None
             else None
         )
         return RelaySyncResult(
             job_id=job_id,
-            state=remote["state"],
+            state=snapshot["state"],
             last_sequence=cursor,
             events=tuple(sanitized_events),
             outputs=tuple(outputs),

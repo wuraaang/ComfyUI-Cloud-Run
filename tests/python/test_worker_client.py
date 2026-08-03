@@ -40,6 +40,155 @@ class RecordingTransport:
 
 
 class WorkerClientTests(unittest.TestCase):
+    def test_snapshot_accepts_migrated_schema_one_job_timestamps(self):
+        from cloud_run.worker_client import (
+            WorkerClient,
+            WorkerTransportResponse,
+        )
+
+        payload = {
+            "job_id": "job-1",
+            "state": "succeeded",
+            "prompt_id": "11111111-1111-4111-8111-111111111111",
+            "events": [
+                {
+                    "sequence": 1,
+                    "type": "execution_success",
+                    "data": {"timestamp": 10.0},
+                    "created_at": 10.0,
+                }
+            ],
+            "last_sequence": 1,
+            "outputs": [],
+            "error": None,
+            "created_at": 20.0,
+            "updated_at": 20.0,
+        }
+
+        class Transport:
+            async def request(self, request, *, max_bytes):
+                return WorkerTransportResponse(
+                    status=200,
+                    headers={"Content-Type": "application/json"},
+                    body=json.dumps(payload).encode("utf-8"),
+                )
+
+        client = WorkerClient(
+            base_url="http://8.8.8.8:30000",
+            provider_token="a" * 64,
+            session_id="session-1",
+            session_secret=b"s" * 32,
+            transport=Transport(),
+            clock=lambda: 1000,
+            nonce=lambda: "snapshot-legacy-1",
+        )
+
+        snapshot = asyncio.run(client.snapshot("job-1", 0))
+
+        self.assertEqual(snapshot["last_sequence"], 1)
+        self.assertEqual(snapshot["events"][0]["created_at"], 10.0)
+
+    def test_snapshot_is_exact_validated_and_bound_to_its_cursor(self):
+        from cloud_run.worker_client import (
+            WorkerClient,
+            WorkerClientError,
+            WorkerTransportResponse,
+        )
+
+        valid = {
+            "job_id": "job-1",
+            "state": "succeeded",
+            "prompt_id": "11111111-1111-4111-8111-111111111111",
+            "events": [
+                {
+                    "sequence": 94,
+                    "type": "execution_success",
+                    "data": {"timestamp": 158.0},
+                    "created_at": 158.0,
+                }
+            ],
+            "last_sequence": 94,
+            "outputs": [],
+            "error": None,
+            "created_at": 1.0,
+            "updated_at": 158.0,
+        }
+
+        class SnapshotTransport:
+            def __init__(self, payload):
+                self.payload = payload
+                self.requests = []
+
+            async def request(self, request, *, max_bytes):
+                self.requests.append(request)
+                return WorkerTransportResponse(
+                    status=200,
+                    headers={"Content-Type": "application/json"},
+                    body=json.dumps(
+                        self.payload,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ).encode("utf-8"),
+                )
+
+        def client(payload):
+            transport = SnapshotTransport(payload)
+            return (
+                WorkerClient(
+                    base_url="http://8.8.8.8:30000",
+                    provider_token="a" * 64,
+                    session_id="session-1",
+                    session_secret=b"s" * 32,
+                    transport=transport,
+                    clock=lambda: 1000,
+                    nonce=lambda: "snapshot-1",
+                ),
+                transport,
+            )
+
+        worker, transport = client(valid)
+        snapshot = asyncio.run(worker.snapshot("job-1", 93))
+
+        self.assertEqual(snapshot, valid)
+        self.assertIsNot(snapshot, valid)
+        self.assertEqual(
+            transport.requests[0].url,
+            (
+                "http://8.8.8.8:30000/worker/v1/jobs/job-1/"
+                "snapshot?after_sequence=93"
+            ),
+        )
+
+        invalid_payloads = []
+        invalid_payloads.append({**valid, "extra": True})
+        invalid_payloads.append(
+            {key: value for key, value in valid.items() if key != "error"}
+        )
+        invalid_payloads.append({**valid, "job_id": "job-2"})
+        invalid_payloads.append({**valid, "state": "complete"})
+        invalid_payloads.append(
+            {
+                **valid,
+                "events": [{**valid["events"][0], "sequence": 95}],
+            }
+        )
+        invalid_payloads.append({**valid, "last_sequence": 93})
+        invalid_payloads.append(
+            {
+                **valid,
+                "outputs": [{"artifact_id": "output-1"}],
+            }
+        )
+        invalid_payloads.append({**valid, "error": "private error"})
+        invalid_payloads.append({**valid, "created_at": 200.0})
+        invalid_payloads.append({**valid, "updated_at": float("inf")})
+
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload):
+                invalid, _transport = client(payload)
+                with self.assertRaises(WorkerClientError):
+                    asyncio.run(invalid.snapshot("job-1", 93))
+
     def test_boundary_401_is_typed_and_never_echoes_response(self):
         from cloud_run.worker_client import (
             WorkerBoundaryAuthenticationError,

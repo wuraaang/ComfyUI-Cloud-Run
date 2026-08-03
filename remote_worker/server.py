@@ -40,6 +40,7 @@ from .jobs import (
     JobBusyError,
     JobError,
     JobResult,
+    JobSnapshot,
     JobValidationError,
     parse_job_request,
 )
@@ -64,6 +65,7 @@ _ROUTES = (
     ("POST", "/worker/v1/jobs"),
     ("GET", "/worker/v1/jobs/{job_id}"),
     ("GET", "/worker/v1/jobs/{job_id}/events"),
+    ("GET", "/worker/v1/jobs/{job_id}/snapshot"),
     (
         "GET",
         "/worker/v1/jobs/{job_id}/previews/{preview_id}",
@@ -640,6 +642,22 @@ class WorkerApplication:
             },
         )
 
+    async def _job_snapshot(self, request, job_id):
+        if self.job_manager is None:
+            return _error(501, "Worker route is not implemented.")
+        try:
+            cursor = self._event_cursor(request)
+            snapshot = self.job_manager.snapshot(job_id, cursor)
+        except JobValidationError:
+            return _error(400, "Worker event cursor was rejected.")
+        except JobError:
+            return _error(503, "Worker job snapshot is unavailable.")
+        if snapshot is None:
+            return _error(404, "Worker job was not found.")
+        if not isinstance(snapshot, JobSnapshot):
+            return _error(503, "Worker job snapshot is unavailable.")
+        return _response(200, snapshot.public_payload())
+
     async def _job_preview(self, job_id, preview_id):
         if self.job_manager is None:
             return _error(501, "Worker route is not implemented.")
@@ -759,6 +777,11 @@ class WorkerApplication:
             return await self._job(parameters["job_id"])
         if route == "/worker/v1/jobs/{job_id}/events":
             return await self._job_events(
+                request,
+                parameters["job_id"],
+            )
+        if route == "/worker/v1/jobs/{job_id}/snapshot":
+            return await self._job_snapshot(
                 request,
                 parameters["job_id"],
             )

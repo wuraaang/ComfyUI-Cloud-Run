@@ -153,6 +153,74 @@ class JobResult:
         }
 
 
+@dataclass(frozen=True)
+class JobSnapshot:
+    job_id: str
+    state: str
+    prompt_id: object
+    events: tuple
+    last_sequence: int
+    outputs: tuple
+    error: object
+    created_at: float
+    updated_at: float
+
+    @classmethod
+    def from_record(cls, record, after_sequence):
+        if (
+            isinstance(after_sequence, bool)
+            or not isinstance(after_sequence, int)
+            or after_sequence < 0
+        ):
+            raise JobValidationError("Remote job event cursor is invalid.")
+        return cls(
+            job_id=record["job_id"],
+            state=record["state"],
+            prompt_id=record["prompt_id"],
+            events=tuple(
+                {
+                    "sequence": event["sequence"],
+                    "type": event["type"],
+                    "data": dict(event["data"]),
+                    "created_at": event["created_at"],
+                }
+                for event in record["events"]
+                if event["sequence"] > after_sequence
+            ),
+            last_sequence=record["sequence"],
+            outputs=tuple(
+                _public_output(record["outputs"][artifact_id])
+                for artifact_id in sorted(record["outputs"])
+            ),
+            error=(
+                dict(record["error"])
+                if record["error"] is not None
+                else None
+            ),
+            created_at=float(record["created_at"]),
+            updated_at=float(record["updated_at"]),
+        )
+
+    def public_payload(self):
+        return {
+            "job_id": self.job_id,
+            "state": self.state,
+            "prompt_id": self.prompt_id,
+            "events": [
+                {
+                    **event,
+                    "data": dict(event["data"]),
+                }
+                for event in self.events
+            ],
+            "last_sequence": self.last_sequence,
+            "outputs": [dict(item) for item in self.outputs],
+            "error": dict(self.error) if self.error is not None else None,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+
+
 def _job_error():
     return JobValidationError("Remote job request was rejected.")
 
@@ -524,6 +592,7 @@ class JobManager:
             )
 
     def _initial_record(self, request, client_id):
+        now = self._now()
         return {
             "kind": "job",
             "job_id": request.job_id,
@@ -537,7 +606,8 @@ class JobManager:
             "previews": {},
             "outputs": {},
             "error": None,
-            "updated_at": self._now(),
+            "created_at": now,
+            "updated_at": now,
         }
 
     def _append_event(self, record, event_type, data):
@@ -798,6 +868,13 @@ class JobManager:
                         "subfolder": descriptor["subfolder"],
                         "type": descriptor["type"],
                     }
+                    descriptor_type = descriptor.get("type")
+                    if descriptor_type == "temp":
+                        continue
+                    if descriptor_type != "output":
+                        raise JobError(
+                            "Remote output descriptor is invalid."
+                        )
                     try:
                         path = Path(self.comfy.output_path(minimal))
                     except Exception:
@@ -1115,6 +1192,21 @@ class JobManager:
         except WorkerStateError:
             raise JobError("Remote worker job state is unavailable.") from None
         return JobResult.from_record(record) if record is not None else None
+
+    def snapshot(self, job_id, after_sequence=0):
+        if (
+            isinstance(after_sequence, bool)
+            or not isinstance(after_sequence, int)
+            or after_sequence < 0
+        ):
+            raise JobValidationError("Remote job event cursor is invalid.")
+        try:
+            record = self.state.job(job_id)
+        except WorkerStateError:
+            raise JobError("Remote worker job state is unavailable.") from None
+        if record is None:
+            return None
+        return JobSnapshot.from_record(record, after_sequence)
 
     def events(self, job_id, after_sequence=0):
         if (

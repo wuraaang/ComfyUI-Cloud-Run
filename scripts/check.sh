@@ -320,6 +320,7 @@ allowed_worker_routes = {
     ("POST", "/worker/v1/jobs"),
     ("GET", "/worker/v1/jobs/{job_id}"),
     ("GET", "/worker/v1/jobs/{job_id}/events"),
+    ("GET", "/worker/v1/jobs/{job_id}/snapshot"),
     ("GET", "/worker/v1/jobs/{job_id}/previews/{preview_id}"),
     ("PUT", "/worker/v1/deadline"),
 }
