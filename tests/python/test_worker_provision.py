@@ -419,6 +419,89 @@ class ProvisionerTests(unittest.TestCase):
             result.readiness,
         )
 
+    def test_concurrent_duplicate_ready_manifest_is_reused_without_replay(self):
+        class BlockingArtifacts(FakeArtifacts):
+            def __init__(self):
+                super().__init__()
+                self.started = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def ensure_many(self, *args, **kwargs):
+                self.started.set()
+                await self.release.wait()
+                return await super().ensure_many(*args, **kwargs)
+
+        desired = manifest(
+            custom_nodes=(custom_node(),),
+            artifacts=(artifact("model-a"),),
+        )
+        artifacts = None
+        disk = FakeDisk()
+        installer = FakeInstaller()
+        comfy = FakeComfy([{"KSampler": {}, "Fancy": {}}])
+        provisioner = self.provisioner(
+            comfy=comfy,
+            installer=installer,
+            disk=disk,
+        )
+
+        async def scenario():
+            nonlocal artifacts
+            artifacts = BlockingArtifacts()
+            provisioner.artifacts = artifacts
+            first = asyncio.create_task(
+                provisioner.apply_manifest(
+                    desired,
+                    required_class_types=("KSampler", "Fancy"),
+                )
+            )
+            await artifacts.started.wait()
+            duplicate = asyncio.create_task(
+                provisioner.apply_manifest(
+                    desired,
+                    required_class_types=("KSampler", "Fancy"),
+                )
+            )
+            await asyncio.sleep(0)
+            artifacts.release.set()
+            return await asyncio.gather(first, duplicate)
+
+        first_result, duplicate_result = asyncio.run(scenario())
+
+        self.assertEqual(duplicate_result, first_result)
+        self.assertEqual(len(disk.calls), 1)
+        self.assertEqual(len(artifacts.ensure_calls), 1)
+        self.assertEqual(installer.nodes, ["fancy"])
+        self.assertEqual(comfy.restarts, 1)
+        self.assertEqual(comfy.ensure_calls, 0)
+
+    def test_ready_manifest_replay_with_changed_required_classes_fails_without_mutation(self):
+        from remote_worker.provision import ProvisionError
+
+        desired = manifest()
+        disk = FakeDisk()
+        comfy = FakeComfy([{"KSampler": {}}])
+        provisioner = self.provisioner(comfy=comfy, disk=disk)
+        asyncio.run(
+            provisioner.apply_manifest(
+                desired,
+                required_class_types=("KSampler",),
+            )
+        )
+        before = json.loads(json.dumps(self.state.load()))
+
+        with self.assertRaises(ProvisionError):
+            asyncio.run(
+                provisioner.apply_manifest(
+                    desired,
+                    required_class_types=("KSampler", "Unknown"),
+                )
+            )
+
+        self.assertEqual(self.state.load(), before)
+        self.assertEqual(len(disk.calls), 1)
+        self.assertEqual(comfy.ensure_calls, 1)
+
     def test_ui_package_and_profile_are_transferred_without_graph_authority(self):
         panel_archive = artifact(
             "agent-panel-archive",

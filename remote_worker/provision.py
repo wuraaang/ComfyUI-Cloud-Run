@@ -1526,6 +1526,36 @@ class Provisioner:
                 raise _provision_error()
             transfer_catalog = _manifest_transfer_catalog(desired)
             transaction_id = "provision-" + desired.digest
+            ready_record = self.state_store.load()["transactions"].get(
+                transaction_id
+            )
+            if (
+                isinstance(ready_record, dict)
+                and ready_record.get("state") == "ready"
+            ):
+                ready_result = self.transaction(transaction_id)
+                if (
+                    ready_result is None
+                    or ready_result.state != "ready"
+                    or not hmac.compare_digest(
+                        ready_result.manifest_digest,
+                        desired.digest,
+                    )
+                    or ready_record.get("required_class_types")
+                    != list(required)
+                    or ready_record.get("failure_code") is not None
+                    or ready_result.missing_class_types
+                    or ready_result.missing_artifacts
+                    or ready_result.progress is None
+                    or ready_result.progress.get("phase") != "ready"
+                    or ready_result.readiness is None
+                    or ready_result.readiness[
+                        "validated_class_types"
+                    ]
+                    != list(required)
+                ):
+                    raise _provision_error()
+                return ready_result
             tracker = None
 
             def persist_progress(snapshot):
