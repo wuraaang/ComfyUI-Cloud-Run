@@ -18,6 +18,8 @@ def model_api(test_case):
 
 
 def quote(OfferQuote):
+    from cloud_run.offers import readiness_estimate
+
     return OfferQuote(
         offer_id="42",
         gpu_name="RTX 4090",
@@ -47,6 +49,13 @@ def quote(OfferQuote):
         max_instance_creates=1,
         inet_down_mbps=1200.0,
         disk_bw_mbps=600.0,
+        dlperf=80.0,
+        readiness_estimate=readiness_estimate(
+            total_bytes=12_000,
+            cached_bytes=0,
+            assumed_mbps=25,
+            source_ready=True,
+        ),
     )
 
 
@@ -163,6 +172,7 @@ class LifecycleModelTests(unittest.TestCase):
         self.assertEqual(paid_quote.disk_bw_mbps, 600.0)
         self.assertEqual(public["inet_down_mbps"], 1200.0)
         self.assertEqual(public["disk_bw_mbps"], 600.0)
+        self.assertEqual(public["dlperf"], 80.0)
         self.assertEqual(paid_quote.max_instance_creates, 1)
         self.assertEqual(paid_quote.to_record()["max_instance_creates"], 1)
         self.assertEqual(public["max_instance_creates"], 1)
@@ -176,7 +186,23 @@ class LifecycleModelTests(unittest.TestCase):
         self.assertEqual(public["worker_archive_sha256"], "b" * 64)
         self.assertEqual(public["protocol_version"], "2")
         self.assertEqual(public["manifest_digest"], "c" * 64)
+        self.assertEqual(public["readiness"]["label"], "cold")
+        self.assertEqual(public["readiness"]["remaining_bytes"], 12_000)
+        self.assertEqual(public["estimate_digest"], paid_quote.readiness_estimate.digest)
         self.assertNotIn("session_secret_hex", public)
+
+    def test_quote_readiness_estimate_is_immutable_and_digest_bound(self):
+        from cloud_run.models import OfferQuote, ReadinessEstimate
+
+        values = quote(OfferQuote).to_record()
+        restored = OfferQuote.from_record(values)
+
+        self.assertIsInstance(restored.readiness_estimate, ReadinessEstimate)
+        self.assertEqual(restored.to_record(), values)
+        malformed = dict(values["readiness_estimate"])
+        malformed["remaining_bytes"] += 1
+        with self.assertRaises(ValueError):
+            OfferQuote.from_record({**values, "readiness_estimate": malformed})
 
     def test_quote_quality_metrics_are_optional_finite_nonnegative_numbers(self):
         from cloud_run.models import OfferQuote
@@ -187,7 +213,7 @@ class LifecycleModelTests(unittest.TestCase):
 
         self.assertEqual(restored.inet_down_mbps, 1200)
         self.assertEqual(restored.disk_bw_mbps, 600.5)
-        for field in ("inet_down_mbps", "disk_bw_mbps"):
+        for field in ("inet_down_mbps", "disk_bw_mbps", "dlperf"):
             for malformed in (True, -1, float("inf"), float("nan"), "500"):
                 with self.subTest(field=field, malformed=malformed):
                     with self.assertRaises(ValueError):

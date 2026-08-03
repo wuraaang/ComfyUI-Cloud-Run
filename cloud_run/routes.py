@@ -1084,6 +1084,7 @@ def register_routes(service_factory=None):
                     "idempotency_key",
                     "deadline",
                     "max_instance_creates",
+                    "estimate_digest",
                 },
                 required={
                     "preflight_id",
@@ -1091,14 +1092,26 @@ def register_routes(service_factory=None):
                     "idempotency_key",
                     "deadline",
                     "max_instance_creates",
+                    "estimate_digest",
                 },
             )
+            if (
+                not isinstance(payload["estimate_digest"], str)
+                or re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    payload["estimate_digest"],
+                ) is None
+            ):
+                raise CloudRunValidationError(
+                    "A valid readiness estimate is required."
+                )
             session = await service.preview_session(
                 preflight_id=payload["preflight_id"],
                 offer_id=payload["offer_id"],
                 idempotency_key=payload["idempotency_key"],
                 deadline=payload["deadline"],
                 max_instance_creates=payload["max_instance_creates"],
+                estimate_digest=payload["estimate_digest"],
             )
         except Exception as error:
             return service_error(error)
@@ -1110,12 +1123,38 @@ def register_routes(service_factory=None):
         try:
             payload = await _request_payload(
                 request,
-                allowed={"idempotency_key"},
-                required={"idempotency_key"},
+                allowed={
+                    "idempotency_key",
+                    "estimate_digest",
+                    "accepted_longer_estimate",
+                    "preflight_id",
+                },
+                required={
+                    "idempotency_key",
+                    "estimate_digest",
+                    "accepted_longer_estimate",
+                    "preflight_id",
+                },
             )
+            if (
+                not isinstance(payload["estimate_digest"], str)
+                or re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    payload["estimate_digest"],
+                ) is None
+                or type(payload["accepted_longer_estimate"]) is not bool
+            ):
+                raise CloudRunValidationError(
+                    "A valid readiness confirmation is required."
+                )
             session = await service.confirm_session(
                 request.match_info.get("session_id", ""),
                 idempotency_key=payload["idempotency_key"],
+                estimate_digest=payload["estimate_digest"],
+                accepted_longer_estimate=(
+                    payload["accepted_longer_estimate"]
+                ),
+                current_preflight_id=payload["preflight_id"],
             )
         except Exception as error:
             return service_error(error)

@@ -147,14 +147,44 @@ class FakeOfferSearch:
         self.mutations = []
         self.provider_offer = {
             "offer_id": 42,
+            "gpu_name": "RTX 4090",
+            "gpu_ram_gb": 24.0,
+            "dph_total": 0.42,
+            "reliability": 0.99,
             "inet_down_mbps": 500.0,
+            "disk_bw_mbps": 600.0,
+            "dlperf": 80.0,
             "private_provider_identity": "must-not-leak-through-preflight",
         }
 
-    async def __call__(self, *, disk_gb):
+    async def __call__(
+        self,
+        *,
+        disk_gb,
+        workflow_min_vram_gb,
+        transfer_bytes,
+        cached_bytes,
+        source_ready,
+    ):
+        from cloud_run.offers import decide_offers
+
         self.calls += 1
         self.disk_gb = disk_gb
-        return [self.provider_offer]
+        self.workflow_min_vram_gb = workflow_min_vram_gb
+        self.transfer_bytes = transfer_bytes
+        self.cached_bytes = cached_bytes
+        self.source_ready = source_ready
+        return [
+            decision.public_payload()
+            for decision in decide_offers(
+                [self.provider_offer],
+                workflow_min_vram_gb=workflow_min_vram_gb,
+                workflow_disk_gb=disk_gb,
+                transfer_bytes=transfer_bytes,
+                cached_bytes=cached_bytes,
+                source_ready=source_ready,
+            )
+        ]
 
 
 class FakeSessionAgentBridge:
@@ -223,6 +253,7 @@ def resolved_resolution():
         artifacts=(artifact,),
         output_allowance_bytes=8,
         disk_gb=80,
+        minimum_vram_gb=24.0,
         rentable=True,
     )
 
@@ -491,25 +522,19 @@ class SessionServiceTests(unittest.TestCase):
         self.assertIsNotNone(
             self.repository.get_manifest(result.manifest_digest)
         )
-        self.assertEqual(
-            offers,
-            [
-                {
-                    "offer_id": 42,
-                    "inet_down_mbps": 500.0,
-                    "private_provider_identity": (
-                        "must-not-leak-through-preflight"
-                    ),
-                    "estimated_transfer_seconds": 1,
-                }
-            ],
-        )
-        self.assertNotIn(
-            "estimated_transfer_seconds",
-            self.offer_search.provider_offer,
-        )
+        self.assertEqual(len(offers), 1)
+        self.assertEqual(offers[0]["offer_id"], 42)
+        self.assertTrue(offers[0]["included"])
+        self.assertEqual(offers[0]["excluded_reasons"], [])
+        self.assertEqual(offers[0]["readiness"]["remaining_bytes"], 12)
+        self.assertEqual(offers[0]["readiness"]["estimated_seconds"], 1)
+        self.assertNotIn("private_provider_identity", offers[0])
         self.assertEqual(self.offer_search.calls, 1)
         self.assertEqual(self.offer_search.disk_gb, 80)
+        self.assertEqual(self.offer_search.workflow_min_vram_gb, 24.0)
+        self.assertEqual(self.offer_search.transfer_bytes, 12)
+        self.assertEqual(self.offer_search.cached_bytes, 0)
+        self.assertTrue(self.offer_search.source_ready)
         self.assertEqual(self.offer_search.mutations, [])
         public = result.public_payload()
         self.assertEqual(
@@ -538,19 +563,10 @@ class SessionServiceTests(unittest.TestCase):
             artifact.source.locator,
         )
         self.assertTrue(result.rentable)
-        self.assertEqual(
-            asyncio.run(service.search_offers(result.preflight_id)),
-            [
-                {
-                    "offer_id": 42,
-                    "inet_down_mbps": 500.0,
-                    "private_provider_identity": (
-                        "must-not-leak-through-preflight"
-                    ),
-                    "estimated_transfer_seconds": 1,
-                }
-            ],
-        )
+        offers = asyncio.run(service.search_offers(result.preflight_id))
+        self.assertEqual(len(offers), 1)
+        self.assertTrue(offers[0]["included"])
+        self.assertNotIn("private_provider_identity", offers[0])
 
     def test_non_huggingface_row_does_not_expose_locator(self):
         result = asyncio.run(
@@ -584,6 +600,74 @@ class SessionServiceTests(unittest.TestCase):
                 )
             )
         self.assertEqual(self.offer_search.calls, 0)
+
+    def test_paid_confirmation_revalidates_current_canvas_without_seed_noise(self):
+        service = self.service(resolved_resolution())
+        reviewed = asyncio.run(service.preflight(self.capture.capture_id))
+        fresh_capture = capture_with_seed(8)
+        self.repository.save_capture(fresh_capture, created_at=101.0)
+        fresh_service = SessionService(
+            job_repository=self.repository,
+            resolver=FakeResolver(resolved_resolution()),
+            offer_search=self.offer_search,
+            release=worker_release(),
+            clock=lambda: 101.0,
+            id_factory=lambda: "preflight-2",
+        )
+        current = asyncio.run(fresh_service.preflight(fresh_capture.capture_id))
+
+        self.assertTrue(
+            fresh_service.matches_paid_preflight(
+                current.preflight_id,
+                reviewed_manifest_digest=reviewed.manifest_digest,
+                reviewed_execution_baseline_digest=(
+                    reviewed.execution_baseline_digest
+                ),
+                reviewed_randomized_seed_node_ids=(
+                    reviewed.randomized_seed_node_ids
+                ),
+                reviewed_transfer_bytes=reviewed.transfer_bytes,
+                reviewed_cached_bytes=reviewed.cached_bytes,
+                reviewed_output_allowance_bytes=(
+                    reviewed.output_allowance_bytes
+                ),
+                reviewed_disk_gb=reviewed.disk_gb,
+            )
+        )
+
+        changed_payload = capture_payload()
+        changed_payload["output"]["1"]["inputs"]["steps"] = 21
+        changed_capture = CompiledCapture.from_payload(changed_payload)
+        self.repository.save_capture(changed_capture, created_at=102.0)
+        changed_service = SessionService(
+            job_repository=self.repository,
+            resolver=FakeResolver(resolved_resolution()),
+            offer_search=self.offer_search,
+            release=worker_release(),
+            clock=lambda: 102.0,
+            id_factory=lambda: "preflight-3",
+        )
+        changed = asyncio.run(
+            changed_service.preflight(changed_capture.capture_id)
+        )
+        self.assertFalse(
+            changed_service.matches_paid_preflight(
+                changed.preflight_id,
+                reviewed_manifest_digest=reviewed.manifest_digest,
+                reviewed_execution_baseline_digest=(
+                    reviewed.execution_baseline_digest
+                ),
+                reviewed_randomized_seed_node_ids=(
+                    reviewed.randomized_seed_node_ids
+                ),
+                reviewed_transfer_bytes=reviewed.transfer_bytes,
+                reviewed_cached_bytes=reviewed.cached_bytes,
+                reviewed_output_allowance_bytes=(
+                    reviewed.output_allowance_bytes
+                ),
+                reviewed_disk_gb=reviewed.disk_gb,
+            )
+        )
 
     def test_missing_reviewed_release_keeps_resolved_preflight_non_rentable(self):
         service = SessionService(

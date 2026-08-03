@@ -875,7 +875,12 @@ class PaidSessionRouteTests(unittest.TestCase):
                 )
             ](
                 FakeRequest(
-                    {"idempotency_key": "private-session-key"},
+                    {
+                        "idempotency_key": "private-session-key",
+                        "estimate_digest": "a" * 64,
+                        "accepted_longer_estimate": False,
+                        "preflight_id": "preflight-1",
+                    },
                     match_info={"session_id": "session-1"},
                 )
             )
@@ -929,6 +934,7 @@ class PaidSessionRouteTests(unittest.TestCase):
                 "duration_seconds": 7200,
             },
             "max_instance_creates": 1,
+            "estimate_digest": "a" * 64,
         }
 
         quote_response = asyncio.run(
@@ -947,7 +953,10 @@ class PaidSessionRouteTests(unittest.TestCase):
                     {
                         "idempotency_key": (
                             "private-session-idempotency-key"
-                        )
+                        ),
+                        "estimate_digest": "a" * 64,
+                        "accepted_longer_estimate": True,
+                        "preflight_id": "preflight-2",
                     },
                     match_info={"session_id": "session-1"},
                 )
@@ -975,10 +984,14 @@ class PaidSessionRouteTests(unittest.TestCase):
                 "duration_seconds": 7200,
             },
             max_instance_creates=1,
+            estimate_digest="a" * 64,
         )
         service.confirm_session.assert_awaited_once_with(
             "session-1",
             idempotency_key="private-session-idempotency-key",
+            estimate_digest="a" * 64,
+            accepted_longer_estimate=True,
+            current_preflight_id="preflight-2",
         )
         self.assertEqual(quote_response.status, 200)
         self.assertEqual(quote_response.payload["status"], "offer_selected")

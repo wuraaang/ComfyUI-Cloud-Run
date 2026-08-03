@@ -199,12 +199,30 @@ export function createCloudRunApi(fetchImpl) {
       );
     },
 
-    confirmSession(sessionId, idempotencyKey) {
+    confirmSession(
+      sessionId,
+      idempotencyKey,
+      estimateDigest,
+      acceptedLongerEstimate,
+      preflightId,
+    ) {
+      if (
+        typeof estimateDigest !== "string"
+        || !/^[0-9a-f]{64}$/.test(estimateDigest)
+        || typeof acceptedLongerEstimate !== "boolean"
+        || typeof preflightId !== "string"
+        || !/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}$/.test(preflightId)
+      ) {
+        throw new Error("request failed");
+      }
       return fetchJson(
         fetchImpl,
         `${sessionEndpoint(sessionId)}/confirm`,
         jsonOptions("POST", {
           idempotency_key: String(idempotencyKey),
+          estimate_digest: estimateDigest,
+          accepted_longer_estimate: acceptedLongerEstimate,
+          preflight_id: preflightId,
         }),
       );
     },

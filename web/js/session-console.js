@@ -207,6 +207,31 @@ function estimatedTransferSeconds(transferBytes, inetDownMbps) {
 }
 
 
+function safeReadinessEstimate(value) {
+  if (
+    !value
+    || typeof value !== "object"
+    || !["cold", "prepositioned", "warm"].includes(value.label)
+    || !Number.isSafeInteger(value.cached_bytes)
+    || value.cached_bytes < 0
+    || !Number.isSafeInteger(value.remaining_bytes)
+    || value.remaining_bytes < 0
+    || typeof value.assumed_mbps !== "number"
+    || !Number.isFinite(value.assumed_mbps)
+    || value.assumed_mbps <= 0
+    || !Number.isSafeInteger(value.estimated_seconds)
+    || value.estimated_seconds < 0
+    || typeof value.source_ready !== "boolean"
+    || typeof value.ten_minute_eligible !== "boolean"
+    || typeof value.digest !== "string"
+    || !/^[0-9a-f]{64}$/.test(value.digest)
+  ) {
+    return null;
+  }
+  return value;
+}
+
+
 function bytesText(value) {
   const bytes = Number(value);
   if (!Number.isSafeInteger(bytes) || bytes < 0) return "unknown size";
@@ -422,8 +447,25 @@ export function createSessionConsole(document, api = {}, options = {}) {
     type: "button",
     className: "cloud-run-danger",
   });
+  const longerEstimateReview = element(document, "label", {
+    id: "cloud-run-longer-estimate-review",
+  });
+  const longerEstimateCheckbox = element(document, "input", {
+    id: "cloud-run-accept-longer-estimate",
+    type: "checkbox",
+  });
+  const longerEstimateText = element(document, "span", {
+    text: "I accept that this reviewed preparation estimate exceeds ten minutes.",
+  });
+  longerEstimateReview.append(longerEstimateCheckbox, longerEstimateText);
+  longerEstimateReview.hidden = true;
   confirmButton.disabled = true;
-  quotePanel.append(quoteTitle, quoteDetails, confirmButton);
+  quotePanel.append(
+    quoteTitle,
+    quoteDetails,
+    longerEstimateReview,
+    confirmButton,
+  );
 
   const sessionPanel = element(document, "section", {
     className: "cloud-run-live-session",
@@ -606,6 +648,7 @@ export function createSessionConsole(document, api = {}, options = {}) {
   let currentSession = null;
   let currentJob = null;
   let sessionIdempotencyKey = null;
+  let currentReadiness = null;
   let destroyReviewToken = null;
   let explicitOutputAllowance = null;
   let eventCursor = 0;
@@ -671,7 +714,13 @@ export function createSessionConsole(document, api = {}, options = {}) {
     confirmButton.disabled =
       busy
       || currentSession?.status !== "offer_selected"
-      || !sessionIdempotencyKey;
+      || !sessionIdempotencyKey
+      || currentReadiness === null
+      || currentReadiness.source_ready !== true
+      || (
+        !currentReadiness.ten_minute_eligible
+        && longerEstimateCheckbox.checked !== true
+      );
     const ready = currentSession?.status === "ready";
     const deadlineMutable = deadlineCanSynchronize(currentSession);
     extendThirtyButton.disabled = busy || !deadlineMutable;
@@ -690,6 +739,9 @@ export function createSessionConsole(document, api = {}, options = {}) {
   function clearPaidReview() {
     sessionIdempotencyKey = null;
     quoteDetails.replaceChildren();
+    currentReadiness = null;
+    longerEstimateCheckbox.checked = false;
+    longerEstimateReview.hidden = true;
     quotePanel.hidden = true;
     confirmButton.hidden = true;
     confirmButton.disabled = true;
@@ -833,10 +885,22 @@ export function createSessionConsole(document, api = {}, options = {}) {
       && payload.transfer_bytes >= 0
       ? payload.transfer_bytes
       : 0;
+    const cached = Number.isSafeInteger(payload?.cached_bytes)
+      && payload.cached_bytes >= 0
+      && payload.cached_bytes <= transfer
+      ? payload.cached_bytes
+      : 0;
+    const minimumVram = strictNonnegativeNumber(payload?.minimum_vram_gb);
     const output = positiveInteger(payload?.output_allowance_bytes);
     const disk = positiveInteger(payload?.disk_gb);
     summary.textContent =
       `Transfer: ${bytesText(transfer)}. ` +
+      `Pre-positioned: ${bytesText(cached)}; remaining ${bytesText(
+        transfer - cached,
+      )}. ` +
+      `Workflow minimum VRAM: ${
+        minimumVram === null ? "unavailable" : `${minimumVram} GiB`
+      }. ` +
       `Output allowance: ${output === null ? "required" : bytesText(output)}. ` +
       `Disk: ${disk === null ? "pending" : `${disk} GiB ephemeral`}.`;
     currentPreflightId =
@@ -884,6 +948,13 @@ export function createSessionConsole(document, api = {}, options = {}) {
     }
     quotePanel.hidden = false;
     quoteDetails.replaceChildren();
+    const readiness = safeReadinessEstimate(quote.readiness);
+    const changedEstimate = readiness?.digest !== currentReadiness?.digest;
+    currentReadiness = readiness;
+    if (changedEstimate) longerEstimateCheckbox.checked = false;
+    longerEstimateReview.hidden = (
+      readiness === null || readiness.ten_minute_eligible
+    );
     const values = [
       `Offer ${safeText(quote.offer_id, "unknown")}`,
       `${safeText(quote.gpu_name, "Unknown GPU")} — ` +
@@ -897,15 +968,20 @@ export function createSessionConsole(document, api = {}, options = {}) {
       }`,
       `Download: ${metricText(quote.inet_down_mbps, "Mbps")}`,
       `Disk speed: ${metricText(quote.disk_bw_mbps, "MB/s")}`,
+      `DLPerf: ${metricText(quote.dlperf, "")}`.trim(),
       `Download class: ${downloadClassText(quote.inet_down_mbps)}`,
       `Bandwidth: ${bandwidthPrice(quote.inet_down_cost)} down; ` +
         `${bandwidthPrice(quote.inet_up_cost)} up`,
       `theoretical transfer ≈ ${theoreticalTransferText(
-        estimatedTransferSeconds(
+        readiness?.estimated_seconds ?? estimatedTransferSeconds(
           quote.transfer_bytes,
           quote.inet_down_mbps,
         ),
       )}; actual startup can be longer`,
+      `Readiness: ${readiness?.label ?? "unavailable"}; ` +
+        `cached ${bytesText(readiness?.cached_bytes)}; ` +
+        `remaining ${bytesText(readiness?.remaining_bytes)}; ` +
+        `assumption ${metricText(readiness?.assumed_mbps, "MB/s")}`,
       `${positiveInteger(quote.disk_gb) ?? "unknown"} GB ephemeral disk`,
       `${bytesText(quote.transfer_bytes)} dependencies and inputs`,
       `${bytesText(quote.output_allowance_bytes)} output allowance`,
@@ -1483,16 +1559,30 @@ export function createSessionConsole(document, api = {}, options = {}) {
     if (
       !safeId(currentSession?.session_id)
       || !sessionIdempotencyKey
+      || currentReadiness === null
       || typeof api.confirmSession !== "function"
     ) {
       return;
     }
     setBusy(true);
-    status.textContent = "Submitting explicit paid confirmation…";
+    status.textContent =
+      "Rechecking the current canvas and profile before rental…";
     try {
+      if (typeof options.revalidateCurrentCanvas !== "function") {
+        throw new Error("current canvas validation unavailable");
+      }
+      const currentPreflight = await options.revalidateCurrentCanvas();
+      const currentPreflightId = safeId(currentPreflight?.preflight_id);
+      if (currentPreflightId === null || currentPreflight?.rentable !== true) {
+        throw new Error("current canvas changed");
+      }
+      status.textContent = "Submitting explicit paid confirmation…";
       renderSession(await api.confirmSession(
         currentSession.session_id,
         sessionIdempotencyKey,
+        currentReadiness.digest,
+        longerEstimateCheckbox.checked === true,
+        currentPreflightId,
       ));
       status.textContent =
         "Paid confirmation accepted; provisioning is server-driven.";
@@ -1504,6 +1594,8 @@ export function createSessionConsole(document, api = {}, options = {}) {
       schedulePoll();
     }
   });
+
+  longerEstimateCheckbox.addEventListener("change", () => setBusy(busy));
 
   async function updateDeadline(action, acknowledged = undefined) {
     if (
@@ -1676,6 +1768,8 @@ export function createSessionConsole(document, api = {}, options = {}) {
     status,
     quotePanel,
     confirmButton,
+    longerEstimateReview,
+    longerEstimateCheckbox,
     sessionPanel,
     sessionError,
     provisioningStatus,
@@ -1702,6 +1796,9 @@ export function createSessionConsole(document, api = {}, options = {}) {
     stopPolling: clearPoll,
     get preflightId() {
       return currentPreflightId;
+    },
+    get outputAllowance() {
+      return explicitOutputAllowance;
     },
     get canSearchOffers() {
       return canSearchOffers();

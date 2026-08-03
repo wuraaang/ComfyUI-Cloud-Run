@@ -42,6 +42,17 @@ function fullQuote(overrides = {}) {
       protocol_version: "1",
       manifest_digest: "c".repeat(64),
       max_instance_creates: 1,
+      readiness: {
+        label: "cold",
+        cached_bytes: 0,
+        remaining_bytes: 12 * 1024,
+        assumed_mbps: 25,
+        estimated_seconds: 1,
+        source_ready: true,
+        ten_minute_eligible: true,
+        digest: "d".repeat(64),
+      },
+      estimate_digest: "d".repeat(64),
     },
     ...overrides,
   };
@@ -158,9 +169,16 @@ test("session API uses only the exact same-origin lifecycle routes", async () =>
     idempotency_key: "session-key",
     deadline: { mode: "finite", duration_seconds: 7_200 },
     max_instance_creates: 1,
+    estimate_digest: "d".repeat(64),
   });
   await api.approveMapping("FancyNode", "d".repeat(64));
-  await api.confirmSession("session-1", "session-key");
+  await api.confirmSession(
+    "session-1",
+    "session-key",
+    "d".repeat(64),
+    false,
+    "preflight-2",
+  );
   await api.getSession("session-1");
   await api.createJob("session-1", "capture-2", "job-key-2");
   await api.getJob("session-1", "job-2");
@@ -826,11 +844,61 @@ test("paid review renders unavailable connection metrics without non-finite text
     "Disk speed: unavailable",
     "Download class: unavailable",
     "Bandwidth: unavailable down; unavailable up",
-    "theoretical transfer ≈ unavailable; actual startup can be longer",
+    "theoretical transfer ≈ 1 second; actual startup can be longer",
   ]) {
     assert.ok(text.includes(expected), expected);
   }
   assert.doesNotMatch(text, /NaN|Infinity/);
+});
+
+
+test("long readiness estimate requires one digest-bound acceptance", async () => {
+  const document = new FakeDocument();
+  const calls = [];
+  const api = fakeApi();
+  api.confirmSession = async (...args) => {
+    calls.push(args);
+    return sessionPayload({ status: "bootstrapping" });
+  };
+  const view = createSessionConsole(document, api, {
+    async revalidateCurrentCanvas() {
+      return rentablePreflight({ preflight_id: "preflight-current" });
+    },
+  });
+  document.body.appendChild(view.root);
+  const quote = fullQuote();
+  quote.offer = {
+    ...quote.offer,
+    transfer_bytes: 29_347_469_703,
+    readiness: {
+      label: "cold",
+      cached_bytes: 0,
+      remaining_bytes: 29_347_469_703,
+      assumed_mbps: 25,
+      estimated_seconds: 1_174,
+      source_ready: true,
+      ten_minute_eligible: false,
+      digest: "e".repeat(64),
+    },
+    estimate_digest: "e".repeat(64),
+  };
+
+  view.renderQuote(quote, { idempotencyKey: "session-key" });
+
+  assert.equal(view.longerEstimateReview.hidden, false);
+  assert.equal(view.confirmButton.disabled, true);
+  assert.match(view.root.textContent, /20 minutes/);
+  view.longerEstimateCheckbox.checked = true;
+  await view.longerEstimateCheckbox.dispatchEvent({ type: "change" });
+  assert.equal(view.confirmButton.disabled, false);
+  await view.confirmButton.click();
+  assert.deepEqual(calls, [[
+    "session-1",
+    "session-key",
+    "e".repeat(64),
+    true,
+    "preflight-current",
+  ]]);
 });
 
 

@@ -23,7 +23,7 @@ const UNFILTERED_MIN_VRAM_GB = 1;
 const INVALID_PRICE_MESSAGE =
   "Price must be blank or a number such as 0.46 (0,46 also works).";
 const INVALID_VRAM_MESSAGE =
-  "VRAM must be blank or a whole number such as 16 or 24.";
+  "VRAM preference must be blank or a whole number such as 16 or 24.";
 const SESSION_DURATION_SECONDS = new Map([
   ["none", null],
   ["1800", 30 * 60],
@@ -32,6 +32,20 @@ const SESSION_DURATION_SECONDS = new Map([
   ["7200", DEFAULT_SESSION_SECONDS],
 ]);
 const mountedCloudRuns = new WeakMap();
+const OFFER_REASON_TEXT = new Map([
+  ["workflow_requirements", "meets workflow VRAM and disk requirements"],
+  ["price_cap", "within the hard price cap"],
+  ["source_ready", "all required artifacts have a verified source"],
+  ["quality_metrics", "required reliability and transfer metrics are present"],
+  ["vram", "VRAM below the workflow minimum"],
+  ["disk", "disk below the workflow requirement"],
+  ["price", "price above the hard cap"],
+  ["reliability", "reliability below the safety floor"],
+  ["source_readiness", "required artifact source is not ready"],
+  ["missing_metrics", "required offer metrics are unavailable"],
+  ["blacklisted", "host is temporarily excluded after a failure"],
+  ["suspicious_price", "price is inconsistent with equivalent offers"],
+]);
 
 
 function createElement(document, tagName, options = {}) {
@@ -230,6 +244,39 @@ function theoreticalTransferText(value) {
 }
 
 
+function readinessBytes(value) {
+  if (!Number.isSafeInteger(value) || value < 0) return "unavailable";
+  if (value >= 1024 ** 3) return `${(value / 1024 ** 3).toFixed(1)} GiB`;
+  if (value >= 1024 ** 2) return `${(value / 1024 ** 2).toFixed(1)} MiB`;
+  if (value >= 1024) return `${Math.round(value / 1024)} KiB`;
+  return `${value} B`;
+}
+
+
+function safeReadiness(value) {
+  if (
+    !value
+    || typeof value !== "object"
+    || !["cold", "prepositioned", "warm"].includes(value.label)
+    || !Number.isSafeInteger(value.cached_bytes)
+    || value.cached_bytes < 0
+    || !Number.isSafeInteger(value.remaining_bytes)
+    || value.remaining_bytes < 0
+    || !Number.isFinite(value.assumed_mbps)
+    || value.assumed_mbps <= 0
+    || !Number.isSafeInteger(value.estimated_seconds)
+    || value.estimated_seconds < 0
+    || typeof value.source_ready !== "boolean"
+    || typeof value.ten_minute_eligible !== "boolean"
+    || typeof value.digest !== "string"
+    || !/^[0-9a-f]{64}$/.test(value.digest)
+  ) {
+    return null;
+  }
+  return value;
+}
+
+
 function createIdempotencyKey(browserWindow) {
   const cryptography = browserWindow?.crypto ?? globalThis.crypto;
   if (typeof cryptography?.randomUUID === "function") {
@@ -253,7 +300,14 @@ export function renderOffers(document, container, offers, onSelect) {
     container.textContent = "No matching offers found.";
     return;
   }
-  offers.forEach((offer, index) => {
+  const included = offers.filter((offer) => offer?.included !== false).slice(0, 5);
+  const excluded = offers.filter((offer) => offer?.included === false);
+  if (included.length === 0) {
+    container.appendChild(createElement(document, "div", {
+      text: "No eligible offer matches the workflow and safety limits.",
+    }));
+  }
+  included.forEach((offer, index) => {
     const row = createElement(document, "label", {
       className: "cloud-run-offer",
     });
@@ -287,19 +341,55 @@ export function renderOffers(document, container, offers, onSelect) {
     const performance = dlperf !== null
       ? `DLPerf ${metricNumberText(dlperf)}`
       : "DLPerf unavailable";
-    const estimate = theoreticalTransferText(offer?.estimated_transfer_seconds);
+    const readiness = safeReadiness(offer?.readiness);
+    const estimate = theoreticalTransferText(
+      readiness?.estimated_seconds ?? offer?.estimated_transfer_seconds,
+    );
+    const readinessText = readiness
+      ? `${readiness.label}; cached ${readinessBytes(readiness.cached_bytes)}; ` +
+        `remaining ${readinessBytes(readiness.remaining_bytes)}; ` +
+        `assumption ${metricNumberText(readiness.assumed_mbps)} MB/s`
+      : "readiness unavailable";
+    const includedReasons = Array.isArray(offer?.included_reasons)
+      ? offer.included_reasons
+        .map((reason) => OFFER_REASON_TEXT.get(reason))
+        .filter(Boolean)
+      : [];
     details.textContent =
       `${String(offer?.gpu_name ?? "Unknown GPU")} — ` +
       `${decimalText(offer?.gpu_ram_gb)} GB — ` +
       `${hourlyText(offer?.dph_total)} — ${reliability} — ` +
       `${performance} — ${download} — ` +
       `${disk} — ${downloadClassText(downloadMbps)} — ` +
-      `${downloadPrice}, ${uploadPrice} — theoretical transfer ≈ ${estimate}; ` +
-      "actual startup can be longer";
+      `${downloadPrice}, ${uploadPrice} — ${readinessText} — ` +
+      `theoretical transfer ≈ ${estimate}; actual startup can be longer` +
+      `${includedReasons.length ? ` — ${includedReasons.join("; ")}` : ""}`;
     selector.addEventListener("click", () => onSelect(offer));
     row.append(selector, details);
     container.appendChild(row);
   });
+  if (excluded.length > 0) {
+    const details = createElement(document, "details", {
+      className: "cloud-run-excluded-offers",
+    });
+    const summary = createElement(document, "summary", {
+      text: `${excluded.length} excluded offer${excluded.length === 1 ? "" : "s"}`,
+    });
+    details.appendChild(summary);
+    for (const offer of excluded.slice(0, 20)) {
+      const reasons = Array.isArray(offer?.excluded_reasons)
+        ? offer.excluded_reasons
+          .map((reason) => OFFER_REASON_TEXT.get(reason))
+          .filter(Boolean)
+        : [];
+      details.appendChild(createElement(document, "div", {
+        text:
+          `${String(offer?.gpu_name ?? "Unknown GPU")} — ` +
+          `${reasons.length ? reasons.join(", ") : "not eligible"}`,
+      }));
+    }
+    container.appendChild(details);
+  }
 }
 
 
@@ -423,7 +513,7 @@ export function mountCloudRun(
   vramInput.setAttribute("min", "1");
   vramInput.setAttribute("max", "1024");
   vramInput.setAttribute("step", "1");
-  vramInput.setAttribute("placeholder", "No VRAM filter");
+  vramInput.setAttribute("placeholder", "No VRAM preference");
   const durationSelect = createElement(document, "select", {
     id: "cloud-run-session-duration",
     testId: "cloud-run-session-duration",
@@ -530,6 +620,30 @@ export function mountCloudRun(
       id: "cloud-run-dependency-console",
       searchButton,
       manageSearch: false,
+      async revalidateCurrentCanvas() {
+        const context = record?.captureContext ?? captureContext;
+        if (!context.app || !context.api) {
+          throw new Error("Pinned ComfyUI capture API is unavailable.");
+        }
+        const capture = await captureOfficialQueuePayload({
+          app: context.app,
+          api: context.api,
+        });
+        const persisted = typeof context.onCapture === "function"
+          ? await context.onCapture(capture)
+          : await cloudApi.capture(capture);
+        if (
+          !persisted
+          || typeof persisted.capture_id !== "string"
+          || !persisted.capture_id
+        ) {
+          throw new Error("Cloud Vast capture persistence failed.");
+        }
+        return cloudApi.preflight(
+          persisted.capture_id,
+          sessionConsole.outputAllowance,
+        );
+      },
       setTimeout: typeof browserWindow?.setTimeout === "function"
         ? browserWindow.setTimeout.bind(browserWindow)
         : undefined,
@@ -577,7 +691,7 @@ export function mountCloudRun(
     "Maximum hourly price ($/h, optional)",
     priceInput,
   );
-  appendField(document, card, "Minimum VRAM (GB, optional)", vramInput);
+  appendField(document, card, "Preferred VRAM (GB, optional)", vramInput);
   appendField(document, card, "Session duration", durationSelect);
   card.appendChild(createLimitReview);
   card.append(
@@ -767,9 +881,12 @@ export function mountCloudRun(
         if (changed) sessionIdempotencyKey = null;
         setBusy(false);
       });
+      const includedCount = result.offers.filter(
+        (offer) => offer?.included !== false,
+      ).length;
       status.textContent =
-        `${result.offers.length} matching offer` +
-        `${result.offers.length === 1 ? "" : "s"} found.`;
+        `${includedCount} matching offer` +
+        `${includedCount === 1 ? "" : "s"} found.`;
     } catch {
       offers.replaceChildren();
       status.textContent = "Vast offer search is unavailable.";
@@ -789,6 +906,12 @@ export function mountCloudRun(
 
   reviewButton.addEventListener("click", async () => {
     if (!selectedOffer || !sessionConsole.preflightId) return;
+    const readiness = safeReadiness(selectedOffer.readiness);
+    if (readiness === null || readiness.source_ready !== true) {
+      status.textContent =
+        "This offer has no verified source-ready estimate.";
+      return;
+    }
     const durationSeconds = SESSION_DURATION_SECONDS.get(
       String(durationSelect.value),
     );
@@ -820,6 +943,7 @@ export function mountCloudRun(
           duration_seconds: durationSeconds,
         },
         max_instance_creates: 1,
+        estimate_digest: readiness.digest,
       });
       sessionConsole.renderQuote(session, {
         idempotencyKey: sessionIdempotencyKey,

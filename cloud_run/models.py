@@ -284,6 +284,21 @@ _NODE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}")
 _CONFIGURATION_REVISION = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
 )
+_READINESS_LABELS = frozenset({"cold", "prepositioned", "warm"})
+_OFFER_REASON_CODES = frozenset({
+    "workflow_requirements",
+    "price_cap",
+    "source_ready",
+    "quality_metrics",
+    "vram",
+    "disk",
+    "price",
+    "reliability",
+    "source_readiness",
+    "missing_metrics",
+    "blacklisted",
+    "suspicious_price",
+})
 
 
 def _valid_node_id_tuple(value):
@@ -306,6 +321,150 @@ def _canonical_uuid(value):
         return str(uuid.UUID(value)) == value
     except (AttributeError, TypeError, ValueError):
         return False
+
+
+@dataclass(frozen=True)
+class ReadinessEstimate:
+    label: str
+    cached_bytes: int
+    remaining_bytes: int
+    assumed_mbps: float
+    estimated_seconds: int
+    source_ready: bool
+    ten_minute_eligible: bool
+    digest: str
+
+    def __post_init__(self):
+        if (
+            self.label not in _READINESS_LABELS
+            or type(self.cached_bytes) is not int
+            or self.cached_bytes < 0
+            or type(self.remaining_bytes) is not int
+            or self.remaining_bytes < 0
+            or isinstance(self.assumed_mbps, bool)
+            or not isinstance(self.assumed_mbps, (int, float))
+            or not math.isfinite(self.assumed_mbps)
+            or self.assumed_mbps <= 0
+            or type(self.estimated_seconds) is not int
+            or self.estimated_seconds < 0
+            or type(self.source_ready) is not bool
+            or type(self.ten_minute_eligible) is not bool
+            or not isinstance(self.digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", self.digest) is None
+        ):
+            raise ValueError("Invalid readiness estimate.")
+        if (
+            (self.label == "warm") != (self.remaining_bytes == 0)
+            or (
+                self.label == "prepositioned"
+                and (self.cached_bytes == 0 or self.remaining_bytes == 0)
+            )
+            or (
+                self.label == "cold"
+                and (self.cached_bytes != 0 or self.remaining_bytes == 0)
+            )
+            or self.ten_minute_eligible
+            != (self.source_ready and self.estimated_seconds <= 600)
+        ):
+            raise ValueError("Invalid readiness estimate.")
+        payload = {
+            "assumed_mbps": float(self.assumed_mbps),
+            "cached_bytes": self.cached_bytes,
+            "estimated_seconds": self.estimated_seconds,
+            "label": self.label,
+            "remaining_bytes": self.remaining_bytes,
+            "source_ready": self.source_ready,
+            "ten_minute_eligible": self.ten_minute_eligible,
+        }
+        calculated = hashlib.sha256(
+            json.dumps(
+                payload,
+                ensure_ascii=True,
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        if calculated != self.digest:
+            raise ValueError("Invalid readiness estimate.")
+
+    def public_payload(self):
+        return {
+            "label": self.label,
+            "cached_bytes": self.cached_bytes,
+            "remaining_bytes": self.remaining_bytes,
+            "assumed_mbps": float(self.assumed_mbps),
+            "estimated_seconds": self.estimated_seconds,
+            "source_ready": self.source_ready,
+            "ten_minute_eligible": self.ten_minute_eligible,
+            "digest": self.digest,
+        }
+
+    @classmethod
+    def from_payload(cls, payload):
+        if not isinstance(payload, dict) or set(payload) != {
+            "label",
+            "cached_bytes",
+            "remaining_bytes",
+            "assumed_mbps",
+            "estimated_seconds",
+            "source_ready",
+            "ten_minute_eligible",
+            "digest",
+        }:
+            raise ValueError("Invalid readiness estimate.")
+        try:
+            return cls(**payload)
+        except (TypeError, ValueError):
+            raise ValueError("Invalid readiness estimate.") from None
+
+
+@dataclass(frozen=True)
+class OfferDecision:
+    offer: dict | None
+    included: bool
+    score: tuple
+    reasons: tuple[str, ...]
+    estimate: ReadinessEstimate | None
+
+    def __post_init__(self):
+        if (
+            (self.offer is not None and not isinstance(self.offer, dict))
+            or type(self.included) is not bool
+            or not isinstance(self.score, tuple)
+            or not isinstance(self.reasons, tuple)
+            or not self.reasons
+            or any(reason not in _OFFER_REASON_CODES for reason in self.reasons)
+            or (
+                self.estimate is not None
+                and not isinstance(self.estimate, ReadinessEstimate)
+            )
+        ):
+            raise ValueError("Invalid offer decision.")
+        if self.offer is not None:
+            object.__setattr__(self, "offer", dict(self.offer))
+
+    @property
+    def included_reasons(self):
+        return self.reasons if self.included else ()
+
+    @property
+    def excluded_reasons(self):
+        return () if self.included else self.reasons
+
+    def public_payload(self):
+        payload = dict(self.offer or {})
+        payload.update({
+            "included": self.included,
+            "included_reasons": list(self.included_reasons),
+            "excluded_reasons": list(self.excluded_reasons),
+            "readiness": (
+                self.estimate.public_payload()
+                if self.estimate is not None
+                else None
+            ),
+        })
+        return payload
 
 
 @dataclass(frozen=True)
@@ -338,6 +497,8 @@ class OfferQuote:
     max_instance_creates: int = 1
     inet_down_mbps: float | None = None
     disk_bw_mbps: float | None = None
+    dlperf: float | None = None
+    readiness_estimate: ReadinessEstimate | None = None
 
     def __post_init__(self):
         finite_numbers = (
@@ -407,7 +568,7 @@ class OfferQuote:
                 or cost < 0
             ):
                 raise ValueError("Invalid paid offer quote.")
-        for metric in (self.inet_down_mbps, self.disk_bw_mbps):
+        for metric in (self.inet_down_mbps, self.disk_bw_mbps, self.dlperf):
             if metric is not None and (
                 isinstance(metric, bool)
                 or not isinstance(metric, (int, float))
@@ -415,6 +576,18 @@ class OfferQuote:
                 or metric < 0
             ):
                 raise ValueError("Invalid paid offer quote.")
+        if (
+            self.readiness_estimate is not None
+            and not isinstance(self.readiness_estimate, ReadinessEstimate)
+        ):
+            raise ValueError("Invalid paid offer quote.")
+        if (
+            self.readiness_estimate is not None
+            and self.readiness_estimate.cached_bytes
+            + self.readiness_estimate.remaining_bytes
+            != self.transfer_bytes
+        ):
+            raise ValueError("Invalid paid offer quote.")
         if self.deadline_mode == "finite":
             if (
                 isinstance(self.duration_seconds, bool)
@@ -483,6 +656,8 @@ class OfferQuote:
                 "max_instance_creates": 1,
                 "inet_down_mbps": None,
                 "disk_bw_mbps": None,
+                "dlperf": None,
+                "readiness_estimate": None,
             }
         values = dict(payload)
         values.setdefault(
@@ -493,6 +668,16 @@ class OfferQuote:
         if not isinstance(node_ids, (list, tuple)):
             raise ValueError("Invalid paid offer quote.")
         values["randomized_seed_node_ids"] = tuple(node_ids)
+        estimate = values.get("readiness_estimate")
+        if estimate is not None and not isinstance(
+            estimate,
+            ReadinessEstimate,
+        ):
+            values["readiness_estimate"] = ReadinessEstimate.from_payload(
+                estimate
+            )
+        else:
+            values.setdefault("readiness_estimate", None)
         try:
             return cls(**values)
         except (TypeError, ValueError):
@@ -519,6 +704,7 @@ class OfferQuote:
                 self.inet_down_mbps if reviewed else None
             ),
             "disk_bw_mbps": self.disk_bw_mbps if reviewed else None,
+            "dlperf": self.dlperf if reviewed else None,
             "max_price_per_hour": self.max_price_per_hour,
             "expires_at": self.expires_at,
             "disk_gb": self.disk_gb if reviewed else None,
@@ -544,6 +730,16 @@ class OfferQuote:
             "manifest_digest": self.manifest_digest if reviewed else None,
             "max_instance_creates": (
                 self.max_instance_creates if reviewed else None
+            ),
+            "readiness": (
+                self.readiness_estimate.public_payload()
+                if reviewed and self.readiness_estimate is not None
+                else None
+            ),
+            "estimate_digest": (
+                self.readiness_estimate.digest
+                if reviewed and self.readiness_estimate is not None
+                else None
             ),
         }
 

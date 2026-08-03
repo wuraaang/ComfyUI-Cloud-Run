@@ -28,6 +28,7 @@ from .models import (
 )
 from .offers import (
     apply_offer_policy,
+    decide_offers,
     offer_meets_connection_quality_policy,
 )
 from .repository import (
@@ -613,6 +614,7 @@ class CloudRunService:
         idempotency_key,
         deadline,
         max_instance_creates,
+        estimate_digest=None,
     ):
         release = self._reviewed_release()
         repository = self._session_repository()
@@ -644,10 +646,51 @@ class CloudRunService:
             identifier,
             settings,
             disk_gb=preflight.disk_gb,
+            min_vram_gb=max(
+                1,
+                math.ceil(
+                    float(getattr(preflight, "minimum_vram_gb", 0.0))
+                ),
+            ),
         )
         if selected is None:
             raise QuoteUnavailable(
                 "The selected Vast offer is no longer available."
+            )
+        decisions = decide_offers(
+            [selected],
+            workflow_min_vram_gb=float(
+                getattr(preflight, "minimum_vram_gb", 0.0)
+            ),
+            workflow_disk_gb=preflight.disk_gb,
+            preferred_vram_gb=(
+                None
+                if settings["min_vram_gb"] <= 1
+                else settings["min_vram_gb"]
+            ),
+            max_price_per_hour=(
+                None
+                if settings["max_price_per_hour"] >= 100
+                else settings["max_price_per_hour"]
+            ),
+            transfer_bytes=preflight.transfer_bytes,
+            cached_bytes=int(getattr(preflight, "cached_bytes", 0)),
+            source_ready=True,
+        )
+        decision = next(
+            (item for item in decisions if item.included),
+            None,
+        )
+        if decision is None or decision.estimate is None:
+            raise QuoteUnavailable(
+                "The selected Vast offer is no longer available."
+            )
+        if estimate_digest is not None and (
+            not isinstance(estimate_digest, str)
+            or estimate_digest != decision.estimate.digest
+        ):
+            raise QuoteUnavailable(
+                "The readiness estimate changed before review."
             )
         now = float(self.clock())
         quote = OfferQuote(
@@ -662,6 +705,7 @@ class CloudRunService:
             ),
             inet_down_mbps=selected.get("inet_down_mbps"),
             disk_bw_mbps=selected.get("disk_bw_mbps"),
+            dlperf=selected.get("dlperf"),
             max_price_per_hour=float(settings["max_price_per_hour"]),
             expires_at=now + self.quote_ttl_seconds,
             disk_gb=int(preflight.disk_gb),
@@ -693,6 +737,7 @@ class CloudRunService:
             host_id=selected.get("host_id"),
             public_ipaddr=selected.get("public_ipaddr"),
             max_instance_creates=create_limit,
+            readiness_estimate=decision.estimate,
         )
         candidate = CloudSession.new(
             key,
@@ -729,6 +774,18 @@ class CloudRunService:
             return current is None
         return current is not None and float(current) <= float(quoted)
 
+    @classmethod
+    def _same_optional_number(cls, current, quoted):
+        if current is None or quoted is None:
+            return current is None and quoted is None
+        current_value = cls._finite_metric(current)
+        quoted_value = cls._finite_metric(quoted)
+        return (
+            current_value is not None
+            and quoted_value is not None
+            and current_value == quoted_value
+        )
+
     @staticmethod
     def _finite_metric(value):
         if (
@@ -757,29 +814,51 @@ class CloudRunService:
         )
 
     async def _revalidated_session_offer(self, session, settings):
+        if float(settings["max_price_per_hour"]) != float(
+            session.quote.max_price_per_hour
+        ):
+            return None
         selected = await self._eligible_offer(
             session.quote.offer_id,
             settings,
             disk_gb=session.quote.disk_gb,
+            min_vram_gb=1,
         )
         if selected is None:
             return None
         if (
             self._connection_quality_is_eligible(selected)
-            and self._connection_speed_matches_quote(
+            and str(selected.get("offer_id")) == session.quote.offer_id
+            and str(selected.get("gpu_name")) == session.quote.gpu_name
+            and self._same_optional_number(
+                selected.get("gpu_ram_gb"),
+                session.quote.gpu_ram_gb,
+            )
+            and self._same_optional_number(
+                selected.get("dph_total"),
+                session.quote.dph_total,
+            )
+            and self._same_optional_number(
+                selected.get("reliability"),
+                session.quote.reliability,
+            )
+            and self._same_optional_number(
                 selected.get("inet_down_mbps"),
                 session.quote.inet_down_mbps,
             )
-            and str(selected.get("gpu_name")) == session.quote.gpu_name
-            and float(selected.get("gpu_ram_gb", 0))
-            >= session.quote.gpu_ram_gb
-            and float(selected.get("dph_total", float("inf")))
-            <= session.quote.dph_total
-            and self._bandwidth_cost_not_increased(
+            and self._same_optional_number(
+                selected.get("disk_bw_mbps"),
+                session.quote.disk_bw_mbps,
+            )
+            and self._same_optional_number(
+                selected.get("dlperf"),
+                session.quote.dlperf,
+            )
+            and self._same_optional_number(
                 selected.get("inet_down_cost"),
                 session.quote.inet_down_cost,
             )
-            and self._bandwidth_cost_not_increased(
+            and self._same_optional_number(
                 selected.get("inet_up_cost"),
                 session.quote.inet_up_cost,
             )
@@ -793,7 +872,26 @@ class CloudRunService:
                 or selected.get("host_id") == session.quote.host_id
             )
         ):
-            return selected
+            estimate = session.quote.readiness_estimate
+            if estimate is None:
+                return None
+            decisions = decide_offers(
+                [selected],
+                workflow_min_vram_gb=1,
+                workflow_disk_gb=session.quote.disk_gb,
+                preferred_vram_gb=None,
+                max_price_per_hour=session.quote.max_price_per_hour,
+                transfer_bytes=session.quote.transfer_bytes,
+                cached_bytes=estimate.cached_bytes,
+                source_ready=estimate.source_ready,
+            )
+            if (
+                len(decisions) == 1
+                and decisions[0].included
+                and decisions[0].estimate is not None
+                and decisions[0].estimate.digest == estimate.digest
+            ):
+                return selected
         return None
 
     async def _finish_created_session(self, session_id, instance_id):
@@ -835,7 +933,15 @@ class CloudRunService:
             schedule(session.session_id)
         return session
 
-    async def confirm_session(self, session_id, *, idempotency_key):
+    async def confirm_session(
+        self,
+        session_id,
+        *,
+        idempotency_key,
+        estimate_digest=None,
+        accepted_longer_estimate=False,
+        current_preflight_id=None,
+    ):
         session = self._validated_session(session_id, idempotency_key)
         if session.state not in {
             SessionState.OFFER_SELECTED,
@@ -844,6 +950,72 @@ class CloudRunService:
             return session
         repository = self._session_repository()
         now = float(self.clock())
+        estimate = session.quote.readiness_estimate
+        expected_digest = estimate.digest if estimate is not None else None
+        supplied_digest = (
+            expected_digest if estimate_digest is None else estimate_digest
+        )
+        if (
+            estimate is None
+            or not isinstance(supplied_digest, str)
+            or supplied_digest != expected_digest
+        ):
+            repository.transition(
+                session.session_id,
+                SessionState.FAILED,
+                now=now,
+                sanitized_error=(
+                    "The readiness estimate changed before confirmation."
+                ),
+                failure_code="quote_expired",
+            )
+            raise QuoteUnavailable(
+                "The readiness estimate changed before confirmation."
+            )
+        if current_preflight_id is not None:
+            matches = getattr(
+                self.session_service,
+                "matches_paid_preflight",
+                None,
+            )
+            if not callable(matches) or not matches(
+                current_preflight_id,
+                reviewed_manifest_digest=session.quote.manifest_digest,
+                reviewed_execution_baseline_digest=(
+                    session.quote.execution_baseline_digest
+                ),
+                reviewed_randomized_seed_node_ids=(
+                    session.quote.randomized_seed_node_ids
+                ),
+                reviewed_transfer_bytes=session.quote.transfer_bytes,
+                reviewed_cached_bytes=estimate.cached_bytes,
+                reviewed_output_allowance_bytes=(
+                    session.quote.output_allowance_bytes
+                ),
+                reviewed_disk_gb=session.quote.disk_gb,
+            ):
+                repository.transition(
+                    session.session_id,
+                    SessionState.FAILED,
+                    now=now,
+                    sanitized_error=(
+                        "The canvas or profile changed before confirmation."
+                    ),
+                    failure_code="quote_expired",
+                )
+                raise QuoteUnavailable(
+                    "The canvas or profile changed before confirmation."
+                )
+        if (
+            not estimate.source_ready
+            or (
+                not estimate.ten_minute_eligible
+                and accepted_longer_estimate is not True
+            )
+        ):
+            raise CloudRunValidationError(
+                "Accept the reviewed longer readiness estimate before rental."
+            )
         if (
             session.retry_count != 0
             or 1 + session.retry_count
@@ -864,6 +1036,7 @@ class CloudRunService:
                 SessionState.FAILED,
                 now=now,
                 sanitized_error="The quote expired before confirmation.",
+                failure_code="quote_expired",
             )
             raise QuoteUnavailable("The quote expired before confirmation.")
         if not self._release_matches_quote(release, session.quote):
@@ -874,6 +1047,7 @@ class CloudRunService:
                 sanitized_error=(
                     "The reviewed worker release changed before confirmation."
                 ),
+                failure_code="quote_expired",
             )
             raise QuoteUnavailable(
                 "The reviewed worker release changed before confirmation."
@@ -888,6 +1062,7 @@ class CloudRunService:
                 sanitized_error=(
                     "The selected offer changed or is no longer eligible."
                 ),
+                failure_code="quote_expired",
             )
             raise QuoteUnavailable(
                 "The selected offer changed or is no longer eligible."
@@ -992,19 +1167,48 @@ class CloudRunService:
             return await self.session_service.search_offers(preflight_id)
         return await self._search_without_preflight()
 
-    async def _search_without_preflight(self, *, disk_gb=DEFAULT_DISK_GB):
+    async def _search_without_preflight(
+        self,
+        *,
+        disk_gb=DEFAULT_DISK_GB,
+        workflow_min_vram_gb=None,
+        transfer_bytes=0,
+        cached_bytes=0,
+        source_ready=True,
+    ):
         settings = self._settings()
+        hard_vram = (
+            settings["min_vram_gb"]
+            if workflow_min_vram_gb is None
+            else max(1, math.ceil(float(workflow_min_vram_gb)))
+        )
         offers = await self.provider.search_offers(
             settings["api_key"],
             max_price_per_hour=settings["max_price_per_hour"],
-            min_vram_gb=settings["min_vram_gb"],
+            min_vram_gb=hard_vram,
             disk_gb=disk_gb,
         )
-        return apply_offer_policy(
+        decisions = decide_offers(
             offers,
+            workflow_min_vram_gb=hard_vram,
+            workflow_disk_gb=disk_gb,
+            preferred_vram_gb=(
+                None
+                if settings["min_vram_gb"] <= 1
+                else settings["min_vram_gb"]
+            ),
+            max_price_per_hour=(
+                None
+                if settings["max_price_per_hour"] >= 100
+                else settings["max_price_per_hour"]
+            ),
+            transfer_bytes=transfer_bytes,
+            cached_bytes=cached_bytes,
+            source_ready=source_ready,
             blacklist=self.blacklist,
             now=float(self.clock()),
         )
+        return [decision.public_payload() for decision in decisions]
 
     async def _eligible_offer(
         self,
@@ -1012,12 +1216,17 @@ class CloudRunService:
         settings,
         *,
         disk_gb=DEFAULT_DISK_GB,
+        min_vram_gb=None,
     ):
         selected = await self.provider.get_offer(
             settings["api_key"],
             identifier,
             max_price_per_hour=settings["max_price_per_hour"],
-            min_vram_gb=settings["min_vram_gb"],
+            min_vram_gb=(
+                settings["min_vram_gb"]
+                if min_vram_gb is None
+                else min_vram_gb
+            ),
             disk_gb=disk_gb,
         )
         if selected is None:
@@ -1069,6 +1278,7 @@ class CloudRunService:
             ),
             inet_down_mbps=selected.get("inet_down_mbps"),
             disk_bw_mbps=selected.get("disk_bw_mbps"),
+            dlperf=selected.get("dlperf"),
             max_price_per_hour=float(settings["max_price_per_hour"]),
             expires_at=now + self.quote_ttl_seconds,
             disk_gb=self.disk_gb,

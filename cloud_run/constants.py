@@ -38,6 +38,7 @@ VAST_CREATE_FAILURE_CODES = frozenset(
         "server_disconnected",
         "invalid_response",
         "confirmation_interrupted",
+        "quote_expired",
         "transport_unknown",
     }
 )

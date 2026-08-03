@@ -66,6 +66,8 @@ class FakePreflightService:
             disk_gb=96,
             execution_baseline_digest="e" * 64,
             randomized_seed_node_ids=("3",),
+            minimum_vram_gb=24.0,
+            cached_bytes=0,
         )
 
     def require_rentable_preflight(self, preflight_id):
@@ -280,6 +282,11 @@ class CloudRunServiceTests(unittest.TestCase):
         self.assertIn("inet_down_mbps", reopened.quote.to_record())
         self.assertEqual(reopened.quote.inet_down_mbps, 500.0)
         self.assertEqual(reopened.quote.disk_bw_mbps, 600.0)
+        self.assertIsNotNone(reopened.quote.readiness_estimate)
+        self.assertEqual(
+            reopened.quote.readiness_estimate.remaining_bytes,
+            12_000,
+        )
         self.assertEqual(reopened.quote.duration_seconds, 7_200)
         self.assertEqual(reopened.quote.max_instance_creates, 1)
         self.assertEqual(
@@ -309,6 +316,90 @@ class CloudRunServiceTests(unittest.TestCase):
             "session_secret_hex",
             repr(quoted.public_payload()),
         )
+
+    def test_long_estimate_requires_exact_digest_acceptance_before_create(self):
+        from cloud_run.service import CloudRunValidationError, QuoteUnavailable
+
+        for case in ("not-accepted", "wrong-digest"):
+            with self.subTest(case=case):
+                self.setUp()
+                provider = FakeProvider(lookups=[offer(), offer()])
+                preflights = FakePreflightService()
+                preflights.result.transfer_bytes = 29_347_469_703
+                service = self.service(provider, session_service=preflights)
+                quoted = asyncio.run(
+                    service.preview_session(
+                        preflight_id="preflight-1",
+                        offer_id="42",
+                        idempotency_key="long-estimate-" + case,
+                        deadline={"mode": "none", "duration_seconds": None},
+                        max_instance_creates=1,
+                    )
+                )
+                estimate = quoted.quote.readiness_estimate
+                self.assertGreater(estimate.estimated_seconds, 600)
+                if case == "not-accepted":
+                    with self.assertRaises(CloudRunValidationError):
+                        asyncio.run(
+                            service.confirm_session(
+                                quoted.session_id,
+                                idempotency_key="long-estimate-" + case,
+                                estimate_digest=estimate.digest,
+                                accepted_longer_estimate=False,
+                            )
+                        )
+                    self.assertEqual(
+                        service.get_session(quoted.session_id).state,
+                        SessionState.OFFER_SELECTED,
+                    )
+                else:
+                    with self.assertRaises(QuoteUnavailable):
+                        asyncio.run(
+                            service.confirm_session(
+                                quoted.session_id,
+                                idempotency_key="long-estimate-" + case,
+                                estimate_digest="f" * 64,
+                                accepted_longer_estimate=True,
+                            )
+                        )
+                    saved = service.get_session(quoted.session_id)
+                    self.assertEqual(saved.state, SessionState.FAILED)
+                    self.assertEqual(saved.failure_code, "quote_expired")
+                self.assertEqual(provider.create_calls, [])
+
+    def test_changed_current_canvas_expires_quote_before_provider_create(self):
+        from cloud_run.service import QuoteUnavailable
+
+        provider = FakeProvider(lookups=[offer(), offer()])
+        preflights = FakePreflightService()
+        preflights.matches_paid_preflight = lambda *_args, **_kwargs: False
+        service = self.service(provider, session_service=preflights)
+        quoted = asyncio.run(
+            service.preview_session(
+                preflight_id="preflight-1",
+                offer_id="42",
+                idempotency_key="changed-current-canvas",
+                deadline={"mode": "none", "duration_seconds": None},
+                max_instance_creates=1,
+            )
+        )
+
+        with self.assertRaises(QuoteUnavailable):
+            asyncio.run(
+                service.confirm_session(
+                    quoted.session_id,
+                    idempotency_key="changed-current-canvas",
+                    estimate_digest=(
+                        quoted.quote.readiness_estimate.digest
+                    ),
+                    accepted_longer_estimate=False,
+                    current_preflight_id="preflight-current",
+                )
+            )
+
+        saved = service.get_session(quoted.session_id)
+        self.assertEqual(saved.failure_code, "quote_expired")
+        self.assertEqual(provider.create_calls, [])
 
     def test_paid_session_create_limit_is_validated_before_offer_lookup(self):
         from cloud_run.service import CloudRunValidationError
@@ -1179,7 +1270,10 @@ class CloudRunServiceTests(unittest.TestCase):
                         )
                         confirm = service.confirm
                         identifier = preview.attempt_id
-                    if accepted:
+                    exact_session_terms = (
+                        not session_path or current_speed == quoted_speed
+                    )
+                    if accepted and exact_session_terms:
                         result = asyncio.run(
                             confirm(identifier, idempotency_key=key)
                         )

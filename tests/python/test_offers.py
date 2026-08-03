@@ -24,11 +24,13 @@ def normalized_offer(
     inet_down_mbps=1000,
     disk_bw_mbps=600,
     dlperf=None,
+    gpu_ram_gb=24.0,
+    disk_gb=96,
 ):
     return {
         "offer_id": offer_id,
         "gpu_name": gpu_name,
-        "gpu_ram_gb": 24.0,
+        "gpu_ram_gb": gpu_ram_gb,
         "dph_total": price,
         "reliability": reliability,
         "machine_id": machine_id,
@@ -37,6 +39,7 @@ def normalized_offer(
         "inet_down_mbps": inet_down_mbps,
         "disk_bw_mbps": disk_bw_mbps,
         "dlperf": dlperf,
+        "disk_gb": disk_gb,
     }
 
 
@@ -441,6 +444,137 @@ class RankingPolicyTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(OfferSelectionError, "no eligible offer"):
             select_best_offer(offers, requested_gpu="RTX 5090")
+
+
+class ExplainedOfferDecisionTests(unittest.TestCase):
+    def test_empty_preferences_are_not_hard_filters(self):
+        from cloud_run.offers import decide_offers
+
+        decisions = decide_offers(
+            [
+                normalized_offer(1, gpu_ram_gb=24, price=0.51, dlperf=80),
+                normalized_offer(2, gpu_ram_gb=48, price=1.25, dlperf=120),
+            ],
+            workflow_min_vram_gb=24,
+            workflow_disk_gb=80,
+            preferred_vram_gb=None,
+            max_price_per_hour=None,
+            transfer_bytes=0,
+            cached_bytes=0,
+            source_ready=True,
+        )
+
+        self.assertEqual(
+            [decision.offer["offer_id"] for decision in decisions if decision.included],
+            [2, 1],
+        )
+        self.assertTrue(all(decision.included for decision in decisions))
+
+    def test_workflow_minimum_and_price_cap_are_hard_but_vram_is_soft(self):
+        from cloud_run.offers import decide_offers
+
+        decisions = decide_offers(
+            [
+                normalized_offer(1, gpu_ram_gb=12, price=0.20, dlperf=90),
+                normalized_offer(2, gpu_ram_gb=24, price=0.51, dlperf=120),
+                normalized_offer(3, gpu_ram_gb=24, price=0.50, dlperf=80),
+                normalized_offer(4, gpu_ram_gb=24, price=0.49, dlperf=140),
+            ],
+            workflow_min_vram_gb=24,
+            workflow_disk_gb=80,
+            preferred_vram_gb=12,
+            max_price_per_hour=0.50,
+            transfer_bytes=0,
+            cached_bytes=0,
+            source_ready=True,
+        )
+
+        included = [decision.offer["offer_id"] for decision in decisions if decision.included]
+        self.assertEqual(included, [4, 3])
+        excluded = {
+            decision.offer["offer_id"]: decision.excluded_reasons
+            for decision in decisions
+            if not decision.included
+        }
+        self.assertIn("vram", excluded[1])
+        self.assertIn("price", excluded[2])
+
+    def test_exclusions_are_typed_and_performant_offer_beats_cheap_weak_offer(self):
+        from cloud_run.offers import decide_offers
+
+        offers = [
+            normalized_offer(1, price=0.35, dlperf=20),
+            normalized_offer(2, price=0.45, dlperf=100),
+            normalized_offer(3, disk_gb=79, dlperf=90),
+            normalized_offer(4, reliability=0.90, dlperf=90),
+            normalized_offer(5, inet_down_mbps=None, dlperf=90),
+        ]
+        decisions = decide_offers(
+            offers,
+            workflow_min_vram_gb=24,
+            workflow_disk_gb=80,
+            preferred_vram_gb=24,
+            max_price_per_hour=0.50,
+            transfer_bytes=1,
+            cached_bytes=0,
+            source_ready=True,
+        )
+
+        included = [decision.offer["offer_id"] for decision in decisions if decision.included]
+        self.assertEqual(included, [2, 1])
+        excluded = {
+            decision.offer["offer_id"]: decision.excluded_reasons
+            for decision in decisions
+            if not decision.included
+        }
+        self.assertIn("disk", excluded[3])
+        self.assertIn("reliability", excluded[4])
+        self.assertIn("missing_metrics", excluded[5])
+
+        unavailable = decide_offers(
+            [normalized_offer(6, dlperf=80)],
+            workflow_min_vram_gb=24,
+            workflow_disk_gb=80,
+            transfer_bytes=1,
+            source_ready=False,
+        )
+        self.assertEqual(unavailable[0].excluded_reasons, ("source_readiness",))
+
+    def test_readiness_estimate_uses_remaining_bytes_and_measured_megabytes(self):
+        from cloud_run.offers import readiness_estimate
+
+        for observed_mb_s, minimum_seconds in ((25, 1_173), (30, 978)):
+            with self.subTest(observed_mb_s=observed_mb_s):
+                estimate = readiness_estimate(
+                    total_bytes=29_347_469_703,
+                    cached_bytes=0,
+                    assumed_mbps=observed_mb_s,
+                    source_ready=True,
+                )
+                self.assertEqual(estimate.label, "cold")
+                self.assertGreaterEqual(estimate.estimated_seconds, minimum_seconds)
+                self.assertFalse(estimate.ten_minute_eligible)
+                self.assertEqual(len(estimate.digest), 64)
+
+        prepositioned = readiness_estimate(
+            total_bytes=29_347_469_703,
+            cached_bytes=20_000_000_000,
+            assumed_mbps=30,
+            source_ready=True,
+        )
+        self.assertEqual(prepositioned.label, "prepositioned")
+        self.assertLessEqual(prepositioned.estimated_seconds, 600)
+        self.assertTrue(prepositioned.ten_minute_eligible)
+
+        warm = readiness_estimate(
+            total_bytes=29_347_469_703,
+            cached_bytes=29_347_469_703,
+            assumed_mbps=25,
+            source_ready=True,
+        )
+        self.assertEqual(warm.label, "warm")
+        self.assertEqual(warm.remaining_bytes, 0)
+        self.assertEqual(warm.estimated_seconds, 0)
 
 
 if __name__ == "__main__":

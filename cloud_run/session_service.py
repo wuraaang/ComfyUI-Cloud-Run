@@ -41,7 +41,6 @@ from .models import (
     SessionState,
     TransferState,
 )
-from .offers import estimated_transfer_seconds
 from .orchestrator import LocalOrchestrator
 from .reconciler import SessionReconciler
 from .relay import (
@@ -438,6 +437,8 @@ class PreflightResult:
     disk_gb: int | None
     execution_baseline_digest: str
     randomized_seed_node_ids: tuple[str, ...]
+    minimum_vram_gb: float = 0.0
+    cached_bytes: int = 0
 
     def __post_init__(self):
         _identifier(self.preflight_id, "preflight ID")
@@ -454,6 +455,15 @@ class PreflightResult:
             or self.transfer_bytes < 0
         ):
             raise SessionServiceError("Invalid preflight transfer size.")
+        if (
+            isinstance(self.minimum_vram_gb, bool)
+            or not isinstance(self.minimum_vram_gb, (int, float))
+            or not math.isfinite(self.minimum_vram_gb)
+            or not 0 <= float(self.minimum_vram_gb) <= 1024
+            or type(self.cached_bytes) is not int
+            or not 0 <= self.cached_bytes <= self.transfer_bytes
+        ):
+            raise SessionServiceError("Invalid preflight readiness inputs.")
         if self.output_allowance_bytes is not None and (
             isinstance(self.output_allowance_bytes, bool)
             or not isinstance(self.output_allowance_bytes, int)
@@ -518,6 +528,8 @@ class PreflightResult:
             "randomized_seed_node_ids": list(
                 self.randomized_seed_node_ids
             ),
+            "minimum_vram_gb": float(self.minimum_vram_gb),
+            "cached_bytes": self.cached_bytes,
         }
 
     @classmethod
@@ -534,9 +546,11 @@ class PreflightResult:
             "execution_baseline_digest",
             "randomized_seed_node_ids",
         }
+        optional = {"minimum_vram_gb", "cached_bytes"}
         if (
             not isinstance(payload, dict)
-            or set(payload) != fields
+            or not fields.issubset(payload)
+            or not set(payload).issubset(fields | optional)
             or not isinstance(payload["rows"], list)
             or not isinstance(payload["randomized_seed_node_ids"], list)
         ):
@@ -548,6 +562,8 @@ class PreflightResult:
         values["randomized_seed_node_ids"] = tuple(
             payload["randomized_seed_node_ids"]
         )
+        values.setdefault("minimum_vram_gb", 0.0)
+        values.setdefault("cached_bytes", 0)
         return cls(**values)
 
 
@@ -698,6 +714,45 @@ def _transfer_bytes(resolution):
         identities[("profile", profile.archive.artifact_id)] = (
             profile.archive.size_bytes
         )
+    return sum(identities.values())
+
+
+def _cached_bytes(resolution):
+    identities = {}
+    verified = getattr(resolution, "verified_cached_artifact_ids", ())
+    if (
+        not isinstance(verified, (tuple, list, frozenset, set))
+        or any(not isinstance(item, str) for item in verified)
+    ):
+        return 0
+    verified = frozenset(verified)
+
+    def remember(identity, artifact):
+        cache_identities = {
+            value
+            for value in (
+                getattr(artifact, "artifact_id", None),
+                getattr(artifact, "sha256", None),
+            )
+            if isinstance(value, str)
+        }
+        if (
+            getattr(getattr(artifact, "source", None), "kind", None) == "r2"
+            and not cache_identities.isdisjoint(verified)
+        ):
+            identities[identity] = artifact.size_bytes
+
+    for node in resolution.custom_nodes:
+        remember(("archive", node.archive.artifact_id), node.archive)
+        for wheel in node.wheels:
+            remember(("wheel", wheel.filename, wheel.sha256), wheel)
+    for artifact in resolution.artifacts:
+        remember(("artifact", artifact.artifact_id), artifact)
+    for package in getattr(resolution, "ui_packages", ()):
+        remember(("ui-package", package.archive.artifact_id), package.archive)
+    profile = getattr(resolution, "profile", None)
+    if profile is not None:
+        remember(("profile", profile.archive.artifact_id), profile.archive)
     return sum(identities.values())
 
 
@@ -1268,6 +1323,10 @@ class SessionService:
             disk_gb=disk_gb,
             execution_baseline_digest=execution_baseline_digest,
             randomized_seed_node_ids=randomized_seed_node_ids,
+            minimum_vram_gb=float(
+                getattr(resolution, "minimum_vram_gb", 0.0)
+            ),
+            cached_bytes=_cached_bytes(resolution),
         )
         self.job_repository.save_preflight(
             result.preflight_id,
@@ -1332,6 +1391,8 @@ class SessionService:
             != result.output_allowance_bytes
             or manifest.get("disk_gb") != result.disk_gb
             or _manifest_transfer_bytes(manifest) != result.transfer_bytes
+            or float(manifest.get("minimum_vram_gb", -1))
+            != float(result.minimum_vram_gb)
             or self.release is None
             or manifest.get("worker_version")
             != self.release.worker_commit
@@ -1349,22 +1410,82 @@ class SessionService:
         result = self.require_rentable_preflight(preflight_id)
         if self.offer_search is None:
             raise PreflightBlocked("Vast offer search is unavailable.")
-        if callable(self.offer_search):
-            offers = await self.offer_search(disk_gb=result.disk_gb)
-        elif callable(getattr(self.offer_search, "search", None)):
-            offers = await self.offer_search.search(disk_gb=result.disk_gb)
+        search = (
+            self.offer_search
+            if callable(self.offer_search)
+            else getattr(self.offer_search, "search", None)
+        )
+        if callable(search):
+            offers = await search(
+                disk_gb=result.disk_gb,
+                workflow_min_vram_gb=result.minimum_vram_gb,
+                transfer_bytes=result.transfer_bytes,
+                cached_bytes=result.cached_bytes,
+                source_ready=result.rentable,
+            )
         else:
             raise PreflightBlocked("Vast offer search is unavailable.")
-        return [
-            {
-                **offer,
-                "estimated_transfer_seconds": estimated_transfer_seconds(
-                    result.transfer_bytes,
-                    offer.get("inet_down_mbps"),
-                ),
-            }
-            for offer in offers
-        ]
+        if not isinstance(offers, list):
+            raise PreflightBlocked("Vast offer search is unavailable.")
+        return offers
+
+    def matches_paid_preflight(
+        self,
+        preflight_id,
+        *,
+        reviewed_manifest_digest,
+        reviewed_execution_baseline_digest,
+        reviewed_randomized_seed_node_ids,
+        reviewed_transfer_bytes,
+        reviewed_cached_bytes,
+        reviewed_output_allowance_bytes,
+        reviewed_disk_gb,
+    ):
+        """Compare the current canvas/profile to the reviewed paid terms."""
+        try:
+            current = self.require_rentable_preflight(preflight_id)
+            reviewed_json = self.job_repository.get_manifest(
+                reviewed_manifest_digest
+            )
+            current_json = self.job_repository.get_manifest(
+                current.manifest_digest
+            )
+            if not isinstance(reviewed_json, str) or not isinstance(
+                current_json,
+                str,
+            ):
+                return False
+            reviewed_manifest = json.loads(reviewed_json)
+            current_manifest = json.loads(current_json)
+            if not isinstance(reviewed_manifest, dict) or not isinstance(
+                current_manifest,
+                dict,
+            ):
+                return False
+            reviewed_manifest = dict(reviewed_manifest)
+            current_manifest = dict(current_manifest)
+            reviewed_manifest.pop("prompt_digest", None)
+            current_manifest.pop("prompt_digest", None)
+            return bool(
+                current.execution_baseline_digest
+                == reviewed_execution_baseline_digest
+                and current.randomized_seed_node_ids
+                == tuple(reviewed_randomized_seed_node_ids)
+                and current.transfer_bytes == reviewed_transfer_bytes
+                and current.cached_bytes == reviewed_cached_bytes
+                and current.output_allowance_bytes
+                == reviewed_output_allowance_bytes
+                and current.disk_gb == reviewed_disk_gb
+                and current_manifest == reviewed_manifest
+            )
+        except (
+            json.JSONDecodeError,
+            PreflightBlocked,
+            PreflightNotFound,
+            TypeError,
+            ValueError,
+        ):
+            return False
 
     def approve_mapping(self, mapping_id, candidate_digest):
         if self.mapping_repository is None:

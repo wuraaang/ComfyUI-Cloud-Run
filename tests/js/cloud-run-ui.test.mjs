@@ -37,6 +37,21 @@ function settingsPayload(overrides = {}) {
 }
 
 
+function readinessPayload(overrides = {}) {
+  return {
+    label: "cold",
+    cached_bytes: 0,
+    remaining_bytes: 12 * 1024,
+    assumed_mbps: 25,
+    estimated_seconds: 235,
+    source_ready: true,
+    ten_minute_eligible: true,
+    digest: "d".repeat(64),
+    ...overrides,
+  };
+}
+
+
 function quoteSession(status = "offer_selected", overrides = {}) {
   const rentalOutcome = status === "offer_selected"
     ? "not_started"
@@ -72,6 +87,8 @@ function quoteSession(status = "offer_selected", overrides = {}) {
       protocol_version: "1",
       manifest_digest: "c".repeat(64),
       max_instance_creates: 1,
+      readiness: readinessPayload(),
+      estimate_digest: "d".repeat(64),
     },
     instance_id: status === "offer_selected" ? null : "77",
     deadline_at: 8_200,
@@ -522,7 +539,7 @@ test("filter validation identifies the invalid field", async () => {
     );
     assert.match(
       document.getElementById("cloud-run-status").textContent,
-      /^VRAM must be blank or a whole number such as 16 or 24\.$/,
+      /^VRAM preference must be blank or a whole number such as 16 or 24\.$/,
     );
   }
 });
@@ -686,6 +703,8 @@ test("paid review defaults to manual destruction with one provider create", asyn
     if (endpoint === "/cloud-run/api/offers") {
       return jsonResponse({
         offers: [{
+          included: true,
+          readiness: readinessPayload(),
           offer_id: "42",
           gpu_name: "<RTX 4090>",
           gpu_ram_gb: 24,
@@ -761,6 +780,7 @@ test("paid review defaults to manual destruction with one provider create", asyn
     idempotency_key: "session-key",
     deadline: { mode: "none", duration_seconds: null },
     max_instance_creates: 1,
+    estimate_digest: "d".repeat(64),
   });
   assert.match(
     document.getElementById("cloud-run-dependency-console").textContent,
@@ -795,6 +815,16 @@ test("paid review defaults to manual destruction with one provider create", asyn
   await document.getElementById("cloud-run-confirm-session").click();
 
   assert.equal(localSubmissions.length, 0);
+  assert.equal(captureCount, 2);
+  const confirmRequest = calls.find(
+    ([endpoint]) => endpoint === "/cloud-run/api/sessions/session-1/confirm",
+  );
+  assert.deepEqual(JSON.parse(confirmRequest[1].body), {
+    idempotency_key: "session-key",
+    estimate_digest: "d".repeat(64),
+    accepted_longer_estimate: false,
+    preflight_id: "preflight-1",
+  });
   assert.ok(
     calls.some(
       ([endpoint]) =>
@@ -823,6 +853,8 @@ test("listed finite session duration remains available", async () => {
     if (endpoint === "/cloud-run/api/offers") {
       return jsonResponse({
         offers: [{
+          included: true,
+          readiness: readinessPayload(),
           offer_id: "42",
           gpu_name: "RTX 4090",
           gpu_ram_gb: 24,
@@ -878,6 +910,8 @@ test("forged session duration is rejected instead of using a fallback", async ()
     if (endpoint === "/cloud-run/api/offers") {
       return jsonResponse({
         offers: [{
+          included: true,
+          readiness: readinessPayload(),
           offer_id: "42",
           gpu_name: "RTX 4090",
           gpu_ram_gb: 24,
@@ -1085,6 +1119,8 @@ test("verified absence requires a fresh manual offer review and idempotency key"
       offerSearches += 1;
       return jsonResponse({
         offers: [{
+          included: true,
+          readiness: readinessPayload(),
           offer_id: String(40 + offerSearches),
           gpu_name: "RTX 4090",
           gpu_ram_gb: 24,
@@ -1410,6 +1446,47 @@ test("offer rendering marks missing connection metrics unavailable", () => {
   assert.match(container.textContent, /download class unavailable/);
   assert.match(container.textContent, /theoretical transfer ≈ unavailable/);
   assert.doesNotMatch(container.textContent, /NaN|Infinity/);
+});
+
+
+test("offer rendering limits the shortlist and explains excluded offers", async () => {
+  const document = new FakeDocument();
+  const container = document.createElement("div");
+  document.body.appendChild(container);
+  const selected = [];
+  const included = Array.from({ length: 7 }, (_, index) => ({
+    included: true,
+    included_reasons: ["workflow_requirements", "price_cap"],
+    excluded_reasons: [],
+    readiness: readinessPayload(),
+    offer_id: String(index + 1),
+    gpu_name: `GPU ${index + 1}`,
+    gpu_ram_gb: 24,
+    dph_total: 0.5,
+    reliability: 0.99,
+    inet_down_mbps: 1000,
+    disk_bw_mbps: 900,
+    dlperf: 80,
+  }));
+  renderOffers(document, container, [
+    ...included,
+    {
+      ...included[0],
+      included: false,
+      included_reasons: [],
+      excluded_reasons: ["vram", "price"],
+      offer_id: "99",
+      gpu_name: "Excluded GPU",
+    },
+  ], (offer) => selected.push(offer.offer_id));
+
+  assert.equal(container.querySelectorAll("input").length, 5);
+  assert.match(container.textContent, /meets workflow VRAM and disk/);
+  assert.match(container.textContent, /1 excluded offer/);
+  assert.match(container.textContent, /VRAM below the workflow minimum/);
+  assert.match(container.textContent, /price above the hard cap/);
+  await document.getElementById("cloud-run-offer-0").click();
+  assert.deepEqual(selected, ["1"]);
 });
 
 
