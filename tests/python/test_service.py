@@ -1,5 +1,6 @@
 import asyncio
 from dataclasses import replace
+import json
 import tempfile
 import types
 import unittest
@@ -1603,6 +1604,204 @@ class CloudRunServiceTests(unittest.TestCase):
                 )
             )
         self.assertEqual(provider.create_calls, [])
+
+
+class DesktopRelayServiceTests(unittest.TestCase):
+    def setUp(self):
+        from cloud_run.job_repository import JobRepository
+
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.database = Path(self.temporary_directory.name) / "attempts.sqlite3"
+        self.attempts = AttemptRepository(self.database)
+        self.sessions = SessionRepository(self.database)
+        self.jobs = JobRepository(self.database)
+
+    def ready_session(self, session_id="session-1"):
+        session = CloudSession.new(
+            "ready-session-key-" + session_id,
+            session_id=session_id,
+            manifest_digest="b" * 64,
+            deadline_at=7_300.0,
+            deadline_mode="finite",
+            now=100.0,
+            state=SessionState.READY,
+        ).transition(
+            SessionState.READY,
+            now=101.0,
+            installed_manifest_digest="b" * 64,
+            instance_id="instance-1",
+            worker_base_url="http://8.8.8.8:30000",
+            provider_token="a" * 64,
+            session_secret_hex="c" * 64,
+        )
+        return self.sessions.create_or_get(session)[0]
+
+    def service(self, relay, worker_factory):
+        from cloud_run.service import CloudRunService
+
+        return CloudRunService(
+            FakeSettings(),
+            self.attempts,
+            job_repository=self.jobs,
+            session_repository=self.sessions,
+            desktop_relay=relay,
+            desktop_worker_factory=worker_factory,
+            clock=lambda: 200.0,
+        )
+
+    def test_activation_requires_ready_and_uses_only_backend_worker(self):
+        class Relay:
+            def __init__(inner_self):
+                inner_self.calls = []
+
+            async def start(inner_self):
+                inner_self.calls.append(("start",))
+
+            async def activate(
+                inner_self,
+                session_id,
+                worker,
+                profile_revision,
+            ):
+                inner_self.calls.append(
+                    ("activate", session_id, worker, profile_revision)
+                )
+                return types.SimpleNamespace(ready=True)
+
+            async def deactivate(inner_self, session_id):
+                inner_self.calls.append(("deactivate", session_id))
+
+            def status(inner_self):
+                return types.SimpleNamespace(ready=False)
+
+        relay = Relay()
+        worker = object()
+        service = self.service(relay, lambda _session: worker)
+        ready = self.ready_session()
+
+        result = asyncio.run(service.activate_desktop_relay(ready.session_id))
+
+        self.assertTrue(result.ready)
+        self.assertEqual(
+            relay.calls,
+            [("start",), ("activate", "session-1", worker, 0)],
+        )
+        failed = CloudSession.new(
+            "failed-session-key",
+            session_id="session-failed",
+            now=100.0,
+            state=SessionState.FAILED,
+        )
+        self.sessions.create_or_get(failed)
+        with self.assertRaisesRegex(Exception, "ready"):
+            asyncio.run(service.activate_desktop_relay("session-failed"))
+
+    def test_native_prompt_intent_is_persisted_before_forwarding(self):
+        service = self.service(types.SimpleNamespace(), lambda _session: object())
+        self.ready_session()
+        body = json.dumps(
+            {
+                "client_id": "desktop-client-1",
+                "prompt": {
+                    "9": {
+                        "class_type": "SaveImage",
+                        "inputs": {"filename_prefix": "ComfyUI"},
+                    }
+                },
+                "extra_data": {
+                    "extra_pnginfo": {
+                        "workflow": {
+                            "version": 0.4,
+                            "nodes": [{"id": 9, "type": "SaveImage"}],
+                            "extra": {"frontendVersion": "1.47.10"},
+                        }
+                    }
+                },
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+        identity = service.prepare_native_prompt("session-1", body)
+        saved = self.jobs.get_job(identity["job_id"])
+
+        self.assertEqual(saved.state.value, "queued")
+        self.assertEqual(saved.execution_state.value, "queued")
+        self.assertEqual(saved.session_id, "session-1")
+        self.assertEqual(saved.manifest_digest, "b" * 64)
+        self.assertEqual(identity["request_id"], saved.idempotency_key)
+        self.assertIsNotNone(
+            self.jobs.get_capture_by_prompt_digest(saved.prompt_digest)
+        )
+
+    def test_native_prompt_rejects_duplicate_json_keys_before_persistence(self):
+        service = self.service(types.SimpleNamespace(), lambda _session: object())
+        self.ready_session()
+        body = (
+            b'{"client_id":"desktop-client-1",'
+            b'"client_id":"desktop-client-2",'
+            b'"prompt":{"9":{"class_type":"SaveImage",'
+            b'"inputs":{"filename_prefix":"ComfyUI"}}},'
+            b'"extra_data":{"extra_pnginfo":{"workflow":'
+            b'{"version":0.4,"nodes":[{"id":9,'
+            b'"type":"SaveImage"}],"extra":'
+            b'{"frontendVersion":"1.47.10"}}}}}'
+        )
+
+        with self.assertRaisesRegex(Exception, "Invalid native prompt"):
+            service.prepare_native_prompt("session-1", body)
+
+        self.assertEqual(self.jobs.list_jobs("session-1"), [])
+
+    def test_recover_reactivates_persisted_ready_session_and_closes(self):
+        from cloud_run.desktop_relay import DesktopRelayConfig
+
+        ready = self.ready_session()
+        self.jobs.save_desktop_relay(
+            DesktopRelayConfig(
+                bind_host="127.0.0.1",
+                port=32145,
+                active_session_id=ready.session_id,
+                profile_revision=4,
+                updated_at=150.0,
+            )
+        )
+
+        class Relay:
+            def __init__(inner_self):
+                inner_self.calls = []
+
+            async def start(inner_self):
+                inner_self.calls.append(("start",))
+
+            async def activate(
+                inner_self,
+                session_id,
+                worker,
+                profile_revision,
+            ):
+                inner_self.calls.append(
+                    ("activate", session_id, worker, profile_revision)
+                )
+
+            async def close(inner_self):
+                inner_self.calls.append(("close",))
+
+        relay = Relay()
+        worker = object()
+        service = self.service(relay, lambda _session: worker)
+
+        asyncio.run(service.recover())
+        asyncio.run(service.close())
+
+        self.assertEqual(
+            relay.calls,
+            [
+                ("start",),
+                ("activate", "session-1", worker, 4),
+                ("close",),
+            ],
+        )
 
 
 if __name__ == "__main__":

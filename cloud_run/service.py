@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 import secrets
 import time
+import uuid
 
 from .capture import CompiledCapture
 from .constants import (
@@ -16,7 +18,11 @@ from .constants import (
 from .models import (
     AttemptState,
     CloudAttempt,
+    CloudJob,
     CloudSession,
+    ExecutionState,
+    HarvestState,
+    JobState,
     OfferQuote,
     SessionState,
 )
@@ -34,6 +40,27 @@ from . import vast
 
 
 DEFAULT_QUOTE_TTL_SECONDS = 120
+
+
+def _strict_json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if not isinstance(key, str) or key in result:
+            raise ValueError("Invalid JSON object.")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(_value):
+    raise ValueError("Invalid JSON constant.")
+
+
+def _native_prompt_intent_class():
+    if "." in (__package__ or ""):
+        from ..remote_worker.native_jobs import NativePromptIntent
+    else:
+        from remote_worker.native_jobs import NativePromptIntent
+    return NativePromptIntent
 
 
 class CloudRunError(RuntimeError):
@@ -165,6 +192,8 @@ class CloudRunService:
         session_service=None,
         session_repository=None,
         release=None,
+        desktop_relay=None,
+        desktop_worker_factory=None,
     ):
         self.settings_store = settings_store
         self.repository = repository
@@ -179,6 +208,150 @@ class CloudRunService:
         self.session_service = session_service
         self.session_repository = session_repository
         self.release = release if isinstance(release, WorkerRelease) else None
+        self.desktop_relay = desktop_relay
+        self.desktop_worker_factory = desktop_worker_factory
+
+    def _desktop_components(self):
+        relay = self.desktop_relay
+        if relay is None or not all(
+            callable(getattr(relay, method, None))
+            for method in ("start", "activate", "deactivate", "status")
+        ):
+            raise CloudRunValidationError(
+                "ComfyUI Vast Desktop relay is unavailable."
+            )
+        if not callable(self.desktop_worker_factory):
+            raise CloudRunValidationError(
+                "ComfyUI Vast Desktop worker is unavailable."
+            )
+        return relay
+
+    def desktop_setup(self):
+        relay = self._desktop_components()
+        status = relay.status().public_payload()
+        return {
+            **status,
+            "manual_setup_required": True,
+            "instructions": [
+                "Open Remote Connections in ComfyUI Desktop.",
+                "Add the loopback URL with the name ComfyUI Vast.",
+                "Open ComfyUI Vast only after this status is ready.",
+            ],
+        }
+
+    async def activate_desktop_relay(self, session_id):
+        relay = self._desktop_components()
+        session = self.get_session(session_id)
+        if session.state != SessionState.READY:
+            raise CloudRunValidationError(
+                "The ComfyUI Vast session is not ready."
+            )
+        await relay.start()
+        try:
+            worker = self.desktop_worker_factory(session)
+        except Exception:
+            raise CloudRunValidationError(
+                "ComfyUI Vast Desktop worker is unavailable."
+            ) from None
+        profile_revision = 0
+        if self.job_repository is not None and callable(
+            getattr(self.job_repository, "get_desktop_relay", None)
+        ):
+            config = self.job_repository.get_desktop_relay()
+            if (
+                config is not None
+                and config.active_session_id == session.session_id
+                and config.profile_revision is not None
+            ):
+                profile_revision = config.profile_revision
+        return await relay.activate(
+            session.session_id,
+            worker,
+            profile_revision,
+        )
+
+    async def deactivate_desktop_relay(self, session_id):
+        relay = self._desktop_components()
+        self.get_session(session_id)
+        return await relay.deactivate(str(session_id))
+
+    def prepare_native_prompt(self, session_id, body):
+        if self.job_repository is None:
+            raise CloudRunValidationError(
+                "Native prompt storage is unavailable."
+            )
+        session = self.get_session(session_id)
+        if session.state not in {
+            SessionState.READY,
+            SessionState.RUNNING,
+            SessionState.HARVESTING,
+        }:
+            raise CloudRunValidationError(
+                "The ComfyUI Vast session is not ready."
+            )
+        manifest_digest = session.installed_manifest_digest
+        if manifest_digest != session.manifest_digest:
+            raise CloudRunValidationError(
+                "The ComfyUI Vast environment is not validated."
+            )
+        if not isinstance(body, bytes):
+            raise CloudRunValidationError("Invalid native prompt.")
+        try:
+            NativePromptIntent = _native_prompt_intent_class()
+
+            parsed = json.loads(
+                body.decode("utf-8"),
+                object_pairs_hook=_strict_json_object,
+                parse_constant=_reject_json_constant,
+            )
+            job_id = uuid.uuid4().hex
+            request_id = uuid.uuid4().hex
+            intent = NativePromptIntent.from_http(
+                job_id=job_id,
+                request_id=request_id,
+                manifest_digest=manifest_digest,
+                body=parsed,
+            )
+        except Exception:
+            raise CloudRunValidationError("Invalid native prompt.") from None
+        now = self.clock()
+        if (
+            isinstance(now, bool)
+            or not isinstance(now, (int, float))
+            or not math.isfinite(now)
+            or now < 0
+        ):
+            raise CloudRunValidationError(
+                "Native prompt storage clock is unavailable."
+            )
+        now = float(now)
+        self.job_repository.save_capture(intent.capture, created_at=now)
+        job = CloudJob(
+            job_id=job_id,
+            session_id=session.session_id,
+            idempotency_key=request_id,
+            state=JobState.QUEUED,
+            prompt_digest=intent.capture.prompt_digest,
+            capture_json=intent.capture.canonical_payload(),
+            manifest_digest=manifest_digest,
+            remote_prompt_id=None,
+            sanitized_error=None,
+            created_at=now,
+            updated_at=now,
+            version=1,
+            execution_state=ExecutionState.QUEUED,
+            harvest_state=HarvestState.PENDING,
+        )
+        saved, created = self.job_repository.create_job(job)
+        if not created or saved != job:
+            raise CloudRunValidationError(
+                "Native prompt identity could not be persisted."
+            )
+        return {
+            "job_id": job_id,
+            "request_id": request_id,
+            "manifest_digest": manifest_digest,
+        }
 
     async def capture(self, payload):
         if self.job_repository is None:
@@ -1139,6 +1312,43 @@ class CloudRunService:
         recover_jobs = getattr(reconciler, "recover", None)
         if callable(recover_jobs):
             await recover_jobs()
+        relay = self.desktop_relay
+        start = getattr(relay, "start", None)
+        if callable(start):
+            await start()
+            config = (
+                self.job_repository.get_desktop_relay()
+                if self.job_repository is not None
+                and callable(
+                    getattr(
+                        self.job_repository,
+                        "get_desktop_relay",
+                        None,
+                    )
+                )
+                else None
+            )
+            if config is not None and config.active_session_id is not None:
+                session = (
+                    self.session_repository.get(config.active_session_id)
+                    if self.session_repository is not None
+                    else None
+                )
+                if (
+                    session is not None
+                    and session.state == SessionState.READY
+                    and callable(self.desktop_worker_factory)
+                    and callable(getattr(relay, "activate", None))
+                ):
+                    try:
+                        worker = self.desktop_worker_factory(session)
+                        await relay.activate(
+                            session.session_id,
+                            worker,
+                            config.profile_revision,
+                        )
+                    except Exception:
+                        pass
         return recovered
 
     async def close(self):
@@ -1150,3 +1360,6 @@ class CloudRunService:
         close = getattr(reconciler, "close", None)
         if callable(close):
             await close()
+        relay_close = getattr(self.desktop_relay, "close", None)
+        if callable(relay_close):
+            await relay_close()

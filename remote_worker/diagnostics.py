@@ -7,11 +7,18 @@ from dataclasses import dataclass
 import re
 from typing import Optional, Tuple
 
-from cloud_run.run_errors import (
-    MAX_SAFE_LOG_LINES,
-    MAX_SAFE_TEXT_BYTES,
-    sanitize_text,
-)
+if "." in (__package__ or ""):
+    from ..cloud_run.run_errors import (
+        MAX_SAFE_LOG_LINES,
+        MAX_SAFE_TEXT_BYTES,
+        sanitize_text,
+    )
+else:
+    from cloud_run.run_errors import (
+        MAX_SAFE_LOG_LINES,
+        MAX_SAFE_TEXT_BYTES,
+        sanitize_text,
+    )
 
 
 _STREAMS = frozenset({"stdout", "stderr"})

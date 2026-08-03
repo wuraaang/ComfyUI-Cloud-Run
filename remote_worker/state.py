@@ -11,7 +11,10 @@ import stat
 import tempfile
 import uuid
 
-from cloud_run.worker_protocol import PROTOCOL_VERSION
+if "." in (__package__ or ""):
+    from ..cloud_run.worker_protocol import PROTOCOL_VERSION
+else:
+    from cloud_run.worker_protocol import PROTOCOL_VERSION
 
 STATE_SCHEMA_VERSION = 3
 MAX_STATE_BYTES = 16 * 1024 * 1024

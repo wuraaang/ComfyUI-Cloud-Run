@@ -19,7 +19,13 @@ from .models import (
     JobState,
     TransferState,
 )
-from .repository import _canonical_json, _initialize_database, _private_connection
+from .repository import (
+    _canonical_json,
+    _get_desktop_relay,
+    _initialize_database,
+    _private_connection,
+    _save_desktop_relay,
+)
 from .run_errors import RunErrorCode, RunJournalEntry, RunPhase
 
 
@@ -218,6 +224,16 @@ class JobRepository:
 
     def _connect(self):
         return _private_connection(self.path)
+
+    def get_desktop_relay(self):
+        return _get_desktop_relay(self.path)
+
+    def save_desktop_relay(self, config, *, expected_updated_at=None):
+        return _save_desktop_relay(
+            self.path,
+            config,
+            expected_updated_at=expected_updated_at,
+        )
 
     @staticmethod
     def _row_to_job(row):

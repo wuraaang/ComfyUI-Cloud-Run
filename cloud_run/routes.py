@@ -14,6 +14,7 @@ from .dependency_repository import (
     DependencyRepository,
     MappingValidationError,
 )
+from .desktop_relay import DesktopRelay, DesktopRelayError
 from .job_repository import JobRepository
 from .huggingface import HuggingFaceClient
 from .lifecycle import CloudRunLifecycle
@@ -310,6 +311,12 @@ def build_service():
         repository=job_repository,
         private_root=data_directory / "relay",
         output_root=output_root,
+    )
+    service.desktop_worker_factory = worker_factory
+    service.desktop_relay = DesktopRelay(
+        repository=job_repository,
+        worker_factory=worker_factory,
+        native_prompt=service.prepare_native_prompt,
     )
     return service
 
@@ -781,6 +788,11 @@ def register_routes(service_factory=None):
                 {"error": "R2 cache transfer is unavailable."},
                 status=502,
             )
+        if isinstance(error, DesktopRelayError):
+            return web.json_response(
+                {"error": "ComfyUI Vast Desktop relay is unavailable."},
+                status=503,
+            )
         if isinstance(error, AttemptNotFound):
             return web.json_response({"error": str(error)}, status=404)
         if isinstance(error, SessionNotFound):
@@ -867,6 +879,18 @@ def register_routes(service_factory=None):
         return web.json_response(
             browser_settings(SettingsStore().load())
         )
+
+    @routes.get("/cloud-run/api/desktop-context")
+    async def get_local_desktop_context(_request):
+        return web.json_response({"role": "local"})
+
+    @routes.get("/cloud-run/api/desktop-setup")
+    async def get_desktop_setup(_request):
+        try:
+            payload = make_service().desktop_setup()
+        except Exception as error:
+            return service_error(error)
+        return web.json_response(payload)
 
     @routes.put("/cloud-run/api/settings")
     async def put_settings(request):
@@ -1054,6 +1078,37 @@ def register_routes(service_factory=None):
         except Exception as error:
             return service_error(error)
         return web.json_response(_session_payload(session, service))
+
+    @routes.post(
+        "/cloud-run/api/sessions/{session_id}/desktop-relay"
+    )
+    async def post_session_desktop_relay(request):
+        service = make_service()
+        try:
+            await _request_payload(
+                request,
+                allowed=set(),
+                required=set(),
+            )
+            status = await service.activate_desktop_relay(
+                request.match_info.get("session_id", "")
+            )
+        except Exception as error:
+            return service_error(error)
+        return web.json_response(status.public_payload())
+
+    @routes.delete(
+        "/cloud-run/api/sessions/{session_id}/desktop-relay"
+    )
+    async def delete_session_desktop_relay(request):
+        service = make_service()
+        try:
+            status = await service.deactivate_desktop_relay(
+                request.match_info.get("session_id", "")
+            )
+        except Exception as error:
+            return service_error(error)
+        return web.json_response(status.public_payload())
 
     @routes.post("/cloud-run/api/sessions/{session_id}/jobs")
     async def post_session_job(request):

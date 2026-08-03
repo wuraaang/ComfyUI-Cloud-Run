@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import importlib.util
 import json
 from pathlib import Path
 import tempfile
@@ -39,7 +40,143 @@ class RecordingTransport:
         )
 
 
+@unittest.skipUnless(importlib.util.find_spec("aiohttp"), "aiohttp unavailable")
+class AiohttpWorkerTransportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_websocket_opens_with_the_comfyui_aiohttp_api(self):
+        from aiohttp import web
+
+        from cloud_run.worker_client import (
+            AiohttpWorkerTransport,
+            WorkerRequest,
+        )
+
+        async def websocket_handler(request):
+            socket = web.WebSocketResponse()
+            await socket.prepare(request)
+            await socket.send_bytes(b"native-preview")
+            await socket.close()
+            return socket
+
+        application = web.Application()
+        application.router.add_get("/ws", websocket_handler)
+        runner = web.AppRunner(application, access_log=None)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        self.addAsyncCleanup(runner.cleanup)
+        port = runner.addresses[0][1]
+        request = WorkerRequest(
+            method="GET",
+            url="http://127.0.0.1:" + str(port) + "/ws?clientId=test",
+            headers={"Authorization": "private"},
+            body=b"",
+        )
+
+        socket = await AiohttpWorkerTransport().websocket(
+            request,
+            max_bytes=1024,
+        )
+        self.addAsyncCleanup(socket.close)
+        message = await socket.__aiter__().__anext__()
+
+        self.assertEqual(bytes(message.data), b"native-preview")
+
+    async def test_websocket_redirect_is_rejected_before_credentials_move(self):
+        from aiohttp import web
+
+        from cloud_run.worker_client import (
+            AiohttpWorkerTransport,
+            WorkerClientError,
+            WorkerRequest,
+        )
+
+        target_hits = []
+
+        async def target_handler(request):
+            target_hits.append(dict(request.headers))
+            socket = web.WebSocketResponse()
+            await socket.prepare(request)
+            return socket
+
+        target_application = web.Application()
+        target_application.router.add_get("/target", target_handler)
+        target_runner = web.AppRunner(target_application, access_log=None)
+        await target_runner.setup()
+        target_site = web.TCPSite(target_runner, "127.0.0.1", 0)
+        await target_site.start()
+        self.addAsyncCleanup(target_runner.cleanup)
+        target_port = target_runner.addresses[0][1]
+
+        async def redirect_handler(_request):
+            raise web.HTTPFound(
+                "http://127.0.0.1:"
+                + str(target_port)
+                + "/target"
+            )
+
+        redirect_application = web.Application()
+        redirect_application.router.add_get("/ws", redirect_handler)
+        redirect_runner = web.AppRunner(redirect_application, access_log=None)
+        await redirect_runner.setup()
+        redirect_site = web.TCPSite(redirect_runner, "127.0.0.1", 0)
+        await redirect_site.start()
+        self.addAsyncCleanup(redirect_runner.cleanup)
+        redirect_port = redirect_runner.addresses[0][1]
+        request = WorkerRequest(
+            method="GET",
+            url="http://127.0.0.1:" + str(redirect_port) + "/ws",
+            headers={"Authorization": "private"},
+            body=b"",
+        )
+
+        with self.assertRaises(WorkerClientError):
+            await AiohttpWorkerTransport().websocket(
+                request,
+                max_bytes=1024,
+            )
+
+        self.assertEqual(target_hits, [])
+
+
 class WorkerClientTests(unittest.TestCase):
+    def test_native_websocket_uses_only_the_private_signed_request(self):
+        from cloud_run.worker_client import WorkerClient
+
+        sentinel = object()
+
+        class Transport:
+            def __init__(self):
+                self.calls = []
+
+            async def request(self, request, *, max_bytes):
+                raise AssertionError("HTTP transport was not expected")
+
+            async def websocket(self, request, *, max_bytes):
+                self.calls.append((request, max_bytes))
+                return sentinel
+
+        transport = Transport()
+        client = WorkerClient(
+            base_url="http://8.8.8.8:30000",
+            provider_token="a" * 64,
+            session_id="session-1",
+            session_secret=b"s" * 32,
+            transport=transport,
+            clock=lambda: 1000,
+            nonce=lambda: "native-ws-1",
+        )
+        request = client.native_envelope(
+            "GET",
+            "/ws?clientId=desktop-client-1",
+            b"",
+        )
+
+        result = asyncio.run(client.native_websocket(request))
+
+        self.assertIs(result, sentinel)
+        self.assertEqual(transport.calls[0][0], request)
+        self.assertGreater(transport.calls[0][1], 0)
+
     def test_snapshot_accepts_migrated_schema_one_job_timestamps(self):
         from cloud_run.worker_client import (
             WorkerClient,

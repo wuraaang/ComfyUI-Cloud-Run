@@ -17,10 +17,16 @@ import struct
 import time
 import uuid
 
-from cloud_run.manifest import (
-    PINNED_COMFYUI_CORE_VERSION,
-    PINNED_COMFYUI_FRONTEND_VERSION,
-)
+if "." in (__package__ or ""):
+    from ..cloud_run.manifest import (
+        PINNED_COMFYUI_CORE_VERSION,
+        PINNED_COMFYUI_FRONTEND_VERSION,
+    )
+else:
+    from cloud_run.manifest import (
+        PINNED_COMFYUI_CORE_VERSION,
+        PINNED_COMFYUI_FRONTEND_VERSION,
+    )
 from .diagnostics import BoundedDiagnostics, ProcessDiagnostic
 
 PINNED_PYTHON_VERSION = "3.12"

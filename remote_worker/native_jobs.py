@@ -17,14 +17,24 @@ import tempfile
 import time
 import uuid
 
-from cloud_run.run_errors import RunErrorCode, RunPhase, SafeRunError
-from cloud_run.worker_protocol import (
-    CaptureValidationError,
-    CompiledCapture,
-    FORBIDDEN_KEYS,
-    MAX_CAPTURE_BYTES,
-    canonical_json,
-)
+if "." in (__package__ or ""):
+    from ..cloud_run.run_errors import RunErrorCode, RunPhase, SafeRunError
+    from ..cloud_run.worker_protocol import (
+        CaptureValidationError,
+        CompiledCapture,
+        FORBIDDEN_KEYS,
+        MAX_CAPTURE_BYTES,
+        canonical_json,
+    )
+else:
+    from cloud_run.run_errors import RunErrorCode, RunPhase, SafeRunError
+    from cloud_run.worker_protocol import (
+        CaptureValidationError,
+        CompiledCapture,
+        FORBIDDEN_KEYS,
+        MAX_CAPTURE_BYTES,
+        canonical_json,
+    )
 from .comfy import (
     AiohttpComfyHttp,
     ComfyProcessError,

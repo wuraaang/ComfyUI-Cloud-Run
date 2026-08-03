@@ -752,7 +752,7 @@ class SessionRepositoryTests(unittest.TestCase):
                 ).fetchall()
             }
 
-        self.assertEqual(version, "8")
+        self.assertEqual(version, "9")
         self.assertEqual(migrated.failure_code, None)
         self.assertEqual(migrated.create_empty_observations, 0)
         self.assertIsNone(migrated.create_first_empty_at)

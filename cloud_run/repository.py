@@ -30,6 +30,10 @@ class ConcurrentSessionUpdate(RuntimeError):
     pass
 
 
+class ConcurrentDesktopRelayUpdate(RuntimeError):
+    pass
+
+
 class PaidRentalConflict(RuntimeError):
     """A static refusal while another paid rental may still exist."""
 
@@ -69,6 +73,49 @@ class DestroyReviewRecord:
     unverified_artifact_ids: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class DesktopRelayConfig:
+    bind_host: str
+    port: int
+    active_session_id: str | None
+    profile_revision: int | None
+    updated_at: float
+
+    def __post_init__(self):
+        active = self.active_session_id
+        revision = self.profile_revision
+        if (
+            self.bind_host != "127.0.0.1"
+            or isinstance(self.port, bool)
+            or not isinstance(self.port, int)
+            or not 1 <= self.port <= 65535
+            or (
+                active is not None
+                and (
+                    not isinstance(active, str)
+                    or re.fullmatch(
+                        r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}", active
+                    )
+                    is None
+                )
+            )
+            or (
+                revision is not None
+                and (
+                    isinstance(revision, bool)
+                    or not isinstance(revision, int)
+                    or revision < 0
+                )
+            )
+            or (active is None) != (revision is None)
+            or isinstance(self.updated_at, bool)
+            or not isinstance(self.updated_at, (int, float))
+            or not math.isfinite(self.updated_at)
+            or self.updated_at < 0
+        ):
+            raise ValueError("Invalid Desktop relay configuration.")
+
+
 def _canonical_json(value):
     return json.dumps(
         value,
@@ -94,6 +141,103 @@ def _private_connection(path):
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA busy_timeout = 5000")
     return connection
+
+
+def _desktop_relay_from_row(row):
+    if row is None:
+        return None
+    return DesktopRelayConfig(
+        bind_host=row["bind_host"],
+        port=int(row["port"]),
+        active_session_id=row["active_session_id"],
+        profile_revision=(
+            int(row["profile_revision"])
+            if row["profile_revision"] is not None
+            else None
+        ),
+        updated_at=float(row["updated_at"]),
+    )
+
+
+def _get_desktop_relay(path):
+    with closing(_private_connection(path)) as connection:
+        row = connection.execute(
+            """
+            SELECT bind_host, port, active_session_id, profile_revision,
+                   updated_at
+            FROM desktop_relay
+            WHERE singleton = 1
+            """
+        ).fetchone()
+    return _desktop_relay_from_row(row)
+
+
+def _save_desktop_relay(path, config, *, expected_updated_at=None):
+    if not isinstance(config, DesktopRelayConfig):
+        raise ValueError("Invalid Desktop relay configuration.")
+    if expected_updated_at is not None and (
+        isinstance(expected_updated_at, bool)
+        or not isinstance(expected_updated_at, (int, float))
+        or not math.isfinite(expected_updated_at)
+        or expected_updated_at < 0
+    ):
+        raise ValueError("Invalid Desktop relay update precondition.")
+    with closing(_private_connection(path)) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        current = connection.execute(
+            """
+            SELECT bind_host, port, active_session_id, profile_revision,
+                   updated_at
+            FROM desktop_relay
+            WHERE singleton = 1
+            """
+        ).fetchone()
+        if expected_updated_at is not None and (
+            current is None
+            or float(current["updated_at"]) != float(expected_updated_at)
+        ):
+            connection.rollback()
+            raise ConcurrentDesktopRelayUpdate(
+                "Desktop relay configuration changed concurrently."
+            )
+        if current is not None and config.updated_at <= float(
+            current["updated_at"]
+        ):
+            connection.rollback()
+            raise ConcurrentDesktopRelayUpdate(
+                "Desktop relay configuration revision must advance."
+            )
+        connection.execute(
+            """
+            INSERT INTO desktop_relay(
+                singleton, bind_host, port, active_session_id,
+                profile_revision, updated_at
+            ) VALUES(1, ?, ?, ?, ?, ?)
+            ON CONFLICT(singleton) DO UPDATE SET
+                bind_host = excluded.bind_host,
+                port = excluded.port,
+                active_session_id = excluded.active_session_id,
+                profile_revision = excluded.profile_revision,
+                updated_at = excluded.updated_at
+            """,
+            (
+                config.bind_host,
+                config.port,
+                config.active_session_id,
+                config.profile_revision,
+                float(config.updated_at),
+            ),
+        )
+        row = connection.execute(
+            """
+            SELECT bind_host, port, active_session_id, profile_revision,
+                   updated_at
+            FROM desktop_relay
+            WHERE singleton = 1
+            """
+        ).fetchone()
+        connection.commit()
+    return _desktop_relay_from_row(row)
 
 
 def _initialize_database(path):
@@ -449,10 +593,22 @@ def _initialize_database(path):
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS desktop_relay (
+                    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                    bind_host TEXT NOT NULL,
+                    port INTEGER NOT NULL,
+                    active_session_id TEXT,
+                    profile_revision INTEGER,
+                    updated_at REAL NOT NULL
+                )
+                """
+            )
             _migrate_legacy_attempts(connection)
             connection.execute(
                 """
-                INSERT INTO schema_meta(key, value) VALUES('schema_version', '8')
+                INSERT INTO schema_meta(key, value) VALUES('schema_version', '9')
                 ON CONFLICT(key) DO UPDATE SET value = excluded.value
                 """
             )
@@ -819,6 +975,16 @@ class SessionRepository:
 
     def _connect(self):
         return _private_connection(self.path)
+
+    def get_desktop_relay(self):
+        return _get_desktop_relay(self.path)
+
+    def save_desktop_relay(self, config, *, expected_updated_at=None):
+        return _save_desktop_relay(
+            self.path,
+            config,
+            expected_updated_at=expected_updated_at,
+        )
 
     @staticmethod
     def _quote_json(quote):

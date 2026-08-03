@@ -72,6 +72,31 @@ class LoaderContractTests(unittest.TestCase):
             package = importlib.util.module_from_spec(spec)
             sys.modules[package_name] = package
             spec.loader.exec_module(package)
+            native_jobs = importlib.import_module(
+                package_name + ".remote_worker.native_jobs"
+            )
+            self.assertEqual(
+                native_jobs.RunErrorCode.__module__,
+                package_name + ".cloud_run.run_errors",
+            )
+            self.assertEqual(
+                native_jobs.CompiledCapture.__module__,
+                package_name + ".cloud_run.worker_protocol",
+            )
+            desktop_relay = importlib.import_module(
+                package_name + ".cloud_run.desktop_relay"
+            )
+            service_module = importlib.import_module(
+                package_name + ".cloud_run.service"
+            )
+            self.assertEqual(
+                desktop_relay._native_route_policy().__module__,
+                package_name + ".remote_worker.native_proxy",
+            )
+            self.assertEqual(
+                service_module._native_prompt_intent_class().__module__,
+                package_name + ".remote_worker.native_jobs",
+            )
         finally:
             sys.modules.pop(package_name, None)
             for name in list(sys.modules):
@@ -96,6 +121,8 @@ class LoaderContractTests(unittest.TestCase):
             ],
             [
                 ("GET", "/cloud-run/api/settings"),
+                ("GET", "/cloud-run/api/desktop-context"),
+                ("GET", "/cloud-run/api/desktop-setup"),
                 ("PUT", "/cloud-run/api/settings"),
                 ("POST", "/cloud-run/api/captures"),
                 ("POST", "/cloud-run/api/preflights"),
@@ -117,6 +144,14 @@ class LoaderContractTests(unittest.TestCase):
                 (
                     "GET",
                     "/cloud-run/api/sessions/{session_id}",
+                ),
+                (
+                    "POST",
+                    "/cloud-run/api/sessions/{session_id}/desktop-relay",
+                ),
+                (
+                    "DELETE",
+                    "/cloud-run/api/sessions/{session_id}/desktop-relay",
                 ),
                 (
                     "POST",

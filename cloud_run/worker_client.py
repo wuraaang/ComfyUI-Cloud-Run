@@ -23,11 +23,13 @@ from .vast import derive_base_url
 from .worker_protocol import (
     is_boundary_token,
     is_worker_session_id,
+    native_request_material,
     sign_request,
 )
 
 
 MAX_WORKER_JSON_BYTES = 16 * 1024 * 1024
+MAX_WORKER_NATIVE_RESPONSE_BYTES = 64 * 1024 * 1024
 MAX_WORKER_PREVIEW_BYTES = 16 * 1024 * 1024
 MAX_WORKER_ERROR_BYTES = 64 * 1024
 MAX_WORKER_UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024
@@ -151,6 +153,14 @@ def _strict_object(pairs):
 
 def _reject_constant(_value):
     raise ValueError("Invalid JSON constant.")
+
+
+def _native_route_policy():
+    if "." in (__package__ or ""):
+        from ..remote_worker.native_proxy import NativeRoutePolicy
+    else:
+        from remote_worker.native_proxy import NativeRoutePolicy
+    return NativeRoutePolicy
 
 
 def _json_bytes(payload):
@@ -421,7 +431,7 @@ class AiohttpWorkerTransport:
             not isinstance(request, WorkerRequest)
             or isinstance(max_bytes, bool)
             or not isinstance(max_bytes, int)
-            or not 0 < max_bytes <= MAX_WORKER_JSON_BYTES
+            or not 0 < max_bytes <= MAX_WORKER_NATIVE_RESPONSE_BYTES
         ):
             raise _client_error()
         try:
@@ -432,6 +442,7 @@ class AiohttpWorkerTransport:
             async with ClientSession(
                 timeout=ClientTimeout(total=30),
                 auto_decompress=False,
+                trust_env=False,
             ) as session:
                 async with session.request(
                     request.method,
@@ -492,6 +503,7 @@ class AiohttpWorkerTransport:
                     sock_read=60,
                 ),
                 auto_decompress=False,
+                trust_env=False,
             ) as session:
                 async with session.request(
                     request.method,
@@ -523,6 +535,72 @@ class AiohttpWorkerTransport:
             raise
         except Exception:
             raise _client_error() from None
+
+    async def websocket(self, request, *, max_bytes):
+        if (
+            not isinstance(request, WorkerRequest)
+            or request.method != "GET"
+            or request.body
+            or isinstance(max_bytes, bool)
+            or not isinstance(max_bytes, int)
+            or not 0 < max_bytes <= MAX_WORKER_JSON_BYTES
+        ):
+            raise _client_error()
+        try:
+            from aiohttp import ClientSession, ClientTimeout
+        except ImportError:
+            raise _client_error() from None
+        session = ClientSession(
+            timeout=ClientTimeout(total=None, sock_connect=30, sock_read=60),
+            auto_decompress=False,
+            trust_env=False,
+        )
+        try:
+            original_request = session.request
+
+            def request_without_redirects(method, url, **kwargs):
+                kwargs["allow_redirects"] = False
+                return original_request(method, url, **kwargs)
+
+            # aiohttp's public ws_connect API does not expose redirect
+            # controls.  It delegates the handshake to session.request, so
+            # pin that one request path to the authenticated worker origin.
+            session.request = request_without_redirects
+            socket = await session.ws_connect(
+                request.url,
+                headers=request.headers,
+                heartbeat=30,
+                autoclose=False,
+                max_msg_size=max_bytes,
+            )
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            await session.close()
+            raise
+        except Exception:
+            await session.close()
+            raise _client_error() from None
+        return _OwnedWorkerWebSocket(session, socket)
+
+
+class _OwnedWorkerWebSocket:
+    def __init__(self, session, socket):
+        self._session = session
+        self._socket = socket
+
+    def __aiter__(self):
+        return self._socket.__aiter__()
+
+    async def send_str(self, value):
+        return await self._socket.send_str(value)
+
+    async def send_bytes(self, value):
+        return await self._socket.send_bytes(value)
+
+    async def close(self, *, code=1000):
+        try:
+            return await self._socket.close(code=code)
+        finally:
+            await self._session.close()
 
 
 class WorkerClient:
@@ -638,6 +716,131 @@ class WorkerClient:
             headers=headers,
             body=body,
         )
+
+    def native_envelope(
+        self,
+        method,
+        path_qs,
+        body,
+        *,
+        identity=None,
+        headers=None,
+    ):
+        try:
+            NativeRoutePolicy = _native_route_policy()
+        except ImportError:
+            raise _client_error() from None
+        if (
+            not isinstance(method, str)
+            or not isinstance(path_qs, str)
+            or not isinstance(body, bytes)
+            or len(body) > MAX_WORKER_JSON_BYTES
+        ):
+            raise _client_error()
+        route = NativeRoutePolicy().classify(method, path_qs)
+        if route is None or (method.upper() == "GET" and body):
+            raise _client_error()
+        semantic_identity = {} if identity is None else identity
+        if not isinstance(semantic_identity, dict):
+            raise _client_error()
+        if route.kind == "prompt":
+            if set(semantic_identity) != {
+                "job_id",
+                "request_id",
+                "manifest_digest",
+            }:
+                raise _client_error()
+        elif semantic_identity:
+            raise _client_error()
+        forwarded = {} if headers is None else headers
+        if not isinstance(forwarded, dict) or any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in forwarded.items()
+        ):
+            raise _client_error()
+        allowed = {
+            "accept": "Accept",
+            "content-type": "Content-Type",
+            "if-modified-since": "If-Modified-Since",
+            "if-none-match": "If-None-Match",
+            "range": "Range",
+        }
+        if any(key.casefold() not in allowed for key in forwarded):
+            raise _client_error()
+        request_headers = {
+            "Authorization": "Bearer " + self._provider_token,
+            "Accept": "*/*",
+        }
+        for key, value in forwarded.items():
+            if (
+                not value
+                or len(value) > 8192
+                or any(character in value for character in "\r\n")
+            ):
+                raise _client_error()
+            request_headers[allowed[key.casefold()]] = value
+        if body and "Content-Type" not in request_headers:
+            request_headers["Content-Type"] = "application/json"
+        try:
+            material = native_request_material(body, semantic_identity)
+            envelope = sign_request(
+                self._session_secret,
+                method,
+                path_qs,
+                material,
+                timestamp=self._timestamp(),
+                nonce=self.nonce(),
+            )
+        except Exception:
+            raise _client_error() from None
+        request_headers.update(
+            {
+                "X-Cloud-Run-Protocol-Version": envelope[
+                    "protocol_version"
+                ],
+                "X-Cloud-Run-Timestamp": str(envelope["timestamp"]),
+                "X-Cloud-Run-Nonce": envelope["nonce"],
+                "X-Cloud-Run-Signature": envelope["signature"],
+            }
+        )
+        if semantic_identity:
+            request_headers.update(
+                {
+                    "X-Cloud-Vast-Job-Id": semantic_identity["job_id"],
+                    "X-Cloud-Vast-Request-Id": semantic_identity[
+                        "request_id"
+                    ],
+                    "X-Cloud-Vast-Manifest": semantic_identity[
+                        "manifest_digest"
+                    ],
+                }
+            )
+        return WorkerRequest(
+            method=method.upper(),
+            url=self._base_url + path_qs,
+            headers=request_headers,
+            body=body,
+        )
+
+    async def native_websocket(self, request):
+        websocket = getattr(self.transport, "websocket", None)
+        if (
+            not isinstance(request, WorkerRequest)
+            or request.method != "GET"
+            or request.body
+            or not callable(websocket)
+            or not request.url.startswith(self._base_url + "/ws?")
+        ):
+            raise _client_error()
+        try:
+            return await websocket(
+                request,
+                max_bytes=MAX_WORKER_JSON_BYTES,
+            )
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            raise
+        except Exception:
+            raise _client_error() from None
 
     async def _json(
         self,

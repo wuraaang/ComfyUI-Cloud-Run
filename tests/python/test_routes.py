@@ -1710,5 +1710,100 @@ class RelayMediaRouteTests(unittest.TestCase):
         self.assertNotIn("job-1", repr(response.payload))
 
 
+class DesktopRelayRouteTests(unittest.TestCase):
+    def setUp(self):
+        self.calls = []
+
+        class Status:
+            def __init__(inner_self, active):
+                inner_self.active = active
+
+            def public_payload(inner_self):
+                return {
+                    "bound": True,
+                    "url": "http://127.0.0.1:32145",
+                    "connection_name": "ComfyUI Vast",
+                    "active_session_id": (
+                        "session-1" if inner_self.active else None
+                    ),
+                    "profile_revision": 3 if inner_self.active else None,
+                    "ready": inner_self.active,
+                    "error": None,
+                }
+
+        test = self
+
+        class Service:
+            def desktop_setup(inner_self):
+                return {
+                    **Status(True).public_payload(),
+                    "manual_setup_required": True,
+                    "instructions": ["Open Remote Connections."],
+                }
+
+            async def activate_desktop_relay(inner_self, session_id):
+                test.calls.append(("activate", session_id))
+                return Status(True)
+
+            async def deactivate_desktop_relay(inner_self, session_id):
+                test.calls.append(("deactivate", session_id))
+                return Status(False)
+
+        service = Service()
+        self.handlers = captured_handlers(service_factory=lambda: service)
+
+    def test_local_context_and_setup_never_set_remote_capability(self):
+        context = asyncio.run(
+            self.handlers[("GET", "/cloud-run/api/desktop-context")](
+                FakeRequest()
+            )
+        )
+        setup = asyncio.run(
+            self.handlers[("GET", "/cloud-run/api/desktop-setup")](
+                FakeRequest()
+            )
+        )
+
+        self.assertEqual(context.payload, {"role": "local"})
+        self.assertNotIn("Set-Cookie", context.headers)
+        self.assertEqual(setup.payload["url"], "http://127.0.0.1:32145")
+        self.assertEqual(setup.payload["connection_name"], "ComfyUI Vast")
+        self.assertNotIn("capability", repr(setup.payload).casefold())
+
+    def test_activation_and_deactivation_are_explicit_local_only_routes(self):
+        activate = asyncio.run(
+            self.handlers[
+                (
+                    "POST",
+                    "/cloud-run/api/sessions/{session_id}/desktop-relay",
+                )
+            ](
+                FakeRequest(
+                    body={},
+                    match_info={"session_id": "session-1"},
+                )
+            )
+        )
+        deactivate = asyncio.run(
+            self.handlers[
+                (
+                    "DELETE",
+                    "/cloud-run/api/sessions/{session_id}/desktop-relay",
+                )
+            ](
+                FakeRequest(match_info={"session_id": "session-1"})
+            )
+        )
+
+        self.assertEqual(activate.status, 200)
+        self.assertTrue(activate.payload["ready"])
+        self.assertEqual(deactivate.status, 200)
+        self.assertFalse(deactivate.payload["ready"])
+        self.assertEqual(
+            self.calls,
+            [("activate", "session-1"), ("deactivate", "session-1")],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

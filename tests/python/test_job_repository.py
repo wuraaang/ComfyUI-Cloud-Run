@@ -16,6 +16,10 @@ from cloud_run.models import (
     TransferState,
 )
 from cloud_run.run_errors import RunErrorCode, RunJournalEntry, RunPhase
+from cloud_run.repository import (
+    ConcurrentDesktopRelayUpdate,
+    DesktopRelayConfig,
+)
 
 
 def cloud_job(
@@ -251,7 +255,77 @@ class JobRepositoryTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     jobs.record_provision_progress(**payload)
 
-    def test_legacy_schema_is_migrated_idempotently_to_run_journal_v8(self):
+    def test_desktop_relay_config_is_exact_secret_free_and_concurrent(self):
+        jobs = JobRepository(self.path)
+        first = jobs.save_desktop_relay(
+            DesktopRelayConfig(
+                bind_host="127.0.0.1",
+                port=32145,
+                active_session_id=None,
+                profile_revision=None,
+                updated_at=10.0,
+            )
+        )
+        active = jobs.save_desktop_relay(
+            DesktopRelayConfig(
+                bind_host="127.0.0.1",
+                port=32145,
+                active_session_id="session-1",
+                profile_revision=3,
+                updated_at=11.0,
+            ),
+            expected_updated_at=first.updated_at,
+        )
+
+        self.assertEqual(JobRepository(self.path).get_desktop_relay(), active)
+        with self.assertRaises(ConcurrentDesktopRelayUpdate):
+            jobs.save_desktop_relay(
+                DesktopRelayConfig(
+                    bind_host="127.0.0.1",
+                    port=32145,
+                    active_session_id=None,
+                    profile_revision=None,
+                    updated_at=12.0,
+                ),
+                expected_updated_at=10.0,
+            )
+        with self.assertRaises(ConcurrentDesktopRelayUpdate):
+            jobs.save_desktop_relay(
+                DesktopRelayConfig(
+                    bind_host="127.0.0.1",
+                    port=32145,
+                    active_session_id=None,
+                    profile_revision=None,
+                    updated_at=11.0,
+                ),
+                expected_updated_at=11.0,
+            )
+        with closing(sqlite3.connect(self.path)) as connection:
+            columns = [
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(desktop_relay)"
+                )
+            ]
+            row = connection.execute(
+                "SELECT * FROM desktop_relay"
+            ).fetchone()
+        self.assertEqual(
+            columns,
+            [
+                "singleton",
+                "bind_host",
+                "port",
+                "active_session_id",
+                "profile_revision",
+                "updated_at",
+            ],
+        )
+        rendered = repr((columns, row))
+        for forbidden in ("bearer", "secret", "token", "worker_url"):
+            self.assertNotIn(forbidden, rendered.casefold())
+
+    def test_legacy_schema_is_migrated_idempotently_to_run_journal_v9(self):
         self.path.parent.mkdir(parents=True)
         with closing(sqlite3.connect(self.path)) as connection:
             connection.execute(
@@ -372,7 +446,7 @@ class JobRepositoryTests(unittest.TestCase):
             set(),
         )
         self.assertIsNotNone(journal_exists)
-        self.assertEqual(schema_version, "8")
+        self.assertEqual(schema_version, "9")
 
     def test_execution_success_survives_an_independent_harvest_failure(self):
         jobs = JobRepository(self.path)

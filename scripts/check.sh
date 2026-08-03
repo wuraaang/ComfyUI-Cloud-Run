@@ -277,6 +277,8 @@ for node in ast.walk(routes_tree):
 allowed_cloud_run_routes = {
     ("GET", "/cloud-run/api/settings"),
     ("PUT", "/cloud-run/api/settings"),
+    ("GET", "/cloud-run/api/desktop-context"),
+    ("GET", "/cloud-run/api/desktop-setup"),
     ("POST", "/cloud-run/api/captures"),
     ("POST", "/cloud-run/api/preflights"),
     ("PUT", "/cloud-run/api/mappings/{mapping_id}"),
@@ -289,6 +291,14 @@ allowed_cloud_run_routes = {
     ("POST", "/cloud-run/api/sessions"),
     ("POST", "/cloud-run/api/sessions/{session_id}/confirm"),
     ("GET", "/cloud-run/api/sessions/{session_id}"),
+    (
+        "POST",
+        "/cloud-run/api/sessions/{session_id}/desktop-relay",
+    ),
+    (
+        "DELETE",
+        "/cloud-run/api/sessions/{session_id}/desktop-relay",
+    ),
     ("POST", "/cloud-run/api/sessions/{session_id}/jobs"),
     ("GET", "/cloud-run/api/sessions/{session_id}/jobs/{job_id}"),
     (

@@ -69,6 +69,8 @@ class ProviderMutationSurfaceTests(unittest.TestCase):
             set(captured_handlers()),
             {
                 ("GET", "/cloud-run/api/settings"),
+                ("GET", "/cloud-run/api/desktop-context"),
+                ("GET", "/cloud-run/api/desktop-setup"),
                 ("PUT", "/cloud-run/api/settings"),
                 ("POST", "/cloud-run/api/captures"),
                 ("POST", "/cloud-run/api/preflights"),
@@ -90,6 +92,14 @@ class ProviderMutationSurfaceTests(unittest.TestCase):
                 (
                     "GET",
                     "/cloud-run/api/sessions/{session_id}",
+                ),
+                (
+                    "POST",
+                    "/cloud-run/api/sessions/{session_id}/desktop-relay",
+                ),
+                (
+                    "DELETE",
+                    "/cloud-run/api/sessions/{session_id}/desktop-relay",
                 ),
                 (
                     "POST",
