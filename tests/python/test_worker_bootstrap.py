@@ -618,6 +618,7 @@ class HttpsTransportTests(unittest.TestCase):
 class WorkerArtifactTests(unittest.TestCase):
     def test_bootstrap_allowlist_matches_reviewed_artifact_members(self):
         self.assertEqual(_REVIEWED_ARCHIVE_FILES, EXPECTED_FILES)
+        self.assertIn("cloud_run/run_errors.py", EXPECTED_FILES)
 
     def test_worker_artifact_is_byte_identical_allowlisted_and_normalized(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -642,6 +643,7 @@ class WorkerArtifactTests(unittest.TestCase):
             self.assertIn("remote_worker/gateway.py", names)
             self.assertIn("remote_worker/bootstrap.py", names)
             self.assertIn("cloud_run/manifest.py", names)
+            self.assertIn("cloud_run/run_errors.py", names)
             self.assertIn("cloud_run/worker_protocol.py", names)
             self.assertTrue(
                 all(
@@ -649,6 +651,7 @@ class WorkerArtifactTests(unittest.TestCase):
                     or name
                     in {
                         "cloud_run/manifest.py",
+                        "cloud_run/run_errors.py",
                         "cloud_run/worker_protocol.py",
                     }
                     for name in names

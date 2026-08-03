@@ -38,6 +38,7 @@ ALLOWED_REMOTE_FILES = frozenset(
 SHARED_FILES = frozenset(
     {
         "cloud_run/manifest.py",
+        "cloud_run/run_errors.py",
         "cloud_run/worker_protocol.py",
     }
 )

@@ -14,6 +14,7 @@ from .constants import (
     MIN_SESSION_DISK_GB,
     VAST_CREATE_FAILURE_CODES,
 )
+from .run_errors import RunErrorCode
 from .worker_protocol import is_boundary_token
 
 
@@ -42,6 +43,22 @@ class JobState(str, Enum):
     QUEUED = "queued"
     RUNNING = "running"
     HARVESTING = "harvesting"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
+class ExecutionState(str, Enum):
+    PENDING = "pending"
+    QUEUED = "queued"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    INTERRUPTED = "interrupted"
+
+
+class HarvestState(str, Enum):
+    PENDING = "pending"
+    RUNNING = "running"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
 
@@ -1105,6 +1122,26 @@ class CloudJob:
     created_at: float
     updated_at: float
     version: int
+    execution_state: ExecutionState = ExecutionState.PENDING
+    harvest_state: HarvestState = HarvestState.PENDING
+    error_code: RunErrorCode | None = None
+
+    def __post_init__(self):
+        object.__setattr__(
+            self,
+            "execution_state",
+            ExecutionState(self.execution_state),
+        )
+        object.__setattr__(
+            self,
+            "harvest_state",
+            HarvestState(self.harvest_state),
+        )
+        object.__setattr__(
+            self,
+            "error_code",
+            None if self.error_code is None else RunErrorCode(self.error_code),
+        )
 
     def transition(self, state, *, now=None, **changes):
         target = JobState(state)
@@ -1112,9 +1149,23 @@ class CloudJob:
             raise InvalidStateTransition(
                 f"Cannot transition from {self.state.value} to {target.value}."
             )
-        unknown = set(changes) - {"remote_prompt_id", "sanitized_error"}
+        unknown = set(changes) - {
+            "remote_prompt_id",
+            "sanitized_error",
+            "execution_state",
+            "harvest_state",
+            "error_code",
+        }
         if unknown:
             raise TypeError("Unsupported job fields: " + ", ".join(sorted(unknown)))
+        if "execution_state" in changes:
+            changes["execution_state"] = ExecutionState(
+                changes["execution_state"]
+            )
+        if "harvest_state" in changes:
+            changes["harvest_state"] = HarvestState(changes["harvest_state"])
+        if "error_code" in changes and changes["error_code"] is not None:
+            changes["error_code"] = RunErrorCode(changes["error_code"])
         timestamp = float(time.time() if now is None else now)
         return replace(self, state=target, updated_at=timestamp, **changes)
 
@@ -1123,6 +1174,11 @@ class CloudJob:
             "job_id": self.job_id,
             "session_id": self.session_id,
             "status": self.state.value,
+            "execution_state": self.execution_state.value,
+            "harvest_state": self.harvest_state.value,
+            "error_code": (
+                self.error_code.value if self.error_code is not None else None
+            ),
             "error": self.sanitized_error,
             "created_at": self.created_at,
             "updated_at": self.updated_at,

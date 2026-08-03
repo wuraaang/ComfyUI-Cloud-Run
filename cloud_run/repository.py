@@ -193,6 +193,9 @@ def _initialize_database(path):
                     manifest_digest TEXT NOT NULL,
                     remote_prompt_id TEXT,
                     sanitized_error TEXT,
+                    execution_state TEXT NOT NULL DEFAULT 'pending',
+                    harvest_state TEXT NOT NULL DEFAULT 'pending',
+                    error_code TEXT,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
                     version INTEGER NOT NULL,
@@ -200,6 +203,51 @@ def _initialize_database(path):
                 )
                 """
             )
+            job_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(jobs)"
+                ).fetchall()
+            }
+            if "execution_state" not in job_columns:
+                connection.execute(
+                    "ALTER TABLE jobs ADD COLUMN execution_state "
+                    "TEXT NOT NULL DEFAULT 'pending'"
+                )
+                connection.execute(
+                    """
+                    UPDATE jobs SET execution_state = CASE state
+                        WHEN 'queued' THEN 'queued'
+                        WHEN 'running' THEN 'running'
+                        WHEN 'harvesting' THEN 'succeeded'
+                        WHEN 'succeeded' THEN 'succeeded'
+                        WHEN 'failed' THEN 'failed'
+                        ELSE 'pending'
+                    END
+                    """
+                )
+            if "harvest_state" not in job_columns:
+                connection.execute(
+                    "ALTER TABLE jobs ADD COLUMN harvest_state "
+                    "TEXT NOT NULL DEFAULT 'pending'"
+                )
+                connection.execute(
+                    """
+                    UPDATE jobs SET harvest_state = CASE state
+                        WHEN 'harvesting' THEN 'running'
+                        WHEN 'succeeded' THEN 'succeeded'
+                        ELSE 'pending'
+                    END
+                    """
+                )
+            if "error_code" not in job_columns:
+                connection.execute("ALTER TABLE jobs ADD COLUMN error_code TEXT")
+                connection.execute(
+                    """
+                    UPDATE jobs SET error_code = 'internal_error'
+                    WHERE state = 'failed'
+                    """
+                )
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS manifests (
@@ -238,6 +286,29 @@ def _initialize_database(path):
                     payload_json TEXT NOT NULL,
                     created_at REAL NOT NULL,
                     PRIMARY KEY(job_id, sequence)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS run_journal (
+                    entry_id TEXT PRIMARY KEY,
+                    session_id TEXT,
+                    manifest_digest TEXT,
+                    transaction_id TEXT,
+                    job_id TEXT,
+                    phase TEXT NOT NULL,
+                    code TEXT NOT NULL,
+                    message TEXT NOT NULL,
+                    node_id TEXT,
+                    process_exit_code INTEGER,
+                    restart_count INTEGER NOT NULL,
+                    last_probe TEXT,
+                    byte_cursor INTEGER NOT NULL,
+                    event_cursor INTEGER NOT NULL,
+                    output_state TEXT,
+                    details_json TEXT NOT NULL,
+                    created_at REAL NOT NULL
                 )
                 """
             )
@@ -381,7 +452,7 @@ def _initialize_database(path):
             _migrate_legacy_attempts(connection)
             connection.execute(
                 """
-                INSERT INTO schema_meta(key, value) VALUES('schema_version', '7')
+                INSERT INTO schema_meta(key, value) VALUES('schema_version', '8')
                 ON CONFLICT(key) DO UPDATE SET value = excluded.value
                 """
             )

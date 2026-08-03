@@ -12,8 +12,15 @@ import sqlite3
 import time
 
 from .capture import CompiledCapture
-from .models import CloudJob, JobState, TransferState
+from .models import (
+    CloudJob,
+    ExecutionState,
+    HarvestState,
+    JobState,
+    TransferState,
+)
 from .repository import _canonical_json, _initialize_database, _private_connection
+from .run_errors import RunErrorCode, RunJournalEntry, RunPhase
 
 
 class ConcurrentJobUpdate(RuntimeError):
@@ -89,8 +96,13 @@ class StoredPreflight:
 
 _JOB_COLUMNS = """
     job_id, session_id, idempotency_key, state, prompt_digest, capture_json,
-    manifest_digest, remote_prompt_id, sanitized_error, created_at, updated_at,
-    version
+    manifest_digest, remote_prompt_id, sanitized_error, execution_state,
+    harvest_state, error_code, created_at, updated_at, version
+"""
+_JOURNAL_COLUMNS = """
+    entry_id, session_id, manifest_digest, transaction_id, job_id, phase, code,
+    message, node_id, process_exit_code, restart_count, last_probe, byte_cursor,
+    event_cursor, output_state, details_json, created_at
 """
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}")
 _PROVISION_PHASES = {
@@ -224,6 +236,13 @@ class JobRepository:
             created_at=float(row["created_at"]),
             updated_at=float(row["updated_at"]),
             version=int(row["version"]),
+            execution_state=ExecutionState(row["execution_state"]),
+            harvest_state=HarvestState(row["harvest_state"]),
+            error_code=(
+                RunErrorCode(row["error_code"])
+                if row["error_code"] is not None
+                else None
+            ),
         )
 
     @staticmethod
@@ -244,6 +263,9 @@ class JobRepository:
             job.manifest_digest,
             job.remote_prompt_id,
             job.sanitized_error,
+            job.execution_state.value,
+            job.harvest_state.value,
+            job.error_code.value if job.error_code is not None else None,
             job.created_at,
             job.updated_at,
             job.version,
@@ -300,7 +322,7 @@ class JobRepository:
                 connection.execute(
                     f"""
                     INSERT INTO jobs ({_JOB_COLUMNS})
-                    VALUES ({",".join("?" for _ in range(12))})
+                    VALUES ({",".join("?" for _ in range(15))})
                     """,
                     self._job_values(job),
                 )
@@ -338,6 +360,9 @@ class JobRepository:
                     manifest_digest = ?,
                     remote_prompt_id = ?,
                     sanitized_error = ?,
+                    execution_state = ?,
+                    harvest_state = ?,
+                    error_code = ?,
                     updated_at = ?,
                     version = version + 1
                 WHERE job_id = ? AND version = ?
@@ -349,6 +374,9 @@ class JobRepository:
                     job.manifest_digest,
                     job.remote_prompt_id,
                     job.sanitized_error,
+                    job.execution_state.value,
+                    job.harvest_state.value,
+                    job.error_code.value if job.error_code is not None else None,
                     job.updated_at,
                     job.job_id,
                     job.version,
@@ -365,6 +393,110 @@ class JobRepository:
             ).fetchone()
             connection.commit()
         return self._row_to_job(row)
+
+    @staticmethod
+    def _row_to_journal(row):
+        if row is None:
+            return None
+        try:
+            details = json.loads(row["details_json"])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raise ValueError("Stored journal evidence is invalid.") from None
+        return RunJournalEntry(
+            entry_id=row["entry_id"],
+            session_id=row["session_id"],
+            manifest_digest=row["manifest_digest"],
+            transaction_id=row["transaction_id"],
+            job_id=row["job_id"],
+            phase=RunPhase(row["phase"]),
+            code=RunErrorCode(row["code"]),
+            message=row["message"],
+            node_id=row["node_id"],
+            process_exit_code=(
+                int(row["process_exit_code"])
+                if row["process_exit_code"] is not None
+                else None
+            ),
+            restart_count=int(row["restart_count"]),
+            last_probe=row["last_probe"],
+            byte_cursor=int(row["byte_cursor"]),
+            event_cursor=int(row["event_cursor"]),
+            output_state=row["output_state"],
+            details=details,
+            created_at=float(row["created_at"]),
+        )
+
+    @staticmethod
+    def _journal_values(entry):
+        if not isinstance(entry, RunJournalEntry):
+            raise TypeError("A validated journal entry is required.")
+        return (
+            entry.entry_id,
+            entry.session_id,
+            entry.manifest_digest,
+            entry.transaction_id,
+            entry.job_id,
+            entry.phase.value,
+            entry.code.value,
+            entry.message,
+            entry.node_id,
+            entry.process_exit_code,
+            entry.restart_count,
+            entry.last_probe,
+            entry.byte_cursor,
+            entry.event_cursor,
+            entry.output_state,
+            _canonical_json(entry.details),
+            entry.created_at,
+        )
+
+    def record_journal(self, entry):
+        values = self._journal_values(entry)
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                f"""
+                INSERT OR IGNORE INTO run_journal ({_JOURNAL_COLUMNS})
+                VALUES ({",".join("?" for _ in range(17))})
+                """,
+                values,
+            )
+            if cursor.rowcount == 1:
+                connection.commit()
+                return True
+            row = connection.execute(
+                f"""
+                SELECT {_JOURNAL_COLUMNS}
+                FROM run_journal
+                WHERE entry_id = ?
+                """,
+                (entry.entry_id,),
+            ).fetchone()
+            connection.commit()
+        if self._row_to_journal(row) != entry:
+            raise ValueError("Journal entry identity cannot change.")
+        return False
+
+    def list_journal(self, session_id, *, after=0.0):
+        session_identifier = _require_strict_identifier(
+            session_id,
+            "session ID",
+        )
+        threshold = _require_finite_timestamp(after, "journal timestamp")
+        if threshold < 0:
+            raise ValueError("Invalid journal timestamp.")
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                f"""
+                SELECT {_JOURNAL_COLUMNS}
+                FROM run_journal
+                WHERE session_id = ? AND created_at > ?
+                ORDER BY created_at, entry_id
+                LIMIT 10000
+                """,
+                (session_identifier, threshold),
+            ).fetchall()
+        return [self._row_to_journal(row) for row in rows]
 
     def save_manifest(self, manifest_digest, manifest_json, *, created_at=None):
         digest = _require_digest(manifest_digest, "manifest digest")

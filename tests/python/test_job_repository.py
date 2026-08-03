@@ -8,7 +8,14 @@ import unittest
 from pathlib import Path
 
 from cloud_run.job_repository import JobRepository
-from cloud_run.models import CloudJob, JobState, TransferState
+from cloud_run.models import (
+    CloudJob,
+    ExecutionState,
+    HarvestState,
+    JobState,
+    TransferState,
+)
+from cloud_run.run_errors import RunErrorCode, RunJournalEntry, RunPhase
 
 
 def cloud_job(
@@ -16,6 +23,9 @@ def cloud_job(
     job_id="job-1",
     session_id="session-1",
     idempotency_key="job-key-1",
+    execution_state=ExecutionState.PENDING,
+    harvest_state=HarvestState.PENDING,
+    error_code=None,
 ):
     return CloudJob(
         job_id=job_id,
@@ -34,6 +44,9 @@ def cloud_job(
         created_at=10.0,
         updated_at=10.0,
         version=1,
+        execution_state=execution_state,
+        harvest_state=harvest_state,
+        error_code=error_code,
     )
 
 
@@ -83,6 +96,46 @@ class JobRepositoryTests(unittest.TestCase):
         self.assertEqual(event.sequence, 1)
         self.assertEqual(event.payload, {"max": 10, "value": 2})
         self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o600)
+
+    def test_run_journal_is_idempotent_bounded_and_survives_reopen(self):
+        jobs = JobRepository(self.path)
+        entry = RunJournalEntry(
+            entry_id="journal-1",
+            session_id="session-1",
+            manifest_digest="a" * 64,
+            transaction_id="provision-" + "a" * 64,
+            job_id="job-1",
+            phase=RunPhase.SYNCHRONIZATION,
+            code=RunErrorCode.SYNCHRONIZATION,
+            message="Worker snapshot timed out; retry scheduled.",
+            node_id=None,
+            process_exit_code=None,
+            restart_count=1,
+            last_probe="gateway reachable",
+            byte_cursor=29_347_469_703,
+            event_cursor=94,
+            output_state="pending",
+            details={"retry": 2, "inventory": "unchanged"},
+            created_at=20.0,
+        )
+
+        self.assertTrue(jobs.record_journal(entry))
+        self.assertFalse(jobs.record_journal(entry))
+        self.assertEqual(JobRepository(self.path).list_journal("session-1"), [entry])
+        self.assertEqual(
+            JobRepository(self.path).list_journal("session-1", after=20.0),
+            [],
+        )
+
+        with self.assertRaisesRegex(ValueError, "identity"):
+            jobs.record_journal(
+                RunJournalEntry(
+                    **{
+                        **entry.__dict__,
+                        "message": "A different safe message.",
+                    }
+                )
+            )
 
     def test_provision_restart_repair_and_installed_sets_survive_reopen(self):
         jobs = JobRepository(self.path)
@@ -198,7 +251,7 @@ class JobRepositoryTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     jobs.record_provision_progress(**payload)
 
-    def test_legacy_schema_is_migrated_idempotently_to_output_provenance_v7(self):
+    def test_legacy_schema_is_migrated_idempotently_to_run_journal_v8(self):
         self.path.parent.mkdir(parents=True)
         with closing(sqlite3.connect(self.path)) as connection:
             connection.execute(
@@ -275,6 +328,16 @@ class JobRepositoryTests(unittest.TestCase):
                     "PRAGMA table_info(transfers)"
                 )
             }
+            job_columns = {
+                row[1]
+                for row in connection.execute("PRAGMA table_info(jobs)")
+            }
+            journal_exists = connection.execute(
+                """
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'run_journal'
+                """
+            ).fetchone()
 
         self.assertIsNotNone(jobs)
         self.assertEqual(
@@ -300,7 +363,32 @@ class JobRepositoryTests(unittest.TestCase):
         self.assertIsNone(legacy_transfer.source_node_id)
         self.assertIsNone(legacy_transfer.published_device)
         self.assertIsNone(legacy_transfer.published_inode)
-        self.assertEqual(schema_version, "7")
+        self.assertEqual(
+            {
+                "execution_state",
+                "harvest_state",
+                "error_code",
+            }.difference(job_columns),
+            set(),
+        )
+        self.assertIsNotNone(journal_exists)
+        self.assertEqual(schema_version, "8")
+
+    def test_execution_success_survives_an_independent_harvest_failure(self):
+        jobs = JobRepository(self.path)
+        saved, created = jobs.create_job(
+            cloud_job(
+                execution_state=ExecutionState.SUCCEEDED,
+                harvest_state=HarvestState.FAILED,
+                error_code=RunErrorCode.INVALID_OUTPUT,
+            )
+        )
+        reopened = JobRepository(self.path).get_job(saved.job_id)
+
+        self.assertTrue(created)
+        self.assertEqual(reopened.execution_state, ExecutionState.SUCCEEDED)
+        self.assertEqual(reopened.harvest_state, HarvestState.FAILED)
+        self.assertEqual(reopened.error_code, RunErrorCode.INVALID_OUTPUT)
 
     def test_verified_output_provenance_survives_reopen_and_is_immutable(self):
         jobs = JobRepository(self.path)

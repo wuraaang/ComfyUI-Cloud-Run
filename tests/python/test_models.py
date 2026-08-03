@@ -287,7 +287,13 @@ class LifecycleModelTests(unittest.TestCase):
         self.assertIsNone(public["manifest_digest"])
 
     def test_session_and_job_state_contracts_are_exact(self):
-        from cloud_run.models import JobState, SessionState, TransferState
+        from cloud_run.models import (
+            ExecutionState,
+            HarvestState,
+            JobState,
+            SessionState,
+            TransferState,
+        )
 
         self.assertEqual(
             {state.value for state in SessionState},
@@ -332,6 +338,60 @@ class LifecycleModelTests(unittest.TestCase):
                 "abandoned",
             },
         )
+        self.assertEqual(
+            {state.value for state in ExecutionState},
+            {
+                "pending",
+                "queued",
+                "running",
+                "succeeded",
+                "failed",
+                "interrupted",
+            },
+        )
+        self.assertEqual(
+            {state.value for state in HarvestState},
+            {"pending", "running", "succeeded", "failed"},
+        )
+
+    def test_job_execution_and_harvest_dimensions_change_independently(self):
+        from cloud_run.models import (
+            CloudJob,
+            ExecutionState,
+            HarvestState,
+            JobState,
+        )
+        from cloud_run.run_errors import RunErrorCode
+
+        job = CloudJob(
+            job_id="job-1",
+            session_id="session-1",
+            idempotency_key="job-key-1",
+            state=JobState.HARVESTING,
+            prompt_digest="a" * 64,
+            capture_json='{"output":{},"workflow":{}}',
+            manifest_digest="b" * 64,
+            remote_prompt_id="prompt-1",
+            sanitized_error=None,
+            created_at=10.0,
+            updated_at=11.0,
+            version=2,
+            execution_state=ExecutionState.SUCCEEDED,
+            harvest_state=HarvestState.RUNNING,
+            error_code=None,
+        )
+
+        failed_harvest = job.transition(
+            JobState.HARVESTING,
+            now=12.0,
+            harvest_state=HarvestState.FAILED,
+            error_code=RunErrorCode.INVALID_OUTPUT,
+            sanitized_error="Persistent output descriptor was invalid.",
+        )
+
+        self.assertEqual(failed_harvest.execution_state, ExecutionState.SUCCEEDED)
+        self.assertEqual(failed_harvest.harvest_state, HarvestState.FAILED)
+        self.assertEqual(failed_harvest.error_code, RunErrorCode.INVALID_OUTPUT)
 
     def test_session_rejects_disk_outside_the_provider_contract(self):
         from cloud_run.models import CloudSession

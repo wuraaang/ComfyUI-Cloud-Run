@@ -42,6 +42,7 @@ _LOCK_FIELDS = {
 _REVIEWED_ARCHIVE_FILES = frozenset(
     {
         "cloud_run/manifest.py",
+        "cloud_run/run_errors.py",
         "cloud_run/worker_protocol.py",
         "remote_worker/Caddyfile",
         "remote_worker/__init__.py",
