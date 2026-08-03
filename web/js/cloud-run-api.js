@@ -59,6 +59,9 @@ export const CAPTURES_ENDPOINT = "/cloud-run/api/captures";
 export const PREFLIGHTS_ENDPOINT = "/cloud-run/api/preflights";
 export const OFFERS_ENDPOINT = "/cloud-run/api/offers";
 export const SESSIONS_ENDPOINT = "/cloud-run/api/sessions";
+export const DESKTOP_CONTEXT_ENDPOINT = "/cloud-run/api/desktop-context";
+export const DESKTOP_SETUP_ENDPOINT = "/cloud-run/api/desktop-setup";
+export const DESKTOP_BOOTSTRAP_ENDPOINT = "/cloud-run/api/desktop-bootstrap";
 
 
 function identifier(value) {
@@ -94,6 +97,45 @@ function jobEndpoint(sessionId, jobId) {
 export function createCloudRunApi(fetchImpl) {
   if (typeof fetchImpl !== "function") throw new Error("request failed");
   return {
+    getDesktopContext() {
+      return fetchJson(fetchImpl, DESKTOP_CONTEXT_ENDPOINT);
+    },
+
+    getDesktopSetup() {
+      return fetchJson(fetchImpl, DESKTOP_SETUP_ENDPOINT);
+    },
+
+    activateDesktopRelay(sessionId) {
+      return fetchJson(
+        fetchImpl,
+        `${sessionEndpoint(sessionId)}/desktop-relay`,
+        jsonOptions("POST", {}),
+      );
+    },
+
+    deactivateDesktopRelay(sessionId) {
+      return fetchJson(
+        fetchImpl,
+        `${sessionEndpoint(sessionId)}/desktop-relay`,
+        { method: "DELETE" },
+      );
+    },
+
+    getDesktopBootstrap() {
+      return fetchJson(fetchImpl, DESKTOP_BOOTSTRAP_ENDPOINT);
+    },
+
+    acknowledgeDesktopBootstrap(revision) {
+      if (!Number.isSafeInteger(revision) || revision <= 0) {
+        throw new Error("request failed");
+      }
+      return fetchJson(
+        fetchImpl,
+        DESKTOP_BOOTSTRAP_ENDPOINT,
+        jsonOptions("POST", { bootstrap_revision: revision }),
+      );
+    },
+
     getSettings() {
       return fetchJson(fetchImpl, SETTINGS_ENDPOINT);
     },

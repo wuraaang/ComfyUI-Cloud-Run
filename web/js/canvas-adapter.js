@@ -19,7 +19,7 @@ export async function captureOfficialQueuePayload({
     throw new Error("Pinned ComfyUI prompt API is unavailable.");
   }
   if (captureInFlight) {
-    throw new Error("A Cloud Run canvas capture is already in progress.");
+    throw new Error("A Cloud Vast canvas capture is already in progress.");
   }
 
   captureInFlight = true;
@@ -55,7 +55,7 @@ export async function captureOfficialQueuePayload({
   try {
     await app.queuePrompt(number, 1, queueNodeIds);
     if (!captured) {
-      throw new Error("ComfyUI was busy; no Cloud Run payload was captured.");
+      throw new Error("ComfyUI was busy; no Cloud Vast payload was captured.");
     }
     return captured;
   } finally {

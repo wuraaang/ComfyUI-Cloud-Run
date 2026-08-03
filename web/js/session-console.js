@@ -251,7 +251,7 @@ function sessionMessage(session) {
     confirming: "Revalidating the exact Vast offer.",
     creating: "Creating the Vast instance; billing may have started.",
     reconciling_create:
-      "GPU rental could not be confirmed. Cloud Run is checking Vast inventory.",
+      "GPU rental could not be confirmed. Cloud Vast is checking Vast inventory.",
     bootstrapping: "Authenticating the project Remote Worker.",
     provisioning: "Transferring and installing verified dependencies.",
     validating: "Validating remote ComfyUI nodes and files.",
@@ -262,9 +262,9 @@ function sessionMessage(session) {
     destroy_requested: "GPU destruction requested and durably recorded.",
     destroying: "Destroying the GPU and verifying Vast inventory.",
     destroyed: "Vast inventory confirms that billing has stopped.",
-    failed: "Cloud Run session needs attention.",
+    failed: "Cloud Vast session needs attention.",
   };
-  return messages[String(session?.status)] ?? "Unknown Cloud Run session state.";
+  return messages[String(session?.status)] ?? "Unknown Cloud Vast session state.";
 }
 
 
@@ -347,7 +347,7 @@ export function createSessionConsole(document, api = {}, options = {}) {
     id: options.id ?? "cloud-run-session-console",
     className: "cloud-run-session-console",
   });
-  const title = element(document, "h3", { text: "Cloud Run session" });
+  const title = element(document, "h3", { text: "Cloud Vast session" });
   const settingsSummary = element(document, "div", {
     className: "cloud-run-configured-summary",
   });
@@ -418,7 +418,7 @@ export function createSessionConsole(document, api = {}, options = {}) {
   const quoteDetails = element(document, "div");
   const confirmButton = element(document, "button", {
     id: "cloud-run-confirm-session",
-    text: "Confirm & rent this GPU",
+    text: "Louer et préparer",
     type: "button",
     className: "cloud-run-danger",
   });
@@ -516,13 +516,25 @@ export function createSessionConsole(document, api = {}, options = {}) {
   const historyRows = element(document, "div");
   historyPanel.append(historyTitle, historyRows);
 
+  const desktopPanel = element(document, "section", {
+    className: "cloud-run-desktop-setup",
+  });
+  desktopPanel.hidden = true;
+  const desktopTitle = element(document, "h4", { text: "ComfyUI Vast" });
+  const desktopStatus = element(document, "div");
+  const desktopInstructions = element(document, "div");
+  const desktopGuidance = element(document, "div", {
+    text: "Ouvrir ComfyUI Vast dans Desktop.",
+  });
+  desktopPanel.append(
+    desktopTitle,
+    desktopStatus,
+    desktopInstructions,
+    desktopGuidance,
+  );
+
   const sessionControls = element(document, "div", {
     className: "cloud-run-actions",
-  });
-  const runNextJobButton = element(document, "button", {
-    id: "cloud-run-next-job",
-    text: "Run current canvas on this GPU",
-    type: "button",
   });
   const destroyButton = element(document, "button", {
     id: "cloud-run-destroy-gpu",
@@ -535,12 +547,10 @@ export function createSessionConsole(document, api = {}, options = {}) {
     text: "Verify Vast access",
     type: "button",
   });
-  runNextJobButton.hidden = true;
   destroyButton.hidden = true;
   verifyVastAccessButton.hidden = true;
   sessionControls.append(
     verifyVastAccessButton,
-    runNextJobButton,
     destroyButton,
   );
 
@@ -582,6 +592,7 @@ export function createSessionConsole(document, api = {}, options = {}) {
     preflightControls,
     quotePanel,
     sessionPanel,
+    desktopPanel,
     jobPanel,
     historyPanel,
     sessionControls,
@@ -663,7 +674,6 @@ export function createSessionConsole(document, api = {}, options = {}) {
       || !sessionIdempotencyKey;
     const ready = currentSession?.status === "ready";
     const deadlineMutable = deadlineCanSynchronize(currentSession);
-    runNextJobButton.disabled = busy || !ready;
     extendThirtyButton.disabled = busy || !deadlineMutable;
     extendHourButton.disabled = busy || !deadlineMutable;
     disableDeadlineButton.disabled = busy || !deadlineMutable;
@@ -698,7 +708,7 @@ export function createSessionConsole(document, api = {}, options = {}) {
     clearPoll();
     currentSession = null;
     sessionPanel.hidden = true;
-    runNextJobButton.hidden = true;
+    desktopPanel.hidden = true;
     destroyButton.hidden = true;
     verifyVastAccessButton.hidden = true;
     notifySession(null);
@@ -920,7 +930,7 @@ export function createSessionConsole(document, api = {}, options = {}) {
     }
     quoteDetails.appendChild(element(document, "strong", {
       text:
-        "No rental exists until Confirm & rent this GPU is pressed. " +
+        "No rental exists until Louer et préparer is pressed. " +
         "After confirmation, billing continues until verified destruction.",
     }));
     confirmButton.hidden = payload?.status !== "offer_selected";
@@ -1026,7 +1036,7 @@ export function createSessionConsole(document, api = {}, options = {}) {
         "cloud-run-deadline-warning cloud-run-danger";
       deadlineWarning.textContent =
         "RED WARNING — automatic deadline disabled; Vast billing has no " +
-        "Cloud Run time limit.";
+        "Cloud Vast time limit.";
     } else {
       deadlineWarning.className = "cloud-run-deadline-warning";
       const deadline = finiteNumber(session?.deadline_at);
@@ -1219,6 +1229,90 @@ export function createSessionConsole(document, api = {}, options = {}) {
     if (currentJob) renderJob(currentJob);
   }
 
+  function safeDesktopSetup(payload, expectedSessionId) {
+    if (
+      !payload
+      || typeof payload !== "object"
+      || payload.connection_name !== "ComfyUI Vast"
+      || typeof payload.bound !== "boolean"
+      || typeof payload.ready !== "boolean"
+      || (
+        payload.active_session_id !== null
+        && payload.active_session_id !== expectedSessionId
+      )
+      || !Array.isArray(payload.instructions)
+      || payload.instructions.length > 8
+      || payload.instructions.some(
+        (item) => typeof item !== "string" || !item || item.length > 500,
+      )
+    ) {
+      return null;
+    }
+    let parsed;
+    try {
+      parsed = new URL(payload.url);
+    } catch {
+      return null;
+    }
+    if (
+      parsed.protocol !== "http:"
+      || parsed.hostname !== "127.0.0.1"
+      || !/^[1-9][0-9]{0,4}$/.test(parsed.port)
+      || Number(parsed.port) > 65535
+      || parsed.pathname !== "/"
+      || parsed.search
+      || parsed.hash
+      || parsed.username
+      || parsed.password
+    ) {
+      return null;
+    }
+    return {
+      ...payload,
+      instructions: [...payload.instructions],
+    };
+  }
+
+  async function refreshDesktopSetup() {
+    const expectedSessionId = safeId(currentSession?.session_id);
+    if (
+      currentSession?.status !== "ready"
+      || expectedSessionId === null
+      || typeof api.getDesktopSetup !== "function"
+    ) {
+      desktopPanel.hidden = currentSession?.status !== "ready";
+      desktopStatus.textContent = "ComfyUI Vast Desktop setup is unavailable.";
+      desktopInstructions.textContent = "";
+      return null;
+    }
+    let setup;
+    try {
+      setup = safeDesktopSetup(
+        await api.getDesktopSetup(),
+        expectedSessionId,
+      );
+    } catch {
+      setup = null;
+    }
+    if (
+      currentSession?.session_id !== expectedSessionId
+      || currentSession?.status !== "ready"
+    ) {
+      return null;
+    }
+    desktopPanel.hidden = false;
+    if (setup === null) {
+      desktopStatus.textContent = "ComfyUI Vast Desktop setup is unavailable.";
+      desktopInstructions.textContent = "";
+      return null;
+    }
+    desktopStatus.textContent =
+      `${setup.connection_name} — ${setup.ready ? "active" : "not active"}. `
+      + `Desktop address: ${setup.url}`;
+    desktopInstructions.textContent = setup.instructions.join(" ");
+    return setup;
+  }
+
   function renderSession(session) {
     if (!session || typeof session !== "object") return;
     currentSession = session;
@@ -1233,7 +1327,7 @@ export function createSessionConsole(document, api = {}, options = {}) {
       `${session.instance_id ? `; Vast instance ${String(session.instance_id)}` : ""}.`;
     if (outcome === "unknown") {
       sessionStatus.textContent =
-        "GPU rental could not be confirmed. Cloud Run is checking Vast inventory. " +
+        "GPU rental could not be confirmed. Cloud Vast is checking Vast inventory. " +
         "Do not start another rental yet. " +
         "Billing status is not yet known; Vast may have created an instance. " +
         identity;
@@ -1291,7 +1385,7 @@ export function createSessionConsole(document, api = {}, options = {}) {
     }
 
     const ready = session.status === "ready";
-    runNextJobButton.hidden = !ready;
+    desktopPanel.hidden = !ready;
     deadlineControls.hidden = !deadlineCanSynchronize(session);
     destroyButton.hidden = session.can_destroy !== true;
     verifyVastAccessButton.hidden =
@@ -1311,6 +1405,7 @@ export function createSessionConsole(document, api = {}, options = {}) {
     }
     setBusy(busy);
     notifySession(session);
+    if (ready) void refreshDesktopSetup();
     schedulePoll();
   }
 
@@ -1404,41 +1499,6 @@ export function createSessionConsole(document, api = {}, options = {}) {
     } catch {
       status.textContent =
         "Paid confirmation was not accepted; no automatic retry was issued.";
-    } finally {
-      setBusy(false);
-      schedulePoll();
-    }
-  });
-
-  runNextJobButton.addEventListener("click", async () => {
-    if (
-      currentSession?.status !== "ready"
-      || typeof options.capture !== "function"
-      || typeof options.newIdempotencyKey !== "function"
-      || typeof api.createJob !== "function"
-    ) {
-      return;
-    }
-    setBusy(true);
-    status.textContent =
-      "Compiling the current canvas without local execution…";
-    try {
-      const captured = await options.capture();
-      const nextCaptureId = safeId(
-        typeof captured === "string" ? captured : captured?.capture_id,
-      );
-      const key = safeId(options.newIdempotencyKey());
-      if (!nextCaptureId || !key) throw new Error("invalid capture");
-      setCapture(nextCaptureId);
-      renderJob(await api.createJob(
-        currentSession.session_id,
-        nextCaptureId,
-        key,
-      ));
-      status.textContent = "Remote job submitted to the current GPU session.";
-    } catch {
-      status.textContent =
-        "The fresh canvas could not be submitted to this GPU session.";
     } finally {
       setBusy(false);
       schedulePoll();
@@ -1620,7 +1680,6 @@ export function createSessionConsole(document, api = {}, options = {}) {
     sessionError,
     provisioningStatus,
     deadlineWarning,
-    runNextJobButton,
     destroyButton,
     verifyVastAccessButton,
     destroyReview,
@@ -1639,6 +1698,7 @@ export function createSessionConsole(document, api = {}, options = {}) {
     setCapture,
     clearPaidReview,
     refresh,
+    refreshDesktopSetup,
     stopPolling: clearPoll,
     get preflightId() {
       return currentPreflightId;

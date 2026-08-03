@@ -530,7 +530,7 @@ test("ambiguous rental is red, polls, blocks paid controls, and permits destroy"
 
   assert.match(
     view.root.textContent,
-    /GPU rental could not be confirmed\. Cloud Run is checking Vast inventory\./,
+    /GPU rental could not be confirmed\. Cloud Vast is checking Vast inventory\./,
   );
   assert.match(view.root.textContent, /Do not start another rental yet\./);
   assert.match(
@@ -990,28 +990,34 @@ test("no-limit stays red and destroy requires review then final acknowledgement"
 });
 
 
-test("ready session captures a fresh canvas and submits a second job", async () => {
+test("ready session shows ComfyUI Vast Desktop guidance without a second Run", async () => {
   const document = new FakeDocument();
   const api = fakeApi();
-  const capture = {
-    calls: 0,
-    async capture() {
-      capture.calls += 1;
-      return { capture_id: "capture-2" };
-    },
-  };
-  const view = createSessionConsole(document, api, {
-    capture: () => capture.capture(),
-    newIdempotencyKey: () => "job-key-2",
+  api.getDesktopSetup = async () => ({
+    bound: true,
+    url: "http://127.0.0.1:32145",
+    connection_name: "ComfyUI Vast",
+    active_session_id: "session-1",
+    profile_revision: 3,
+    ready: true,
+    error: null,
+    manual_setup_required: true,
+    instructions: [
+      "Open Remote Connections in ComfyUI Desktop.",
+      "Add the loopback URL with the name ComfyUI Vast.",
+    ],
   });
+  const view = createSessionConsole(document, api);
   document.body.appendChild(view.root);
   view.renderSession(sessionPayload({ status: "ready" }));
+  await view.refreshDesktopSetup();
 
-  await view.runNextJobButton.click();
-
-  assert.equal(capture.calls, 1);
-  assert.equal(api.jobCalls[0].capture_id, "capture-2");
-  assert.equal(api.jobCalls[0].idempotency_key, "job-key-2");
+  assert.equal(document.getElementById("cloud-run-next-job"), null);
+  assert.equal(view.runNextJobButton, undefined);
+  assert.match(view.root.textContent, /ComfyUI Vast/);
+  assert.match(view.root.textContent, /127\.0\.0\.1:32145/);
+  assert.match(view.root.textContent, /Ouvrir ComfyUI Vast dans Desktop/);
+  assert.deepEqual(api.jobCalls, []);
 });
 
 

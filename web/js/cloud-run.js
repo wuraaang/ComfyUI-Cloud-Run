@@ -7,6 +7,12 @@ import {
   SESSIONS_ENDPOINT,
 } from "./cloud-run-api.js";
 import { createSessionConsole } from "./session-console.js";
+import {
+  installNativePromptIdentity,
+  isVastRole,
+  readDesktopContext,
+  startExtension,
+} from "./comfyui-vast.js";
 
 
 const OPEN_COMMAND_ID = "vast-cloud-run.open";
@@ -354,13 +360,13 @@ export function mountCloudRun(
   const launcher = createElement(document, "button", {
     id: "cloud-run-button",
     testId: "cloud-run-button",
-    text: "☁ Cloud Run",
+    text: "☁ Cloud Vast",
     type: "button",
   });
   launcher.setAttribute("aria-haspopup", "dialog");
   launcher.setAttribute("aria-controls", "cloud-run-modal");
-  launcher.setAttribute("aria-label", "Cloud Run on Vast.ai");
-  launcher.setAttribute("title", "Launch on Vast.ai — paid GPU rental");
+  launcher.setAttribute("aria-label", "Cloud Vast on Vast.ai");
+  launcher.setAttribute("title", "Cloud Vast — paid GPU rental");
 
   const dialog = createElement(document, "dialog", {
     id: "cloud-run-modal",
@@ -375,7 +381,7 @@ export function mountCloudRun(
   });
   const title = createElement(document, "h2", {
     id: "cloud-run-title",
-    text: "Cloud Run",
+    text: "Cloud Vast",
   });
   const closeButton = createElement(document, "button", {
     id: "cloud-run-close",
@@ -441,7 +447,7 @@ export function mountCloudRun(
     testId: "cloud-run-create-limit-review",
     text:
       "Maximum provider creates for this review: 1. " +
-      "Cloud Run never rents a replacement automatically.",
+      "Cloud Vast never rents a replacement automatically.",
   });
 
   const primaryActions = createElement(document, "div", {
@@ -509,7 +515,7 @@ export function mountCloudRun(
       || typeof persisted.capture_id !== "string"
       || !persisted.capture_id
     ) {
-      throw new Error("Cloud Run capture persistence failed.");
+      throw new Error("Cloud Vast capture persistence failed.");
     }
     record.currentCapture = capture;
     record.sessionConsole.setCapture(persisted.capture_id);
@@ -524,8 +530,6 @@ export function mountCloudRun(
       id: "cloud-run-dependency-console",
       searchButton,
       manageSearch: false,
-      capture: captureCurrentCanvas,
-      newIdempotencyKey: () => createIdempotencyKey(browserWindow),
       setTimeout: typeof browserWindow?.setTimeout === "function"
         ? browserWindow.setTimeout.bind(browserWindow)
         : undefined,
@@ -687,13 +691,13 @@ export function mountCloudRun(
       const allowed = new Set([
         "Pinned ComfyUI queue API is unavailable.",
         "Pinned ComfyUI prompt API is unavailable.",
-        "A Cloud Run canvas capture is already in progress.",
-        "ComfyUI was busy; no Cloud Run payload was captured.",
+        "A Cloud Vast canvas capture is already in progress.",
+        "ComfyUI was busy; no Cloud Vast payload was captured.",
       ]);
       status.textContent =
         error instanceof Error && allowed.has(error.message)
           ? error.message
-          : "Canvas capture failed before any Cloud Run mutation.";
+          : "Canvas capture failed before any Cloud Vast mutation.";
     }
   };
 
@@ -895,6 +899,21 @@ export function registerCloudRunWhenReady(browserWindow, document, tries = 0) {
 
   const fetchImpl = api.fetchApi.bind(api);
   const cloudApi = createCloudRunApi(fetchImpl);
+  let contextPromise = null;
+  let desktopContext = null;
+  let vastIdentityInstalled = false;
+  const resolveContext = async () => {
+    if (desktopContext !== null) return desktopContext;
+    if (contextPromise === null) {
+      contextPromise = readDesktopContext(fetchImpl)
+        .then((context) => {
+          desktopContext = context;
+          return context;
+        })
+        .catch(() => null);
+    }
+    return contextPromise;
+  };
   const captureContext = {
     app,
     api,
@@ -905,23 +924,65 @@ export function registerCloudRunWhenReady(browserWindow, document, tries = 0) {
     commands: [
       {
         id: OPEN_COMMAND_ID,
-        label: "Cloud Run",
-        function: () => openCloudRun(
+        label: "Cloud Vast",
+        async function() {
+          const context = await resolveContext();
+          if (context?.role !== "local") return null;
+          return openCloudRun(
+            document,
+            fetchImpl,
+            browserWindow,
+            captureContext,
+          );
+        },
+      },
+    ],
+    menuCommands: [
+      {
+        path: ["Extensions", "Cloud Vast"],
+        commands: [OPEN_COMMAND_ID],
+      },
+    ],
+    async init() {
+      const context = await resolveContext();
+      if (context !== null && isVastRole(context)) {
+        installNativePromptIdentity(api, browserWindow.crypto);
+        vastIdentityInstalled = true;
+      }
+    },
+    async setup() {
+      const context = await resolveContext();
+      if (context === null) return null;
+      if (isVastRole(context) && !vastIdentityInstalled) {
+        installNativePromptIdentity(api, browserWindow.crypto);
+        vastIdentityInstalled = true;
+      }
+      return startExtension({
+        context,
+        api,
+        app,
+        cryptoImpl: browserWindow.crypto,
+        mountLifecycle: () => mountCloudRun(
           document,
           fetchImpl,
           browserWindow,
           captureContext,
         ),
-      },
-    ],
-    menuCommands: [
-      {
-        path: ["Extensions", "Vast Cloud Run"],
-        commands: [OPEN_COMMAND_ID],
-      },
-    ],
-    setup() {
-      mountCloudRun(document, fetchImpl, browserWindow, captureContext);
+        loadBootstrap: (
+          isVastRole(context)
+          && Number.isSafeInteger(context.bootstrap_revision)
+          && context.bootstrap_revision > 0
+        )
+          ? () => cloudApi.getDesktopBootstrap()
+          : undefined,
+        acknowledgeBootstrap: (
+          isVastRole(context)
+          && Number.isSafeInteger(context.bootstrap_revision)
+          && context.bootstrap_revision > 0
+        )
+          ? (revision) => cloudApi.acknowledgeDesktopBootstrap(revision)
+          : undefined,
+      });
     },
   });
   browserWindow.__cloudRunLifecycleRegistered = true;

@@ -217,10 +217,10 @@ test("mounts next to local Run and exposes the reusable session console", async 
   assert.deepEqual(actionbar.children, [queueGroup, launcher, agentPanel]);
   assert.equal(queueButton.textContent, "Run");
   assert.equal(agentPanel.textContent, "Agent Panel");
-  assert.equal(launcher.textContent, "☁ Cloud Run");
+  assert.equal(launcher.textContent, "☁ Cloud Vast");
   assert.equal(
     launcher.getAttribute("title"),
-    "Launch on Vast.ai — paid GPU rental",
+    "Cloud Vast — paid GPU rental",
   );
 
   await launcher.click();
@@ -232,10 +232,7 @@ test("mounts next to local Run and exposes the reusable session console", async 
     document.getElementById("cloud-run-review-session").textContent,
     "Review paid rental",
   );
-  assert.equal(
-    document.getElementById("cloud-run-next-job").textContent,
-    "Run current canvas on this GPU",
-  );
+  assert.equal(document.getElementById("cloud-run-next-job"), null);
   assert.equal(
     document.getElementById("cloud-run-destroy-gpu").textContent,
     "Destroy GPU — stop all Vast billing",
@@ -281,6 +278,9 @@ test("registers through the pinned ComfyUI extension API", async () => {
   };
   api.fetchApi = async (endpoint, options) => {
     requests.push([endpoint, options]);
+    if (endpoint === "/cloud-run/api/desktop-context") {
+      return jsonResponse({ role: "local" });
+    }
     if (endpoint === "/cloud-run/api/settings") {
       return jsonResponse(settingsPayload());
     }
@@ -308,23 +308,82 @@ test("registers through the pinned ComfyUI extension API", async () => {
   assert.equal(registerCloudRunWhenReady(browserWindow, document), true);
   assert.equal(extension.name, "comfyui-cloud-run.lifecycle");
   assert.deepEqual(extension.commands.map(({ id, label }) => ({ id, label })), [
-    { id: "vast-cloud-run.open", label: "Cloud Run" },
+    { id: "vast-cloud-run.open", label: "Cloud Vast" },
   ]);
   assert.deepEqual(extension.menuCommands, [{
-    path: ["Extensions", "Vast Cloud Run"],
+    path: ["Extensions", "Cloud Vast"],
     commands: ["vast-cloud-run.open"],
   }]);
 
-  extension.setup();
+  await extension.init();
+  await extension.setup();
   await extension.commands[0].function();
 
   assert.deepEqual(
     requests.map(([endpoint]) => endpoint),
-    ["/cloud-run/api/settings", "/cloud-run/api/captures"],
+    [
+      "/cloud-run/api/desktop-context",
+      "/cloud-run/api/settings",
+      "/cloud-run/api/captures",
+    ],
   );
   assert.equal(localSubmissions.length, 0);
   assert.equal(api.fetchApi, originalFetch);
   assert.equal(api.queuePrompt, originalQueue);
+});
+
+
+test("vast Desktop role keeps native Run and mounts no lifecycle launcher", async () => {
+  const document = new FakeDocument();
+  mountLocalRunButton(document);
+  const forwarded = [];
+  const api = {
+    async fetchApi(endpoint, options = {}) {
+      if (endpoint === "/cloud-run/api/desktop-context") {
+        return jsonResponse({
+          role: "vast",
+          session_id: "session-1",
+          profile_revision: 3,
+          agent_bridge_url:
+            "ws://127.0.0.1:32145/cloud-run/api/agent/ws",
+        });
+      }
+      forwarded.push([endpoint, options]);
+      return jsonResponse({});
+    },
+  };
+  const app = {
+    registerExtension(value) {
+      this.extension = value;
+    },
+    queuePrompt() {},
+  };
+  const originalQueue = app.queuePrompt;
+  const browserWindow = {
+    comfyAPI: { app: { app }, api: { api } },
+    crypto: {
+      randomUUID: () => "11111111-1111-4111-8111-111111111111",
+    },
+    setTimeout() {
+      assert.fail("ready APIs must not schedule registration retry");
+    },
+  };
+
+  registerCloudRunWhenReady(browserWindow, document);
+  await app.extension.init();
+  await app.extension.setup();
+  await app.extension.commands[0].function();
+  await api.fetchApi("/prompt", { method: "POST", body: "{}" });
+  await api.fetchApi("/object_info");
+
+  assert.equal(document.getElementById("cloud-run-button"), null);
+  assert.equal(document.getElementById("cloud-run-modal"), null);
+  assert.equal(app.queuePrompt, originalQueue);
+  assert.equal(
+    forwarded[0][1].headers.get("X-Cloud-Vast-Request-Id"),
+    "11111111-1111-4111-8111-111111111111",
+  );
+  assert.equal(forwarded[1][1].headers, undefined);
 });
 
 
@@ -678,7 +737,7 @@ test("paid review defaults to manual destruction with one provider create", asyn
   assert.equal(
     document.getElementById("cloud-run-create-limit-review").textContent,
     "Maximum provider creates for this review: 1. " +
-      "Cloud Run never rents a replacement automatically.",
+      "Cloud Vast never rents a replacement automatically.",
   );
   const duration = document.getElementById("cloud-run-session-duration");
   assert.ok(duration);
@@ -1280,7 +1339,11 @@ test("Extensions command remains usable when the actionbar is absent", async () 
     },
   };
   const api = {
-    fetchApi: async () => jsonResponse(settingsPayload()),
+    fetchApi: async (endpoint) => jsonResponse(
+      endpoint === "/cloud-run/api/desktop-context"
+        ? { role: "local" }
+        : settingsPayload(),
+    ),
     async queuePrompt() {},
   };
   const browserWindow = {
@@ -1289,7 +1352,8 @@ test("Extensions command remains usable when the actionbar is absent", async () 
   };
 
   registerCloudRunWhenReady(browserWindow, document);
-  extension.setup();
+  await extension.init();
+  await extension.setup();
   await extension.commands[0].function();
 
   assert.equal(document.getElementById("cloud-run-modal").open, true);
@@ -1351,6 +1415,8 @@ test("offer rendering marks missing connection metrics unavailable", () => {
 
 test("frontend source has no legacy, browser-secret, or provider URL surface", async () => {
   const sources = await Promise.all([
+    "../../web/js/canvas-adapter.js",
+    "../../web/js/comfyui-vast.js",
     "../../web/js/cloud-run.js",
     "../../web/js/cloud-run-api.js",
     "../../web/js/session-console.js",
@@ -1380,7 +1446,9 @@ test("frontend source has no legacy, browser-secret, or provider URL surface", a
   );
   assert.ok(source.includes("createCloudRunApi"));
   assert.ok(source.includes("createSession"));
-  assert.ok(source.includes("Run current canvas on this GPU"));
+  assert.ok(!source.includes("Run current canvas on this GPU"));
+  assert.ok(!source.includes("Run Vast"));
+  assert.ok(!source.includes("Cloud Run"));
   assert.ok(source.includes("Destroy GPU — stop all Vast billing"));
   assert.ok(source.includes("MutationObserver"));
   assert.ok(source.includes("#cloud-run-button:focus-visible"));
