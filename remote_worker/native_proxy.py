@@ -189,7 +189,10 @@ class NativeRoutePolicy:
                 "/embeddings",
                 "/queue",
                 "/history",
+                "/system_stats",
             }:
+                if path == "/system_stats" and path_qs != "/system_stats":
+                    return None
                 return NativeRoute("http", path_qs)
             if path.startswith("/models/") and _safe_components(path):
                 return NativeRoute("http", path_qs)
@@ -360,6 +363,16 @@ class AiohttpNativeTransport:
                 skip_auto_headers={"Accept-Encoding"},
                 timeout=ClientTimeout(total=120, connect=10, sock_read=60),
             )
+            original_request = self._session.request
+
+            def request_without_redirects(method, url, **kwargs):
+                kwargs["allow_redirects"] = False
+                return original_request(method, url, **kwargs)
+
+            # aiohttp's public ws_connect API does not expose redirect
+            # controls. Its handshake uses session.request, so pin that
+            # request path to the fixed loopback origin.
+            self._session.request = request_without_redirects
         return self._session
 
     async def request(self, *, method, path_qs, body, headers, allow_redirects):
@@ -396,7 +409,6 @@ class AiohttpNativeTransport:
                 path_qs,
                 heartbeat=30,
                 max_msg_size=MAX_NATIVE_WEBSOCKET_BYTES,
-                max_redirects=0,
                 autoclose=False,
             )
         except (asyncio.CancelledError, KeyboardInterrupt):

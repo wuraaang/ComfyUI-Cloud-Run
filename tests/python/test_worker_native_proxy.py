@@ -1,9 +1,11 @@
 import asyncio
+import importlib.util
 import json
 import tempfile
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
+from unittest import mock
 
 from cloud_run.worker_protocol import sign_request
 
@@ -189,6 +191,29 @@ class RecordingObserver:
 
 
 class NativeRoutePolicyTests(unittest.TestCase):
+    def test_system_stats_allows_only_exact_get(self):
+        from remote_worker.native_proxy import NativeRoutePolicy
+
+        policy = NativeRoutePolicy()
+
+        route = policy.classify("GET", "/system_stats")
+
+        self.assertIsNotNone(route)
+        self.assertEqual(route.kind, "http")
+        self.assertEqual(route.path_qs, "/system_stats")
+        rejected = {
+            ("POST", "/system_stats"),
+            ("PUT", "/system_stats"),
+            ("GET", "/system_stats?"),
+            ("GET", "/system_stats?detail=1"),
+            ("GET", "/system_stats#fragment"),
+            ("GET", "http://attacker.invalid/system_stats"),
+            ("GET", "/system_stats%2f..%2fmanager"),
+        }
+        for method, path_qs in sorted(rejected):
+            with self.subTest(method=method, path_qs=path_qs):
+                self.assertIsNone(policy.classify(method, path_qs))
+
     def test_exact_native_surface_is_allowlisted(self):
         from remote_worker.native_proxy import NativeRoutePolicy
 
@@ -240,6 +265,98 @@ class NativeRoutePolicyTests(unittest.TestCase):
         for method, path in sorted(rejected):
             with self.subTest(method=method, path=path):
                 self.assertIsNone(policy.classify(method, path))
+
+
+@unittest.skipUnless(importlib.util.find_spec("aiohttp"), "aiohttp unavailable")
+class AiohttpNativeTransportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_websocket_opens_and_closes_with_real_aiohttp_api(self):
+        from aiohttp import WSMsgType, web
+
+        from remote_worker.native_proxy import AiohttpNativeTransport
+
+        async def websocket_handler(request):
+            socket = web.WebSocketResponse()
+            await socket.prepare(request)
+            await socket.send_str("native-status")
+            await socket.close()
+            return socket
+
+        application = web.Application()
+        application.router.add_get("/ws", websocket_handler)
+        runner = web.AppRunner(application, access_log=None)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        self.addAsyncCleanup(runner.cleanup)
+        port = runner.addresses[0][1]
+        transport = AiohttpNativeTransport()
+        self.addAsyncCleanup(transport.close)
+
+        with mock.patch(
+            "remote_worker.native_proxy.COMFY_LOOPBACK_ORIGIN",
+            "http://127.0.0.1:" + str(port),
+        ):
+            socket = await transport.websocket("/ws?clientId=desktop-client-1")
+            message = await socket.receive()
+            closed = await socket.receive()
+            await socket.close()
+
+        self.assertEqual(message.type, WSMsgType.TEXT)
+        self.assertEqual(message.data, "native-status")
+        self.assertIn(closed.type, {WSMsgType.CLOSE, WSMsgType.CLOSED})
+        self.assertTrue(socket.closed)
+
+    async def test_websocket_redirect_is_rejected_before_target_or_headers_are_reached(
+        self,
+    ):
+        from aiohttp import web
+
+        from remote_worker.native_proxy import (
+            AiohttpNativeTransport,
+            NativeProxyError,
+        )
+
+        target_hits = []
+
+        async def target_handler(request):
+            target_hits.append(dict(request.headers))
+            socket = web.WebSocketResponse()
+            await socket.prepare(request)
+            return socket
+
+        target_application = web.Application()
+        target_application.router.add_get("/target", target_handler)
+        target_runner = web.AppRunner(target_application, access_log=None)
+        await target_runner.setup()
+        target_site = web.TCPSite(target_runner, "127.0.0.1", 0)
+        await target_site.start()
+        self.addAsyncCleanup(target_runner.cleanup)
+        target_port = target_runner.addresses[0][1]
+
+        async def redirect_handler(_request):
+            raise web.HTTPFound(
+                "http://127.0.0.1:" + str(target_port) + "/target"
+            )
+
+        redirect_application = web.Application()
+        redirect_application.router.add_get("/ws", redirect_handler)
+        redirect_runner = web.AppRunner(redirect_application, access_log=None)
+        await redirect_runner.setup()
+        redirect_site = web.TCPSite(redirect_runner, "127.0.0.1", 0)
+        await redirect_site.start()
+        self.addAsyncCleanup(redirect_runner.cleanup)
+        redirect_port = redirect_runner.addresses[0][1]
+        transport = AiohttpNativeTransport()
+        self.addAsyncCleanup(transport.close)
+
+        with mock.patch(
+            "remote_worker.native_proxy.COMFY_LOOPBACK_ORIGIN",
+            "http://127.0.0.1:" + str(redirect_port),
+        ):
+            with self.assertRaises(NativeProxyError):
+                await transport.websocket("/ws?clientId=desktop-client-1")
+
+        self.assertEqual(target_hits, [])
 
 
 class NativeProxyTests(unittest.IsolatedAsyncioTestCase):

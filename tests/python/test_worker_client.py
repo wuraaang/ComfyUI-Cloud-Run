@@ -139,6 +139,37 @@ class AiohttpWorkerTransportTests(unittest.IsolatedAsyncioTestCase):
 
 
 class WorkerClientTests(unittest.TestCase):
+    def test_native_system_stats_envelope_rejects_bodies_and_identity_headers(self):
+        from cloud_run.worker_client import WorkerClient, WorkerClientError
+
+        client = WorkerClient(
+            base_url="http://8.8.8.8:30000",
+            provider_token="a" * 64,
+            session_id="session-1",
+            session_secret=b"s" * 32,
+            transport=RecordingTransport(),
+            clock=lambda: 1000,
+            nonce=lambda: "system-stats",
+        )
+
+        request = client.native_envelope("GET", "/system_stats", b"")
+
+        self.assertEqual(request.method, "GET")
+        self.assertTrue(request.url.endswith("/system_stats"))
+        for method, path_qs, body, options in (
+            ("GET", "/system_stats", b"body", {}),
+            ("POST", "/system_stats", b"", {}),
+            ("GET", "/system_stats?detail=1", b"", {}),
+            ("GET", "/system_stats", b"", {"identity": {"job_id": "job-1"}}),
+            ("GET", "/system_stats", b"", {"headers": {"Authorization": "x"}}),
+            ("GET", "/system_stats", b"", {"headers": {"Cookie": "x"}}),
+            ("GET", "/system_stats", b"", {"headers": {"Host": "x"}}),
+            ("GET", "/system_stats", b"", {"headers": {"X-Forwarded-For": "x"}}),
+        ):
+            with self.subTest(method=method, path_qs=path_qs, options=options):
+                with self.assertRaises(WorkerClientError):
+                    client.native_envelope(method, path_qs, body, **options)
+
     def test_profile_snapshot_is_exact_cursor_bound_and_supports_unchanged(self):
         from cloud_run.worker_client import (
             WorkerClient,
