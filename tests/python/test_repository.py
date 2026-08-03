@@ -672,9 +672,81 @@ class SessionRepositoryTests(unittest.TestCase):
             SessionState.RUNNING,
         )
 
-    def test_destroy_review_is_hashed_version_bound_and_consumed_once(self):
+    def _insert_active_destroy_job(self, session_id, job_id="destroy-job"):
+        with closing(sqlite3.connect(self.database_path)) as connection:
+            connection.execute(
+                """
+                INSERT INTO jobs(
+                    job_id, session_id, idempotency_key, state,
+                    prompt_digest, capture_json, manifest_digest,
+                    created_at, updated_at, version
+                ) VALUES (?, ?, ?, 'running', ?, '{}', ?, 100.0, 100.0, 1)
+                """,
+                (job_id, session_id, job_id + "-key", "a" * 64, "b" * 64),
+            )
+            connection.commit()
+
+    def _insert_unverified_destroy_output(self, job_id, artifact_id="output-2"):
+        with closing(sqlite3.connect(self.database_path)) as connection:
+            connection.execute(
+                """
+                INSERT INTO transfers(
+                    job_id, artifact_id, direction, expected_size, sha256,
+                    offset, state, private_path
+                ) VALUES (?, ?, 'download', 1, ?, 0, 'transferring', ?)
+                """,
+                (job_id, artifact_id, "c" * 64, "/private/" + artifact_id),
+            )
+            connection.commit()
+
+    def _insert_profile_revision(self, profile_id, revision):
+        with closing(sqlite3.connect(self.database_path)) as connection:
+            connection.execute(
+                """
+                INSERT INTO profile_revisions(
+                    profile_id, revision, base_revision, bootstrap_digest,
+                    archive_path, archive_size_bytes, archive_sha256,
+                    artifacts_json, ui_packages_json, source, created_at
+                ) VALUES (?, ?, ?, ?, '/private/profile.tar.gz', 1, ?,
+                          '[]', '[]', 'local', 100.0)
+                """,
+                (
+                    profile_id,
+                    revision,
+                    None if revision == 1 else revision - 1,
+                    "d" * 64,
+                    "e" * 64,
+                ),
+            )
+            connection.commit()
+
+    def _set_destroy_manifest_profile(self, session, profile_id):
+        with closing(sqlite3.connect(self.database_path)) as connection:
+            connection.execute(
+                """
+                INSERT INTO manifests(manifest_digest, manifest_json, created_at)
+                VALUES (?, ?, 100.0)
+                """,
+                (
+                    session.manifest_digest,
+                    json.dumps({"profile": {"profile_id": profile_id}}),
+                ),
+            )
+            connection.commit()
+
+    def test_destroy_review_survives_progress_only_session_version_change(self):
         sessions = repository.SessionRepository(self.database_path)
         saved, _created = sessions.create_or_get(make_session())
+        saved = sessions.transition(
+            saved.session_id,
+            SessionState.OFFER_SELECTED,
+            now=101.0,
+        )
+        saved = sessions.transition(
+            saved.session_id,
+            SessionState.CONFIRMING,
+            now=102.0,
+        )
         raw_token = "review-token-never-store-raw"
         digest = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
 
@@ -682,55 +754,192 @@ class SessionRepositoryTests(unittest.TestCase):
             saved.session_id,
             token_digest=digest,
             expires_at=400.0,
-            session_version=saved.version,
-            instance_id=saved.instance_id,
-            unverified_artifact_ids=("output-2",),
+            profile_id=None,
         )
-        consumed = sessions.consume_destroy_review(
+        sessions.update(
             saved.session_id,
-            token_digest=digest,
-            now=200.0,
+            now=103.0,
+            sanitized_error="Progress message changed.",
         )
-        repeated = sessions.consume_destroy_review(
-            saved.session_id,
-            token_digest=digest,
-            now=200.0,
+        consumed, requested = (
+            sessions.consume_destroy_review_and_request_destroy(
+                saved.session_id,
+                token_digest=digest,
+                now=200.0,
+            )
         )
+        self.assertEqual(consumed.session_id, saved.session_id)
+        self.assertEqual(requested.state, SessionState.DESTROY_REQUESTED)
 
-        self.assertEqual(
-            consumed.unverified_artifact_ids,
-            ("output-2",),
-        )
-        self.assertIsNone(repeated)
         with closing(sessions._connect()) as connection:
             rows = connection.execute(
                 "SELECT token_digest FROM destroy_reviews"
             ).fetchall()
         self.assertNotIn(raw_token, repr(rows))
 
-    def test_destroy_review_is_invalidated_by_session_version_change(self):
+    def test_destroy_review_rejects_changed_instance_or_residual_inventory(self):
+        for index, changes in enumerate(
+            (
+                {"instance_id": "77"},
+                {"residual_inventory": ("88",)},
+            )
+        ):
+            with self.subTest(changes=changes):
+                sessions = repository.SessionRepository(self.database_path)
+                saved, _created = sessions.create_or_get(
+                    make_session(
+                        key="destroy-inventory-" + str(index),
+                        session_id="destroy-inventory-" + str(index),
+                    )
+                )
+                digest = "f" * 64
+                sessions.save_destroy_review(
+                    saved.session_id,
+                    token_digest=digest,
+                    expires_at=400.0,
+                    profile_id=None,
+                )
+                sessions.update(saved.session_id, now=101.0, **changes)
+
+                self.assertIsNone(
+                    sessions.consume_destroy_review_and_request_destroy(
+                        saved.session_id,
+                        token_digest=digest,
+                        now=200.0,
+                    )
+                )
+
+    def test_destroy_review_rejects_changed_active_job_or_unverified_output(self):
+        sessions = repository.SessionRepository(self.database_path)
+        active, _created = sessions.create_or_get(
+            make_session(key="active-job-key", session_id="active-job")
+        )
+        self._insert_active_destroy_job(active.session_id)
+        sessions.save_destroy_review(
+            active.session_id,
+            token_digest="a" * 64,
+            expires_at=400.0,
+            profile_id=None,
+        )
+        with closing(sqlite3.connect(self.database_path)) as connection:
+            connection.execute(
+                "UPDATE jobs SET state = 'succeeded' WHERE job_id = ?",
+                ("destroy-job",),
+            )
+            connection.commit()
+
+        self.assertIsNone(
+            sessions.consume_destroy_review_and_request_destroy(
+                active.session_id,
+                token_digest="a" * 64,
+                now=200.0,
+            )
+        )
+
+        output, _created = sessions.create_or_get(
+            make_session(key="output-key", session_id="output-session")
+        )
+        self._insert_active_destroy_job(output.session_id, "output-job")
+        sessions.save_destroy_review(
+            output.session_id,
+            token_digest="b" * 64,
+            expires_at=400.0,
+            profile_id=None,
+        )
+        self._insert_unverified_destroy_output("output-job")
+
+        self.assertIsNone(
+            sessions.consume_destroy_review_and_request_destroy(
+                output.session_id,
+                token_digest="b" * 64,
+                now=200.0,
+            )
+        )
+
+    def test_destroy_review_rejects_changed_label_or_profile_revision(self):
+        sessions = repository.SessionRepository(self.database_path)
+        label, _created = sessions.create_or_get(
+            make_session(key="label-key", session_id="label-session")
+        )
+        sessions.save_destroy_review(
+            label.session_id,
+            token_digest="c" * 64,
+            expires_at=400.0,
+            profile_id=None,
+        )
+        with closing(sqlite3.connect(self.database_path)) as connection:
+            connection.execute(
+                "UPDATE sessions SET label = ? WHERE session_id = ?",
+                ("comfy-cloud-run-renamed", label.session_id),
+            )
+            connection.commit()
+
+        self.assertIsNone(
+            sessions.consume_destroy_review_and_request_destroy(
+                label.session_id,
+                token_digest="c" * 64,
+                now=200.0,
+            )
+        )
+
+        profile, _created = sessions.create_or_get(
+            make_session(key="profile-key", session_id="profile-session")
+        )
+        self._insert_profile_revision("desktop-profile", 1)
+        self._set_destroy_manifest_profile(profile, "desktop-profile")
+        sessions.save_destroy_review(
+            profile.session_id,
+            token_digest="d" * 64,
+            expires_at=400.0,
+            profile_id="desktop-profile",
+        )
+        self._insert_profile_revision("desktop-profile", 2)
+
+        self.assertIsNone(
+            sessions.consume_destroy_review_and_request_destroy(
+                profile.session_id,
+                token_digest="d" * 64,
+                now=200.0,
+            )
+        )
+
+    def test_destroy_review_is_consumed_once_and_atomically_sets_destroy_requested(self):
         sessions = repository.SessionRepository(self.database_path)
         saved, _created = sessions.create_or_get(make_session())
-        digest = "f" * 64
+        saved = sessions.transition(
+            saved.session_id,
+            SessionState.OFFER_SELECTED,
+            now=101.0,
+        )
+        saved = sessions.transition(
+            saved.session_id,
+            SessionState.CONFIRMING,
+            now=102.0,
+        )
+        digest = "e" * 64
         sessions.save_destroy_review(
             saved.session_id,
             token_digest=digest,
             expires_at=400.0,
-            session_version=saved.version,
-            instance_id=saved.instance_id,
-            unverified_artifact_ids=(),
+            profile_id=None,
         )
-        sessions.save(
-            saved.transition(SessionState.OFFER_SELECTED, now=101.0)
+        consumed = sessions.consume_destroy_review_and_request_destroy(
+            saved.session_id,
+            token_digest=digest,
+            now=200.0,
+        )
+        repeated = sessions.consume_destroy_review_and_request_destroy(
+            saved.session_id,
+            token_digest=digest,
+            now=200.0,
         )
 
-        self.assertIsNone(
-            sessions.consume_destroy_review(
-                saved.session_id,
-                token_digest=digest,
-                now=200.0,
-            )
-        )
+        reviewed, requested = consumed
+        self.assertEqual(reviewed.unverified_artifact_ids, ())
+        self.assertTrue(requested.destroy_requested)
+        self.assertEqual(requested.state, SessionState.DESTROY_REQUESTED)
+        self.assertTrue(sessions.get(saved.session_id).destroy_requested)
+        self.assertIsNone(repeated)
 
     def test_destroy_review_expires_at_the_five_minute_boundary(self):
         sessions = repository.SessionRepository(self.database_path)
@@ -740,18 +949,72 @@ class SessionRepositoryTests(unittest.TestCase):
             saved.session_id,
             token_digest=digest,
             expires_at=400.0,
-            session_version=saved.version,
-            instance_id=saved.instance_id,
-            unverified_artifact_ids=(),
+            profile_id=None,
         )
 
         self.assertIsNone(
-            sessions.consume_destroy_review(
+            sessions.consume_destroy_review_and_request_destroy(
                 saved.session_id,
                 token_digest=digest,
                 now=400.0,
             )
         )
+
+    def test_v12_destroy_reviews_are_invalidated_during_v13_migration(self):
+        self.database_path.parent.mkdir(parents=True)
+        with closing(sqlite3.connect(self.database_path)) as connection:
+            connection.execute(
+                "CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+            )
+            connection.execute(
+                "INSERT INTO schema_meta VALUES ('schema_version', '12')"
+            )
+            connection.execute(
+                """
+                CREATE TABLE destroy_reviews (
+                    session_id TEXT PRIMARY KEY,
+                    token_digest TEXT NOT NULL,
+                    expires_at REAL NOT NULL,
+                    session_version INTEGER NOT NULL,
+                    instance_id TEXT,
+                    unverified_artifact_ids_json TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                "INSERT INTO destroy_reviews VALUES (?, ?, ?, ?, NULL, '[]')",
+                ("legacy-session", "a" * 64, 400.0, 1),
+            )
+            connection.execute(
+                "CREATE TABLE readiness_reports (sentinel TEXT PRIMARY KEY)"
+            )
+            connection.execute(
+                "INSERT INTO readiness_reports VALUES ('keep-me')"
+            )
+            connection.commit()
+
+        sessions = repository.SessionRepository(self.database_path)
+        with closing(sessions._connect()) as connection:
+            version = connection.execute(
+                "SELECT value FROM schema_meta WHERE key = 'schema_version'"
+            ).fetchone()[0]
+            destroy_columns = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(destroy_reviews)"
+                ).fetchall()
+            }
+            reviews = connection.execute(
+                "SELECT * FROM destroy_reviews"
+            ).fetchall()
+            readiness = connection.execute(
+                "SELECT sentinel FROM readiness_reports"
+            ).fetchall()
+
+        self.assertEqual(version, "13")
+        self.assertNotIn("session_version", destroy_columns)
+        self.assertEqual(reviews, [])
+        self.assertEqual(readiness[0][0], "keep-me")
 
     def test_pending_deadline_intent_survives_repository_reopen(self):
         sessions = repository.SessionRepository(self.database_path)
@@ -903,7 +1166,7 @@ class SessionRepositoryTests(unittest.TestCase):
                 ).fetchall()
             }
 
-        self.assertEqual(version, "12")
+        self.assertEqual(version, "13")
         self.assertEqual(migrated.failure_code, None)
         self.assertEqual(migrated.create_empty_observations, 0)
         self.assertIsNone(migrated.create_first_empty_at)

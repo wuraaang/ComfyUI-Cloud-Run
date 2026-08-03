@@ -70,9 +70,13 @@ _SESSION_COLUMNS = """
 class DestroyReviewRecord:
     session_id: str
     expires_at: float
-    session_version: int
+    managed_label: str
     instance_id: str | None
+    residual_instance_ids: tuple[str, ...]
+    active_job_id: str | None
     unverified_artifact_ids: tuple[str, ...]
+    profile_id: str | None
+    profile_revision: int | None
 
 
 @dataclass(frozen=True)
@@ -702,9 +706,13 @@ def _initialize_database(path):
                     session_id TEXT PRIMARY KEY,
                     token_digest TEXT NOT NULL,
                     expires_at REAL NOT NULL,
-                    session_version INTEGER NOT NULL,
+                    managed_label TEXT NOT NULL,
                     instance_id TEXT,
-                    unverified_artifact_ids_json TEXT NOT NULL
+                    residual_instance_ids_json TEXT NOT NULL,
+                    active_job_id TEXT,
+                    unverified_artifact_ids_json TEXT NOT NULL,
+                    profile_id TEXT,
+                    profile_revision INTEGER
                 )
                 """
             )
@@ -809,9 +817,44 @@ def _initialize_database(path):
                 """
             )
             _migrate_legacy_attempts(connection)
+            schema_version_row = connection.execute(
+                "SELECT value FROM schema_meta WHERE key = 'schema_version'"
+            ).fetchone()
+            try:
+                schema_version = (
+                    int(schema_version_row["value"])
+                    if schema_version_row is not None
+                    else 0
+                )
+            except (TypeError, ValueError):
+                schema_version = 0
+            if schema_version < 13:
+                connection.execute("DROP TABLE IF EXISTS destroy_reviews")
+                connection.execute(
+                    """
+                    CREATE TABLE destroy_reviews (
+                        session_id TEXT PRIMARY KEY,
+                        token_digest TEXT NOT NULL,
+                        expires_at REAL NOT NULL,
+                        managed_label TEXT NOT NULL,
+                        instance_id TEXT,
+                        residual_instance_ids_json TEXT NOT NULL,
+                        active_job_id TEXT,
+                        unverified_artifact_ids_json TEXT NOT NULL,
+                        profile_id TEXT,
+                        profile_revision INTEGER
+                    )
+                    """
+                )
             connection.execute(
                 """
-                INSERT INTO schema_meta(key, value) VALUES('schema_version', '12')
+                CREATE INDEX IF NOT EXISTS destroy_reviews_expires_at
+                ON destroy_reviews(expires_at)
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO schema_meta(key, value) VALUES('schema_version', '13')
                 ON CONFLICT(key) DO UPDATE SET value = excluded.value
                 """
             )
@@ -1716,82 +1759,219 @@ class SessionRepository:
             connection.commit()
         return saved
 
+    @staticmethod
+    def _destroy_review_identifiers(value):
+        try:
+            items = json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if (
+            not isinstance(items, list)
+            or len(items) > 100_000
+            or any(
+                not isinstance(item, str)
+                or not item
+                or len(item) > 200
+                for item in items
+            )
+            or len(set(items)) != len(items)
+        ):
+            return None
+        return tuple(sorted(items))
+
+    @staticmethod
+    def _destroy_review_manifest_profile_id(connection, session):
+        manifest_digest = (
+            session["installed_manifest_digest"]
+            or session["manifest_digest"]
+        )
+        if manifest_digest is None:
+            return None
+        manifest = connection.execute(
+            """
+            SELECT manifest_json FROM manifests
+            WHERE manifest_digest = ?
+            """,
+            (manifest_digest,),
+        ).fetchone()
+        if manifest is None:
+            return None
+        try:
+            profile = json.loads(manifest["manifest_json"]).get("profile")
+        except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+            return False
+        if profile is None:
+            return None
+        profile_id = profile.get("profile_id") if isinstance(profile, dict) else None
+        if (
+            not isinstance(profile_id, str)
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}", profile_id)
+            is None
+        ):
+            return False
+        return profile_id
+
+    def _destroy_review_snapshot(self, connection, session_id, profile_id):
+        session = connection.execute(
+            f"""
+            SELECT {_SESSION_COLUMNS}
+            FROM sessions
+            WHERE session_id = ?
+            """,
+            (session_id,),
+        ).fetchone()
+        if session is None:
+            return None
+        residual_ids = self._destroy_review_identifiers(
+            session["residual_inventory_json"] or "[]"
+        )
+        manifest_profile_id = self._destroy_review_manifest_profile_id(
+            connection,
+            session,
+        )
+        if (
+            residual_ids is None
+            or manifest_profile_id is False
+            or (
+                profile_id is not None
+                and manifest_profile_id != profile_id
+            )
+            or (
+                profile_id is None
+                and manifest_profile_id not in (None, False)
+            )
+        ):
+            return None
+        active_jobs = connection.execute(
+            """
+            SELECT job_id
+            FROM jobs
+            WHERE session_id = ? AND state IN ('running', 'harvesting')
+            ORDER BY created_at, job_id
+            """,
+            (session_id,),
+        ).fetchall()
+        if len(active_jobs) > 1:
+            return None
+        artifact_rows = connection.execute(
+            """
+            SELECT DISTINCT transfer.artifact_id
+            FROM transfers AS transfer
+            JOIN jobs AS job ON job.job_id = transfer.job_id
+            WHERE job.session_id = ?
+              AND transfer.direction = 'download'
+              AND transfer.state != 'verified'
+            ORDER BY transfer.artifact_id
+            """,
+            (session_id,),
+        ).fetchall()
+        artifact_ids = tuple(row["artifact_id"] for row in artifact_rows)
+        if self._destroy_review_identifiers(_canonical_json(list(artifact_ids))) is None:
+            return None
+        profile_revision = None
+        if profile_id is not None:
+            revision = connection.execute(
+                """
+                SELECT MAX(revision) AS revision
+                FROM profile_revisions
+                WHERE profile_id = ?
+                """,
+                (profile_id,),
+            ).fetchone()["revision"]
+            if revision is None:
+                return None
+            profile_revision = int(revision)
+        return {
+            "managed_label": session["label"],
+            "instance_id": session["instance_id"],
+            "residual_instance_ids": residual_ids,
+            "active_job_id": (
+                active_jobs[0]["job_id"] if active_jobs else None
+            ),
+            "unverified_artifact_ids": artifact_ids,
+            "profile_id": profile_id,
+            "profile_revision": profile_revision,
+        }, session
+
     def save_destroy_review(
         self,
         session_id,
         *,
         token_digest,
         expires_at,
-        session_version,
-        instance_id,
-        unverified_artifact_ids,
+        profile_id,
     ):
         identifier = str(session_id or "")
         digest = str(token_digest or "")
-        expiry = float(expires_at)
-        version = int(session_version)
-        instance = None if instance_id is None else str(instance_id)
-        artifact_ids = tuple(
-            sorted(str(item) for item in unverified_artifact_ids)
-        )
+        profile = None if profile_id is None else str(profile_id)
+        try:
+            expiry = float(expires_at)
+        except (TypeError, ValueError):
+            raise ValueError("Destroy review metadata is invalid.") from None
         if (
             not identifier
             or len(identifier) > 200
             or not re.fullmatch(r"[0-9a-f]{64}", digest)
             or not math.isfinite(expiry)
             or expiry <= 0
-            or version < 1
-            or (instance is not None and (not instance or len(instance) > 200))
-            or len(artifact_ids) > 100_000
-            or len(set(artifact_ids)) != len(artifact_ids)
-            or any(not item or len(item) > 200 for item in artifact_ids)
+            or (
+                profile is not None
+                and re.fullmatch(
+                    r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}", profile
+                )
+                is None
+            )
         ):
             raise ValueError("Destroy review metadata is invalid.")
         with closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
-            session = connection.execute(
-                """
-                SELECT version, instance_id
-                FROM sessions
-                WHERE session_id = ?
-                """,
-                (identifier,),
-            ).fetchone()
-            if (
-                session is None
-                or int(session["version"]) != version
-                or session["instance_id"] != instance
-            ):
+            reviewed = self._destroy_review_snapshot(
+                connection,
+                identifier,
+                profile,
+            )
+            if reviewed is None:
                 connection.rollback()
                 raise ConcurrentSessionUpdate(
                     "The session changed before destruction review."
                 )
+            snapshot, _session = reviewed
             connection.execute(
                 """
                 INSERT INTO destroy_reviews(
-                    session_id, token_digest, expires_at, session_version,
-                    instance_id, unverified_artifact_ids_json
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    session_id, token_digest, expires_at, managed_label,
+                    instance_id, residual_instance_ids_json, active_job_id,
+                    unverified_artifact_ids_json, profile_id, profile_revision
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(session_id) DO UPDATE SET
                     token_digest = excluded.token_digest,
                     expires_at = excluded.expires_at,
-                    session_version = excluded.session_version,
+                    managed_label = excluded.managed_label,
                     instance_id = excluded.instance_id,
+                    residual_instance_ids_json =
+                        excluded.residual_instance_ids_json,
+                    active_job_id = excluded.active_job_id,
                     unverified_artifact_ids_json =
-                        excluded.unverified_artifact_ids_json
+                        excluded.unverified_artifact_ids_json,
+                    profile_id = excluded.profile_id,
+                    profile_revision = excluded.profile_revision
                 """,
                 (
                     identifier,
                     digest,
                     expiry,
-                    version,
-                    instance,
-                    _canonical_json(list(artifact_ids)),
+                    snapshot["managed_label"],
+                    snapshot["instance_id"],
+                    _canonical_json(list(snapshot["residual_instance_ids"])),
+                    snapshot["active_job_id"],
+                    _canonical_json(list(snapshot["unverified_artifact_ids"])),
+                    snapshot["profile_id"],
+                    snapshot["profile_revision"],
                 ),
             )
             connection.commit()
 
-    def consume_destroy_review(
+    def consume_destroy_review_and_request_destroy(
         self,
         session_id,
         *,
@@ -1800,7 +1980,10 @@ class SessionRepository:
     ):
         identifier = str(session_id or "")
         digest = str(token_digest or "")
-        timestamp = float(now)
+        try:
+            timestamp = float(now)
+        except (TypeError, ValueError):
+            return None
         if (
             not identifier
             or not re.fullmatch(r"[0-9a-f]{64}", digest)
@@ -1810,68 +1993,92 @@ class SessionRepository:
             return None
         with closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute(
+            review = connection.execute(
                 """
-                SELECT
-                    review.token_digest,
-                    review.expires_at,
-                    review.session_version,
-                    review.instance_id AS reviewed_instance_id,
-                    review.unverified_artifact_ids_json,
-                    session.version AS current_version,
-                    session.instance_id AS live_instance_id
-                FROM destroy_reviews AS review
-                JOIN sessions AS session
-                    ON session.session_id = review.session_id
-                WHERE review.session_id = ?
+                SELECT token_digest, expires_at, managed_label, instance_id,
+                       residual_instance_ids_json, active_job_id,
+                       unverified_artifact_ids_json, profile_id,
+                       profile_revision
+                FROM destroy_reviews
+                WHERE session_id = ?
                 """,
                 (identifier,),
             ).fetchone()
-            if row is None:
+            if review is None:
                 connection.commit()
                 return None
-            stale = (
-                timestamp >= float(row["expires_at"])
-                or int(row["session_version"])
-                != int(row["current_version"])
-                or row["reviewed_instance_id"]
-                != row["live_instance_id"]
+            if not hmac.compare_digest(review["token_digest"], digest):
+                connection.commit()
+                return None
+            residual_ids = self._destroy_review_identifiers(
+                review["residual_instance_ids_json"]
             )
-            if stale:
+            artifact_ids = self._destroy_review_identifiers(
+                review["unverified_artifact_ids_json"]
+            )
+            reviewed_snapshot = {
+                "managed_label": review["managed_label"],
+                "instance_id": review["instance_id"],
+                "residual_instance_ids": residual_ids,
+                "active_job_id": review["active_job_id"],
+                "unverified_artifact_ids": artifact_ids,
+                "profile_id": review["profile_id"],
+                "profile_revision": (
+                    int(review["profile_revision"])
+                    if review["profile_revision"] is not None
+                    else None
+                ),
+            }
+            current = self._destroy_review_snapshot(
+                connection,
+                identifier,
+                review["profile_id"],
+            )
+            if (
+                timestamp >= float(review["expires_at"])
+                or residual_ids is None
+                or artifact_ids is None
+                or current is None
+                or reviewed_snapshot != current[0]
+            ):
                 connection.execute(
                     "DELETE FROM destroy_reviews WHERE session_id = ?",
                     (identifier,),
                 )
-                connection.commit()
-                return None
-            if not hmac.compare_digest(row["token_digest"], digest):
                 connection.commit()
                 return None
             try:
-                artifact_ids = tuple(
-                    str(item)
-                    for item in json.loads(
-                        row["unverified_artifact_ids_json"]
-                    )
+                requested = self._row_to_session(current[1]).transition(
+                    SessionState.DESTROY_REQUESTED,
+                    now=timestamp,
+                    destroy_requested=True,
                 )
-            except (json.JSONDecodeError, TypeError, ValueError):
-                connection.execute(
-                    "DELETE FROM destroy_reviews WHERE session_id = ?",
-                    (identifier,),
-                )
-                connection.commit()
-                return None
+                saved = self._save_in_transaction(connection, requested)
+            except Exception:
+                connection.rollback()
+                raise
             connection.execute(
                 "DELETE FROM destroy_reviews WHERE session_id = ?",
                 (identifier,),
             )
             connection.commit()
-        return DestroyReviewRecord(
-            session_id=identifier,
-            expires_at=float(row["expires_at"]),
-            session_version=int(row["session_version"]),
-            instance_id=row["reviewed_instance_id"],
-            unverified_artifact_ids=artifact_ids,
+        return (
+            DestroyReviewRecord(
+                session_id=identifier,
+                expires_at=float(review["expires_at"]),
+                managed_label=reviewed_snapshot["managed_label"],
+                instance_id=reviewed_snapshot["instance_id"],
+                residual_instance_ids=reviewed_snapshot[
+                    "residual_instance_ids"
+                ],
+                active_job_id=reviewed_snapshot["active_job_id"],
+                unverified_artifact_ids=reviewed_snapshot[
+                    "unverified_artifact_ids"
+                ],
+                profile_id=reviewed_snapshot["profile_id"],
+                profile_revision=reviewed_snapshot["profile_revision"],
+            ),
+            saved,
         )
 
     def list_all(self):
