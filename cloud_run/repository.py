@@ -266,9 +266,7 @@ def _stored_session_may_require_recovery(row):
     """Select possible provider state before parsing versioned quote JSON."""
     try:
         state = SessionState(row["state"])
-        residual_inventory = json.loads(
-            row["residual_inventory_json"] or "[]"
-        )
+        residual_inventory = json.loads(row["residual_inventory_json"])
         post_start_evidence = bool(
             row["destroy_requested"]
             or row["installed_manifest_digest"] is not None

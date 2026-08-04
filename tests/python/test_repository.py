@@ -1571,6 +1571,33 @@ class SessionRepositoryTests(unittest.TestCase):
             ["confirming-session"],
         )
 
+    def test_recovery_prefilter_fails_closed_on_null_residual_inventory(self):
+        sessions = repository.SessionRepository(self.database_path)
+        terminal = make_session(
+            key="terminal-key",
+            session_id="terminal-session",
+            now=100.0,
+        ).transition(
+            SessionState.OFFER_SELECTED,
+            now=101.0,
+        ).transition(
+            SessionState.DESTROYED,
+            now=102.0,
+        )
+        sessions.create_or_get(terminal)
+        with closing(sessions._connect()) as connection:
+            stored = dict(
+                connection.execute(
+                    "SELECT * FROM sessions WHERE session_id = ?",
+                    (terminal.session_id,),
+                ).fetchone()
+            )
+        stored["residual_inventory_json"] = None
+
+        self.assertTrue(
+            repository._stored_session_may_require_recovery(stored)
+        )
+
     def test_recent_sessions_query_is_bounded(self):
         sessions = repository.SessionRepository(self.database_path)
         for index in range(25):
