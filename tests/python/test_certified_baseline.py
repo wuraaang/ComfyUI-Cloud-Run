@@ -218,6 +218,46 @@ class CertifiedBaselineTests(unittest.TestCase):
             "0fc239d03f09fc9a78a087b7a6514dafb7b0a614ed5f73ef24f22dd56006eebe",
         )
 
+    def test_shipped_web_claims_match_worker_canonical_records(self):
+        lock = self._official_lock()
+        for package in (
+            lock["ui_packages"][0],
+            lock["custom_nodes"][0],
+        ):
+            prefix = package["web"]["root"].rstrip("/") + "/"
+            records = [
+                {
+                    "mode": 0o644,
+                    "path": item["path"].removeprefix(prefix),
+                    "sha256": item["sha256"],
+                    "size_bytes": item["size_bytes"],
+                }
+                for item in package["source_archive"]["files"]
+                if item["path"].startswith(prefix)
+            ]
+            measured = hashlib.sha256(
+                json.dumps(
+                    records,
+                    allow_nan=False,
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest()
+            self.assertEqual(measured, package["web"]["sha256"])
+
+        hermes = lock["ui_packages"][1]
+        hermes_root = (
+            Path(self.baseline.__file__).with_name("baseline_assets")
+            / hermes["package_id"]
+            / hermes["web"]["root"]
+        )
+        self.assertEqual(
+            self.baseline.canonical_tree_sha256(hermes_root),
+            hermes["web"]["sha256"],
+        )
+        self.assertFalse(hasattr(self.baseline, "_KNOWN_WEB_DIGESTS"))
+
     def test_cache_child_symlinks_are_rejected_without_writing_outside(self):
         for child in ("downloads", "archives"):
             with self.subTest(child=child):

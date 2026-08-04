@@ -467,14 +467,14 @@ No commit is created for this read-only task.
   - Agent Panel Registry version ID: e4ad28a2-549e-4804-9927-b4699ad5ec0f
   - Agent Panel source URL: https://cdn.comfy.org/artokun/comfyui-agent-panel/0.11.38/node.zip
   - Agent Panel source size/SHA-256: 2,807,293 bytes / 81e33c49cd65cfb85cf42e604629e25e237f3903958329f015eeb785eb913df1
-  - Agent Panel locked web tree: 67 files, 2,852,341 bytes, canonical SHA-256 8c6d1072e7c1f1e528c9ad5a52998ebc7626916f76b2374d1d4c21833f2b25cd
+  - Agent Panel locked web tree: 67 files, 2,852,341 bytes, canonical SHA-256 8a49270675f193c65c998068b1ac92257bc28b168aa38ad9567f2d2fa771542d
   - Agent Panel curated tar size/SHA-256 from the repository's deterministic build_package_archive: 2,908,160 bytes / c0e05111db15e8bc040c63ff9457fc142326afab66532f942b631f268fb606be
   - Efficiency repository: https://github.com/jags111/efficiency-nodes-comfyui
   - Efficiency version/commit: 1.0.9 at 835bbe14627cccc871822e804c65c734960d3c6e
   - Efficiency Registry version ID: 03cae633-3466-451d-b479-4ad1e1fbba04
   - Efficiency source URL: https://cdn.comfy.org/jags111/efficiency-nodes-comfyui/1.0.9/node.zip
   - Efficiency source size/SHA-256: 131,210,938 bytes / 3061180cbe2afd1c8301875af9bff555e1462814020de791019162767bd64c8f
-  - Efficiency locked JS tree: 18 files, 113,571 bytes, canonical SHA-256 c91b4a8c3a944e40e248990c3ef2f8f12971e466fbfb67265f50d60bbfd64351
+  - Efficiency locked JS tree: 18 files, 113,571 bytes, canonical SHA-256 b22af6b88ae5846edd8d69921c7958d0105d4e7703c861aa64e33ae61b02d250
   - Efficiency curated runtime tar: 36 files, 26,173,440 bytes, SHA-256 0fc239d03f09fc9a78a087b7a6514dafb7b0a614ed5f73ef24f22dd56006eebe
   - simpleeval wheel: simpleeval-1.0.7-py3-none-any.whl, 18,792 bytes, SHA-256 97ac271bfd8f2af9e7b9a36ceea67617f26fa873f9d5ae1922f64d4c1442534b
   - simpleeval source URL: https://files.pythonhosted.org/packages/0f/2f/f32aa85591882378bb43caa09363f3ed97df399369a5144c7f19f2275bc0/simpleeval-1.0.7-py3-none-any.whl
@@ -485,7 +485,7 @@ No commit is created for this read-only task.
   - web/hermes-nous.css: 17,083 bytes, SHA-256 cd55d3eeb3acff8ccc4cf0bdebf16a828da9d4ad9191f768a671697cfacc7c0d
   - web/hermes-nous.js: 15,050 bytes, SHA-256 da2b4f3ab8b60c6dfc0942f6a43066a0b3e032084b71f5f021a81e014e4f4a4d
   - canonical source tree SHA-256: 743a5a2505cab78c3502c0fcf50b83780790a5a5b14e7fc1be3e438a3ca7c82f
-  - canonical web SHA-256: cf27b215865ecd50d5db03c120be880720200ea3c8e2b8489839c42bd7a99c38
+  - canonical web SHA-256: d07506b932fc68e7548281e5ad32944c5d6bb1d8ec3f97e5a693033889784275
   - deterministic curated tar size/SHA-256: 40,960 bytes / d332e736ed8d98dece91a697d359eddd2ee37b0ac8f2d2cd1898332adf78f23e
   - provenance repository: https://github.com/wuraaang/ComfyUI-Cloud-Run
   - revision: sha256:743a5a2505cab78c3502c0fcf50b83780790a5a5b14e7fc1be3e438a3ca7c82f

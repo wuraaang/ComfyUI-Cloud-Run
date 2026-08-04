@@ -207,6 +207,61 @@ class DependencyManifestTests(unittest.TestCase):
                 with self.assertRaises(ManifestValidationError):
                     validate_dependency(custom_node(class_types=(invalid,)))
 
+    def test_manifest_rejects_conflicting_or_protected_wheel_distributions(self):
+        first_wheel = PythonWheelSpec(
+            filename="simpleeval-1.0.7-py3-none-any.whl",
+            size_bytes=5,
+            sha256="1" * 64,
+            source=source(locator="local-upload:wheel-simpleeval-1"),
+        )
+        second_wheel = replace(
+            first_wheel,
+            filename="simpleeval-9.9.9-py3-none-any.whl",
+            sha256="2" * 64,
+            source=source(locator="local-upload:wheel-simpleeval-9"),
+        )
+        first = replace(custom_node(), wheels=(first_wheel,))
+        second = replace(
+            custom_node(),
+            package_id="acme.second",
+            archive=artifact(
+                "custom_node_archive",
+                "custom_nodes/acme.second",
+                20,
+                "3" * 64,
+                artifact_id="custom-acme-second",
+            ),
+            wheels=(second_wheel,),
+            provided_class_types=("SecondNode",),
+        )
+
+        with self.assertRaises(ManifestValidationError):
+            validate_dependency(
+                dependency_manifest(custom_nodes=(first, second))
+            )
+
+        protected = replace(
+            first,
+            wheels=(
+                replace(
+                    first_wheel,
+                    filename="torch-9.9.9-py3-none-any.whl",
+                ),
+            ),
+        )
+        with self.assertRaises(ManifestValidationError):
+            validate_dependency(
+                dependency_manifest(custom_nodes=(protected,))
+            )
+
+        exact_reuse = replace(second, wheels=(first_wheel,))
+        self.assertIs(
+            validate_dependency(
+                dependency_manifest(custom_nodes=(first, exact_reuse))
+            ).custom_nodes[1].wheels[0],
+            first_wheel,
+        )
+
     def test_ui_revision_accepts_git_commit_or_explicit_sha256_only(self):
         for revision in ("a" * 40, "sha256:" + "b" * 64):
             with self.subTest(revision=revision):

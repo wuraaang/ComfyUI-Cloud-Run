@@ -15,6 +15,8 @@ from .artifacts import (
 from .comfy_host import HostCompatibilityError, NodeNotFound
 from .dependency_repository import MappingValidationError
 from .manifest import (
+    _PROTECTED_RUNTIME_DISTRIBUTIONS,
+    _wheel_distribution,
     ArtifactSpec,
     CustomNodeSpec,
     ProfileSpec,
@@ -118,6 +120,30 @@ def _custom_node_from_mapping(candidate):
     return node
 
 
+def _merge_custom_node(nodes, wheels, node):
+    existing_node = nodes.get(node.package_id)
+    if existing_node is not None and existing_node != node:
+        raise ArtifactCollisionError(
+            "Custom-node package has conflicting approved mappings."
+        )
+    for wheel in node.wheels:
+        distribution = _wheel_distribution(wheel.filename)
+        existing_wheel = wheels.get(distribution)
+        if (
+            not distribution
+            or distribution in _PROTECTED_RUNTIME_DISTRIBUTIONS
+            or (
+                existing_wheel is not None
+                and existing_wheel != wheel
+            )
+        ):
+            raise ArtifactCollisionError(
+                "Python wheel distribution has conflicting approved identities."
+            )
+        wheels[distribution] = wheel
+    nodes[node.package_id] = node
+
+
 class DependencyResolver:
     """Resolve nodes without installing, uploading, renting, or executing."""
 
@@ -193,12 +219,18 @@ class DependencyResolver:
                     raise ValueError("Conflicting UI package.")
                 packages[package.package_id] = package
             nodes = {}
+            class_packages = {}
             for node in custom_nodes:
                 validate_dependency(node)
                 existing = nodes.get(node.package_id)
                 if existing is not None and existing != node:
                     raise ValueError("Conflicting custom-node package.")
                 nodes[node.package_id] = node
+                for class_type in node.provided_class_types:
+                    provider = class_packages.get(class_type)
+                    if provider is not None and provider != node.package_id:
+                        raise ValueError("Conflicting custom-node class.")
+                    class_packages[class_type] = node.package_id
             if set(packages).intersection(nodes):
                 raise ValueError("Conflicting Desktop package identity.")
             locals_by_id = {}
@@ -377,8 +409,24 @@ class DependencyResolver:
             reason="No approved immutable source is available.",
         )
 
-    async def resolve_nodes(self, capture):
+    async def resolve_nodes(self, capture, *, certified_custom_nodes=()):
         self.host.assert_compatible()
+        if not isinstance(certified_custom_nodes, tuple) or not all(
+            isinstance(item, CustomNodeSpec)
+            for item in certified_custom_nodes
+        ):
+            raise MappingValidationError(
+                "Approved Desktop profile is invalid."
+            )
+        certified_classes = {}
+        for node in certified_custom_nodes:
+            for class_type in node.provided_class_types:
+                provider = certified_classes.get(class_type)
+                if provider is not None and provider != node.package_id:
+                    raise MappingValidationError(
+                        "Approved Desktop profile is invalid."
+                    )
+                certified_classes[class_type] = node.package_id
         rows = []
         seen = set()
         for raw_class_type in capture.executable_class_types:
@@ -386,6 +434,15 @@ class DependencyResolver:
             if class_type in seen:
                 continue
             seen.add(class_type)
+            if class_type in certified_classes:
+                rows.append(
+                    NodeResolution(
+                        class_type=class_type,
+                        status="resolved",
+                        source_kind="certified_baseline",
+                    )
+                )
+                continue
             rows.append(await self._resolve_one(class_type))
         resolved = tuple(rows)
         return NodeResolutionResult(
@@ -404,7 +461,17 @@ class DependencyResolver:
         base_bytes,
         explicit_output_allowance_bytes,
     ):
-        nodes = await self.resolve_nodes(capture)
+        (
+            ui_packages,
+            baseline_custom_nodes,
+            baseline_local_artifacts,
+            profile,
+            minimum_vram_gb,
+        ) = self._approved_profile(capture)
+        nodes = await self.resolve_nodes(
+            capture,
+            certified_custom_nodes=baseline_custom_nodes,
+        )
         requirements = static_file_requirements(capture, metadata)
         model_sources = {}
         if self.model_source_resolver is not None:
@@ -422,13 +489,6 @@ class DependencyResolver:
             requirements=requirements,
         )
         artifact_rows = artifact_result.rows
-        (
-            ui_packages,
-            baseline_custom_nodes,
-            baseline_local_artifacts,
-            profile,
-            minimum_vram_gb,
-        ) = self._approved_profile(capture)
         local_artifacts_by_id = {}
         for local in (
             *artifact_result.local_artifacts,
@@ -480,9 +540,14 @@ class DependencyResolver:
             explicit_bytes=explicit_output_allowance_bytes,
         )
 
-        custom_nodes_by_package = {
-            node.package_id: node for node in baseline_custom_nodes
-        }
+        custom_nodes_by_package = {}
+        wheels_by_distribution = {}
+        for node in baseline_custom_nodes:
+            _merge_custom_node(
+                custom_nodes_by_package,
+                wheels_by_distribution,
+                node,
+            )
         ui_package_ids = {package.package_id for package in ui_packages}
         for row in nodes.rows:
             if row.status != "resolved" or row.source_kind != "approved":
@@ -498,12 +563,11 @@ class DependencyResolver:
                 raise ArtifactCollisionError(
                     "Desktop package has conflicting approved roles."
                 )
-            existing = custom_nodes_by_package.get(custom_node.package_id)
-            if existing is not None and existing != custom_node:
-                raise ArtifactCollisionError(
-                    "Custom-node package has conflicting approved mappings."
-                )
-            custom_nodes_by_package[custom_node.package_id] = custom_node
+            _merge_custom_node(
+                custom_nodes_by_package,
+                wheels_by_distribution,
+                custom_node,
+            )
         custom_nodes = tuple(
             custom_nodes_by_package[key]
             for key in sorted(custom_nodes_by_package)

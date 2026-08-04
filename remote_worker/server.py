@@ -638,7 +638,18 @@ class WorkerApplication:
         if self.provisioner is None:
             return _error(501, "Worker route is not implemented.")
         try:
-            result = self.provisioner.transaction(transaction_id)
+            transaction_live = getattr(
+                self.provisioner,
+                "transaction_live",
+                None,
+            )
+            if not callable(transaction_live):
+                raise ProvisionError(
+                    "Worker transaction is unavailable."
+                )
+            result = await transaction_live(transaction_id)
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            raise
         except ProvisionError:
             return _error(503, "Worker transaction is unavailable.")
         except Exception:

@@ -174,6 +174,7 @@ def _runtime_environment():
     result.setdefault("PATH", os.defpath)
     result.update(
         {
+            "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONHASHSEED": "0",
             "PYTHONNOUSERSITE": "1",
             "PYTHONUNBUFFERED": "1",
@@ -234,6 +235,21 @@ def _validated_system_stats(stats):
             "Remote ComfyUI identity does not match."
         )
     return stats
+
+
+def _validated_object_info(payload):
+    if (
+        not isinstance(payload, dict)
+        or len(payload) > 100_000
+        or not all(
+            isinstance(name, str)
+            and 0 < len(name) <= 200
+            and isinstance(value, dict)
+            for name, value in payload.items()
+        )
+    ):
+        raise _comfy_error()
+    return payload
 
 
 class AiohttpComfyHttp:
@@ -779,6 +795,30 @@ class ComfyProcess:
     async def ensure_running(self):
         return await self.start()
 
+    async def probe_running(self):
+        """Read live native identity without starting or replacing ComfyUI."""
+
+        async with self._process_lock():
+            process = self._process
+            if not self._running():
+                raise _comfy_error()
+            try:
+                _validated_system_stats(
+                    await self.http.get_json("/system_stats")
+                )
+                object_info = _validated_object_info(
+                    await self.http.get_json("/object_info")
+                )
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                raise
+            except (ComfyIdentityError, ComfyProcessError):
+                raise
+            except Exception:
+                raise _comfy_error() from None
+            if self._process is not process or not self._running():
+                raise _comfy_error()
+            return object_info
+
     async def _terminate_process(self, process):
         try:
             if getattr(process, "returncode", None) is None:
@@ -828,17 +868,7 @@ class ComfyProcess:
             raise
         except Exception:
             raise _comfy_error() from None
-        if (
-            not isinstance(payload, dict)
-            or len(payload) > 100_000
-            or not all(
-                isinstance(name, str)
-                and 0 < len(name) <= 200
-                and isinstance(value, dict)
-                for name, value in payload.items()
-            )
-        ):
-            raise _comfy_error()
+        payload = _validated_object_info(payload)
         await self._progress("validation")
         return payload
 

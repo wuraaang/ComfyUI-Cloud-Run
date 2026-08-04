@@ -54,6 +54,26 @@ _PROFILE_FORBIDDEN_SUFFIXES = frozenset(
 _UI_CAPABILITIES = frozenset(
     {"graph_read", "graph_edit", "native_run", "native_batch"}
 )
+_PROTECTED_RUNTIME_DISTRIBUTIONS = frozenset(
+    {
+        "accelerate",
+        "aiohttp",
+        "comfyui",
+        "comfyui-frontend-package",
+        "numpy",
+        "open-clip-torch",
+        "pillow",
+        "pip",
+        "requests",
+        "safetensors",
+        "setuptools",
+        "torch",
+        "torchaudio",
+        "torchvision",
+        "transformers",
+        "wheel",
+    }
+)
 
 
 class ManifestValidationError(ValueError):
@@ -553,6 +573,11 @@ def _validate_wheel(wheel):
             raise ManifestValidationError("R2 object digest does not match wheel.")
 
 
+def _wheel_distribution(filename):
+    stem = filename.split("-", 1)[0]
+    return re.sub(r"[-_.]+", "-", stem).casefold()
+
+
 def _validate_custom_node(node):
     if not isinstance(node, CustomNodeSpec):
         raise ManifestValidationError("Invalid custom-node package.")
@@ -713,6 +738,7 @@ def _validate_manifest(manifest):
     provided_class_types = set()
     artifact_ids = set()
     destinations = set()
+    wheels_by_distribution = {}
     for node in manifest.custom_nodes:
         _validate_custom_node(node)
         if node.package_id in package_ids:
@@ -721,6 +747,21 @@ def _validate_manifest(manifest):
         if provided_class_types.intersection(node.provided_class_types):
             raise ManifestValidationError("Class types have multiple providers.")
         provided_class_types.update(node.provided_class_types)
+        for wheel in node.wheels:
+            distribution = _wheel_distribution(wheel.filename)
+            existing_wheel = wheels_by_distribution.get(distribution)
+            if (
+                not distribution
+                or distribution in _PROTECTED_RUNTIME_DISTRIBUTIONS
+                or (
+                    existing_wheel is not None
+                    and existing_wheel != wheel
+                )
+            ):
+                raise ManifestValidationError(
+                    "Python wheel distributions conflict."
+                )
+            wheels_by_distribution[distribution] = wheel
         if node.archive.artifact_id in artifact_ids:
             raise ManifestValidationError("Artifact IDs must be unique.")
         artifact_ids.add(node.archive.artifact_id)

@@ -29,6 +29,113 @@ from remote_worker.state import WorkerStateStore
 
 WORKER_VERSION = "worker-v1"
 
+EFFICIENCY_CLASS_TYPES = (
+    "KSampler (Efficient)",
+    "KSampler Adv. (Efficient)",
+    "KSampler SDXL (Eff.)",
+    "Efficient Loader",
+    "Eff. Loader SDXL",
+    "LoRA Stacker",
+    "Control Net Stacker",
+    "Apply ControlNet Stack",
+    "Unpack SDXL Tuple",
+    "Pack SDXL Tuple",
+    "XY Plot",
+    "XY Input: Seeds++ Batch",
+    "XY Input: Add/Return Noise",
+    "XY Input: Steps",
+    "XY Input: CFG Scale",
+    "XY Input: Sampler/Scheduler",
+    "XY Input: Denoise",
+    "XY Input: VAE",
+    "XY Input: Prompt S/R",
+    "XY Input: Aesthetic Score",
+    "XY Input: Refiner On/Off",
+    "XY Input: Checkpoint",
+    "XY Input: Clip Skip",
+    "XY Input: LoRA",
+    "XY Input: LoRA Plot",
+    "XY Input: LoRA Stacks",
+    "XY Input: Control Net",
+    "XY Input: Control Net Plot",
+    "XY Input: Manual XY Entry",
+    "Manual XY Entry Info",
+    "Join XY Inputs of Same Type",
+    "Image Overlay",
+    "Noise Control Script",
+    "HighRes-Fix Script",
+    "Tiled Upscaler Script",
+    "LoRA Stack to String converter",
+    "Evaluate Integers",
+    "Evaluate Floats",
+    "Evaluate Strings",
+    "Simple Eval Examples",
+)
+
+_BASELINE_LOCK = json.loads(
+    (
+        Path(__file__).parents[2]
+        / "cloud_run"
+        / "certified_baseline.lock.json"
+    ).read_text(encoding="utf-8")
+)
+
+
+def _locked_extension_paths(package_id):
+    record = next(
+        item
+        for item in (
+            *_BASELINE_LOCK["ui_packages"],
+            *_BASELINE_LOCK["custom_nodes"],
+        )
+        if item["package_id"] == package_id
+    )
+    root = record["web"]["root"].rstrip("/") + "/"
+    files = (
+        record["source_archive"]["files"]
+        if "source_archive" in record
+        else record["files"]
+    )
+    return tuple(
+        sorted(
+            "/extensions/"
+            + package_id
+            + "/"
+            + item["path"].removeprefix(root)
+            for item in files
+            if item["path"].startswith(root)
+        )
+    )
+
+
+BASELINE_EXTENSION_PATHS = {
+    package_id: _locked_extension_paths(package_id)
+    for package_id in (
+        "comfyui-agent-panel",
+        "efficiency-nodes-comfyui",
+        "hermes-nous",
+    )
+}
+EXPECTED_BASELINE_EXTENSION_PATHS = tuple(
+    sorted(
+        path
+        for paths in BASELINE_EXTENSION_PATHS.values()
+        for path in paths
+    )
+)
+
+RUNTIME_PACKAGE_VERSIONS = {
+    "aiohttp": "3.12.15",
+    "torch": "2.4.1",
+}
+
+SIMPLEEVAL_FILENAME = "simpleeval-1.0.7-py3-none-any.whl"
+SIMPLEEVAL_SIZE_BYTES = 18_792
+SIMPLEEVAL_SHA256 = (
+    "97ac271bfd8f2af9e7b9a36ceea67617f26fa873f9d5ae1922f64d4c1442534b"
+)
+SIMPLEEVAL_ARTIFACT_ID = "wheel-simpleeval-" + SIMPLEEVAL_SHA256
+
 
 def source(artifact_id):
     return SourceSpec(
@@ -107,6 +214,35 @@ def custom_node():
         wheels=(wheel,),
         provided_class_types=("Fancy",),
     )
+
+
+def efficiency_node(*, wheels=None, class_types=EFFICIENCY_CLASS_TYPES):
+    node = custom_node()
+    simpleeval = replace(
+        node.wheels[0],
+        filename=SIMPLEEVAL_FILENAME,
+        size_bytes=SIMPLEEVAL_SIZE_BYTES,
+        sha256=SIMPLEEVAL_SHA256,
+        source=source(SIMPLEEVAL_ARTIFACT_ID),
+    )
+    return replace(
+        node,
+        package_id="efficiency-nodes-comfyui",
+        archive=replace(
+            node.archive,
+            destination="custom_nodes/efficiency-nodes-comfyui",
+        ),
+        wheels=tuple(wheels) if wheels is not None else (simpleeval,),
+        provided_class_types=tuple(class_types),
+    )
+
+
+def efficiency_object_info(*extra):
+    return {
+        "KSampler": {},
+        **{class_type: {} for class_type in EFFICIENCY_CLASS_TYPES},
+        **{class_type: {} for class_type in extra},
+    }
 
 
 def ui_package(package_id, *, digest_character="b"):
@@ -263,6 +399,7 @@ class FakeInstaller:
         ui_digests=None,
         ui_paths=None,
         node_paths=None,
+        runtime_identities=None,
     ):
         self.events = events if events is not None else []
         self.nodes = []
@@ -272,6 +409,27 @@ class FakeInstaller:
         self.ui_paths = dict(ui_paths or {})
         self.node_paths = dict(node_paths or {})
         self.measurement_reads = {}
+        self.installed_measurement_calls = []
+        self.runtime_identity_calls = 0
+        self.runtime_identities = [
+            dict(item)
+            for item in (
+                runtime_identities
+                or (RUNTIME_PACKAGE_VERSIONS,)
+            )
+        ]
+
+    @staticmethod
+    def _default_paths(package_id):
+        if package_id in BASELINE_EXTENSION_PATHS:
+            return BASELINE_EXTENSION_PATHS[package_id]
+        return (f"/extensions/{package_id}/panel.js",)
+
+    @staticmethod
+    def _default_node_paths(package_id):
+        if package_id in BASELINE_EXTENSION_PATHS:
+            return BASELINE_EXTENSION_PATHS[package_id]
+        return ()
 
     async def install(self, node):
         self.events.append(f"install:{node.package_id}")
@@ -279,7 +437,24 @@ class FakeInstaller:
         return FakeNodeInstallResult(
             package_id=node.package_id,
             extension_paths=tuple(
-                self.node_paths.get(node.package_id, ())
+                self.node_paths.get(
+                    node.package_id,
+                    self._default_node_paths(node.package_id),
+                )
+            ),
+        )
+
+    def measure_node(self, node):
+        self.installed_measurement_calls.append(
+            ("node", node.package_id)
+        )
+        return FakeNodeInstallResult(
+            package_id=node.package_id,
+            extension_paths=tuple(
+                self.node_paths.get(
+                    node.package_id,
+                    self._default_node_paths(node.package_id),
+                )
             ),
         )
 
@@ -297,9 +472,29 @@ class FakeInstaller:
             self.ui_digests.get(package.package_id, package.web_sha256),
             self.ui_paths.get(
                 package.package_id,
-                (f"/extensions/{package.package_id}/panel.js",),
+                self._default_paths(package.package_id),
             ),
         )
+
+    def measure_ui_package(self, package):
+        self.installed_measurement_calls.append(
+            ("ui", package.package_id)
+        )
+        return FakeUiInstallResult(
+            self,
+            package.package_id,
+            self.ui_digests.get(package.package_id, package.web_sha256),
+            self.ui_paths.get(
+                package.package_id,
+                self._default_paths(package.package_id),
+            ),
+        )
+
+    def runtime_identity(self):
+        self.runtime_identity_calls += 1
+        if len(self.runtime_identities) > 1:
+            return self.runtime_identities.pop(0)
+        return dict(self.runtime_identities[0])
 
 
 class FakeComfy:
@@ -308,6 +503,8 @@ class FakeComfy:
         self.ensure_calls = 0
         self.restarts = 0
         self.health_calls = 0
+        self.object_info_calls = 0
+        self.live_probe_calls = 0
 
     async def ensure_running(self):
         self.ensure_calls += 1
@@ -320,9 +517,14 @@ class FakeComfy:
         return {"ready": True}
 
     async def object_info(self):
+        self.object_info_calls += 1
         if len(self.object_info_sequence) > 1:
             return self.object_info_sequence.pop(0)
         return self.object_info_sequence[0]
+
+    async def probe_running(self):
+        self.live_probe_calls += 1
+        return await self.object_info()
 
 
 class FakeClock:
@@ -440,6 +642,7 @@ class ProvisionerTests(unittest.TestCase):
                 "bootstrap_digest": None,
                 "ui_package_digests": {},
                 "served_extension_paths": [],
+                "runtime_package_versions": RUNTIME_PACKAGE_VERSIONS,
                 "comfy_process_healthy": True,
                 "completed_at": result.readiness["completed_at"],
             },
@@ -480,7 +683,9 @@ class ProvisionerTests(unittest.TestCase):
             "ready",
         )
         self.assertEqual(
-            provisioner.transaction(result.transaction_id).readiness,
+            asyncio.run(
+                provisioner.transaction_live(result.transaction_id)
+            ).readiness,
             result.readiness,
         )
 
@@ -538,7 +743,12 @@ class ProvisionerTests(unittest.TestCase):
         self.assertEqual(len(artifacts.ensure_calls), 1)
         self.assertEqual(installer.nodes, ["fancy"])
         self.assertEqual(comfy.restarts, 1)
-        self.assertEqual(comfy.ensure_calls, 0)
+        self.assertEqual(comfy.ensure_calls, 1)
+        self.assertEqual(comfy.object_info_calls, 2)
+        self.assertEqual(
+            installer.installed_measurement_calls,
+            [("node", "fancy"), ("node", "fancy")],
+        )
 
     def test_ready_manifest_replay_with_changed_required_classes_fails_without_mutation(self):
         from remote_worker.provision import ProvisionError
@@ -656,7 +866,7 @@ class ProvisionerTests(unittest.TestCase):
         )
         self.assertEqual(
             result.readiness["served_extension_paths"],
-            ["/extensions/comfyui-agent-panel/panel.js"],
+            list(BASELINE_EXTENSION_PATHS["comfyui-agent-panel"]),
         )
 
     def test_readiness_uses_installer_measurements_not_manifest_claims(self):
@@ -684,31 +894,15 @@ class ProvisionerTests(unittest.TestCase):
         )
 
     def test_all_locked_efficiency_classes_are_present_after_restart(self):
-        efficiency = replace(
-            custom_node(),
-            package_id="efficiency-nodes-comfyui",
-            archive=replace(
-                custom_node().archive,
-                destination="custom_nodes/efficiency-nodes-comfyui",
-            ),
-            provided_class_types=("Efficient Loader", "Evaluate Integers"),
-        )
-        comfy = FakeComfy(
-            [
-                {
-                    "KSampler": {},
-                    "Efficient Loader": {},
-                    "Evaluate Integers": {},
-                }
-            ]
-        )
+        efficiency = efficiency_node()
+        comfy = FakeComfy([efficiency_object_info()])
         provisioner = self.provisioner(
             comfy=comfy,
             installer=FakeInstaller(
                 node_paths={
-                    efficiency.package_id: (
-                        "/extensions/efficiency-nodes-comfyui/appearance.js",
-                    )
+                    efficiency.package_id: BASELINE_EXTENSION_PATHS[
+                        efficiency.package_id
+                    ]
                 }
             ),
         )
@@ -723,38 +917,52 @@ class ProvisionerTests(unittest.TestCase):
         self.assertEqual(comfy.restarts, 1)
         self.assertEqual(
             result.readiness["validated_class_types"],
-            ["Efficient Loader", "Evaluate Integers", "KSampler"],
+            sorted(("KSampler", *EFFICIENCY_CLASS_TYPES)),
         )
 
     def test_expected_frontend_extension_paths_are_served(self):
+        from remote_worker.provision import (
+            _EXPECTED_BASELINE_EXTENSION_CLOSURE,
+        )
+
         panel = ui_package("comfyui-agent-panel")
         hermes = ui_package("hermes-nous", digest_character="c")
-        efficiency = replace(
-            custom_node(),
-            package_id="efficiency-nodes-comfyui",
-            archive=replace(
-                custom_node().archive,
-                destination="custom_nodes/efficiency-nodes-comfyui",
-            ),
-            provided_class_types=("Efficient Loader",),
-        )
-        expected_paths = (
-            "/extensions/comfyui-agent-panel/js/comfyui-mcp-panel.js",
-            "/extensions/efficiency-nodes-comfyui/appearance.js",
-            "/extensions/hermes-nous/hermes-nous.css",
-            "/extensions/hermes-nous/hermes-nous.js",
+        efficiency = efficiency_node()
+        expected_paths = EXPECTED_BASELINE_EXTENSION_PATHS
+        expected_closure = {}
+        for package_id, paths in BASELINE_EXTENSION_PATHS.items():
+            body = json.dumps(
+                list(paths),
+                allow_nan=False,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+            expected_closure[package_id] = {
+                "file_count": len(paths),
+                "sha256": hashlib.sha256(body).hexdigest(),
+            }
+        self.assertEqual(
+            _EXPECTED_BASELINE_EXTENSION_CLOSURE,
+            expected_closure,
         )
         installer = FakeInstaller(
             ui_paths={
-                panel.package_id: expected_paths[:1],
-                hermes.package_id: expected_paths[2:],
+                panel.package_id: BASELINE_EXTENSION_PATHS[
+                    panel.package_id
+                ],
+                hermes.package_id: BASELINE_EXTENSION_PATHS[
+                    hermes.package_id
+                ],
             },
-            node_paths={efficiency.package_id: expected_paths[1:2]},
+            node_paths={
+                efficiency.package_id: BASELINE_EXTENSION_PATHS[
+                    efficiency.package_id
+                ]
+            },
         )
         provisioner = self.provisioner(
-            comfy=FakeComfy(
-                [{"KSampler": {}, "Efficient Loader": {}}]
-            ),
+            comfy=FakeComfy([efficiency_object_info()]),
             installer=installer,
         )
 
@@ -772,6 +980,33 @@ class ProvisionerTests(unittest.TestCase):
             result.readiness["served_extension_paths"],
             list(expected_paths),
         )
+
+    def test_extra_baseline_extension_entrypoint_never_reaches_ready(self):
+        from remote_worker.provision import ProvisionError
+
+        panel = ui_package("comfyui-agent-panel")
+        installer = FakeInstaller(
+            ui_paths={
+                panel.package_id: (
+                    *BASELINE_EXTENSION_PATHS[panel.package_id],
+                    "/extensions/comfyui-agent-panel/js/unreviewed.js",
+                ),
+            }
+        )
+        provisioner = self.provisioner(
+            comfy=FakeComfy([{"KSampler": {}}]),
+            installer=installer,
+        )
+
+        with self.assertRaises(ProvisionError):
+            asyncio.run(
+                provisioner.apply_manifest(
+                    manifest(ui_packages=(panel,)),
+                    required_class_types=("KSampler",),
+                )
+            )
+
+        self.assertEqual(self.state.load()["installed"], {})
 
     def test_spoofed_ui_digest_cannot_pass_worker_readiness_measurement(self):
         from remote_worker.provision import ProvisionError
@@ -793,6 +1028,404 @@ class ProvisionerTests(unittest.TestCase):
                 )
             )
         self.assertEqual(self.state.load()["installed"], {})
+
+    def test_efficiency_closure_rejects_compatible_arbitrary_wheel_delta(self):
+        from remote_worker.provision import ProvisionError
+
+        baseline_node = efficiency_node()
+        installer = FakeInstaller()
+        comfy = FakeComfy(
+            [efficiency_object_info(), efficiency_object_info()]
+        )
+        first = self.provisioner(comfy=comfy, installer=installer)
+        asyncio.run(
+            first.apply_manifest(
+                manifest(custom_nodes=(baseline_node,)),
+                required_class_types=("KSampler",),
+            )
+        )
+        arbitrary_wheel = PythonWheelSpec(
+            filename="arbitrary_plugin-1.0-py3-none-any.whl",
+            size_bytes=1,
+            sha256="f" * 64,
+            source=source("arbitrary-plugin"),
+        )
+        changed_node = replace(
+            baseline_node,
+            wheels=(*baseline_node.wheels, arbitrary_wheel),
+        )
+        reopened = self.provisioner(
+            comfy=comfy,
+            installer=installer,
+        )
+
+        with self.assertRaises(ProvisionError):
+            asyncio.run(
+                reopened.apply_manifest(
+                    manifest(
+                        prompt_marker="2",
+                        custom_nodes=(changed_node,),
+                    ),
+                    required_class_types=("KSampler",),
+                )
+            )
+
+        self.assertEqual(installer.wheel_batches, [])
+
+    def test_efficiency_rejects_a_second_simpleeval_wheel(self):
+        from remote_worker.provision import ProvisionError
+
+        exact = efficiency_node().wheels[0]
+        duplicate_distribution = replace(
+            exact,
+            filename="simpleeval-1.0.8-py3-none-any.whl",
+            size_bytes=1,
+            sha256="e" * 64,
+            source=source("second-simpleeval"),
+        )
+        efficiency = efficiency_node(
+            wheels=(exact, duplicate_distribution)
+        )
+        installer = FakeInstaller()
+        provisioner = self.provisioner(
+            comfy=FakeComfy([efficiency_object_info()]),
+            installer=installer,
+        )
+
+        with self.assertRaises(ProvisionError):
+            asyncio.run(
+                provisioner.apply_manifest(
+                    manifest(custom_nodes=(efficiency,)),
+                    required_class_types=("KSampler",),
+                )
+            )
+
+        self.assertEqual(installer.nodes, [])
+
+    def test_efficiency_requires_the_complete_locked_wheel_identity(self):
+        from remote_worker.provision import ProvisionError
+
+        exact = efficiency_node().wheels[0]
+        wrong_identity = replace(
+            exact,
+            size_bytes=exact.size_bytes + 1,
+            sha256="d" * 64,
+            source=source("wrong-simpleeval-artifact"),
+        )
+        installer = FakeInstaller()
+        provisioner = self.provisioner(
+            comfy=FakeComfy([efficiency_object_info()]),
+            installer=installer,
+        )
+
+        with self.assertRaises(ProvisionError):
+            asyncio.run(
+                provisioner.apply_manifest(
+                    manifest(
+                        custom_nodes=(
+                            efficiency_node(wheels=(wrong_identity,)),
+                        )
+                    ),
+                    required_class_types=("KSampler",),
+                )
+            )
+
+        self.assertEqual(installer.nodes, [])
+
+    def test_efficiency_rejects_incomplete_locked_class_set_before_install(self):
+        from remote_worker.provision import ProvisionError
+
+        incomplete = efficiency_node(
+            class_types=("Efficient Loader",)
+        )
+        installer = FakeInstaller()
+        provisioner = self.provisioner(
+            comfy=FakeComfy(
+                [{"KSampler": {}, "Efficient Loader": {}}]
+            ),
+            installer=installer,
+        )
+
+        with self.assertRaises(ProvisionError):
+            asyncio.run(
+                provisioner.apply_manifest(
+                    manifest(custom_nodes=(incomplete,)),
+                    required_class_types=("KSampler",),
+                )
+            )
+
+        self.assertEqual(installer.nodes, [])
+
+    def test_wrong_baseline_entrypoint_paths_never_reach_ready(self):
+        from remote_worker.provision import ProvisionError
+
+        panel = ui_package("comfyui-agent-panel")
+        hermes = ui_package("hermes-nous", digest_character="c")
+        efficiency = efficiency_node()
+        installer = FakeInstaller(
+            ui_paths={
+                panel.package_id: (
+                    "/extensions/comfyui-agent-panel/not-entrypoint.txt",
+                ),
+                hermes.package_id: (
+                    "/extensions/hermes-nous/not-entrypoint.txt",
+                ),
+            },
+            node_paths={
+                efficiency.package_id: (
+                    "/extensions/efficiency-nodes-comfyui/not-hook.txt",
+                )
+            },
+        )
+        provisioner = self.provisioner(
+            comfy=FakeComfy([efficiency_object_info()]),
+            installer=installer,
+        )
+
+        with self.assertRaises(ProvisionError):
+            asyncio.run(
+                provisioner.apply_manifest(
+                    manifest(
+                        custom_nodes=(efficiency,),
+                        ui_packages=(panel, hermes),
+                    ),
+                    required_class_types=("KSampler",),
+                )
+            )
+
+        self.assertEqual(self.state.load()["installed"], {})
+
+    def test_runtime_package_drift_after_pip_and_restart_fails_closed(self):
+        from remote_worker.provision import ProvisionError
+
+        installer = FakeInstaller(
+            runtime_identities=(
+                RUNTIME_PACKAGE_VERSIONS,
+                {**RUNTIME_PACKAGE_VERSIONS, "torch": "2.5.0"},
+            )
+        )
+        provisioner = self.provisioner(
+            comfy=FakeComfy([{"KSampler": {}, "Fancy": {}}]),
+            installer=installer,
+        )
+
+        with self.assertRaises(ProvisionError):
+            asyncio.run(
+                provisioner.apply_manifest(
+                    manifest(custom_nodes=(custom_node(),)),
+                    required_class_types=("KSampler", "Fancy"),
+                )
+            )
+
+        self.assertGreaterEqual(installer.runtime_identity_calls, 2)
+        self.assertEqual(self.state.load()["installed"], {})
+
+    def test_initial_ready_remeasures_installed_tree_after_comfy_imports(self):
+        from remote_worker.provision import ProvisionError
+
+        class ImportDriftInstaller(FakeInstaller):
+            def measure_node(inner_self, node):
+                super().measure_node(node)
+                raise ProvisionError("Imported node tree drifted.")
+
+        installer = ImportDriftInstaller()
+        provisioner = self.provisioner(
+            comfy=FakeComfy([{"KSampler": {}, "Fancy": {}}]),
+            installer=installer,
+        )
+
+        with self.assertRaises(ProvisionError):
+            asyncio.run(
+                provisioner.apply_manifest(
+                    manifest(custom_nodes=(custom_node(),)),
+                    required_class_types=("KSampler", "Fancy"),
+                )
+            )
+
+        self.assertEqual(
+            installer.installed_measurement_calls,
+            [("node", "fancy")],
+        )
+        self.assertEqual(self.state.load()["installed"], {})
+
+    def test_cached_ready_revalidates_running_process_and_classes(self):
+        from remote_worker.provision import ProvisionError
+
+        comfy = FakeComfy([{"KSampler": {}}, {}])
+        installer = FakeInstaller()
+        provisioner = self.provisioner(
+            comfy=comfy,
+            installer=installer,
+        )
+        desired = manifest()
+        asyncio.run(
+            provisioner.apply_manifest(
+                desired,
+                required_class_types=("KSampler",),
+            )
+        )
+
+        with self.assertRaises(ProvisionError):
+            asyncio.run(
+                provisioner.apply_manifest(
+                    desired,
+                    required_class_types=("KSampler",),
+                )
+            )
+
+        self.assertEqual(comfy.ensure_calls, 2)
+        self.assertEqual(comfy.object_info_calls, 2)
+
+    def test_cached_ready_remeasures_installed_ui_and_rejects_drift(self):
+        from remote_worker.provision import ProvisionError
+
+        panel = ui_package("agent-panel")
+        installer = FakeInstaller()
+        provisioner = self.provisioner(
+            comfy=FakeComfy([{"KSampler": {}}, {"KSampler": {}}]),
+            installer=installer,
+        )
+        desired = manifest(ui_packages=(panel,))
+        asyncio.run(
+            provisioner.apply_manifest(
+                desired,
+                required_class_types=("KSampler",),
+            )
+        )
+        installer.ui_digests[panel.package_id] = "f" * 64
+
+        with self.assertRaises(ProvisionError):
+            asyncio.run(
+                provisioner.apply_manifest(
+                    desired,
+                    required_class_types=("KSampler",),
+                )
+            )
+
+        self.assertIn(
+            ("ui", panel.package_id),
+            installer.installed_measurement_calls,
+        )
+
+    def test_sync_readiness_and_transaction_never_claim_live_health(self):
+        provisioner = self.provisioner(
+            comfy=FakeComfy([{"KSampler": {}}]),
+        )
+        result = asyncio.run(
+            provisioner.apply_manifest(
+                manifest(),
+                required_class_types=("KSampler",),
+            )
+        )
+
+        self.assertIsNone(provisioner.readiness(result.manifest_digest))
+        self.assertIsNone(
+            provisioner.transaction(result.transaction_id).readiness
+        )
+
+    def test_async_transaction_revalidates_live_readiness(self):
+        from remote_worker.provision import ProvisionError
+
+        comfy = FakeComfy([{"KSampler": {}}, {}])
+        provisioner = self.provisioner(comfy=comfy)
+        result = asyncio.run(
+            provisioner.apply_manifest(
+                manifest(),
+                required_class_types=("KSampler",),
+            )
+        )
+        self.assertTrue(
+            hasattr(provisioner, "transaction_live"),
+            "ready transaction reads require an async live boundary",
+        )
+
+        with self.assertRaises(ProvisionError):
+            asyncio.run(
+                provisioner.transaction_live(result.transaction_id)
+            )
+        self.assertEqual(comfy.ensure_calls, 1)
+        self.assertEqual(comfy.live_probe_calls, 1)
+
+    def test_prompt_only_delta_remeasures_installed_ui_before_reuse(self):
+        from remote_worker.provision import ProvisionError
+
+        panel = ui_package("agent-panel")
+        installer = FakeInstaller()
+        comfy = FakeComfy([{"KSampler": {}}, {"KSampler": {}}])
+        first = self.provisioner(comfy=comfy, installer=installer)
+        asyncio.run(
+            first.apply_manifest(
+                manifest(prompt_marker="1", ui_packages=(panel,)),
+                required_class_types=("KSampler",),
+            )
+        )
+        installer.ui_digests[panel.package_id] = "f" * 64
+        reopened = self.provisioner(
+            comfy=comfy,
+            installer=installer,
+        )
+
+        with self.assertRaises(ProvisionError):
+            asyncio.run(
+                reopened.apply_manifest(
+                    manifest(prompt_marker="2", ui_packages=(panel,)),
+                    required_class_types=("KSampler",),
+                )
+            )
+
+        self.assertIn(
+            ("ui", panel.package_id),
+            installer.installed_measurement_calls,
+        )
+
+    def test_prompt_only_a_b_a_uses_current_install_not_historical_ready_cache(self):
+        panel = ui_package("agent-panel")
+        installer = FakeInstaller()
+        provisioner = self.provisioner(
+            comfy=FakeComfy([{"KSampler": {}}]),
+            installer=installer,
+        )
+        first = manifest(prompt_marker="1", ui_packages=(panel,))
+        second = manifest(prompt_marker="2", ui_packages=(panel,))
+
+        first_result = asyncio.run(
+            provisioner.apply_manifest(
+                first,
+                required_class_types=("KSampler",),
+            )
+        )
+        second_result = asyncio.run(
+            provisioner.apply_manifest(
+                second,
+                required_class_types=("KSampler",),
+            )
+        )
+        replayed_first = asyncio.run(
+            provisioner.apply_manifest(
+                first,
+                required_class_types=("KSampler",),
+            )
+        )
+
+        self.assertEqual(first_result.state, "ready")
+        self.assertEqual(second_result.state, "ready")
+        self.assertEqual(replayed_first.manifest_digest, first.digest)
+        self.assertEqual(installer.ui_packages, [panel.package_id])
+        self.assertGreaterEqual(
+            installer.installed_measurement_calls.count(
+                ("ui", panel.package_id)
+            ),
+            5,
+        )
+        transactions = self.state.load()["transactions"]
+        self.assertEqual(
+            transactions[first_result.transaction_id]["state"],
+            "ready",
+        )
+        self.assertEqual(
+            transactions[second_result.transaction_id]["state"],
+            "ready",
+        )
 
     def test_progress_is_bounded_monotonic_sanitized_and_reaches_ready(self):
         model = public_artifact(
@@ -1548,6 +2181,10 @@ class ComfyProcessTests(unittest.TestCase):
             )
             self.assertEqual(options["env"]["CUDA_VISIBLE_DEVICES"], "0")
             self.assertEqual(options["env"]["PATH"], "/runtime/bin")
+            self.assertEqual(
+                options["env"]["PYTHONDONTWRITEBYTECODE"],
+                "1",
+            )
             self.assertNotIn("CONTAINER_API_KEY", options["env"])
             self.assertNotIn("CLOUD_RUN_SESSION_SECRET", options["env"])
             self.assertEqual(
@@ -1713,8 +2350,40 @@ class FakeRouteProvisioner:
             return None
         return self.result
 
+    async def transaction_live(self, transaction_id):
+        return self.transaction(transaction_id)
+
 
 class ProvisionResultProgressTests(unittest.TestCase):
+    def test_worker_readiness_rejects_unhashable_lists_as_provision_error(self):
+        from remote_worker.provision import (
+            ProvisionError,
+            _validated_worker_readiness,
+        )
+
+        readiness = {
+            "protocol_version": "2",
+            "comfyui_core_version": "0.29.0",
+            "comfyui_frontend_version": "1.47.10",
+            "worker_version": "a" * 40,
+            "validated_class_types": ["KSampler"],
+            "validated_artifacts": ["model-1"],
+            "profile_revision": None,
+            "profile_digest": None,
+            "bootstrap_digest": None,
+            "ui_package_digests": {},
+            "served_extension_paths": [],
+            "runtime_package_versions": RUNTIME_PACKAGE_VERSIONS,
+            "comfy_process_healthy": True,
+            "completed_at": 100.0,
+        }
+        for field in ("validated_class_types", "validated_artifacts"):
+            with self.subTest(field=field):
+                with self.assertRaises(ProvisionError):
+                    _validated_worker_readiness(
+                        {**readiness, field: [{}]}
+                    )
+
     def test_progress_is_optional_exact_and_sanitized(self):
         from remote_worker.provision import ProvisionError, ProvisionResult
 

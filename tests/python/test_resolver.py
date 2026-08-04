@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import replace
 import hashlib
 import tempfile
 import unittest
@@ -469,6 +470,86 @@ class DependencyResolverTests(unittest.TestCase):
         self.assertTrue(result.rentable)
         self.assertEqual(result.custom_nodes, (efficiency,))
 
+    def test_certified_efficiency_classes_resolve_before_mapping_lookups(self):
+        input_root = Path(self.temporary_directory.name) / "efficiency-input"
+        input_root.mkdir()
+        efficiency = replace(
+            baseline_efficiency(),
+            provided_class_types=(
+                "KSampler (Efficient)",
+                "XY Input: Sampler/Scheduler",
+            ),
+        )
+
+        class NoMappingLookup:
+            def approved(self, class_type):
+                raise AssertionError(
+                    "certified class queried approved mappings: "
+                    + class_type
+                )
+
+            def candidates(self, class_type):
+                raise AssertionError(
+                    "certified class queried mapping candidates: "
+                    + class_type
+                )
+
+        registry = FakeRegistry({})
+        resolver = DependencyResolver(
+            host=FakeHost({}),
+            repository=NoMappingLookup(),
+            registry=registry,
+            profile_provider=lambda _capture: {
+                "ui_packages": (),
+                "custom_nodes": (efficiency,),
+                "local_artifacts": (),
+                "profile": None,
+                "minimum_vram_gb": 0.0,
+            },
+        )
+
+        result = asyncio.run(
+            resolver.resolve_dependencies(
+                FakeCapture(
+                    *efficiency.provided_class_types,
+                    output={
+                        "1": {
+                            "class_type": "SaveImage",
+                            "inputs": {},
+                        }
+                    },
+                ),
+                metadata={},
+                model_roots={},
+                input_root=input_root,
+                source_mappings={},
+                base_bytes=40 * GIB,
+                explicit_output_allowance_bytes=1024,
+            )
+        )
+
+        self.assertTrue(result.rentable)
+        self.assertEqual(result.custom_nodes, (efficiency,))
+        self.assertEqual(
+            tuple(row.source_kind for row in result.node_rows),
+            ("certified_baseline", "certified_baseline"),
+        )
+        self.assertEqual(registry.calls, [])
+        from cloud_run.session_service import _preflight_rows
+
+        public_rows = _preflight_rows(result, NoMappingLookup())
+        self.assertEqual(
+            tuple(row.source_kind for row in public_rows),
+            ("certified_baseline", "certified_baseline"),
+        )
+        self.assertTrue(
+            all(
+                row.dependency_id.startswith("node:")
+                and len(row.dependency_id) == len("node:") + 64
+                for row in public_rows
+            )
+        )
+
     def test_baseline_and_workflow_package_collision_fails_closed(self):
         approved = self.repository.save_candidate(
             "ApprovedNode",
@@ -504,6 +585,62 @@ class DependencyResolverTests(unittest.TestCase):
                         "ApprovedNode",
                         output={
                             "1": {"class_type": "SaveImage", "inputs": {}}
+                        },
+                    ),
+                    metadata={},
+                    model_roots={},
+                    input_root=input_root,
+                    source_mappings={},
+                    base_bytes=40 * GIB,
+                    explicit_output_allowance_bytes=1024,
+                )
+            )
+
+    def test_baseline_and_workflow_wheel_distribution_collision_fails_closed(self):
+        candidate = complete_candidate()
+        candidate["wheels"] = [
+            {
+                "filename": "simpleeval-9.9.9-py3-none-any.whl",
+                "size_bytes": 9,
+                "sha256": "7" * 64,
+                "locator": "local-upload:wheel-simpleeval-9",
+            }
+        ]
+        approved = self.repository.save_candidate(
+            "ApprovedNode",
+            "manual",
+            candidate,
+            approved=False,
+        )
+        self.repository.approve(
+            "ApprovedNode",
+            approved.candidate_digest,
+        )
+        input_root = Path(self.temporary_directory.name) / "wheel-input"
+        input_root.mkdir()
+        resolver = DependencyResolver(
+            host=FakeHost({"ApprovedNode": custom("ApprovedNode")}),
+            repository=self.repository,
+            registry=FakeRegistry({}),
+            profile_provider=lambda _capture: {
+                "ui_packages": (),
+                "custom_nodes": (baseline_efficiency(),),
+                "local_artifacts": (),
+                "profile": None,
+                "minimum_vram_gb": 0.0,
+            },
+        )
+
+        with self.assertRaises(ArtifactCollisionError):
+            asyncio.run(
+                resolver.resolve_dependencies(
+                    FakeCapture(
+                        "ApprovedNode",
+                        output={
+                            "1": {
+                                "class_type": "SaveImage",
+                                "inputs": {},
+                            }
                         },
                     ),
                     metadata={},

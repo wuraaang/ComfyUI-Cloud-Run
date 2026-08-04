@@ -472,6 +472,37 @@ class WorkerApplicationTests(unittest.TestCase):
             },
         )
 
+    def test_provision_transaction_route_uses_live_revalidation(self):
+        from remote_worker.provision import ProvisionResult
+
+        calls = []
+        transaction_id = "provision-" + "b" * 64
+
+        class Provisioner:
+            def transaction(inner_self, _transaction_id):
+                calls.append("sync")
+                raise AssertionError("synchronous readiness is unsafe")
+
+            async def transaction_live(inner_self, observed_id):
+                calls.append(("live", observed_id))
+                return ProvisionResult(
+                    transaction_id=observed_id,
+                    manifest_digest="b" * 64,
+                    state="applying",
+                    planned_restarts=0,
+                    repair_restarts=0,
+                    missing_class_types=(),
+                    missing_artifacts=(),
+                )
+
+        worker = self.application(provisioner=Provisioner())
+
+        response = asyncio.run(worker._transaction(transaction_id))
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(calls, [("live", transaction_id)])
+        self.assertEqual(response.payload["state"], "applying")
+
     def test_signed_profile_routes_apply_snapshot_and_serve_ranges(self):
         from remote_worker.profile import (
             WorkerProfileArtifact,

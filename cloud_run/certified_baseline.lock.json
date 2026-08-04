@@ -583,7 +583,7 @@
       "web": {
         "file_count": 18,
         "root": "js",
-        "sha256": "c91b4a8c3a944e40e248990c3ef2f8f12971e466fbfb67265f50d60bbfd64351",
+        "sha256": "b22af6b88ae5846edd8d69921c7958d0105d4e7703c861aa64e33ae61b02d250",
         "size_bytes": 113571
       },
       "wheels": [
@@ -1072,7 +1072,7 @@
       "web": {
         "file_count": 67,
         "root": "web",
-        "sha256": "8c6d1072e7c1f1e528c9ad5a52998ebc7626916f76b2374d1d4c21833f2b25cd",
+        "sha256": "8a49270675f193c65c998068b1ac92257bc28b168aa38ad9567f2d2fa771542d",
         "size_bytes": 2852341
       }
     },
@@ -1111,7 +1111,7 @@
       "web": {
         "file_count": 2,
         "root": "web",
-        "sha256": "cf27b215865ecd50d5db03c120be880720200ea3c8e2b8489839c42bd7a99c38",
+        "sha256": "d07506b932fc68e7548281e5ad32944c5d6bb1d8ec3f97e5a693033889784275",
         "size_bytes": 32133
       }
     }

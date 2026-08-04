@@ -30,7 +30,7 @@ from .manifest import (
 _LOCK_PATH = Path(__file__).with_name("certified_baseline.lock.json")
 _ASSETS_ROOT = Path(__file__).with_name("baseline_assets")
 _OFFICIAL_LOCK_SHA256 = (
-    "51f21118dbd0bc314144a5650d5fcc4de4ace051eeb8b3a701560d8e5228e350"
+    "158f59a73e5b898747f53bdbd3940ca2f627445f778218b76338d484f9e48a52"
 )
 _HEX_64 = re.compile(r"[0-9a-f]{64}")
 _EXECUTABLE_SUFFIXES = frozenset(
@@ -61,15 +61,6 @@ _AGENT_LOADER = (
     b"__all__ = [\"NODE_CLASS_MAPPINGS\", "
     b'"NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]\n'
 )
-_KNOWN_WEB_DIGESTS = frozenset(
-    {
-        "8c6d1072e7c1f1e528c9ad5a52998ebc7626916f76b2374d1d4c21833f2b25cd",
-        "c91b4a8c3a944e40e248990c3ef2f8f12971e466fbfb67265f50d60bbfd64351",
-        "cf27b215865ecd50d5db03c120be880720200ea3c8e2b8489839c42bd7a99c38",
-    }
-)
-
-
 class CertifiedBaselineUnavailable(RuntimeError):
     """The immutable Desktop baseline cannot be certified safely."""
 
@@ -406,10 +397,7 @@ def _verify_web(root, record):
     ):
         _fail()
     measured = _sha256(_canonical_bytes(records))
-    if (
-        measured != record["sha256"]
-        and record["sha256"] not in _KNOWN_WEB_DIGESTS
-    ):
+    if measured != record["sha256"]:
         _fail()
 
 

@@ -6,6 +6,7 @@ import asyncio
 import ast
 from dataclasses import dataclass
 import hashlib
+from importlib import metadata as importlib_metadata
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -69,6 +70,17 @@ _PROTECTED_DISTRIBUTIONS = frozenset(
         "wheel",
     }
 )
+_EFFICIENCY_WHEEL_IDENTITY = {
+    "filename": "simpleeval-1.0.7-py3-none-any.whl",
+    "size_bytes": 18_792,
+    "sha256": (
+        "97ac271bfd8f2af9e7b9a36ceea67617f26fa873f9d5ae1922f64d4c1442534b"
+    ),
+    "source_locator": (
+        "local-upload:wheel-simpleeval-"
+        "97ac271bfd8f2af9e7b9a36ceea67617f26fa873f9d5ae1922f64d4c1442534b"
+    ),
+}
 
 
 class InstallError(RuntimeError):
@@ -246,6 +258,23 @@ def safe_extract(archive_path, destination):
                 resolved_parent = target_parent.resolve(strict=True)
                 if not _within(resolved_parent, resolved_destination):
                     raise _install_error()
+                try:
+                    relative_parent = target_parent.relative_to(
+                        resolved_destination
+                    )
+                except ValueError:
+                    raise _install_error() from None
+                normalized_parent = resolved_destination
+                for component in relative_parent.parts:
+                    normalized_parent = normalized_parent / component
+                    metadata = os.lstat(normalized_parent)
+                    if (
+                        not stat.S_ISDIR(metadata.st_mode)
+                        or stat.S_ISLNK(metadata.st_mode)
+                        or metadata.st_uid != os.getuid()
+                    ):
+                        raise _install_error()
+                    os.chmod(normalized_parent, 0o755)
                 if kind == "directory":
                     target.mkdir(mode=0o755, exist_ok=True)
                     metadata = os.lstat(target)
@@ -350,6 +379,104 @@ def _canonical_bytes(value):
     ).encode("utf-8")
 
 
+def _canonical_tree_records(root):
+    root = Path(root)
+    try:
+        root_metadata = os.lstat(root)
+        if (
+            not stat.S_ISDIR(root_metadata.st_mode)
+            or stat.S_ISLNK(root_metadata.st_mode)
+            or root_metadata.st_uid != os.getuid()
+            or stat.S_IMODE(root_metadata.st_mode) != 0o755
+        ):
+            raise _install_error()
+        records = []
+
+        def visit(directory, relative_parent=PurePosixPath()):
+            with os.scandir(directory) as entries:
+                ordered = sorted(entries, key=lambda entry: entry.name)
+            for entry in ordered:
+                relative = relative_parent / entry.name
+                _archive_name(relative.as_posix())
+                metadata = entry.stat(follow_symlinks=False)
+                mode = stat.S_IMODE(metadata.st_mode)
+                if stat.S_ISLNK(metadata.st_mode):
+                    raise _install_error()
+                if stat.S_ISDIR(metadata.st_mode):
+                    if metadata.st_uid != os.getuid() or mode != 0o755:
+                        raise _install_error()
+                    records.append(
+                        {
+                            "kind": "directory",
+                            "mode": mode,
+                            "path": relative.as_posix(),
+                        }
+                    )
+                    visit(Path(entry.path), relative)
+                    continue
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_uid != os.getuid()
+                    or metadata.st_nlink != 1
+                    or mode not in {0o644, 0o755}
+                ):
+                    raise _install_error()
+                descriptor = None
+                try:
+                    flags = os.O_RDONLY
+                    if hasattr(os, "O_NOFOLLOW"):
+                        flags |= os.O_NOFOLLOW
+                    descriptor = os.open(entry.path, flags)
+                    opened = os.fstat(descriptor)
+                    if (
+                        not stat.S_ISREG(opened.st_mode)
+                        or opened.st_dev != metadata.st_dev
+                        or opened.st_ino != metadata.st_ino
+                        or opened.st_uid != metadata.st_uid
+                        or opened.st_nlink != 1
+                        or opened.st_size != metadata.st_size
+                        or stat.S_IMODE(opened.st_mode) != mode
+                    ):
+                        raise _install_error()
+                    digest = hashlib.sha256()
+                    size = 0
+                    while True:
+                        chunk = os.read(descriptor, TRANSFER_CHUNK_BYTES)
+                        if not chunk:
+                            break
+                        size += len(chunk)
+                        digest.update(chunk)
+                    if size != metadata.st_size:
+                        raise _install_error()
+                finally:
+                    if descriptor is not None:
+                        os.close(descriptor)
+                records.append(
+                    {
+                        "kind": "file",
+                        "mode": mode,
+                        "path": relative.as_posix(),
+                        "sha256": digest.hexdigest(),
+                        "size_bytes": size,
+                    }
+                )
+
+        visit(root)
+        if not records:
+            raise _install_error()
+        return tuple(sorted(records, key=lambda item: item["path"]))
+    except InstallError:
+        raise
+    except (OSError, RuntimeError, ValueError):
+        raise _install_error() from None
+
+
+def _canonical_tree_sha256(root):
+    return hashlib.sha256(
+        _canonical_bytes(_canonical_tree_records(root))
+    ).hexdigest()
+
+
 def _measured_web_tree(root, package_id):
     root = Path(root)
     try:
@@ -405,6 +532,7 @@ def _measured_web_tree(root, package_id):
 
 def _ui_measurement(content, package):
     try:
+        _canonical_tree_sha256(content)
         files = sorted(
             path
             for path in content.rglob("*")
@@ -510,6 +638,45 @@ def _validated_wheel_distributions(wheels, required=None):
     ):
         raise _install_error()
     return distributions
+
+
+def _validate_efficiency_wheels(wheels):
+    if len(wheels) != 1:
+        raise _install_error()
+    wheel = wheels[0]
+    if (
+        wheel.filename != _EFFICIENCY_WHEEL_IDENTITY["filename"]
+        or wheel.size_bytes != _EFFICIENCY_WHEEL_IDENTITY["size_bytes"]
+        or not secrets.compare_digest(
+            wheel.sha256,
+            _EFFICIENCY_WHEEL_IDENTITY["sha256"],
+        )
+        or wheel.source.kind != "local-upload"
+        or wheel.source.locator
+        != _EFFICIENCY_WHEEL_IDENTITY["source_locator"]
+        or wheel.source.immutable_revision is not None
+        or wheel.source.secret_handle is not None
+    ):
+        raise _install_error()
+
+
+def _installed_directory(root, package_id):
+    path = root / package_id
+    try:
+        metadata = os.lstat(path)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o755
+            or path.parent.resolve(strict=True) != root
+        ):
+            raise _install_error()
+    except InstallError:
+        raise
+    except (OSError, RuntimeError):
+        raise _install_error() from None
+    return path
 
 
 class SubprocessRunner:
@@ -670,6 +837,79 @@ class CustomNodeInstaller:
             verified.append((wheel, path))
         return await self._install_wheels(verified)
 
+    def runtime_identity(self):
+        try:
+            return {
+                name: importlib_metadata.version(name)
+                for name in ("aiohttp", "torch")
+            }
+        except (importlib_metadata.PackageNotFoundError, TypeError, ValueError):
+            raise _install_error() from None
+
+    def measure_node(self, node):
+        node = self._validate_node(node)
+        destination = _installed_directory(
+            self.custom_nodes_root,
+            node.package_id,
+        )
+        archive_path = _verified_file(
+            self.archive_path(node.archive),
+            size_bytes=node.archive.size_bytes,
+            sha256=node.archive.sha256,
+        )
+        staging_parent = Path(
+            tempfile.mkdtemp(
+                prefix=f".{node.package_id}-measure-",
+                suffix=".part",
+                dir=str(self.custom_nodes_root),
+            )
+        )
+        os.chmod(staging_parent, 0o700)
+        expected = staging_parent / "content"
+        try:
+            safe_extract(archive_path, expected)
+            expected_digest = _canonical_tree_sha256(expected)
+            installed_digest = _canonical_tree_sha256(destination)
+        finally:
+            if staging_parent.exists():
+                _safe_remove_tree(staging_parent, self.custom_nodes_root)
+        if not secrets.compare_digest(expected_digest, installed_digest):
+            raise _install_error()
+        return InstallResult(
+            package_id=node.package_id,
+            revision=node.revision,
+            destination=destination,
+            wheels=tuple(wheel.filename for wheel in node.wheels),
+            extension_paths=_extension_paths(
+                destination,
+                node.package_id,
+            ),
+        )
+
+    def measure_ui_package(self, package):
+        try:
+            validate_dependency(package)
+        except (TypeError, ValueError):
+            raise _install_error() from None
+        if not isinstance(package, UiPackageSpec):
+            raise _install_error()
+        destination = _installed_directory(
+            self.custom_nodes_root,
+            package.package_id,
+        )
+        web_sha256, extension_paths = _ui_measurement(
+            destination,
+            package,
+        )
+        return UiInstallResult(
+            package_id=package.package_id,
+            revision=package.revision,
+            destination=destination,
+            wheels=(),
+            web_sha256=web_sha256,
+            extension_paths=extension_paths,
+        )
+
     def _replace_content(self, content, destination):
         backup = None
         try:
@@ -717,6 +957,8 @@ class CustomNodeInstaller:
 
     async def install(self, node):
         node = self._validate_node(node)
+        if node.package_id == "efficiency-nodes-comfyui":
+            _validate_efficiency_wheels(node.wheels)
         archive_path = _verified_file(
             self.archive_path(node.archive),
             size_bytes=node.archive.size_bytes,

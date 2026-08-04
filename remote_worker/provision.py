@@ -78,6 +78,77 @@ _BASELINE_EXTENSION_PACKAGE_IDS = frozenset(
         "hermes-nous",
     }
 )
+_EXPECTED_BASELINE_EXTENSION_CLOSURE = {
+    "comfyui-agent-panel": {
+        "file_count": 67,
+        "sha256": "78b1c532d73ba547427e1a8def2ebfe37cd38fb7c4a6cadf0d1252c1ec52b40f",
+    },
+    "efficiency-nodes-comfyui": {
+        "file_count": 18,
+        "sha256": "90ece8b09cd2d95aea97cc2c1def3641ab806277e4c4883d651cab9a150f5667",
+    },
+    "hermes-nous": {
+        "file_count": 2,
+        "sha256": "2e9393fdb0708f2aae14011475dd8183426a88a15c2534911cfd20462f1536d5",
+    },
+}
+_EFFICIENCY_CLASS_TYPES = frozenset(
+    {
+        "KSampler (Efficient)",
+        "KSampler Adv. (Efficient)",
+        "KSampler SDXL (Eff.)",
+        "Efficient Loader",
+        "Eff. Loader SDXL",
+        "LoRA Stacker",
+        "Control Net Stacker",
+        "Apply ControlNet Stack",
+        "Unpack SDXL Tuple",
+        "Pack SDXL Tuple",
+        "XY Plot",
+        "XY Input: Seeds++ Batch",
+        "XY Input: Add/Return Noise",
+        "XY Input: Steps",
+        "XY Input: CFG Scale",
+        "XY Input: Sampler/Scheduler",
+        "XY Input: Denoise",
+        "XY Input: VAE",
+        "XY Input: Prompt S/R",
+        "XY Input: Aesthetic Score",
+        "XY Input: Refiner On/Off",
+        "XY Input: Checkpoint",
+        "XY Input: Clip Skip",
+        "XY Input: LoRA",
+        "XY Input: LoRA Plot",
+        "XY Input: LoRA Stacks",
+        "XY Input: Control Net",
+        "XY Input: Control Net Plot",
+        "XY Input: Manual XY Entry",
+        "Manual XY Entry Info",
+        "Join XY Inputs of Same Type",
+        "Image Overlay",
+        "Noise Control Script",
+        "HighRes-Fix Script",
+        "Tiled Upscaler Script",
+        "LoRA Stack to String converter",
+        "Evaluate Integers",
+        "Evaluate Floats",
+        "Evaluate Strings",
+        "Simple Eval Examples",
+    }
+)
+_RUNTIME_PACKAGE_NAMES = frozenset({"aiohttp", "torch"})
+_EFFICIENCY_WHEEL_IDENTITY = {
+    "filename": "simpleeval-1.0.7-py3-none-any.whl",
+    "size_bytes": 18_792,
+    "sha256": (
+        "97ac271bfd8f2af9e7b9a36ceea67617f26fa873f9d5ae1922f64d4c1442534b"
+    ),
+    "source_kind": "local-upload",
+    "source_locator": (
+        "local-upload:wheel-simpleeval-"
+        "97ac271bfd8f2af9e7b9a36ceea67617f26fa873f9d5ae1922f64d4c1442534b"
+    ),
+}
 _PROGRESS_FIELDS = {
     "phase",
     "dependency_id",
@@ -215,16 +286,74 @@ def _required_baseline_paths_present(desired, paths):
         *(item.package_id for item in desired.ui_packages),
         *(item.package_id for item in desired.custom_nodes),
     }
-    prefixes = tuple(
-        f"/extensions/{package_id}/"
-        for package_id in sorted(
-            package_ids.intersection(_BASELINE_EXTENSION_PACKAGE_IDS)
+    present = package_ids.intersection(_BASELINE_EXTENSION_PACKAGE_IDS)
+    paths = set(paths)
+    for package_id in present:
+        package_paths = sorted(
+            path
+            for path in paths
+            if path.startswith(f"/extensions/{package_id}/")
         )
-    )
-    return all(
-        any(path.startswith(prefix) for path in paths)
-        for prefix in prefixes
-    )
+        expected = _EXPECTED_BASELINE_EXTENSION_CLOSURE[package_id]
+        digest = hashlib.sha256(
+            json.dumps(
+                package_paths,
+                allow_nan=False,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        if (
+            len(package_paths) != expected["file_count"]
+            or not hmac.compare_digest(digest, expected["sha256"])
+        ):
+            return False
+    return True
+
+
+def _validate_certified_baseline(desired):
+    for node in desired.custom_nodes:
+        if node.package_id != "efficiency-nodes-comfyui":
+            continue
+        if (
+            frozenset(node.provided_class_types) != _EFFICIENCY_CLASS_TYPES
+            or len(node.wheels) != 1
+        ):
+            raise _provision_error()
+        wheel = node.wheels[0]
+        if (
+            wheel.filename != _EFFICIENCY_WHEEL_IDENTITY["filename"]
+            or wheel.size_bytes
+            != _EFFICIENCY_WHEEL_IDENTITY["size_bytes"]
+            or not hmac.compare_digest(
+                wheel.sha256,
+                _EFFICIENCY_WHEEL_IDENTITY["sha256"],
+            )
+            or wheel.source.kind
+            != _EFFICIENCY_WHEEL_IDENTITY["source_kind"]
+            or wheel.source.locator
+            != _EFFICIENCY_WHEEL_IDENTITY["source_locator"]
+            or wheel.source.immutable_revision is not None
+            or wheel.source.secret_handle is not None
+        ):
+            raise _provision_error()
+
+
+def _validated_runtime_identity(value):
+    if (
+        not isinstance(value, dict)
+        or set(value) != _RUNTIME_PACKAGE_NAMES
+        or any(
+            not isinstance(version, str)
+            or not 1 <= len(version) <= 200
+            or version != version.strip()
+            or any(ord(character) < 32 for character in version)
+            for version in value.values()
+        )
+    ):
+        raise _provision_error()
+    return {name: value[name] for name in sorted(value)}
 
 
 def _validated_progress(value):
@@ -348,6 +477,7 @@ def _validated_worker_readiness(value):
         "bootstrap_digest",
         "ui_package_digests",
         "served_extension_paths",
+        "runtime_package_versions",
         "comfy_process_healthy",
         "completed_at",
     }
@@ -358,14 +488,16 @@ def _validated_worker_readiness(value):
     profile_revision = value["profile_revision"]
     if (
         not isinstance(class_types, list)
+        or len(class_types) > 100_000
+        or not all(_valid_class_type(item) for item in class_types)
         or class_types != sorted(set(class_types))
         or not isinstance(artifacts, list)
-        or len(artifacts) != len(set(artifacts))
-        or not all(_valid_class_type(item) for item in class_types)
+        or len(artifacts) > 100_000
         or not all(
             isinstance(item, str) and _IDENTIFIER.fullmatch(item)
             for item in artifacts
         )
+        or len(artifacts) != len(set(artifacts))
         or (
             profile_revision is not None
             and (
@@ -401,6 +533,10 @@ def _validated_worker_readiness(value):
             value["served_extension_paths"]
         )
         != value["served_extension_paths"]
+        or _validated_runtime_identity(
+            value["runtime_package_versions"]
+        )
+        != value["runtime_package_versions"]
         or value["comfy_process_healthy"] is not True
         or isinstance(value["completed_at"], bool)
         or not isinstance(value["completed_at"], (int, float))
@@ -1237,12 +1373,16 @@ class Provisioner:
         self.stall_poll_interval = float(stall_poll_interval)
         for dependency, method in (
             (comfy, "ensure_running"),
+            (comfy, "probe_running"),
             (comfy, "restart"),
             (comfy, "object_info"),
             (artifacts, "ensure_many"),
             (artifacts, "validate"),
             (installer, "install"),
             (installer, "install_wheels"),
+            (installer, "measure_node"),
+            (installer, "measure_ui_package"),
+            (installer, "runtime_identity"),
             (disk, "reserve"),
         ):
             if not callable(getattr(dependency, method, None)):
@@ -1297,6 +1437,97 @@ class Provisioner:
             raise WorkerIdentityError(
                 "Worker runtime identity does not match."
             )
+
+    def _runtime_identity(self):
+        try:
+            return _validated_runtime_identity(
+                self.installer.runtime_identity()
+            )
+        except ProvisionError:
+            raise
+        except Exception:
+            raise _provision_error() from None
+
+    def _installed_measurements(self, desired):
+        ui_package_digests = {}
+        served_extension_paths = set()
+        try:
+            for node in sorted(
+                desired.custom_nodes,
+                key=lambda item: item.package_id,
+            ):
+                result = self.installer.measure_node(node)
+                paths = _node_install_measurement(result, node)
+                served_extension_paths.update(paths)
+            for package in sorted(
+                desired.ui_packages,
+                key=lambda item: item.package_id,
+            ):
+                result = self.installer.measure_ui_package(package)
+                digest, paths = _ui_install_measurement(result, package)
+                ui_package_digests[package.package_id] = digest
+                served_extension_paths.update(paths)
+        except ProvisionError:
+            raise
+        except Exception:
+            raise _provision_error() from None
+        return ui_package_digests, sorted(served_extension_paths)
+
+    async def _revalidate_ready(
+        self,
+        desired,
+        required,
+        readiness,
+        *,
+        allow_start,
+    ):
+        try:
+            if allow_start:
+                await self.comfy.ensure_running()
+                object_info = await self.comfy.object_info()
+            else:
+                object_info = await self.comfy.probe_running()
+            if (
+                not isinstance(object_info, dict)
+                or any(item not in object_info for item in required)
+                or self.artifacts.validate(_manifest_archives(desired))
+            ):
+                raise _provision_error()
+            runtime_identity = self._runtime_identity()
+            ui_digests, extension_paths = self._installed_measurements(
+                desired
+            )
+            if (
+                runtime_identity != readiness["runtime_package_versions"]
+                or ui_digests != readiness["ui_package_digests"]
+                or extension_paths != readiness["served_extension_paths"]
+                or not _required_baseline_paths_present(
+                    desired,
+                    extension_paths,
+                )
+            ):
+                raise _provision_error()
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            raise
+        except ProvisionError:
+            raise
+        except Exception:
+            raise _provision_error() from None
+
+    def _live_readiness_payload(self, desired, persisted):
+        profile = desired.profile
+        return _validated_worker_readiness(
+            {
+                **persisted,
+                "profile_digest": (
+                    profile.archive.sha256 if profile is not None else None
+                ),
+                "bootstrap_digest": (
+                    profile.bootstrap_digest if profile is not None else None
+                ),
+                "comfy_process_healthy": True,
+            }
+        )
 
     def _prior_budget(self, desired):
         transaction_id = "provision-" + desired.digest
@@ -1387,6 +1618,7 @@ class Provisioner:
                 "profile_revision",
                 "ui_package_digests",
                 "served_extension_paths",
+                "runtime_package_versions",
                 "completed_at",
             }
             or not isinstance(
@@ -1400,6 +1632,10 @@ class Provisioner:
             or isinstance(readiness["completed_at"], bool)
             or not isinstance(readiness["completed_at"], (int, float))
             or not math.isfinite(readiness["completed_at"])
+            or _validated_runtime_identity(
+                readiness["runtime_package_versions"]
+            )
+            != readiness["runtime_package_versions"]
         ):
             raise _provision_error()
         prior = dependency_manifest_from_record(installed["manifest"])
@@ -1525,6 +1761,7 @@ class Provisioner:
         required,
         ui_package_digests,
         served_extension_paths,
+        runtime_package_versions,
         planned_restarts,
         repair_restarts,
         repair_used,
@@ -1549,28 +1786,32 @@ class Provisioner:
             "last_progress_at": tracker.last_progress_at,
             "progress": dict(tracker.snapshot),
         }
+        persisted_readiness = {
+            "protocol_version": desired.protocol_version,
+            "comfyui_core_version": desired.comfyui_core_version,
+            "comfyui_frontend_version": (
+                desired.comfyui_frontend_version
+            ),
+            "worker_version": desired.worker_version,
+            "validated_class_types": list(required),
+            "validated_artifacts": _validated_artifact_ids(desired),
+            "profile_revision": (
+                desired.profile.revision
+                if desired.profile is not None
+                else None
+            ),
+            "ui_package_digests": dict(ui_package_digests),
+            "served_extension_paths": list(served_extension_paths),
+            "runtime_package_versions": dict(
+                runtime_package_versions
+            ),
+            "completed_at": float(self.clock()),
+        }
         installed = {
             "manifest_digest": desired.digest,
             "manifest": _manifest_record(desired),
             "ready_at": float(self.clock()),
-            "readiness": {
-                "protocol_version": desired.protocol_version,
-                "comfyui_core_version": desired.comfyui_core_version,
-                "comfyui_frontend_version": (
-                    desired.comfyui_frontend_version
-                ),
-                "worker_version": desired.worker_version,
-                "validated_class_types": list(required),
-                "validated_artifacts": _validated_artifact_ids(desired),
-                "profile_revision": (
-                    desired.profile.revision
-                    if desired.profile is not None
-                    else None
-                ),
-                "ui_package_digests": dict(ui_package_digests),
-                "served_extension_paths": list(served_extension_paths),
-                "completed_at": float(self.clock()),
-            },
+            "readiness": persisted_readiness,
             "required_class_types": list(required),
             "profile_revision": (
                 desired.profile.revision
@@ -1594,7 +1835,10 @@ class Provisioner:
             missing_class_types=(),
             missing_artifacts=(),
             progress=tracker.snapshot,
-            readiness=self.readiness(desired.digest),
+            readiness=self._live_readiness_payload(
+                desired,
+                persisted_readiness,
+            ),
         )
 
     async def _validate(self, desired, required, tracker):
@@ -1657,6 +1901,7 @@ class Provisioner:
     ):
         async with self._provision_lock():
             self._identity(desired)
+            _validate_certified_baseline(desired)
             required = _required_class_types(
                 desired,
                 required_class_types,
@@ -1669,14 +1914,26 @@ class Provisioner:
                 raise _provision_error()
             transfer_catalog = _manifest_transfer_catalog(desired)
             transaction_id = "provision-" + desired.digest
-            ready_record = self.state_store.load()["transactions"].get(
-                transaction_id
-            )
+            observed_state = self.state_store.load()
+            ready_record = observed_state["transactions"].get(transaction_id)
+            observed_installed = observed_state.get("installed")
             if (
                 isinstance(ready_record, dict)
                 and ready_record.get("state") == "ready"
+                and isinstance(observed_installed, dict)
+                and observed_installed.get("manifest_digest")
+                == desired.digest
             ):
-                ready_result = self.transaction(transaction_id)
+                if (
+                    ready_record.get("required_class_types")
+                    != _state_class_types(required)
+                    or ready_record.get("failure_code") is not None
+                ):
+                    raise _provision_error()
+                ready_result = await self._transaction_live_unlocked(
+                    transaction_id,
+                    allow_start=True,
+                )
                 if (
                     ready_result is None
                     or ready_result.state != "ready"
@@ -1684,9 +1941,6 @@ class Provisioner:
                         ready_result.manifest_digest,
                         desired.digest,
                     )
-                    or ready_record.get("required_class_types")
-                    != _state_class_types(required)
-                    or ready_record.get("failure_code") is not None
                     or ready_result.missing_class_types
                     or ready_result.missing_artifacts
                     or ready_result.progress is None
@@ -1699,6 +1953,7 @@ class Provisioner:
                 ):
                     raise _provision_error()
                 return ready_result
+            runtime_identity_before = self._runtime_identity()
             tracker = None
 
             def persist_progress(snapshot):
@@ -1734,11 +1989,31 @@ class Provisioner:
                 installed = self._installed_manifest(state, desired)
                 installed_state = state.get("installed")
                 if installed_state:
-                    ui_package_digests = dict(
-                        installed_state["ui_package_digests"]
-                    )
+                    if (
+                        runtime_identity_before
+                        != installed_state["readiness"][
+                            "runtime_package_versions"
+                        ]
+                    ):
+                        raise _provision_error()
+                    (
+                        measured_ui_digests,
+                        measured_extension_paths,
+                    ) = self._installed_measurements(installed)
+                    if (
+                        measured_ui_digests
+                        != installed_state["ui_package_digests"]
+                        or measured_extension_paths
+                        != installed_state["served_extension_paths"]
+                        or not _required_baseline_paths_present(
+                            installed,
+                            measured_extension_paths,
+                        )
+                    ):
+                        raise _provision_error()
+                    ui_package_digests = measured_ui_digests
                     served_extension_paths = set(
-                        installed_state["served_extension_paths"]
+                        measured_extension_paths
                     )
                 else:
                     ui_package_digests = {}
@@ -2008,6 +2283,9 @@ class Provisioner:
                         raise ProvisionError(
                             "Provisioning validation failed."
                         )
+                runtime_identity_after = self._runtime_identity()
+                if runtime_identity_after != runtime_identity_before:
+                    raise _provision_error()
                 expected_ui_digests = {
                     item.package_id: item.web_sha256
                     for item in sorted(
@@ -2016,11 +2294,17 @@ class Provisioner:
                     )
                 }
                 ordered_extension_paths = sorted(served_extension_paths)
+                (
+                    measured_ui_digests,
+                    measured_extension_paths,
+                ) = self._installed_measurements(desired)
                 if (
                     ui_package_digests != expected_ui_digests
+                    or measured_ui_digests != expected_ui_digests
+                    or measured_extension_paths != ordered_extension_paths
                     or not _required_baseline_paths_present(
                         desired,
-                        ordered_extension_paths,
+                        measured_extension_paths,
                     )
                 ):
                     raise _provision_error()
@@ -2029,6 +2313,7 @@ class Provisioner:
                     required=required,
                     ui_package_digests=ui_package_digests,
                     served_extension_paths=ordered_extension_paths,
+                    runtime_package_versions=runtime_identity_after,
                     planned_restarts=planned_restarts,
                     repair_restarts=repair_restarts,
                     repair_used=repair_used,
@@ -2115,33 +2400,7 @@ class Provisioner:
             or not _HEX_64.fullmatch(manifest_digest)
         ):
             raise _provision_error()
-        state = self.state_store.load()
-        installed = state.get("installed")
-        if (
-            not isinstance(installed, dict)
-            or installed.get("manifest_digest") != manifest_digest
-            or not isinstance(installed.get("manifest"), dict)
-        ):
-            return None
-        try:
-            desired = dependency_manifest_from_record(installed["manifest"])
-            self._installed_manifest(state, desired)
-            persisted = installed["readiness"]
-            profile = desired.profile
-            return _validated_worker_readiness(
-                {
-                    **persisted,
-                    "profile_digest": (
-                        profile.archive.sha256 if profile is not None else None
-                    ),
-                    "bootstrap_digest": (
-                        profile.bootstrap_digest if profile is not None else None
-                    ),
-                    "comfy_process_healthy": True,
-                }
-            )
-        except (KeyError, TypeError, ValueError, ProvisionError):
-            raise _provision_error() from None
+        return None
 
     def transaction(self, transaction_id):
         if (
@@ -2170,14 +2429,65 @@ class Provisioner:
                 ),
                 missing_artifacts=tuple(record["missing_artifacts"]),
                 progress=record.get("progress"),
-                readiness=(
-                    self.readiness(record["manifest_digest"])
-                    if record["state"] == "ready"
-                    else None
-                ),
+                readiness=None,
             )
         except (KeyError, TypeError, ValueError):
             raise _provision_error() from None
+
+    async def _transaction_live_unlocked(
+        self,
+        transaction_id,
+        *,
+        allow_start=False,
+    ):
+        result = self.transaction(transaction_id)
+        if result is None or result.state != "ready":
+            return result
+        try:
+            state = self.state_store.load()
+            installed = state.get("installed")
+            if (
+                not isinstance(installed, dict)
+                or installed.get("manifest_digest")
+                != result.manifest_digest
+                or not isinstance(installed.get("manifest"), dict)
+            ):
+                raise _provision_error()
+            desired = dependency_manifest_from_record(installed["manifest"])
+            self._installed_manifest(state, desired)
+            required = tuple(installed["required_class_types"])
+            persisted = installed["readiness"]
+            await self._revalidate_ready(
+                desired,
+                required,
+                persisted,
+                allow_start=allow_start,
+            )
+            live_readiness = self._live_readiness_payload(
+                desired,
+                persisted,
+            )
+            return ProvisionResult(
+                transaction_id=result.transaction_id,
+                manifest_digest=result.manifest_digest,
+                state=result.state,
+                planned_restarts=result.planned_restarts,
+                repair_restarts=result.repair_restarts,
+                missing_class_types=result.missing_class_types,
+                missing_artifacts=result.missing_artifacts,
+                progress=result.progress,
+                readiness=live_readiness,
+            )
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            raise
+        except ProvisionError:
+            raise
+        except Exception:
+            raise _provision_error() from None
+
+    async def transaction_live(self, transaction_id):
+        async with self._provision_lock():
+            return await self._transaction_live_unlocked(transaction_id)
 
     async def repair(self, transaction_id):
         result = self.transaction(transaction_id)
