@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping
 from dataclasses import dataclass
+import hashlib
 import hmac
 import json
 import math
@@ -66,6 +67,17 @@ PROGRESS_PERSIST_BYTES = 1024 * 1024
 PROGRESS_PERSIST_SECONDS = 1
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}")
 _HEX_64 = re.compile(r"[0-9a-f]{64}")
+_EXTENSION_PATH = re.compile(
+    r"/extensions/[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}/"
+    r"[A-Za-z0-9._@+/-]+"
+)
+_BASELINE_EXTENSION_PACKAGE_IDS = frozenset(
+    {
+        "comfyui-agent-panel",
+        "efficiency-nodes-comfyui",
+        "hermes-nous",
+    }
+)
 _PROGRESS_FIELDS = {
     "phase",
     "dependency_id",
@@ -130,6 +142,89 @@ class UploadsRequired(ProvisionError):
             raise ProvisionError("Provisioning upload state is invalid.")
         self.artifact_ids = identifiers
         super().__init__("Verified artifact uploads are required.")
+
+
+def _valid_class_type(value):
+    return bool(
+        isinstance(value, str)
+        and 1 <= len(value) <= 200
+        and value == value.strip()
+        and all(32 <= ord(character) <= 126 for character in value)
+    )
+
+
+def _state_class_type(value):
+    if isinstance(value, str) and _IDENTIFIER.fullmatch(value):
+        return value
+    if not _valid_class_type(value):
+        raise _provision_error()
+    return "class-" + hashlib.sha256(value.encode("ascii")).hexdigest()
+
+
+def _state_class_types(values):
+    return [_state_class_type(item) for item in values]
+
+
+def _validated_extension_paths(value):
+    if not isinstance(value, list) or any(
+        not isinstance(item, str)
+        or _EXTENSION_PATH.fullmatch(item) is None
+        or "//" in item
+        or "/./" in item
+        or "/../" in item
+        for item in value
+    ):
+        raise ProvisionError("Provisioning readiness is invalid.")
+    if value != sorted(set(value)):
+        raise ProvisionError("Provisioning readiness is invalid.")
+    return list(value)
+
+
+def _package_extension_paths(value, package_id):
+    try:
+        paths = tuple(value)
+    except TypeError:
+        raise _provision_error() from None
+    prefix = f"/extensions/{package_id}/"
+    if not all(isinstance(item, str) for item in paths):
+        raise _provision_error()
+    if (
+        not isinstance(package_id, str)
+        or _IDENTIFIER.fullmatch(package_id) is None
+        or any(
+            _EXTENSION_PATH.fullmatch(item) is None
+            or not item.startswith(prefix)
+            for item in paths
+        )
+        or tuple(sorted(set(paths))) != paths
+    ):
+        raise _provision_error()
+    return paths
+
+
+def _replace_package_paths(paths, package_id, replacements):
+    prefix = f"/extensions/{package_id}/"
+    return {
+        *(item for item in paths if not item.startswith(prefix)),
+        *replacements,
+    }
+
+
+def _required_baseline_paths_present(desired, paths):
+    package_ids = {
+        *(item.package_id for item in desired.ui_packages),
+        *(item.package_id for item in desired.custom_nodes),
+    }
+    prefixes = tuple(
+        f"/extensions/{package_id}/"
+        for package_id in sorted(
+            package_ids.intersection(_BASELINE_EXTENSION_PACKAGE_IDS)
+        )
+    )
+    return all(
+        any(path.startswith(prefix) for path in paths)
+        for prefix in prefixes
+    )
 
 
 def _validated_progress(value):
@@ -199,11 +294,12 @@ class ProvisionResult:
             or not isinstance(self.missing_class_types, tuple)
             or not isinstance(self.missing_artifacts, tuple)
             or not all(
+                _valid_class_type(item)
+                for item in self.missing_class_types
+            )
+            or not all(
                 isinstance(item, str) and _IDENTIFIER.fullmatch(item)
-                for item in (
-                    *self.missing_class_types,
-                    *self.missing_artifacts,
-                )
+                for item in self.missing_artifacts
             )
         ):
             raise ProvisionError("Provisioning result is invalid.")
@@ -251,6 +347,7 @@ def _validated_worker_readiness(value):
         "profile_digest",
         "bootstrap_digest",
         "ui_package_digests",
+        "served_extension_paths",
         "comfy_process_healthy",
         "completed_at",
     }
@@ -264,9 +361,10 @@ def _validated_worker_readiness(value):
         or class_types != sorted(set(class_types))
         or not isinstance(artifacts, list)
         or len(artifacts) != len(set(artifacts))
+        or not all(_valid_class_type(item) for item in class_types)
         or not all(
             isinstance(item, str) and _IDENTIFIER.fullmatch(item)
-            for item in (*class_types, *artifacts)
+            for item in artifacts
         )
         or (
             profile_revision is not None
@@ -299,6 +397,10 @@ def _validated_worker_readiness(value):
             or not _HEX_64.fullmatch(digest)
             for package_id, digest in value["ui_package_digests"].items()
         )
+        or _validated_extension_paths(
+            value["served_extension_paths"]
+        )
+        != value["served_extension_paths"]
         or value["comfy_process_healthy"] is not True
         or isinstance(value["completed_at"], bool)
         or not isinstance(value["completed_at"], (int, float))
@@ -581,7 +683,7 @@ def parse_manifest_request(body):
         not isinstance(required, list)
         or len(required) > MAX_REQUIRED_CLASS_TYPES
         or not all(
-            isinstance(item, str) and _IDENTIFIER.fullmatch(item)
+            _valid_class_type(item)
             for item in required
         )
         or len(set(required)) != len(required)
@@ -660,6 +762,43 @@ def manifest_upload_artifacts(desired):
         for key in sorted(catalog)
         if catalog[key].source.kind == "local-upload"
     )
+
+
+def _node_install_measurement(result, node):
+    try:
+        package_id = result.package_id
+        paths = _package_extension_paths(
+            result.extension_paths,
+            node.package_id,
+        )
+    except (AttributeError, TypeError, ValueError):
+        raise _provision_error() from None
+    if package_id != node.package_id or (
+        node.package_id == "efficiency-nodes-comfyui" and not paths
+    ):
+        raise _provision_error()
+    return paths
+
+
+def _ui_install_measurement(result, package):
+    try:
+        package_id = result.package_id
+        digest = result.web_sha256
+        paths = _package_extension_paths(
+            result.extension_paths,
+            package.package_id,
+        )
+    except (AttributeError, TypeError, ValueError):
+        raise _provision_error() from None
+    if (
+        package_id != package.package_id
+        or not isinstance(digest, str)
+        or _HEX_64.fullmatch(digest) is None
+        or not hmac.compare_digest(digest, package.web_sha256)
+        or not paths
+    ):
+        raise _provision_error()
+    return digest, paths
 
 
 def _manifest_archives(desired):
@@ -1001,7 +1140,7 @@ def _required_class_types(desired, values):
     if (
         len(combined) > MAX_REQUIRED_CLASS_TYPES
         or not all(
-            isinstance(item, str) and _IDENTIFIER.fullmatch(item)
+            _valid_class_type(item)
             for item in combined
         )
     ):
@@ -1202,6 +1341,7 @@ class Provisioner:
                 "required_class_types",
                 "profile_revision",
                 "ui_package_digests",
+                "served_extension_paths",
             }
             or not isinstance(installed["manifest_digest"], str)
             or not isinstance(installed["manifest"], dict)
@@ -1216,7 +1356,7 @@ class Provisioner:
             or installed["required_class_types"]
             != sorted(set(installed["required_class_types"]))
             or not all(
-                isinstance(item, str) and _IDENTIFIER.fullmatch(item)
+                _valid_class_type(item)
                 for item in installed["required_class_types"]
             )
             or (
@@ -1228,6 +1368,10 @@ class Provisioner:
                 )
             )
             or not isinstance(installed["ui_package_digests"], dict)
+            or _validated_extension_paths(
+                installed["served_extension_paths"]
+            )
+            != installed["served_extension_paths"]
         ):
             raise _provision_error()
         readiness = installed["readiness"]
@@ -1242,6 +1386,7 @@ class Provisioner:
                 "validated_artifacts",
                 "profile_revision",
                 "ui_package_digests",
+                "served_extension_paths",
                 "completed_at",
             }
             or not isinstance(
@@ -1290,6 +1435,12 @@ class Provisioner:
             }
             or readiness["ui_package_digests"]
             != installed["ui_package_digests"]
+            or readiness["served_extension_paths"]
+            != installed["served_extension_paths"]
+            or not _required_baseline_paths_present(
+                prior,
+                readiness["served_extension_paths"],
+            )
         ):
             raise _provision_error()
         return prior
@@ -1314,12 +1465,12 @@ class Provisioner:
             "transaction_id": transaction_id,
             "manifest_digest": desired.digest,
             "manifest": None,
-            "required_class_types": list(required),
+            "required_class_types": _state_class_types(required),
             "state": state_name,
             "planned_restarts": planned_restarts,
             "repair_restarts": repair_restarts,
             "repair_used": bool(repair_used),
-            "missing_class_types": list(missing_classes),
+            "missing_class_types": _state_class_types(missing_classes),
             "missing_artifacts": list(missing_artifacts),
             "failure_code": failure_code,
             "updated_at": float(self.clock()),
@@ -1372,6 +1523,8 @@ class Provisioner:
         *,
         desired,
         required,
+        ui_package_digests,
+        served_extension_paths,
         planned_restarts,
         repair_restarts,
         repair_used,
@@ -1384,7 +1537,7 @@ class Provisioner:
             "transaction_id": transaction_id,
             "manifest_digest": desired.digest,
             "manifest": None,
-            "required_class_types": list(required),
+            "required_class_types": _state_class_types(required),
             "state": "ready",
             "planned_restarts": planned_restarts,
             "repair_restarts": repair_restarts,
@@ -1414,13 +1567,8 @@ class Provisioner:
                     if desired.profile is not None
                     else None
                 ),
-                "ui_package_digests": {
-                    item.package_id: item.web_sha256
-                    for item in sorted(
-                        desired.ui_packages,
-                        key=lambda item: item.package_id,
-                    )
-                },
+                "ui_package_digests": dict(ui_package_digests),
+                "served_extension_paths": list(served_extension_paths),
                 "completed_at": float(self.clock()),
             },
             "required_class_types": list(required),
@@ -1429,13 +1577,8 @@ class Provisioner:
                 if desired.profile is not None
                 else None
             ),
-            "ui_package_digests": {
-                item.package_id: item.web_sha256
-                for item in sorted(
-                    desired.ui_packages,
-                    key=lambda item: item.package_id,
-                )
-            },
+            "ui_package_digests": dict(ui_package_digests),
+            "served_extension_paths": list(served_extension_paths),
         }
         self.state_store.record_transaction(
             transaction_id,
@@ -1542,7 +1685,7 @@ class Provisioner:
                         desired.digest,
                     )
                     or ready_record.get("required_class_types")
-                    != list(required)
+                    != _state_class_types(required)
                     or ready_record.get("failure_code") is not None
                     or ready_result.missing_class_types
                     or ready_result.missing_artifacts
@@ -1589,6 +1732,17 @@ class Provisioner:
             try:
                 state = self.state_store.load()
                 installed = self._installed_manifest(state, desired)
+                installed_state = state.get("installed")
+                if installed_state:
+                    ui_package_digests = dict(
+                        installed_state["ui_package_digests"]
+                    )
+                    served_extension_paths = set(
+                        installed_state["served_extension_paths"]
+                    )
+                else:
+                    ui_package_digests = {}
+                    served_extension_paths = set()
                 delta = desired.delta_from(installed)
                 if not delta.compatible:
                     raise IncompatibleManifestError(
@@ -1633,9 +1787,18 @@ class Provisioner:
                     not in new_node_wheels
                 )
                 for node in delta.custom_nodes:
-                    await self._await_progress(
+                    install_result = await self._await_progress(
                         self.installer.install(node),
                         tracker,
+                    )
+                    node_paths = _node_install_measurement(
+                        install_result,
+                        node,
+                    )
+                    served_extension_paths = _replace_package_paths(
+                        served_extension_paths,
+                        node.package_id,
+                        node_paths,
                     )
                     tracker.check()
                 install_ui = getattr(
@@ -1646,9 +1809,19 @@ class Provisioner:
                 if delta.ui_packages and not callable(install_ui):
                     raise _provision_error()
                 for package in delta.ui_packages:
-                    await self._await_progress(
+                    install_result = await self._await_progress(
                         install_ui(package),
                         tracker,
+                    )
+                    digest, package_paths = _ui_install_measurement(
+                        install_result,
+                        package,
+                    )
+                    ui_package_digests[package.package_id] = digest
+                    served_extension_paths = _replace_package_paths(
+                        served_extension_paths,
+                        package.package_id,
+                        package_paths,
                     )
                     tracker.check()
                 if standalone_wheels:
@@ -1790,9 +1963,18 @@ class Provisioner:
                         )
                         tracker.check()
                     for node in repair_nodes:
-                        await self._await_progress(
+                        install_result = await self._await_progress(
                             self.installer.install(node),
                             tracker,
+                        )
+                        node_paths = _node_install_measurement(
+                            install_result,
+                            node,
+                        )
+                        served_extension_paths = _replace_package_paths(
+                            served_extension_paths,
+                            node.package_id,
+                            node_paths,
                         )
                         tracker.check()
                     if repair_nodes:
@@ -1826,9 +2008,27 @@ class Provisioner:
                         raise ProvisionError(
                             "Provisioning validation failed."
                         )
+                expected_ui_digests = {
+                    item.package_id: item.web_sha256
+                    for item in sorted(
+                        desired.ui_packages,
+                        key=lambda item: item.package_id,
+                    )
+                }
+                ordered_extension_paths = sorted(served_extension_paths)
+                if (
+                    ui_package_digests != expected_ui_digests
+                    or not _required_baseline_paths_present(
+                        desired,
+                        ordered_extension_paths,
+                    )
+                ):
+                    raise _provision_error()
                 return self._ready(
                     desired=desired,
                     required=required,
+                    ui_package_digests=ui_package_digests,
+                    served_extension_paths=ordered_extension_paths,
                     planned_restarts=planned_restarts,
                     repair_restarts=repair_restarts,
                     repair_used=repair_used,

@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import io
+import json
 import sys
 import tarfile
 import tempfile
@@ -18,6 +19,13 @@ from cloud_run.manifest import (
 
 
 REVISION = "a" * 40
+SAFE_UI_LOADER = (
+    b"NODE_CLASS_MAPPINGS = {}\n"
+    b"NODE_DISPLAY_NAME_MAPPINGS = {}\n"
+    b'WEB_DIRECTORY = "./web"\n\n'
+    b"__all__ = [\"NODE_CLASS_MAPPINGS\", "
+    b'"NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]\n'
+)
 
 
 def write_tar(path, entries):
@@ -60,6 +68,33 @@ def write_tar(path, entries):
                 info.size = 0
                 archive.addfile(info)
     return path
+
+
+def canonical_web_digest(entries):
+    records = []
+    for entry in entries:
+        name = entry["name"]
+        if entry.get("kind", "file") != "file" or not name.startswith(
+            "web/"
+        ):
+            continue
+        payload = entry.get("payload", b"content")
+        records.append(
+            {
+                "mode": 0o644,
+                "path": name.removeprefix("web/"),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "size_bytes": len(payload),
+            }
+        )
+    body = json.dumps(
+        sorted(records, key=lambda item: item["path"]),
+        allow_nan=False,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(body).hexdigest()
 
 
 class RecordingRunner:
@@ -151,16 +186,17 @@ class WorkerInstallTests(unittest.TestCase):
             runner=runner,
         )
 
-    def ui_package_spec(self):
+    def ui_package_spec(self, *, entries=None, web_digest=None):
         archive_id = "agent-panel-archive"
         archive_path = self.artifacts / f"{archive_id}.tar"
-        write_tar(
-            archive_path,
-            (
-                {"name": "__init__.py", "payload": b"WEB_DIRECTORY = 'web'\n"},
-                {"name": "web/panel.js", "payload": b"export const panel = true;\n"},
-            ),
+        entries = entries or (
+            {"name": "__init__.py", "payload": SAFE_UI_LOADER},
+            {
+                "name": "web/panel.js",
+                "payload": b"export const panel = true;\n",
+            },
         )
+        write_tar(archive_path, entries)
         payload = archive_path.read_bytes()
         return UiPackageSpec(
             package_id="agent-panel",
@@ -178,7 +214,7 @@ class WorkerInstallTests(unittest.TestCase):
                     locator=f"local-upload:{archive_id}",
                 ),
             ),
-            web_sha256=hashlib.sha256(b"export const panel = true;\n").hexdigest(),
+            web_sha256=web_digest or canonical_web_digest(entries),
             required_capabilities=("graph_read", "native_run"),
         )
 
@@ -208,7 +244,9 @@ class WorkerInstallTests(unittest.TestCase):
                     "pip",
                     "install",
                     "--no-index",
+                    "--no-deps",
                     "--disable-pip-version-check",
+                    "--no-compile",
                     str(
                         self.wheels.resolve()
                         / "dep-1.0-py3-none-any.whl"
@@ -239,6 +277,64 @@ class WorkerInstallTests(unittest.TestCase):
             b"export const panel = true;\n",
         )
         self.assertEqual(runner.calls, [])
+
+    def test_ui_install_returns_measured_canonical_web_digest(self):
+        entries = (
+            {"name": "__init__.py", "payload": SAFE_UI_LOADER},
+            {
+                "name": "web/z-last.js",
+                "payload": b"export const z = true;\n",
+                "mode": 0o755,
+            },
+            {
+                "name": "web/a-first.css",
+                "payload": b"body { color: #fff; }\n",
+            },
+        )
+        expected = canonical_web_digest(entries)
+
+        result = asyncio.run(
+            self.installer(RecordingRunner()).install_ui_package(
+                self.ui_package_spec(entries=entries)
+            )
+        )
+
+        self.assertEqual(result.web_sha256, expected)
+        self.assertEqual(
+            result.extension_paths,
+            (
+                "/extensions/agent-panel/a-first.css",
+                "/extensions/agent-panel/z-last.js",
+            ),
+        )
+
+    def test_ui_install_rejects_manifest_web_digest_mismatch(self):
+        from remote_worker.install import InstallError
+
+        spec = self.ui_package_spec(web_digest="0" * 64)
+
+        with self.assertRaises(InstallError):
+            asyncio.run(
+                self.installer(RecordingRunner()).install_ui_package(spec)
+            )
+        self.assertFalse((self.custom_nodes / "agent-panel").exists())
+
+    def test_ui_install_rejects_unreviewed_executable_path(self):
+        from remote_worker.install import InstallError
+
+        entries = (
+            {"name": "__init__.py", "payload": SAFE_UI_LOADER},
+            {"name": "web/panel.js", "payload": b"export {};\n"},
+            {"name": "py/backend.py", "payload": b"raise SystemExit\n"},
+        )
+
+        with self.assertRaises(InstallError):
+            asyncio.run(
+                self.installer(RecordingRunner()).install_ui_package(
+                    self.ui_package_spec(entries=entries)
+                )
+            )
+        self.assertFalse((self.custom_nodes / "agent-panel").exists())
 
     def test_archive_traversal_links_devices_and_bad_metadata_fail_closed(self):
         from remote_worker.install import InstallError, safe_extract
@@ -335,6 +431,75 @@ class WorkerInstallTests(unittest.TestCase):
         )
         self.assertEqual(len(runner.calls), 1)
         self.assertFalse((self.custom_nodes / "fancy").exists())
+
+    def test_efficiency_wheels_install_offline_without_dependency_resolution(self):
+        from remote_worker.install import InstallError
+
+        runner = RecordingRunner()
+        spec = self.node_spec(
+            entries=(
+                {
+                    "name": "__init__.py",
+                    "payload": b'WEB_DIRECTORY = "./js"\n',
+                },
+                {
+                    "name": "js/efficiency.js",
+                    "payload": b"export const efficiency = true;\n",
+                },
+            ),
+            wheel_filename="simpleeval-1.0.7-py3-none-any.whl",
+        )
+        spec = replace(
+            spec,
+            package_id="efficiency-nodes-comfyui",
+            archive=replace(
+                spec.archive,
+                destination="custom_nodes/efficiency-nodes-comfyui",
+            ),
+        )
+
+        asyncio.run(self.installer(runner).install(spec))
+
+        self.assertEqual(
+            runner.calls,
+            [
+                [
+                    sys.executable,
+                    "-m",
+                    "pip",
+                    "install",
+                    "--no-index",
+                    "--no-deps",
+                    "--disable-pip-version-check",
+                    "--no-compile",
+                    str(
+                        self.wheels.resolve()
+                        / "simpleeval-1.0.7-py3-none-any.whl"
+                    ),
+                ]
+            ],
+        )
+
+        empty_runner = RecordingRunner()
+        with self.assertRaises(InstallError):
+            asyncio.run(
+                self.installer(empty_runner).install(
+                    replace(spec, wheels=())
+                )
+            )
+        self.assertEqual(empty_runner.calls, [])
+
+    def test_protected_core_wheel_is_rejected_before_pip(self):
+        from remote_worker.install import InstallError
+
+        runner = RecordingRunner()
+        spec = self.node_spec(
+            wheel_filename="torch-2.4.1-py3-none-any.whl"
+        )
+
+        with self.assertRaises(InstallError):
+            asyncio.run(self.installer(runner).install_wheels(spec.wheels))
+        self.assertEqual(runner.calls, [])
 
 
 if __name__ == "__main__":

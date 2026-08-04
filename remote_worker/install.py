@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import ast
 from dataclasses import dataclass
 import hashlib
+import json
 import os
 from pathlib import Path, PurePosixPath
+import re
 import secrets
 import shutil
 import stat
@@ -24,6 +27,48 @@ from .transfers import TRANSFER_CHUNK_BYTES
 
 
 MAX_ARCHIVE_MEMBERS = 100_000
+_SAFE_UI_LOADER = (
+    b"NODE_CLASS_MAPPINGS = {}\n"
+    b"NODE_DISPLAY_NAME_MAPPINGS = {}\n"
+    b'WEB_DIRECTORY = "./web"\n\n'
+    b"__all__ = [\"NODE_CLASS_MAPPINGS\", "
+    b'"NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]\n'
+)
+_UI_ROOT_FILES = frozenset({"LICENSE", "__init__.py"})
+_UI_FORBIDDEN_EXECUTABLE_SUFFIXES = frozenset(
+    {
+        ".bat",
+        ".cmd",
+        ".com",
+        ".exe",
+        ".ps1",
+        ".py",
+        ".pyc",
+        ".pyo",
+        ".sh",
+    }
+)
+_SERVED_RELATIVE_PATH = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@+/-]*")
+_PROTECTED_DISTRIBUTIONS = frozenset(
+    {
+        "accelerate",
+        "aiohttp",
+        "comfyui",
+        "comfyui-frontend-package",
+        "numpy",
+        "open-clip-torch",
+        "pillow",
+        "pip",
+        "requests",
+        "safetensors",
+        "setuptools",
+        "torch",
+        "torchaudio",
+        "torchvision",
+        "transformers",
+        "wheel",
+    }
+)
 
 
 class InstallError(RuntimeError):
@@ -36,6 +81,17 @@ class InstallResult:
     revision: str
     destination: Path
     wheels: tuple[str, ...]
+    extension_paths: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class UiInstallResult:
+    package_id: str
+    revision: str
+    destination: Path
+    wheels: tuple[str, ...]
+    web_sha256: str
+    extension_paths: tuple[str, ...]
 
 
 def _install_error():
@@ -284,6 +340,178 @@ def _verified_file(path, *, size_bytes, sha256):
     return path
 
 
+def _canonical_bytes(value):
+    return json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _measured_web_tree(root, package_id):
+    root = Path(root)
+    try:
+        root_metadata = os.lstat(root)
+        if not stat.S_ISDIR(root_metadata.st_mode) or root.is_symlink():
+            raise _install_error()
+        files = sorted(
+            (path for path in root.rglob("*") if path.is_file()),
+            key=lambda path: path.relative_to(root).as_posix(),
+        )
+        if not files:
+            raise _install_error()
+        records = []
+        extension_paths = []
+        for path in files:
+            relative = path.relative_to(root).as_posix()
+            if (
+                _SERVED_RELATIVE_PATH.fullmatch(relative) is None
+                or "//" in relative
+                or "/./" in relative
+                or "/../" in relative
+            ):
+                raise _install_error()
+            metadata = os.lstat(path)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or stat.S_ISLNK(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or metadata.st_nlink != 1
+            ):
+                raise _install_error()
+            body = path.read_bytes()
+            if len(body) != metadata.st_size:
+                raise _install_error()
+            records.append(
+                {
+                    "mode": 0o644,
+                    "path": relative,
+                    "sha256": hashlib.sha256(body).hexdigest(),
+                    "size_bytes": len(body),
+                }
+            )
+            extension_paths.append(
+                f"/extensions/{package_id}/{relative}"
+            )
+        digest = hashlib.sha256(_canonical_bytes(records)).hexdigest()
+    except InstallError:
+        raise
+    except (OSError, RuntimeError, ValueError):
+        raise _install_error() from None
+    return digest, tuple(extension_paths)
+
+
+def _ui_measurement(content, package):
+    try:
+        files = sorted(
+            path
+            for path in content.rglob("*")
+            if path.is_file()
+        )
+        relative_files = tuple(
+            path.relative_to(content).as_posix() for path in files
+        )
+        if "__init__.py" not in relative_files:
+            raise _install_error()
+        for path, relative in zip(files, relative_files, strict=True):
+            if relative in _UI_ROOT_FILES:
+                continue
+            if not relative.startswith("web/"):
+                raise _install_error()
+            if path.suffix.casefold() in _UI_FORBIDDEN_EXECUTABLE_SUFFIXES:
+                raise _install_error()
+        if (content / "__init__.py").read_bytes() != _SAFE_UI_LOADER:
+            raise _install_error()
+        digest, extension_paths = _measured_web_tree(
+            content / "web",
+            package.package_id,
+        )
+        if not secrets.compare_digest(digest, package.web_sha256):
+            raise _install_error()
+        return digest, extension_paths
+    except InstallError:
+        raise
+    except (OSError, RuntimeError, ValueError):
+        raise _install_error() from None
+
+
+def _declared_web_root(content):
+    loader = content / "__init__.py"
+    try:
+        body = loader.read_bytes()
+        if len(body) > 1024 * 1024:
+            return None
+        tree = ast.parse(body, filename="__init__.py")
+    except (OSError, SyntaxError, ValueError):
+        return None
+    values = []
+    for statement in tree.body:
+        if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = (
+            statement.targets
+            if isinstance(statement, ast.Assign)
+            else (statement.target,)
+        )
+        if not any(
+            isinstance(target, ast.Name)
+            and target.id == "WEB_DIRECTORY"
+            for target in targets
+        ):
+            continue
+        value = statement.value
+        if not isinstance(value, ast.Constant) or not isinstance(
+            value.value,
+            str,
+        ):
+            return None
+        values.append(value.value)
+    if len(values) != 1:
+        return None
+    value = values[0]
+    if value.startswith("./"):
+        value = value[2:]
+    try:
+        relative = _archive_name(value)
+        root = content.joinpath(*relative.parts)
+        if not root.is_dir() or root.is_symlink():
+            return None
+        if not _within(root.resolve(strict=True), content.resolve(strict=True)):
+            return None
+    except (InstallError, OSError, RuntimeError):
+        return None
+    return root
+
+
+def _extension_paths(content, package_id):
+    root = _declared_web_root(content)
+    if root is None:
+        return ()
+    _digest, extension_paths = _measured_web_tree(root, package_id)
+    return extension_paths
+
+
+def _wheel_distribution(filename):
+    stem = filename.split("-", 1)[0]
+    return re.sub(r"[-_.]+", "-", stem).casefold()
+
+
+def _validated_wheel_distributions(wheels, required=None):
+    distributions = {
+        _wheel_distribution(wheel.filename) for wheel, _path in wheels
+    }
+    if (
+        not distributions
+        or "" in distributions
+        or distributions.intersection(_PROTECTED_DISTRIBUTIONS)
+        or (required is not None and distributions != set(required))
+    ):
+        raise _install_error()
+    return distributions
+
+
 class SubprocessRunner:
     async def run(self, argv):
         process = None
@@ -376,34 +604,41 @@ class CustomNodeInstaller:
             raise _install_error()
         return node
 
-    async def _install_wheels(self, wheels):
-        installed = []
-        for wheel, path in wheels:
-            argv = [
-                sys.executable,
-                "-m",
-                "pip",
-                "install",
-                "--no-index",
-                "--disable-pip-version-check",
-                str(path),
-            ]
-            try:
-                return_code = await self.runner.run(argv)
-            except (asyncio.CancelledError, KeyboardInterrupt):
-                raise
-            except InstallError:
-                raise
-            except Exception:
-                raise _install_error() from None
-            if (
-                isinstance(return_code, bool)
-                or not isinstance(return_code, int)
-                or return_code != 0
-            ):
+    async def _install_wheels(self, wheels, *, required_distributions=None):
+        wheels = tuple(
+            sorted(wheels, key=lambda item: str(item[1].resolve()))
+        )
+        if not wheels:
+            if required_distributions is not None:
                 raise _install_error()
-            installed.append(wheel.filename)
-        return tuple(installed)
+            return ()
+        _validated_wheel_distributions(wheels, required_distributions)
+        argv = [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--no-index",
+            "--no-deps",
+            "--disable-pip-version-check",
+            "--no-compile",
+            *(str(path.resolve()) for _wheel, path in wheels),
+        ]
+        try:
+            return_code = await self.runner.run(argv)
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            raise
+        except InstallError:
+            raise
+        except Exception:
+            raise _install_error() from None
+        if (
+            isinstance(return_code, bool)
+            or not isinstance(return_code, int)
+            or return_code != 0
+        ):
+            raise _install_error()
+        return tuple(wheel.filename for wheel, _path in wheels)
 
     async def install_wheels(self, wheels):
         try:
@@ -511,7 +746,15 @@ class CustomNodeInstaller:
         destination = self.custom_nodes_root / node.package_id
         try:
             safe_extract(archive_path, content)
-            installed_wheels = await self._install_wheels(wheels)
+            extension_paths = _extension_paths(content, node.package_id)
+            installed_wheels = await self._install_wheels(
+                wheels,
+                required_distributions=(
+                    {"simpleeval"}
+                    if node.package_id == "efficiency-nodes-comfyui"
+                    else None
+                ),
+            )
             self._replace_content(content, destination)
         except (InstallError, asyncio.CancelledError, KeyboardInterrupt):
             if staging_parent.exists():
@@ -540,6 +783,7 @@ class CustomNodeInstaller:
             revision=node.revision,
             destination=destination,
             wheels=installed_wheels,
+            extension_paths=extension_paths,
         )
 
     async def install_ui_package(self, package):
@@ -570,6 +814,7 @@ class CustomNodeInstaller:
         destination = self.custom_nodes_root / package.package_id
         try:
             safe_extract(archive_path, content)
+            web_sha256, extension_paths = _ui_measurement(content, package)
             self._replace_content(content, destination)
         except (InstallError, asyncio.CancelledError, KeyboardInterrupt):
             if staging_parent.exists():
@@ -587,9 +832,11 @@ class CustomNodeInstaller:
             raise _install_error() from None
         if staging_parent.exists():
             _safe_remove_tree(staging_parent, self.custom_nodes_root)
-        return InstallResult(
+        return UiInstallResult(
             package_id=package.package_id,
             revision=package.revision,
             destination=destination,
             wheels=(),
+            web_sha256=web_sha256,
+            extension_paths=extension_paths,
         )
