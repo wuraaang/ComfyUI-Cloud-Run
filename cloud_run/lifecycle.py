@@ -21,6 +21,7 @@ BOUNDARY_AUTHENTICATION_ERROR = (
 )
 _WATCHDOGS = {}
 _SESSION_WATCHDOGS = {}
+_PRESERVE_ERROR = object()
 
 
 async def _default_readiness_probe(base_url):
@@ -68,6 +69,7 @@ class CloudRunLifecycle:
         self.release = release if isinstance(release, WorkerRelease) else None
         self.session_repository = session_repository
         self.session_service = session_service
+        self._session_recovery_tasks = {}
 
     def _attempt(self, attempt_id):
         attempt = self.repository.get(str(attempt_id))
@@ -91,9 +93,12 @@ class CloudRunLifecycle:
             inventory = await self.provider.list_instances(api_key)
         except Exception:
             return None
-        if not isinstance(inventory, list):
+        if (
+            not isinstance(inventory, list)
+            or any(not isinstance(item, dict) for item in inventory)
+        ):
             return None
-        return [item for item in inventory if isinstance(item, dict)]
+        return inventory
 
     @staticmethod
     def _by_label(inventory, label):
@@ -477,6 +482,24 @@ class CloudRunLifecycle:
         task.add_done_callback(finished)
         return task
 
+    async def preempt_session(self, session_id):
+        key = str(session_id or "")
+        if not key:
+            raise ValueError("Cloud Run session identity is invalid.")
+        tasks = {
+            task
+            for task in (
+                _SESSION_WATCHDOGS.pop(key, None),
+                self._session_recovery_tasks.pop(key, None),
+            )
+            if task is not None and task is not asyncio.current_task()
+        }
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
     async def _destroy_failed_attempt(self, attempt):
         _settings, api_key = self._api_key()
         instance_id = attempt.instance_id
@@ -768,6 +791,48 @@ class CloudRunLifecycle:
             pending_deadline_action=None,
         )
 
+    @staticmethod
+    def _known_session_instance_ids(session):
+        values = set()
+        if session.instance_id is not None:
+            values.add(str(session.instance_id))
+        values.update(str(item) for item in session.residual_inventory)
+        return values
+
+    def finalize_verified_absence(
+        self,
+        session,
+        inventory,
+        *,
+        terminal_error=_PRESERVE_ERROR,
+    ):
+        if (
+            not isinstance(inventory, list)
+            or any(not isinstance(item, dict) for item in inventory)
+        ):
+            return None
+        known_ids = self._known_session_instance_ids(session)
+        if not known_ids:
+            return None
+        if any(
+            item.get("label") == session.label
+            or (
+                item.get("instance_id") is not None
+                and str(item.get("instance_id")) in known_ids
+            )
+            for item in inventory
+        ):
+            return None
+        error = (
+            session.sanitized_error
+            if terminal_error is _PRESERVE_ERROR
+            else terminal_error
+        )
+        return self._finalize_session_destroyed(
+            session,
+            terminal_error=error,
+        )
+
     async def _activate_session_instance(self, session, instance):
         base_url = self._session_connection(session, instance)
         if base_url is None:
@@ -1000,35 +1065,37 @@ class CloudRunLifecycle:
                     "inventory is unavailable."
                 ),
             )
-        residual = self._session_matches(inventory, session.label)
+        destroyed = self.finalize_verified_absence(
+            session,
+            inventory,
+            terminal_error=terminal_error,
+        )
+        if destroyed is not None:
+            return destroyed
+        known_ids = self._known_session_instance_ids(session)
+        known_ids.add(str(instance_id))
+        residual = [
+            item
+            for item in inventory
+            if item.get("label") == session.label
+            or str(item.get("instance_id")) in known_ids
+        ]
         residual_ids = tuple(
             str(item.get("instance_id"))
             for item in residual
             if item.get("instance_id") is not None
         )
-        still_present = any(
-            str(item.get("instance_id")) == str(instance_id)
-            or item.get("label") == session.label
-            for item in inventory
-        )
-        if still_present:
-            return self.session_repository.transition(
-                session.session_id,
-                SessionState.FAILED,
-                now=float(self.clock()),
-                instance_id=str(instance_id),
-                residual_inventory=(
-                    residual_ids or (str(instance_id),)
-                ),
-                destroy_requested=True,
-                sanitized_error=(
-                    "The Vast instance is still present; destroy it in "
-                    "the Vast console immediately."
-                ),
-            )
-        return self._finalize_session_destroyed(
-            session,
-            terminal_error=terminal_error,
+        return self.session_repository.transition(
+            session.session_id,
+            SessionState.FAILED,
+            now=float(self.clock()),
+            instance_id=str(instance_id),
+            residual_inventory=(residual_ids or (str(instance_id),)),
+            destroy_requested=True,
+            sanitized_error=(
+                "The Vast instance is still present; destroy it in "
+                "the Vast console immediately."
+            ),
         )
 
     async def enforce_session_deadline(self, session_id):
@@ -1071,6 +1138,18 @@ class CloudRunLifecycle:
         ):
             return []
         sessions = repository.list_recoverable()
+        recovery_task = asyncio.current_task()
+        recovery_ids = tuple(session.session_id for session in sessions)
+        if recovery_task is not None:
+            for session_id in recovery_ids:
+                self._session_recovery_tasks[session_id] = recovery_task
+
+            def recovery_finished(completed):
+                for session_id in recovery_ids:
+                    if self._session_recovery_tasks.get(session_id) is completed:
+                        self._session_recovery_tasks.pop(session_id, None)
+
+            recovery_task.add_done_callback(recovery_finished)
         try:
             _settings, api_key = self._api_key()
             inventory = await self._inventory(api_key)
@@ -1089,12 +1168,12 @@ class CloudRunLifecycle:
         for original in sessions:
             session = original
             matches = self._session_matches(managed, session.label)
+            known_ids = self._known_session_instance_ids(session)
             known_id_matches = [
                 item
                 for item in inventory
-                if session.instance_id is not None
-                and str(item.get("instance_id"))
-                == str(session.instance_id)
+                if item.get("instance_id") is not None
+                and str(item.get("instance_id")) in known_ids
             ]
             if session.state in {
                 SessionState.DESTROY_REQUESTED,
@@ -1153,15 +1232,20 @@ class CloudRunLifecycle:
                         SessionState.CREATING,
                     }
                 )
-                if deadline_expired:
-                    session = self._finalize_session_destroyed(session)
-                    confirmed = getattr(
-                        self.session_service,
-                        "confirmed_deadline_destroy",
-                        None,
-                    )
-                    if callable(confirmed):
-                        confirmed(session.session_id)
+                absent = self.finalize_verified_absence(
+                    session,
+                    inventory,
+                )
+                if absent is not None:
+                    session = absent
+                    if deadline_expired:
+                        confirmed = getattr(
+                            self.session_service,
+                            "confirmed_deadline_destroy",
+                            None,
+                        )
+                        if callable(confirmed):
+                            confirmed(session.session_id)
                     recovered.append(session)
                     continue
                 if session.state in {

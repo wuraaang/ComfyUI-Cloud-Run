@@ -129,6 +129,71 @@ class SessionReconcilerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("private transport", repr(entries))
 
+    async def test_preempt_cancels_inflight_reconciliation_and_pending_retry(self):
+        from cloud_run.reconciler import SessionReconciler
+
+        blocking = BlockingReconciliationService()
+        active = SessionReconciler(
+            service=blocking,
+            orchestrator=self.orchestrator,
+            max_retries=1,
+            retry_delay_seconds=60,
+        )
+        self.addAsyncCleanup(active.close)
+        active_task = active.schedule("active-session")
+        await blocking.started.wait()
+
+        await active.preempt("active-session")
+
+        self.assertTrue(active_task.cancelled())
+        self.assertNotIn("active-session", active._tasks)
+
+        failing = FailingReconciliationService()
+        retrying = SessionReconciler(
+            service=failing,
+            orchestrator=self.orchestrator,
+            max_retries=1,
+            retry_delay_seconds=60,
+        )
+        self.addAsyncCleanup(retrying.close)
+        failed_task = retrying.schedule("retry-session")
+        await failing.started.wait()
+        with self.assertRaises(RuntimeError):
+            await failed_task
+        for _attempt in range(3):
+            await asyncio.sleep(0)
+        self.assertIn("retry-session", retrying._retry_handles)
+
+        await retrying.preempt("retry-session")
+        await asyncio.sleep(0)
+
+        self.assertNotIn("retry-session", retrying._retry_handles)
+        self.assertNotIn("retry-session", retrying._retry_counts)
+        self.assertEqual(failing.calls, 1)
+
+    async def test_preempt_is_idempotent_and_not_recorded_as_retryable_failure(self):
+        from cloud_run.reconciler import SessionReconciler
+
+        service = BlockingReconciliationService()
+        reconciler = SessionReconciler(
+            service=service,
+            orchestrator=self.orchestrator,
+            max_retries=2,
+        )
+        self.addAsyncCleanup(reconciler.close)
+        task = reconciler.schedule("session-1")
+        await service.started.wait()
+
+        await reconciler.preempt("session-1")
+        await reconciler.preempt("session-1")
+        await asyncio.sleep(0)
+
+        self.assertTrue(task.cancelled())
+        self.assertEqual(service.calls, 1)
+        self.assertEqual(self.orchestrator.entries("session-1"), ())
+        self.assertEqual(reconciler._tasks, {})
+        self.assertEqual(reconciler._retry_handles, {})
+
 
 class ReconcilerOutputTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):

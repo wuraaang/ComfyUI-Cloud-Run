@@ -982,6 +982,150 @@ class SessionLifecycleTests(LifecycleTestCase):
         )
         self.assertEqual(len(self.session_service.bootstrap_calls), 1)
 
+    def test_preempt_session_cancels_watchdog_before_teardown(self):
+        session = self.save_session()
+        lifecycle = self.session_lifecycle()
+
+        async def scenario():
+            started = asyncio.Event()
+            blocked = asyncio.Event()
+
+            async def blocking_reconcile(_session_id):
+                started.set()
+                await blocked.wait()
+
+            lifecycle.reconcile_session_once = blocking_reconcile
+            task = lifecycle.schedule_session_watchdog(session.session_id)
+            await started.wait()
+            await lifecycle.preempt_session(session.session_id)
+            await lifecycle.preempt_session(session.session_id)
+            return task
+
+        task = asyncio.run(scenario())
+
+        self.assertTrue(task.cancelled())
+        self.assertEqual(self.provider.calls, [])
+
+    def test_preempt_session_cancels_inflight_recovery_inventory(self):
+        session = self.save_session(state=SessionState.READY)
+        lifecycle = self.session_lifecycle()
+
+        async def scenario():
+            started = asyncio.Event()
+            blocked = asyncio.Event()
+
+            async def blocking_inventory(api_key):
+                self.provider.calls.append(("list", api_key))
+                started.set()
+                await blocked.wait()
+                return []
+
+            self.provider.list_instances = blocking_inventory
+            recovery = asyncio.create_task(lifecycle.recover_sessions())
+            await started.wait()
+            await lifecycle.preempt_session(session.session_id)
+            cancelled_by_preempt = recovery.cancelled()
+            if not recovery.done():
+                recovery.cancel()
+                await asyncio.gather(recovery, return_exceptions=True)
+            return cancelled_by_preempt
+
+        cancelled = asyncio.run(scenario())
+
+        self.assertTrue(cancelled)
+        self.assertEqual([call[0] for call in self.provider.calls], ["list"])
+
+    def test_recovery_finalizes_externally_destroyed_known_session_without_delete_or_create(self):
+        session = self.save_session(state=SessionState.READY)
+        self.provider.instances = []
+
+        recovered = asyncio.run(self.session_lifecycle().recover_sessions())
+
+        self.assertEqual(len(recovered), 1)
+        self.assertEqual(recovered[0].state, SessionState.DESTROYED)
+        self.assertIsNone(recovered[0].instance_id)
+        self.assertFalse(recovered[0].public_payload()["billing_may_continue"])
+        self.assertEqual([call[0] for call in self.provider.calls], ["list"])
+
+    def test_external_absence_clears_secrets_and_preserves_verified_evidence(self):
+        session = self.save_session(state=SessionState.READY)
+        session = self.sessions.transition(
+            session.session_id,
+            SessionState.READY,
+            now=self.clock(),
+            installed_manifest_digest=session.manifest_digest,
+            residual_inventory=("residual-instance",),
+            sanitized_error="Verified output evidence remains local.",
+        )
+        self.provider.instances = []
+
+        recovered = asyncio.run(self.session_lifecycle().recover_sessions())[0]
+
+        self.assertEqual(recovered.state, SessionState.DESTROYED)
+        self.assertIsNone(recovered.instance_id)
+        self.assertIsNone(recovered.provider_token)
+        self.assertIsNone(recovered.session_secret_hex)
+        self.assertEqual(recovered.residual_inventory, ())
+        self.assertEqual(
+            recovered.installed_manifest_digest,
+            session.installed_manifest_digest,
+        )
+        self.assertEqual(recovered.quote, session.quote)
+        self.assertEqual(
+            recovered.sanitized_error,
+            "Verified output evidence remains local.",
+        )
+
+    def test_unavailable_inventory_or_invalid_row_never_finalizes_external_destruction(self):
+        for label in ("unavailable", "invalid-row"):
+            with self.subTest(label=label):
+                session_id = "session-" + label
+                session = self.save_session(
+                    state=SessionState.READY,
+                    session_id=session_id,
+                    instance_id="instance-" + label,
+                )
+                lifecycle = self.session_lifecycle()
+                if label == "unavailable":
+                    self.provider.list_error = RuntimeError("private inventory error")
+                else:
+                    async def invalid_inventory(api_key):
+                        self.provider.calls.append(("list", api_key))
+                        return [{"instance_id": "unrelated", "label": "other"}, None]
+
+                    self.provider.list_instances = invalid_inventory
+
+                recovered = asyncio.run(lifecycle.recover_sessions())
+                current = self.sessions.get(session.session_id)
+
+                self.assertIn(current, recovered)
+                self.assertNotEqual(current.state, SessionState.DESTROYED)
+                self.assertEqual(current.instance_id, session.instance_id)
+                self.assertEqual(current.provider_token, session.provider_token)
+                self.provider.list_error = None
+
+    def test_destroy_session_accepts_pre_persisted_destroy_requested_state(self):
+        session = self.save_session(state=SessionState.READY)
+        session = self.sessions.transition(
+            session.session_id,
+            SessionState.DESTROY_REQUESTED,
+            now=self.clock(),
+            destroy_requested=True,
+        )
+        self.provider.instances = [
+            self.worker_instance("instance-1", session.label)
+        ]
+
+        destroyed = asyncio.run(
+            self.session_lifecycle().destroy_session(session.session_id)
+        )
+
+        self.assertEqual(destroyed.state, SessionState.DESTROYED)
+        self.assertEqual(
+            [call[0] for call in self.provider.calls],
+            ["destroy", "list"],
+        )
+
     def test_bootstrap_retries_one_early_boundary_authentication_response(self):
         self.session_service = TransientAuthenticationSessionService(
             self.sessions
