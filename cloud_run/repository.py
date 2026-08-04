@@ -413,16 +413,18 @@ def _migrate_readiness_v14(connection):
         try:
             stored_checks = json.loads(row["checks_json"])
             checks = tuple(
-                ReadinessCheck(
-                    name=item["name"],
-                    status=item["status"],
-                    evidence_digest=item["evidence_digest"],
-                    message=item["message"],
-                    diagnostic_code=(
-                        "legacy_readiness_failure"
-                        if item["status"] == "failed"
-                        else None
-                    ),
+                ReadinessCheck._from_stored_record(
+                    {
+                        "name": item["name"],
+                        "status": item["status"],
+                        "evidence_digest": item["evidence_digest"],
+                        "message": item["message"],
+                        "diagnostic_code": (
+                            "legacy_readiness_failure"
+                            if item["status"] == "failed"
+                            else None
+                        ),
+                    }
                 )
                 for item in stored_checks
                 if isinstance(item, dict)

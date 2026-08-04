@@ -442,7 +442,16 @@ class DesktopRelay:
                 and config is not None
                 and config.bind_host == "127.0.0.1"
                 and 1 <= config.port <= 65535
-                and config.active_session_id in {None, session_id}
+                and (
+                    (
+                        config.active_session_id is None
+                        and config.profile_revision is None
+                    )
+                    or (
+                        config.active_session_id == session_id
+                        and config.profile_revision == profile_revision
+                    )
+                )
                 and (
                     getattr(worker, "session_id", session_id)
                     == session_id

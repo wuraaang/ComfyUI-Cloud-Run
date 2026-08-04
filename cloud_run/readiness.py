@@ -43,11 +43,25 @@ READINESS_DIAGNOSTIC_CODES = frozenset(
         "native_websocket_handshake",
         "profile_package_mismatch",
         "agent_bridge_unavailable",
-        "legacy_readiness_failure",
     }
+)
+_STORED_READINESS_DIAGNOSTIC_CODES = (
+    READINESS_DIAGNOSTIC_CODES | {"legacy_readiness_failure"}
 )
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}")
 _HEX_64 = re.compile(r"[0-9a-f]{64}")
+_PUBLIC_MESSAGE = re.compile(r"[A-Za-z0-9][A-Za-z0-9 .,'()_-]{0,499}")
+_PRIVATE_MESSAGE_MARKERS = (
+    "authorization",
+    "bearer",
+    "cookie",
+    "exception",
+    "header",
+    "runtimeerror",
+    "secret",
+    "token",
+    "traceback",
+)
 
 
 def _canonical_json(value):
@@ -125,6 +139,8 @@ def _safe_message(value):
         or len(value.encode("utf-8")) > 500
         or sanitize_text(value) != value
         or any(ord(character) < 32 for character in value)
+        or _PUBLIC_MESSAGE.fullmatch(value) is None
+        or any(marker in value.casefold() for marker in _PRIVATE_MESSAGE_MARKERS)
     ):
         raise ValueError("Invalid readiness message.")
     return value
@@ -138,7 +154,7 @@ class ReadinessCheck:
     message: str
     diagnostic_code: str | None = None
 
-    def __post_init__(self):
+    def _validate(self, *, allow_legacy):
         _identifier(self.name, "readiness check name")
         if self.status not in _STATUSES or (
             self.status == "not_required"
@@ -147,13 +163,21 @@ class ReadinessCheck:
             raise ValueError("Invalid readiness check status.")
         _digest(self.evidence_digest, "readiness evidence digest")
         _safe_message(self.message)
+        allowed_codes = (
+            _STORED_READINESS_DIAGNOSTIC_CODES
+            if allow_legacy
+            else READINESS_DIAGNOSTIC_CODES
+        )
         if (
             self.status == "failed"
-            and self.diagnostic_code not in READINESS_DIAGNOSTIC_CODES
+            and self.diagnostic_code not in allowed_codes
         ) or (
             self.status != "failed" and self.diagnostic_code is not None
         ):
             raise ValueError("Invalid readiness diagnostic code.")
+
+    def __post_init__(self):
+        self._validate(allow_legacy=False)
 
     def to_record(self):
         return {
@@ -175,6 +199,30 @@ class ReadinessCheck:
         }:
             raise ValueError("Invalid readiness check record.")
         return cls(**value)
+
+    @classmethod
+    def _from_stored_record(cls, value):
+        if not isinstance(value, dict) or set(value) != {
+            "name",
+            "status",
+            "evidence_digest",
+            "message",
+            "diagnostic_code",
+        }:
+            raise ValueError("Invalid readiness check record.")
+        if value.get("diagnostic_code") != "legacy_readiness_failure":
+            return cls(**value)
+        item = object.__new__(cls)
+        for name in (
+            "name",
+            "status",
+            "evidence_digest",
+            "message",
+            "diagnostic_code",
+        ):
+            object.__setattr__(item, name, value[name])
+        item._validate(allow_legacy=True)
+        return item
 
 
 @dataclass(frozen=True, repr=False)
@@ -364,6 +412,14 @@ class ReadinessReport:
 
     @classmethod
     def from_record(cls, value):
+        return cls._from_record(value, stored=False)
+
+    @classmethod
+    def _from_stored_record(cls, value):
+        return cls._from_record(value, stored=True)
+
+    @classmethod
+    def _from_record(cls, value, *, stored):
         fields = {
             "session_id",
             "instance_id",
@@ -385,7 +441,12 @@ class ReadinessReport:
             raise ValueError("Invalid readiness report record.")
         normalized = dict(value)
         normalized["checks"] = tuple(
-            ReadinessCheck.from_record(item) for item in value["checks"]
+            (
+                ReadinessCheck._from_stored_record(item)
+                if stored
+                else ReadinessCheck.from_record(item)
+            )
+            for item in value["checks"]
         )
         return cls(**normalized)
 

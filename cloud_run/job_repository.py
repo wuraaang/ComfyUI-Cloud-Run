@@ -246,7 +246,7 @@ class JobRepository:
             checks = json.loads(row["checks_json"])
         except (TypeError, ValueError, json.JSONDecodeError):
             raise ValueError("Stored readiness report is invalid.") from None
-        report = ReadinessReport.from_record(
+        report = ReadinessReport._from_stored_record(
             {
                 "report_digest": row["report_digest"],
                 "session_id": row["session_id"],

@@ -351,7 +351,11 @@ class DesktopRelayBoundaryTests(unittest.IsolatedAsyncioTestCase):
             return {item.name: item for item in checks}
 
         profile_worker = FakeWorker()
-        profile_worker.session_id = "different-session"
+        await self.relay.activate(
+            "session-1",
+            profile_worker,
+            profile_revision=2,
+        )
         profile = by_name(
             await self.relay.probe_readiness(
                 "session-1",
@@ -360,6 +364,7 @@ class DesktopRelayBoundaryTests(unittest.IsolatedAsyncioTestCase):
                 agent_required=False,
             )
         )
+        await self.relay.deactivate("session-1")
 
         route_worker = FakeWorker()
 

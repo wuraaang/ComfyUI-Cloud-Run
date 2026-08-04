@@ -48,7 +48,13 @@ class ReadinessValueTests(unittest.TestCase):
                     message="Readiness proof failed.",
                     diagnostic_code=code,
                 )
-        for code in (None, "", "private_exception", "native_http_status\n"):
+        for code in (
+            None,
+            "",
+            "private_exception",
+            "native_http_status\n",
+            "legacy_readiness_failure",
+        ):
             with self.subTest(rejected=code):
                 with self.assertRaises(ValueError):
                     self.ReadinessCheck(
@@ -58,6 +64,15 @@ class ReadinessValueTests(unittest.TestCase):
                         message="Readiness proof failed.",
                         diagnostic_code=code,
                     )
+        legacy_record = {
+            "name": self.names[0],
+            "status": "failed",
+            "evidence_digest": "c" * 64,
+            "message": "Readiness proof failed.",
+            "diagnostic_code": "legacy_readiness_failure",
+        }
+        with self.assertRaises(ValueError):
+            self.ReadinessCheck.from_record(legacy_record)
 
     def test_success_and_not_required_reject_diagnostic_code(self):
         for name, status in (
@@ -183,6 +198,22 @@ class ReadinessValueTests(unittest.TestCase):
 
     def test_raw_exception_url_header_and_token_never_enter_report_or_payload(self):
         from cloud_run.readiness import ReadinessCheck, ReadinessReport, evidence_digest
+
+        for unsafe_message in (
+            "https://private.invalid/path",
+            "X-Debug: internal-host",
+            "RuntimeError from private worker.",
+            "Traceback contains internal details.",
+        ):
+            with self.subTest(unsafe_message=unsafe_message):
+                with self.assertRaises(ValueError):
+                    ReadinessCheck(
+                        name=self.names[0],
+                        status="failed",
+                        evidence_digest="c" * 64,
+                        message=unsafe_message,
+                        diagnostic_code="native_http_status",
+                    )
 
         private = {
             "exception": "https://private.invalid/path",
