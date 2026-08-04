@@ -424,12 +424,15 @@ class DesktopRelay:
         ):
             raise DesktopRelayError("Desktop readiness probe was rejected.")
 
-        def check(name, status, proof, message):
+        def check(name, status, proof, message, diagnostic_code=None):
             return ReadinessCheck(
                 name=name,
                 status=status,
                 evidence_digest=evidence_digest(proof),
                 message=message,
+                diagnostic_code=(
+                    diagnostic_code if status == "failed" else None
+                ),
             )
 
         async with self._lock():
@@ -458,10 +461,12 @@ class DesktopRelay:
                     if binding_ok
                     else "Loopback session binding failed."
                 ),
+                "profile_package_mismatch",
             )
 
             http_ok = False
             http_proof = {"status": "unavailable"}
+            http_diagnostic = "native_route_rejected"
             if binding_ok:
                 try:
                     request = worker.native_envelope(
@@ -474,28 +479,35 @@ class DesktopRelay:
                         raise DesktopRelayError(
                             "Native HTTP readiness probe failed."
                         )
-                    response = await worker.transport.request(
-                        request,
-                        max_bytes=MAX_RELAY_RESPONSE_BYTES,
-                    )
-                    http_ok = bool(
-                        isinstance(response, WorkerTransportResponse)
-                        and response.status == 200
-                        and isinstance(response.body, bytes)
-                        and len(response.body) <= MAX_RELAY_RESPONSE_BYTES
-                    )
-                    http_proof = {
-                        "status": response.status,
-                        "body_sha256": (
-                            hashlib.sha256(response.body).hexdigest()
-                            if http_ok
-                            else None
-                        ),
-                    }
                 except (asyncio.CancelledError, KeyboardInterrupt):
                     raise
                 except Exception:
-                    http_ok = False
+                    request = None
+                if request is not None:
+                    http_diagnostic = "native_http_status"
+                    try:
+                        response = await worker.transport.request(
+                            request,
+                            max_bytes=MAX_RELAY_RESPONSE_BYTES,
+                        )
+                        http_ok = bool(
+                            isinstance(response, WorkerTransportResponse)
+                            and response.status == 200
+                            and isinstance(response.body, bytes)
+                            and len(response.body) <= MAX_RELAY_RESPONSE_BYTES
+                        )
+                        http_proof = {
+                            "status": response.status,
+                            "body_sha256": (
+                                hashlib.sha256(response.body).hexdigest()
+                                if http_ok
+                                else None
+                            ),
+                        }
+                    except (asyncio.CancelledError, KeyboardInterrupt):
+                        raise
+                    except Exception:
+                        http_ok = False
             http = check(
                 "native_http_probe",
                 "passed" if http_ok else "failed",
@@ -505,6 +517,7 @@ class DesktopRelay:
                     if http_ok
                     else "Native HTTP readiness probe failed."
                 ),
+                http_diagnostic,
             )
 
             websocket_ok = False
@@ -556,6 +569,7 @@ class DesktopRelay:
                     if websocket_ok
                     else "Native WebSocket readiness probe failed."
                 ),
+                "native_websocket_handshake",
             )
 
             agent_status = "not_required"
@@ -618,6 +632,7 @@ class DesktopRelay:
                     if agent_ok
                     else "Agent Panel readiness probe failed."
                 ),
+                "agent_bridge_unavailable",
             )
             return (binding, http, websocket, agent)
 

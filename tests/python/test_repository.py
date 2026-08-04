@@ -1072,7 +1072,7 @@ class SessionRepositoryTests(unittest.TestCase):
             )
         )
 
-    def test_v12_destroy_reviews_are_invalidated_during_v13_migration(self):
+    def test_v12_destroy_reviews_are_invalidated_before_v14_readiness_migration(self):
         self.database_path.parent.mkdir(parents=True)
         with closing(sqlite3.connect(self.database_path)) as connection:
             connection.execute(
@@ -1098,10 +1098,25 @@ class SessionRepositoryTests(unittest.TestCase):
                 ("legacy-session", "a" * 64, 400.0, 1),
             )
             connection.execute(
-                "CREATE TABLE readiness_reports (sentinel TEXT PRIMARY KEY)"
-            )
-            connection.execute(
-                "INSERT INTO readiness_reports VALUES ('keep-me')"
+                """
+                CREATE TABLE readiness_reports (
+                    report_digest TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    instance_id TEXT NOT NULL,
+                    worker_release_digest TEXT NOT NULL,
+                    manifest_digest TEXT NOT NULL,
+                    profile_revision INTEGER NOT NULL,
+                    relay_origin TEXT NOT NULL,
+                    inventory_observed_at REAL NOT NULL,
+                    created_at REAL NOT NULL,
+                    checks_json TEXT NOT NULL,
+                    ready INTEGER NOT NULL CHECK(ready IN (0, 1)),
+                    UNIQUE(
+                        session_id, instance_id, worker_release_digest,
+                        manifest_digest, profile_revision, relay_origin
+                    )
+                )
+                """
             )
             connection.commit()
 
@@ -1119,14 +1134,21 @@ class SessionRepositoryTests(unittest.TestCase):
             reviews = connection.execute(
                 "SELECT * FROM destroy_reviews"
             ).fetchall()
+            readiness_columns = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(readiness_reports)"
+                ).fetchall()
+            }
             readiness = connection.execute(
-                "SELECT sentinel FROM readiness_reports"
+                "SELECT * FROM readiness_reports"
             ).fetchall()
 
-        self.assertEqual(version, "13")
+        self.assertEqual(version, "14")
         self.assertNotIn("session_version", destroy_columns)
         self.assertEqual(reviews, [])
-        self.assertEqual(readiness[0][0], "keep-me")
+        self.assertIn("attempt_number", readiness_columns)
+        self.assertEqual(readiness, [])
 
     def test_pending_deadline_intent_survives_repository_reopen(self):
         sessions = repository.SessionRepository(self.database_path)
@@ -1278,7 +1300,7 @@ class SessionRepositoryTests(unittest.TestCase):
                 ).fetchall()
             }
 
-        self.assertEqual(version, "13")
+        self.assertEqual(version, "14")
         self.assertEqual(migrated.failure_code, None)
         self.assertEqual(migrated.create_empty_observations, 0)
         self.assertIsNone(migrated.create_first_empty_at)

@@ -36,6 +36,16 @@ REQUIRED_READINESS_CHECKS = (
 
 _CHECK_SET = frozenset(REQUIRED_READINESS_CHECKS)
 _STATUSES = frozenset({"passed", "failed", "not_required"})
+READINESS_DIAGNOSTIC_CODES = frozenset(
+    {
+        "native_route_rejected",
+        "native_http_status",
+        "native_websocket_handshake",
+        "profile_package_mismatch",
+        "agent_bridge_unavailable",
+        "legacy_readiness_failure",
+    }
+)
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}")
 _HEX_64 = re.compile(r"[0-9a-f]{64}")
 
@@ -126,6 +136,7 @@ class ReadinessCheck:
     status: str
     evidence_digest: str
     message: str
+    diagnostic_code: str | None = None
 
     def __post_init__(self):
         _identifier(self.name, "readiness check name")
@@ -136,6 +147,13 @@ class ReadinessCheck:
             raise ValueError("Invalid readiness check status.")
         _digest(self.evidence_digest, "readiness evidence digest")
         _safe_message(self.message)
+        if (
+            self.status == "failed"
+            and self.diagnostic_code not in READINESS_DIAGNOSTIC_CODES
+        ) or (
+            self.status != "failed" and self.diagnostic_code is not None
+        ):
+            raise ValueError("Invalid readiness diagnostic code.")
 
     def to_record(self):
         return {
@@ -143,6 +161,7 @@ class ReadinessCheck:
             "status": self.status,
             "evidence_digest": self.evidence_digest,
             "message": self.message,
+            "diagnostic_code": self.diagnostic_code,
         }
 
     @classmethod
@@ -152,6 +171,7 @@ class ReadinessCheck:
             "status",
             "evidence_digest",
             "message",
+            "diagnostic_code",
         }:
             raise ValueError("Invalid readiness check record.")
         return cls(**value)
@@ -167,6 +187,7 @@ class ReadinessReport:
     relay_origin: str
     inventory_observed_at: float
     created_at: float
+    attempt_number: int
     checks: tuple[ReadinessCheck, ...]
     report_digest: str
 
@@ -189,6 +210,12 @@ class ReadinessReport:
         created = _timestamp(self.created_at, "readiness creation timestamp")
         if observed > created:
             raise ValueError("Invalid readiness timestamps.")
+        if (
+            isinstance(self.attempt_number, bool)
+            or not isinstance(self.attempt_number, int)
+            or self.attempt_number < 1
+        ):
+            raise ValueError("Invalid readiness attempt number.")
         if not isinstance(self.checks, tuple) or not all(
             isinstance(item, ReadinessCheck) for item in self.checks
         ):
@@ -221,6 +248,7 @@ class ReadinessReport:
             "relay_origin": self.relay_origin,
             "inventory_observed_at": float(self.inventory_observed_at),
             "created_at": float(self.created_at),
+            "attempt_number": self.attempt_number,
             "checks": [item.to_record() for item in self.checks],
         }
 
@@ -242,7 +270,12 @@ class ReadinessReport:
             "created_at",
             "checks",
         }
-        if set(values) != required:
+        supplied = frozenset(values)
+        allowed = {
+            frozenset(required),
+            frozenset(required | {"attempt_number"}),
+        }
+        if supplied not in allowed:
             raise ValueError("Invalid readiness report values.")
         checks = values.get("checks")
         if not isinstance(checks, tuple):
@@ -287,6 +320,13 @@ class ReadinessReport:
         )
         if inventory_observed_at > created_at:
             raise ValueError("Invalid readiness timestamps.")
+        attempt_number = values.get("attempt_number", 1)
+        if (
+            isinstance(attempt_number, bool)
+            or not isinstance(attempt_number, int)
+            or attempt_number < 1
+        ):
+            raise ValueError("Invalid readiness attempt number.")
         identity = {
             "session_id": session_id,
             "instance_id": instance_id,
@@ -296,6 +336,7 @@ class ReadinessReport:
             "relay_origin": relay_origin,
             "inventory_observed_at": inventory_observed_at,
             "created_at": created_at,
+            "attempt_number": attempt_number,
             "checks": [item.to_record() for item in ordered],
         }
         report_digest = hashlib.sha256(
@@ -310,6 +351,7 @@ class ReadinessReport:
             relay_origin=relay_origin,
             inventory_observed_at=inventory_observed_at,
             created_at=created_at,
+            attempt_number=attempt_number,
             checks=ordered,
             report_digest=report_digest,
         )
@@ -331,6 +373,7 @@ class ReadinessReport:
             "relay_origin",
             "inventory_observed_at",
             "created_at",
+            "attempt_number",
             "checks",
             "report_digest",
         }
@@ -356,11 +399,13 @@ class ReadinessReport:
             "relay_origin": self.relay_origin,
             "inventory_observed_at": self.inventory_observed_at,
             "created_at": self.created_at,
+            "attempt_number": self.attempt_number,
             "desktop_ready": self.desktop_ready,
             "checks": [
                 {
                     "name": item.name,
                     "status": item.status,
+                    "diagnostic_code": item.diagnostic_code,
                     "message": item.message,
                 }
                 for item in self.checks
@@ -434,7 +479,7 @@ class ReadinessValidator:
             "relay_origin": self.relay_origin,
         }
 
-    async def validate(self, session, manifest, profile):
+    async def validate(self, session, manifest, profile, *, attempt_number=1):
         identity = self.identity(session, manifest, profile)
         observed_at = _timestamp(
             self.clock(),
@@ -463,6 +508,7 @@ class ReadinessValidator:
                         {"check": name, "status": "missing"}
                     ),
                     message="Required readiness proof is unavailable.",
+                    diagnostic_code="profile_package_mismatch",
                 )
         created_at = _timestamp(self.clock(), "readiness creation timestamp")
         if created_at < observed_at:
@@ -471,6 +517,7 @@ class ReadinessValidator:
             **identity,
             inventory_observed_at=observed_at,
             created_at=created_at,
+            attempt_number=attempt_number,
             checks=tuple(by_name[name] for name in REQUIRED_READINESS_CHECKS),
         )
 
@@ -544,6 +591,11 @@ class ControllerReadinessProbe:
                 label + " passed."
                 if passed or not_required
                 else label + " failed."
+            ),
+            diagnostic_code=(
+                None
+                if passed or not_required
+                else "profile_package_mismatch"
             ),
         )
 

@@ -31,7 +31,48 @@ class ReadinessValueTests(unittest.TestCase):
                 if status == "passed"
                 else "Readiness proof failed."
             ),
+            diagnostic_code=(
+                "profile_package_mismatch" if status == "failed" else None
+            ),
         )
+
+    def test_failed_check_requires_allowlisted_diagnostic_code(self):
+        from cloud_run.readiness import READINESS_DIAGNOSTIC_CODES
+
+        for code in READINESS_DIAGNOSTIC_CODES:
+            with self.subTest(code=code):
+                self.ReadinessCheck(
+                    name=self.names[0],
+                    status="failed",
+                    evidence_digest="c" * 64,
+                    message="Readiness proof failed.",
+                    diagnostic_code=code,
+                )
+        for code in (None, "", "private_exception", "native_http_status\n"):
+            with self.subTest(rejected=code):
+                with self.assertRaises(ValueError):
+                    self.ReadinessCheck(
+                        name=self.names[0],
+                        status="failed",
+                        evidence_digest="c" * 64,
+                        message="Readiness proof failed.",
+                        diagnostic_code=code,
+                    )
+
+    def test_success_and_not_required_reject_diagnostic_code(self):
+        for name, status in (
+            (self.names[0], "passed"),
+            ("agent_panel_capabilities", "not_required"),
+        ):
+            with self.subTest(name=name, status=status):
+                with self.assertRaises(ValueError):
+                    self.ReadinessCheck(
+                        name=name,
+                        status=status,
+                        evidence_digest="c" * 64,
+                        message="Readiness proof passed.",
+                        diagnostic_code="profile_package_mismatch",
+                    )
 
     def test_complete_matrix_is_immutable_digest_bound_and_secret_safe(self):
         from cloud_run.readiness import ReadinessReport
@@ -109,6 +150,109 @@ class ReadinessValueTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         self.check(name, status)
 
+    def test_public_readiness_contains_only_check_name_status_code_and_safe_message(self):
+        from cloud_run.readiness import ReadinessReport
+
+        report = ReadinessReport.create(
+            session_id="session-1",
+            instance_id="instance-1",
+            worker_release_digest="a" * 64,
+            manifest_digest="b" * 64,
+            profile_revision=3,
+            relay_origin="http://127.0.0.1:32145",
+            inventory_observed_at=100.0,
+            created_at=101.0,
+            checks=tuple(
+                self.check(name, "failed" if index == 0 else "passed")
+                for index, name in enumerate(self.names)
+            ),
+        )
+
+        checks = report.public_payload()["checks"]
+
+        self.assertEqual(
+            set(checks[0]),
+            {"name", "status", "diagnostic_code", "message"},
+        )
+        self.assertEqual(
+            checks[0]["diagnostic_code"],
+            "profile_package_mismatch",
+        )
+        self.assertIsNone(checks[1]["diagnostic_code"])
+        self.assertNotIn("evidence_digest", repr(checks))
+
+    def test_raw_exception_url_header_and_token_never_enter_report_or_payload(self):
+        from cloud_run.readiness import ReadinessCheck, ReadinessReport, evidence_digest
+
+        private = {
+            "exception": "https://private.invalid/path",
+            "Authorization": "Bearer raw-token",
+            "header": "X-Worker-Secret: private",
+        }
+        checks = []
+        for index, name in enumerate(self.names):
+            checks.append(
+                ReadinessCheck(
+                    name=name,
+                    status="failed" if index == 0 else "passed",
+                    evidence_digest=evidence_digest(
+                        private if index == 0 else {"passed": name}
+                    ),
+                    message=(
+                        "Readiness proof failed."
+                        if index == 0
+                        else "Readiness proof passed."
+                    ),
+                    diagnostic_code=(
+                        "native_http_status" if index == 0 else None
+                    ),
+                )
+            )
+        report = ReadinessReport.create(
+            session_id="session-1",
+            instance_id="instance-1",
+            worker_release_digest="a" * 64,
+            manifest_digest="b" * 64,
+            profile_revision=3,
+            relay_origin="http://127.0.0.1:32145",
+            inventory_observed_at=100.0,
+            created_at=101.0,
+            checks=tuple(checks),
+        )
+
+        rendered = repr((report.to_record(), report.public_payload()))
+
+        for forbidden in (
+            "private.invalid",
+            "Bearer raw-token",
+            "X-Worker-Secret",
+        ):
+            self.assertNotIn(forbidden, rendered)
+
+    def test_attempt_number_participates_in_report_digest(self):
+        from cloud_run.readiness import ReadinessReport
+
+        values = {
+            "session_id": "session-1",
+            "instance_id": "instance-1",
+            "worker_release_digest": "a" * 64,
+            "manifest_digest": "b" * 64,
+            "profile_revision": 3,
+            "relay_origin": "http://127.0.0.1:32145",
+            "inventory_observed_at": 100.0,
+            "created_at": 101.0,
+            "checks": tuple(self.check(name) for name in self.names),
+        }
+
+        first = ReadinessReport.create(attempt_number=1, **values)
+        second = ReadinessReport.create(attempt_number=2, **values)
+
+        self.assertNotEqual(first.report_digest, second.report_digest)
+        self.assertEqual(first.to_record()["attempt_number"], 1)
+        self.assertEqual(second.to_record()["attempt_number"], 2)
+        with self.assertRaises(ValueError):
+            ReadinessReport.create(attempt_number=0, **values)
+
 
 class ReadinessValidatorTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
@@ -149,6 +293,11 @@ class ReadinessValidatorTests(unittest.IsolatedAsyncioTestCase):
                         "Readiness proof passed."
                         if status in {"passed", "not_required"}
                         else "Readiness proof failed."
+                    ),
+                    diagnostic_code=(
+                        "profile_package_mismatch"
+                        if status == "failed"
+                        else None
                     ),
                 )
             )
@@ -362,7 +511,7 @@ class ReadinessRepositoryTests(unittest.TestCase):
             checks=checks,
         )
 
-    def test_schema_v12_persists_and_reuses_exact_identity(self):
+    def test_schema_v14_persists_and_reuses_exact_success_identity(self):
         from cloud_run.job_repository import JobRepository
 
         repository = JobRepository(self.path)
@@ -400,7 +549,7 @@ class ReadinessRepositoryTests(unittest.TestCase):
             count = connection.execute(
                 "SELECT COUNT(*) FROM readiness_reports"
             ).fetchone()[0]
-        self.assertEqual(version, "12")
+        self.assertEqual(version, "14")
         self.assertEqual(count, 1)
 
 

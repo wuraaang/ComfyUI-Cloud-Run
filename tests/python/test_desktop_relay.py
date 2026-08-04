@@ -344,6 +344,131 @@ class DesktopRelayBoundaryTests(unittest.IsolatedAsyncioTestCase):
             self.repository.get_desktop_relay().active_session_id
         )
 
+    async def test_readiness_classifies_route_http_websocket_profile_and_agent_failures(self):
+        from cloud_run.worker_client import WorkerTransportResponse
+
+        def by_name(checks):
+            return {item.name: item for item in checks}
+
+        profile_worker = FakeWorker()
+        profile_worker.session_id = "different-session"
+        profile = by_name(
+            await self.relay.probe_readiness(
+                "session-1",
+                profile_worker,
+                profile_revision=3,
+                agent_required=False,
+            )
+        )
+
+        route_worker = FakeWorker()
+
+        def rejected_route(*_args, **_kwargs):
+            raise RuntimeError(
+                "https://private.invalid Authorization Bearer route-token"
+            )
+
+        route_worker.native_envelope = rejected_route
+        route = by_name(
+            await self.relay.probe_readiness(
+                "session-1",
+                route_worker,
+                profile_revision=3,
+                agent_required=False,
+            )
+        )
+
+        status_worker = FakeWorker()
+
+        async def rejected_status(_request, *, max_bytes):
+            self.assertGreater(max_bytes, 0)
+            return WorkerTransportResponse(
+                status=503,
+                headers={"Authorization": "Bearer response-token"},
+                body=b"https://private.invalid/status",
+            )
+
+        status_worker.transport.request = rejected_status
+        status = by_name(
+            await self.relay.probe_readiness(
+                "session-1",
+                status_worker,
+                profile_revision=3,
+                agent_required=False,
+            )
+        )
+
+        websocket_worker = FakeWorker()
+
+        async def rejected_websocket(_request):
+            raise RuntimeError(
+                "wss://private.invalid Authorization Bearer ws-token"
+            )
+
+        websocket_worker.native_websocket = rejected_websocket
+        websocket = by_name(
+            await self.relay.probe_readiness(
+                "session-1",
+                websocket_worker,
+                profile_revision=3,
+                agent_required=False,
+            )
+        )
+
+        agent_worker = FakeWorker()
+
+        class Socket:
+            async def close(self, *, code):
+                self.close_code = code
+
+        async def open_socket(_request):
+            return Socket()
+
+        agent_worker.native_websocket = open_socket
+        agent = by_name(
+            await self.relay.probe_readiness(
+                "session-1",
+                agent_worker,
+                profile_revision=3,
+                agent_required=True,
+            )
+        )
+
+        self.assertEqual(
+            profile["loopback_session_binding"].diagnostic_code,
+            "profile_package_mismatch",
+        )
+        self.assertEqual(
+            route["native_http_probe"].diagnostic_code,
+            "native_route_rejected",
+        )
+        self.assertEqual(
+            status["native_http_probe"].diagnostic_code,
+            "native_http_status",
+        )
+        self.assertEqual(
+            websocket["native_websocket_probe"].diagnostic_code,
+            "native_websocket_handshake",
+        )
+        self.assertEqual(
+            agent["agent_panel_capabilities"].diagnostic_code,
+            "agent_bridge_unavailable",
+        )
+        rendered = repr(
+            [
+                item.to_record()
+                for checks in (profile, route, status, websocket, agent)
+                for item in checks.values()
+            ]
+        )
+        for forbidden in (
+            "private.invalid",
+            "route-token",
+            "response-token",
+            "ws-token",
+        ):
+            self.assertNotIn(forbidden, rendered)
+
     async def test_inactive_wrong_origin_and_non_native_paths_fail_closed(self):
         inactive = await self.relay.handle(
             FakeRequest("GET", "/", headers=self.host)

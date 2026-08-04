@@ -61,6 +61,60 @@ def cloud_job(
     )
 
 
+def readiness_report(
+    *,
+    attempt_number=1,
+    failed_check=None,
+    observed_at=None,
+):
+    from cloud_run.readiness import (
+        REQUIRED_READINESS_CHECKS,
+        ReadinessCheck,
+        ReadinessReport,
+        evidence_digest,
+    )
+
+    observed = (
+        float(99 + attempt_number)
+        if observed_at is None
+        else float(observed_at)
+    )
+    checks = tuple(
+        ReadinessCheck(
+            name=name,
+            status="failed" if name == failed_check else "passed",
+            evidence_digest=evidence_digest(
+                {
+                    "attempt_number": attempt_number,
+                    "check": name,
+                    "status": "failed" if name == failed_check else "passed",
+                }
+            ),
+            message=(
+                "Readiness proof failed."
+                if name == failed_check
+                else "Readiness proof passed."
+            ),
+            diagnostic_code=(
+                "native_http_status" if name == failed_check else None
+            ),
+        )
+        for name in REQUIRED_READINESS_CHECKS
+    )
+    return ReadinessReport.create(
+        session_id="session-1",
+        instance_id="instance-1",
+        worker_release_digest="a" * 64,
+        manifest_digest="b" * 64,
+        profile_revision=3,
+        relay_origin="http://127.0.0.1:32145",
+        inventory_observed_at=observed,
+        created_at=observed + 0.5,
+        attempt_number=attempt_number,
+        checks=checks,
+    )
+
+
 class JobRepositoryTests(unittest.TestCase):
     def test_native_queue_positions_and_request_material_are_durable_and_idempotent(self):
         jobs = JobRepository(self.path)
@@ -392,7 +446,215 @@ class JobRepositoryTests(unittest.TestCase):
         for forbidden in ("bearer", "secret", "token", "worker_url"):
             self.assertNotIn(forbidden, rendered.casefold())
 
-    def test_legacy_schema_is_migrated_idempotently_to_readiness_v12(self):
+    def test_failed_attempts_are_append_only_and_do_not_block_later_success(self):
+        jobs = JobRepository(self.path)
+        first = readiness_report(
+            attempt_number=1,
+            failed_check="native_http_probe",
+        )
+        second = readiness_report(
+            attempt_number=2,
+            failed_check="native_websocket_probe",
+        )
+        success = readiness_report(attempt_number=3)
+
+        self.assertEqual(jobs.save_readiness_report(first), first)
+        self.assertEqual(jobs.save_readiness_report(second), second)
+        self.assertIsNone(
+            jobs.current_readiness_report(
+                session_id="session-1",
+                instance_id="instance-1",
+                worker_release_digest="a" * 64,
+                manifest_digest="b" * 64,
+                profile_revision=3,
+                relay_origin="http://127.0.0.1:32145",
+            )
+        )
+        self.assertEqual(jobs.save_readiness_report(success), success)
+        self.assertEqual(
+            jobs.list_readiness_attempts(
+                session_id="session-1",
+                instance_id="instance-1",
+                worker_release_digest="a" * 64,
+                manifest_digest="b" * 64,
+                profile_revision=3,
+                relay_origin="http://127.0.0.1:32145",
+            ),
+            [first, second, success],
+        )
+        self.assertEqual(
+            jobs.latest_readiness_attempt(
+                session_id="session-1",
+                instance_id="instance-1",
+                worker_release_digest="a" * 64,
+                manifest_digest="b" * 64,
+                profile_revision=3,
+                relay_origin="http://127.0.0.1:32145",
+            ),
+            success,
+        )
+
+    def test_success_is_reused_but_failures_remain_queryable(self):
+        jobs = JobRepository(self.path)
+        failed = readiness_report(
+            attempt_number=1,
+            failed_check="native_http_probe",
+        )
+        success = readiness_report(attempt_number=2)
+        later_success = readiness_report(attempt_number=3)
+
+        jobs.save_readiness_report(failed)
+        jobs.save_readiness_report(success)
+        reused = jobs.save_readiness_report(later_success)
+
+        self.assertEqual(reused, success)
+        self.assertEqual(
+            jobs.list_readiness_attempts(
+                session_id="session-1",
+                instance_id="instance-1",
+                worker_release_digest="a" * 64,
+                manifest_digest="b" * 64,
+                profile_revision=3,
+                relay_origin="http://127.0.0.1:32145",
+            ),
+            [failed, success],
+        )
+        self.assertEqual(
+            jobs.current_readiness_report(
+                session_id="session-1",
+                instance_id="instance-1",
+                worker_release_digest="a" * 64,
+                manifest_digest="b" * 64,
+                profile_revision=3,
+                relay_origin="http://127.0.0.1:32145",
+            ),
+            success,
+        )
+
+    def test_v13_failed_report_migrates_without_blocking_retry(self):
+        from cloud_run.readiness import REQUIRED_READINESS_CHECKS
+
+        self.path.parent.mkdir(parents=True)
+        checks = [
+            {
+                "name": name,
+                "status": (
+                    "failed" if name == "native_http_probe" else "passed"
+                ),
+                "evidence_digest": hashlib.sha256(
+                    name.encode("ascii")
+                ).hexdigest(),
+                "message": (
+                    "Readiness proof failed."
+                    if name == "native_http_probe"
+                    else "Readiness proof passed."
+                ),
+            }
+            for name in REQUIRED_READINESS_CHECKS
+        ]
+        identity = {
+            "session_id": "session-1",
+            "instance_id": "instance-1",
+            "worker_release_digest": "a" * 64,
+            "manifest_digest": "b" * 64,
+            "profile_revision": 3,
+            "relay_origin": "http://127.0.0.1:32145",
+            "inventory_observed_at": 100.0,
+            "created_at": 101.0,
+            "checks": checks,
+        }
+        encoded = json.dumps(
+            identity,
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        old_digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.execute(
+                "CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+            )
+            connection.execute(
+                "INSERT INTO schema_meta VALUES ('schema_version', '13')"
+            )
+            connection.execute(
+                """
+                CREATE TABLE readiness_reports (
+                    report_digest TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    instance_id TEXT NOT NULL,
+                    worker_release_digest TEXT NOT NULL,
+                    manifest_digest TEXT NOT NULL,
+                    profile_revision INTEGER NOT NULL,
+                    relay_origin TEXT NOT NULL,
+                    inventory_observed_at REAL NOT NULL,
+                    created_at REAL NOT NULL,
+                    checks_json TEXT NOT NULL,
+                    ready INTEGER NOT NULL CHECK(ready IN (0, 1)),
+                    UNIQUE(
+                        session_id, instance_id, worker_release_digest,
+                        manifest_digest, profile_revision, relay_origin
+                    )
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO readiness_reports VALUES (
+                    ?, 'session-1', 'instance-1', ?, ?, 3,
+                    'http://127.0.0.1:32145', 100.0, 101.0, ?, 0
+                )
+                """,
+                (
+                    old_digest,
+                    "a" * 64,
+                    "b" * 64,
+                    json.dumps(checks, separators=(",", ":"), sort_keys=True),
+                ),
+            )
+            connection.commit()
+
+        jobs = JobRepository(self.path)
+        migrated = jobs.latest_readiness_attempt(
+            session_id="session-1",
+            instance_id="instance-1",
+            worker_release_digest="a" * 64,
+            manifest_digest="b" * 64,
+            profile_revision=3,
+            relay_origin="http://127.0.0.1:32145",
+        )
+
+        self.assertEqual(migrated.attempt_number, 1)
+        self.assertFalse(migrated.ready)
+        self.assertEqual(
+            next(
+                item.diagnostic_code
+                for item in migrated.checks
+                if item.status == "failed"
+            ),
+            "legacy_readiness_failure",
+        )
+        self.assertNotEqual(migrated.report_digest, old_digest)
+        self.assertIsNone(
+            jobs.current_readiness_report(
+                session_id="session-1",
+                instance_id="instance-1",
+                worker_release_digest="a" * 64,
+                manifest_digest="b" * 64,
+                profile_revision=3,
+                relay_origin="http://127.0.0.1:32145",
+            )
+        )
+        retry = readiness_report(attempt_number=2)
+        self.assertEqual(jobs.save_readiness_report(retry), retry)
+        with closing(sqlite3.connect(self.path)) as connection:
+            version = connection.execute(
+                "SELECT value FROM schema_meta WHERE key = 'schema_version'"
+            ).fetchone()[0]
+        self.assertEqual(version, "14")
+
+    def test_legacy_schema_is_migrated_idempotently_to_readiness_v14(self):
         self.path.parent.mkdir(parents=True)
         with closing(sqlite3.connect(self.path)) as connection:
             connection.execute(
@@ -520,7 +782,7 @@ class JobRepositoryTests(unittest.TestCase):
         )
         self.assertIsNotNone(journal_exists)
         self.assertIsNotNone(readiness_exists)
-        self.assertEqual(schema_version, "12")
+        self.assertEqual(schema_version, "14")
         self.assertIn("queue_position", job_columns)
         self.assertIn("native_request_digest", job_columns)
         self.assertIn("native_body_json", job_columns)

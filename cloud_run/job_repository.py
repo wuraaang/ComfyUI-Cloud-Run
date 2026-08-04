@@ -257,6 +257,7 @@ class JobRepository:
                 "relay_origin": row["relay_origin"],
                 "inventory_observed_at": float(row["inventory_observed_at"]),
                 "created_at": float(row["created_at"]),
+                "attempt_number": int(row["attempt_number"]),
                 "checks": checks,
             }
         )
@@ -269,7 +270,44 @@ class JobRepository:
         return (
             "report_digest, session_id, instance_id, worker_release_digest, "
             "manifest_digest, profile_revision, relay_origin, "
-            "inventory_observed_at, created_at, checks_json, ready"
+            "inventory_observed_at, created_at, attempt_number, "
+            "checks_json, ready"
+        )
+
+    @staticmethod
+    def _readiness_identity_values(
+        *,
+        session_id,
+        instance_id,
+        worker_release_digest,
+        manifest_digest,
+        profile_revision,
+        relay_origin,
+    ):
+        from .readiness import _relay_origin
+
+        if (
+            not isinstance(session_id, str)
+            or _IDENTIFIER.fullmatch(session_id) is None
+            or not isinstance(instance_id, str)
+            or _IDENTIFIER.fullmatch(instance_id) is None
+            or not isinstance(worker_release_digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", worker_release_digest) is None
+            or not isinstance(manifest_digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", manifest_digest) is None
+            or isinstance(profile_revision, bool)
+            or not isinstance(profile_revision, int)
+            or profile_revision < 0
+        ):
+            raise ValueError("Invalid readiness report identity.")
+        _relay_origin(relay_origin)
+        return (
+            session_id,
+            instance_id,
+            worker_release_digest,
+            manifest_digest,
+            profile_revision,
+            relay_origin,
         )
 
     def get_readiness_report(self, report_digest):
@@ -302,23 +340,14 @@ class JobRepository:
         profile_revision,
         relay_origin,
     ):
-        from .readiness import _relay_origin
-
-        if (
-            not isinstance(session_id, str)
-            or _IDENTIFIER.fullmatch(session_id) is None
-            or not isinstance(instance_id, str)
-            or _IDENTIFIER.fullmatch(instance_id) is None
-            or not isinstance(worker_release_digest, str)
-            or re.fullmatch(r"[0-9a-f]{64}", worker_release_digest) is None
-            or not isinstance(manifest_digest, str)
-            or re.fullmatch(r"[0-9a-f]{64}", manifest_digest) is None
-            or isinstance(profile_revision, bool)
-            or not isinstance(profile_revision, int)
-            or profile_revision < 0
-        ):
-            raise ValueError("Invalid readiness report identity.")
-        _relay_origin(relay_origin)
+        identity = self._readiness_identity_values(
+            session_id=session_id,
+            instance_id=instance_id,
+            worker_release_digest=worker_release_digest,
+            manifest_digest=manifest_digest,
+            profile_revision=profile_revision,
+            relay_origin=relay_origin,
+        )
         with closing(self._connect()) as connection:
             row = connection.execute(
                 "SELECT "
@@ -326,17 +355,40 @@ class JobRepository:
                 + " FROM readiness_reports WHERE "
                 "session_id = ? AND instance_id = ? AND "
                 "worker_release_digest = ? AND manifest_digest = ? AND "
-                "profile_revision = ? AND relay_origin = ?",
-                (
-                    session_id,
-                    instance_id,
-                    worker_release_digest,
-                    manifest_digest,
-                    profile_revision,
-                    relay_origin,
-                ),
+                "profile_revision = ? AND relay_origin = ? AND ready = 1",
+                identity,
             ).fetchone()
         return self._readiness_report_from_row(row)
+
+    def latest_readiness_attempt(self, **identity):
+        values = self._readiness_identity_values(**identity)
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT "
+                + self._readiness_columns()
+                + " FROM readiness_reports WHERE "
+                "session_id = ? AND instance_id = ? AND "
+                "worker_release_digest = ? AND manifest_digest = ? AND "
+                "profile_revision = ? AND relay_origin = ? "
+                "ORDER BY attempt_number DESC LIMIT 1",
+                values,
+            ).fetchone()
+        return self._readiness_report_from_row(row)
+
+    def list_readiness_attempts(self, **identity):
+        values = self._readiness_identity_values(**identity)
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                "SELECT "
+                + self._readiness_columns()
+                + " FROM readiness_reports WHERE "
+                "session_id = ? AND instance_id = ? AND "
+                "worker_release_digest = ? AND manifest_digest = ? AND "
+                "profile_revision = ? AND relay_origin = ? "
+                "ORDER BY attempt_number",
+                values,
+            ).fetchall()
+        return [self._readiness_report_from_row(row) for row in rows]
 
     def save_readiness_report(self, report):
         from .readiness import ReadinessReport
@@ -353,23 +405,43 @@ class JobRepository:
             report.relay_origin,
             report.inventory_observed_at,
             report.created_at,
+            report.attempt_number,
             _canonical_json([item.to_record() for item in report.checks]),
             int(report.ready),
         )
+        identity = values[1:7]
         with closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
+            success = connection.execute(
+                "SELECT "
+                + self._readiness_columns()
+                + " FROM readiness_reports WHERE "
+                "session_id = ? AND instance_id = ? AND "
+                "worker_release_digest = ? AND manifest_digest = ? AND "
+                "profile_revision = ? AND relay_origin = ? AND ready = 1",
+                identity,
+            ).fetchone()
+            if success is not None:
+                connection.commit()
+                return self._readiness_report_from_row(success)
             existing = connection.execute(
                 "SELECT "
                 + self._readiness_columns()
                 + " FROM readiness_reports WHERE "
                 "session_id = ? AND instance_id = ? AND "
                 "worker_release_digest = ? AND manifest_digest = ? AND "
-                "profile_revision = ? AND relay_origin = ?",
-                values[1:7],
+                "profile_revision = ? AND relay_origin = ? AND "
+                "attempt_number = ?",
+                (*identity, report.attempt_number),
             ).fetchone()
             if existing is not None:
+                stored = self._readiness_report_from_row(existing)
                 connection.commit()
-                return self._readiness_report_from_row(existing)
+                if stored == report:
+                    return stored
+                raise ValueError(
+                    "Readiness report attempt already exists."
+                )
             try:
                 connection.execute(
                     """
@@ -377,14 +449,29 @@ class JobRepository:
                         report_digest, session_id, instance_id,
                         worker_release_digest, manifest_digest,
                         profile_revision, relay_origin,
-                        inventory_observed_at, created_at, checks_json, ready
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        inventory_observed_at, created_at, attempt_number,
+                        checks_json, ready
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     values,
                 )
             except sqlite3.IntegrityError:
+                success = connection.execute(
+                    "SELECT "
+                    + self._readiness_columns()
+                    + " FROM readiness_reports WHERE "
+                    "session_id = ? AND instance_id = ? AND "
+                    "worker_release_digest = ? AND manifest_digest = ? AND "
+                    "profile_revision = ? AND relay_origin = ? AND ready = 1",
+                    identity,
+                ).fetchone()
+                if success is not None:
+                    connection.commit()
+                    return self._readiness_report_from_row(success)
                 connection.rollback()
-                raise ValueError("Readiness report identity already exists.") from None
+                raise ValueError(
+                    "Readiness report attempt already exists."
+                ) from None
             row = connection.execute(
                 "SELECT "
                 + self._readiness_columns()

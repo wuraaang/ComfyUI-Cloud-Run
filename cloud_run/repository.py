@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import closing
 from dataclasses import dataclass
+import hashlib
 import hmac
 import json
 import math
@@ -340,6 +341,172 @@ def _save_desktop_relay(path, config, *, expected_updated_at=None):
         ).fetchone()
         connection.commit()
     return _desktop_relay_from_row(row)
+
+
+def _create_readiness_v14_table(connection):
+    connection.execute(
+        """
+        CREATE TABLE readiness_reports (
+            report_digest TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            instance_id TEXT NOT NULL,
+            worker_release_digest TEXT NOT NULL,
+            manifest_digest TEXT NOT NULL,
+            profile_revision INTEGER NOT NULL,
+            relay_origin TEXT NOT NULL,
+            inventory_observed_at REAL NOT NULL,
+            created_at REAL NOT NULL,
+            attempt_number INTEGER NOT NULL CHECK(attempt_number > 0),
+            checks_json TEXT NOT NULL,
+            ready INTEGER NOT NULL CHECK(ready IN (0, 1)),
+            UNIQUE(
+                session_id, instance_id, worker_release_digest,
+                manifest_digest, profile_revision, relay_origin,
+                attempt_number
+            )
+        )
+        """
+    )
+
+
+def _create_readiness_v14_indexes(connection):
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS readiness_reports_success_identity
+        ON readiness_reports(
+            session_id, instance_id, worker_release_digest,
+            manifest_digest, profile_revision, relay_origin
+        )
+        WHERE ready = 1
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS readiness_reports_identity_attempt
+        ON readiness_reports(
+            session_id, instance_id, worker_release_digest,
+            manifest_digest, profile_revision, relay_origin,
+            attempt_number
+        )
+        """
+    )
+
+
+def _migrate_readiness_v14(connection):
+    from .readiness import ReadinessCheck, ReadinessReport
+
+    rows = connection.execute(
+        """
+        SELECT report_digest, session_id, instance_id,
+               worker_release_digest, manifest_digest, profile_revision,
+               relay_origin, inventory_observed_at, created_at,
+               checks_json, ready
+        FROM readiness_reports
+        ORDER BY rowid
+        """
+    ).fetchall()
+    connection.execute(
+        "ALTER TABLE readiness_reports RENAME TO readiness_reports_v13"
+    )
+    _create_readiness_v14_table(connection)
+    for row in rows:
+        try:
+            stored_checks = json.loads(row["checks_json"])
+            checks = tuple(
+                ReadinessCheck(
+                    name=item["name"],
+                    status=item["status"],
+                    evidence_digest=item["evidence_digest"],
+                    message=item["message"],
+                    diagnostic_code=(
+                        "legacy_readiness_failure"
+                        if item["status"] == "failed"
+                        else None
+                    ),
+                )
+                for item in stored_checks
+                if isinstance(item, dict)
+                and set(item)
+                in (
+                    {
+                        "name",
+                        "status",
+                        "evidence_digest",
+                        "message",
+                    },
+                    {
+                        "name",
+                        "status",
+                        "evidence_digest",
+                        "message",
+                        "diagnostic_code",
+                    },
+                )
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            raise ValueError("Stored readiness report is invalid.") from None
+        if not isinstance(stored_checks, list) or len(checks) != len(
+            stored_checks
+        ):
+            raise ValueError("Stored readiness report is invalid.")
+        legacy_identity = {
+            "session_id": row["session_id"],
+            "instance_id": row["instance_id"],
+            "worker_release_digest": row["worker_release_digest"],
+            "manifest_digest": row["manifest_digest"],
+            "profile_revision": int(row["profile_revision"]),
+            "relay_origin": row["relay_origin"],
+            "inventory_observed_at": float(row["inventory_observed_at"]),
+            "created_at": float(row["created_at"]),
+            "checks": stored_checks,
+        }
+        legacy_digest = hashlib.sha256(
+            _canonical_json(legacy_identity).encode("utf-8")
+        ).hexdigest()
+        if not hmac.compare_digest(row["report_digest"], legacy_digest):
+            raise ValueError("Stored readiness report is invalid.")
+        report = ReadinessReport.create(
+            session_id=row["session_id"],
+            instance_id=row["instance_id"],
+            worker_release_digest=row["worker_release_digest"],
+            manifest_digest=row["manifest_digest"],
+            profile_revision=int(row["profile_revision"]),
+            relay_origin=row["relay_origin"],
+            inventory_observed_at=float(row["inventory_observed_at"]),
+            created_at=float(row["created_at"]),
+            attempt_number=1,
+            checks=checks,
+        )
+        if bool(row["ready"]) != report.ready:
+            raise ValueError("Stored readiness report is invalid.")
+        connection.execute(
+            """
+            INSERT INTO readiness_reports(
+                report_digest, session_id, instance_id,
+                worker_release_digest, manifest_digest, profile_revision,
+                relay_origin, inventory_observed_at, created_at,
+                attempt_number, checks_json, ready
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                report.report_digest,
+                report.session_id,
+                report.instance_id,
+                report.worker_release_digest,
+                report.manifest_digest,
+                report.profile_revision,
+                report.relay_origin,
+                report.inventory_observed_at,
+                report.created_at,
+                report.attempt_number,
+                _canonical_json(
+                    [item.to_record() for item in report.checks]
+                ),
+                int(report.ready),
+            ),
+        )
+    connection.execute("DROP TABLE readiness_reports_v13")
+    _create_readiness_v14_indexes(connection)
 
 
 def _initialize_database(path):
@@ -852,9 +1019,19 @@ def _initialize_database(path):
                 ON destroy_reviews(expires_at)
                 """
             )
+            readiness_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(readiness_reports)"
+                ).fetchall()
+            }
+            if "attempt_number" not in readiness_columns:
+                _migrate_readiness_v14(connection)
+            else:
+                _create_readiness_v14_indexes(connection)
             connection.execute(
                 """
-                INSERT INTO schema_meta(key, value) VALUES('schema_version', '13')
+                INSERT INTO schema_meta(key, value) VALUES('schema_version', '14')
                 ON CONFLICT(key) DO UPDATE SET value = excluded.value
                 """
             )
