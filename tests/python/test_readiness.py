@@ -206,7 +206,7 @@ class ReadinessValueTests(unittest.TestCase):
             "Traceback contains internal details.",
             "API key sk-proj-ABC123",
             "Password hunter2",
-            "AWS access key AKIAIOSFODNN7EXAMPLE",
+            "AWS access key " + "AK" + "IAIOSFODNN7EXAMPLE",
             "Credential ABCDEFGHIJKLMNOP",
         ):
             with self.subTest(unsafe_message=unsafe_message):

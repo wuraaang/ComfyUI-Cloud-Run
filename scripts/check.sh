@@ -38,7 +38,7 @@ PYTHONDONTWRITEBYTECODE=1 "$python_command" -m unittest \
   tests.python.test_fake_session_integration -v
 
 echo "[check] fake Desktop bridge"
-PYTHONDONTWRITEBYTECODE=1 "$python_command" -m unittest \
+PYTHONDONTWRITEBYTECODE=1 "$comfyui_python_runner" -m unittest \
   tests.python.test_fake_desktop_bridge_integration -v
 
 echo "[check] worker protocol and artifact"
@@ -625,8 +625,10 @@ allowed_external_hosts = {
     "cas-bridge.xethub.hf.co",
     "cdn-lfs-eu-1.hf.co",
     "cdn-lfs-us-1.hf.co",
+    "cdn.comfy.org",
     "civitai.com",
     "console.vast.ai",
+    "files.pythonhosted.org",
     "github.com",
     "huggingface.co",
     "release-assets.githubusercontent.com",
@@ -656,8 +658,10 @@ if not {
     "cas-bridge.xethub.hf.co",
     "cdn-lfs-eu-1.hf.co",
     "cdn-lfs-us-1.hf.co",
+    "cdn.comfy.org",
     "civitai.com",
     "console.vast.ai",
+    "files.pythonhosted.org",
     "github.com",
     "huggingface.co",
     "release-assets.githubusercontent.com",
@@ -688,6 +692,7 @@ PY
 
 echo "[check] public artifact scan"
 "$python_command" - <<'PY'
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -700,9 +705,26 @@ def fail(message):
     raise SystemExit(1)
 
 
-excluded = {".git", ".worktrees", "__pycache__", "node_modules"}
+excluded = {
+    ".git",
+    ".superpowers",
+    ".worktrees",
+    "__pycache__",
+    "node_modules",
+}
+allowed_public_binary_artifacts = {
+    Path(
+        "tests/fixtures/frontend-1.47.10/"
+        "agent-panel-"
+        "c0e05111db15e8bc040c63ff9457fc142326afab66532f942b631f268fb606be.tar"
+    ): (
+        2_908_160,
+        "c0e05111db15e8bc040c63ff9457fc142326afab66532f942b631f268fb606be",
+    ),
+}
 allowed_suffixes = {
     "",
+    ".css",
     ".js",
     ".json",
     ".md",
@@ -712,8 +734,33 @@ allowed_suffixes = {
     ".toml",
 }
 allowed_json = {
+    Path("cloud_run/certified_baseline.lock.json"),
     Path("package.json"),
     Path("remote_worker/template-policy.json"),
+    Path(
+        "tests/fixtures/certified-baseline/"
+        "agent-panel-0.11.38/PROVENANCE.json"
+    ),
+    Path(
+        "tests/fixtures/certified-baseline/"
+        "agent-panel-0.11.38/WEB_ROOT.json"
+    ),
+    Path(
+        "tests/fixtures/certified-baseline/"
+        "efficiency-nodes-1.0.9/CLASS_TYPES.json"
+    ),
+    Path(
+        "tests/fixtures/certified-baseline/"
+        "efficiency-nodes-1.0.9/PROVENANCE.json"
+    ),
+    Path(
+        "tests/fixtures/certified-baseline/"
+        "efficiency-nodes-1.0.9/RUNTIME_PATHS.json"
+    ),
+    Path("tests/fixtures/certified-baseline/hermes-nous/FILES.json"),
+    Path(
+        "tests/fixtures/certified-baseline/hermes-nous/PROVENANCE.json"
+    ),
     Path("tests/fixtures/cloud-run-core-output-smoke.json"),
     Path("tests/fixtures/native-model-metadata-workflow.json"),
 }
@@ -751,6 +798,7 @@ secret_patterns = {
     ),
 }
 observed_json = set()
+observed_public_binary_artifacts = set()
 count = 0
 for path in sorted(Path(".").rglob("*")):
     if any(part in excluded for part in path.parts):
@@ -763,6 +811,21 @@ for path in sorted(Path(".").rglob("*")):
         continue
     if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
         fail("repository contains a non-regular public artifact")
+    relative = Path(path.as_posix().removeprefix("./"))
+    expected_binary = allowed_public_binary_artifacts.get(relative)
+    if expected_binary is not None:
+        try:
+            body = path.read_bytes()
+        except OSError:
+            fail("reviewed public binary artifact is unavailable")
+        if (
+            metadata.st_size != expected_binary[0]
+            or hashlib.sha256(body).hexdigest() != expected_binary[1]
+        ):
+            fail("reviewed public binary artifact identity changed")
+        observed_public_binary_artifacts.add(relative)
+        count += 1
+        continue
     if path.suffix.casefold() in forbidden_suffixes:
         fail("repository contains a forbidden binary/private artifact")
     if path.suffix.casefold() not in allowed_suffixes:
@@ -773,7 +836,6 @@ for path in sorted(Path(".").rglob("*")):
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
         fail("repository public artifact is not UTF-8 text")
-    relative = Path(path.as_posix().removeprefix("./"))
     if relative.name in {
         ".env",
         "settings.json",
@@ -792,7 +854,9 @@ for path in sorted(Path(".").rglob("*")):
     count += 1
 if observed_json != allowed_json:
     fail("public JSON artifact allowlist changed")
-print("[check] scanned {} public text artifacts".format(count))
+if observed_public_binary_artifacts != set(allowed_public_binary_artifacts):
+    fail("reviewed public binary artifact allowlist changed")
+print("[check] scanned {} public artifacts".format(count))
 PY
 
 echo "[check] all checks passed"

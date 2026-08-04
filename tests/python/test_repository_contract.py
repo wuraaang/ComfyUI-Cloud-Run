@@ -338,6 +338,22 @@ class RepositoryContractTests(unittest.TestCase):
             '("remote_worker/gateway.py", "subprocess.Popen")',
             "secret_patterns",
             "unset VAST_API_KEY CONTAINER_API_KEY",
+            "allowed_public_binary_artifacts",
+            '".superpowers"',
+            '".css"',
+            '"cdn.comfy.org"',
+            '"files.pythonhosted.org"',
+            'Path("cloud_run/certified_baseline.lock.json")',
+            '"agent-panel-0.11.38/PROVENANCE.json"',
+            '"agent-panel-0.11.38/WEB_ROOT.json"',
+            '"efficiency-nodes-1.0.9/CLASS_TYPES.json"',
+            '"efficiency-nodes-1.0.9/PROVENANCE.json"',
+            '"efficiency-nodes-1.0.9/RUNTIME_PATHS.json"',
+            'Path("tests/fixtures/certified-baseline/hermes-nous/FILES.json")',
+            '"tests/fixtures/certified-baseline/hermes-nous/PROVENANCE.json"',
+            "tests/fixtures/frontend-1.47.10/",
+            '"agent-panel-"',
+            "c0e05111db15e8bc040c63ff9457fc142326afab66532f942b631f268fb606be",
             'Path("tests/fixtures/native-model-metadata-workflow.json")',
             'Path("tests/fixtures/cloud-run-core-output-smoke.json")',
         ):
@@ -346,6 +362,12 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertGreaterEqual(
             gate.count('"release-assets.githubusercontent.com"'),
             2,
+        )
+        self.assertIn(
+            'echo "[check] fake Desktop bridge"\n'
+            'PYTHONDONTWRITEBYTECODE=1 "$comfyui_python_runner" '
+            '-m unittest',
+            gate,
         )
 
     def test_gate_rejects_provider_credentials_in_boundary_production_files(self):
