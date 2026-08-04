@@ -1846,7 +1846,10 @@ class SessionRepository:
             """
             SELECT job_id
             FROM jobs
-            WHERE session_id = ? AND state IN ('running', 'harvesting')
+            WHERE session_id = ?
+              AND state IN (
+                  'captured', 'resolving', 'queued', 'running', 'harvesting'
+              )
             ORDER BY created_at, job_id
             """,
             (session_id,),

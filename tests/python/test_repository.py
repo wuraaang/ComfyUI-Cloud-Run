@@ -672,17 +672,36 @@ class SessionRepositoryTests(unittest.TestCase):
             SessionState.RUNNING,
         )
 
-    def _insert_active_destroy_job(self, session_id, job_id="destroy-job"):
+    def _insert_active_destroy_job(
+        self,
+        session_id,
+        job_id="destroy-job",
+        *,
+        state="running",
+    ):
         with closing(sqlite3.connect(self.database_path)) as connection:
             connection.execute(
                 """
                 INSERT INTO jobs(
                     job_id, session_id, idempotency_key, state,
                     prompt_digest, capture_json, manifest_digest,
-                    created_at, updated_at, version
-                ) VALUES (?, ?, ?, 'running', ?, '{}', ?, 100.0, 100.0, 1)
+                    queue_position, created_at, updated_at, version
+                ) VALUES (
+                    ?, ?, ?, ?, ?, '{}', ?,
+                    (SELECT COALESCE(MAX(queue_position), 0) + 1
+                     FROM jobs WHERE session_id = ?),
+                    100.0, 100.0, 1
+                )
                 """,
-                (job_id, session_id, job_id + "-key", "a" * 64, "b" * 64),
+                (
+                    job_id,
+                    session_id,
+                    job_id + "-key",
+                    state,
+                    "a" * 64,
+                    "b" * 64,
+                    session_id,
+                ),
             )
             connection.commit()
 
@@ -855,6 +874,99 @@ class SessionRepositoryTests(unittest.TestCase):
                 now=200.0,
             )
         )
+
+    def test_destroy_review_binds_all_pre_execution_job_states(self):
+        sessions = repository.SessionRepository(self.database_path)
+        for state in ("captured", "resolving", "queued"):
+            for mutation in ("new", "replaced", "removed"):
+                with self.subTest(state=state, mutation=mutation):
+                    suffix = state + "-" + mutation
+                    saved, _created = sessions.create_or_get(
+                        make_session(
+                            key="destroy-" + suffix + "-key",
+                            session_id="destroy-" + suffix,
+                        )
+                    )
+                    saved = sessions.transition(
+                        saved.session_id,
+                        SessionState.OFFER_SELECTED,
+                        now=101.0,
+                    )
+                    saved = sessions.transition(
+                        saved.session_id,
+                        SessionState.CONFIRMING,
+                        now=102.0,
+                    )
+                    original_job_id = suffix + "-original"
+                    if mutation != "new":
+                        self._insert_active_destroy_job(
+                            saved.session_id,
+                            original_job_id,
+                            state=state,
+                        )
+                    digest = "3" * 64
+                    sessions.save_destroy_review(
+                        saved.session_id,
+                        token_digest=digest,
+                        expires_at=400.0,
+                        profile_id=None,
+                    )
+                    if mutation == "new":
+                        self._insert_active_destroy_job(
+                            saved.session_id,
+                            original_job_id,
+                            state=state,
+                        )
+                    else:
+                        with closing(
+                            sqlite3.connect(self.database_path)
+                        ) as connection:
+                            connection.execute(
+                                "DELETE FROM jobs WHERE job_id = ?",
+                                (original_job_id,),
+                            )
+                            connection.commit()
+                        if mutation == "replaced":
+                            self._insert_active_destroy_job(
+                                saved.session_id,
+                                suffix + "-replacement",
+                                state=state,
+                            )
+
+                    self.assertIsNone(
+                        sessions.consume_destroy_review_and_request_destroy(
+                            saved.session_id,
+                            token_digest=digest,
+                            now=200.0,
+                        )
+                    )
+
+    def test_destroy_review_fails_closed_with_multiple_active_jobs(self):
+        sessions = repository.SessionRepository(self.database_path)
+        saved, _created = sessions.create_or_get(
+            make_session(
+                key="multiple-active-key",
+                session_id="multiple-active-session",
+            )
+        )
+        self._insert_active_destroy_job(
+            saved.session_id,
+            "captured-job",
+            state="captured",
+        )
+        self._insert_active_destroy_job(
+            saved.session_id,
+            "queued-job",
+            state="queued",
+        )
+
+        with self.assertRaises(repository.ConcurrentSessionUpdate):
+            sessions.save_destroy_review(
+                saved.session_id,
+                token_digest="4" * 64,
+                expires_at=400.0,
+                profile_id=None,
+            )
 
     def test_destroy_review_rejects_changed_label_or_profile_revision(self):
         sessions = repository.SessionRepository(self.database_path)
