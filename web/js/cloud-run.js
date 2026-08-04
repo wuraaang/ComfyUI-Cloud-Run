@@ -661,6 +661,10 @@ export function mountCloudRun(
         } else if (
           session?.rental_outcome === "unknown"
           || (
+            session?.billing_may_continue === true
+            && session?.rental_outcome !== "active"
+          )
+          || (
             session?.rental_outcome === "active"
             && (
               session?.status === "failed"
@@ -765,8 +769,9 @@ export function mountCloudRun(
       sessionConsole.renderSettings(payload);
       const active = Array.isArray(payload.active_sessions)
         ? [...payload.active_sessions].reverse().find(
-          (session) => ["unknown", "active"].includes(
-            session?.rental_outcome,
+          (session) => (
+            session?.billing_may_continue === true
+            || ["unknown", "active"].includes(session?.rental_outcome)
           ),
         )
         : null;

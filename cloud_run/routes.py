@@ -757,6 +757,10 @@ def _session_payload(session, service=None):
 
     repository = getattr(service, "job_repository", None)
     if not isinstance(repository, JobRepository):
+        seconds_without_progress = max(
+            0.0,
+            now - session.updated_at,
+        )
         payload["current_job"] = None
         payload["history"] = []
         payload["provisioning"] = {
@@ -766,11 +770,9 @@ def _session_payload(session, service=None):
             "total_bytes": 0,
             "installed_units": 0,
             "validated_units": 0,
-            "seconds_without_progress": max(
-                0.0,
-                now - session.updated_at,
-            ),
+            "seconds_without_progress": seconds_without_progress,
             "stall_budget_seconds": 600,
+            "stall_active": seconds_without_progress >= 600,
         }
         return payload
 
@@ -854,6 +856,7 @@ def _session_payload(session, service=None):
         )
     except Exception:
         transaction = None
+    progress_valid = False
     if transaction is not None and manifest is not None:
         current_artifact = catalog.get(
             transaction.current_dependency_id
@@ -887,7 +890,10 @@ def _session_payload(session, service=None):
             )
             and (
                 transaction.phase != "ready"
-                or transaction.transferred_bytes == exact_total
+                or (
+                    transaction.state == "ready"
+                    and transaction.transferred_bytes == exact_total
+                )
             )
             and isinstance(transaction.last_progress_at, (int, float))
             and not isinstance(transaction.last_progress_at, bool)
@@ -913,6 +919,17 @@ def _session_payload(session, service=None):
         transferred_bytes = sum(
             transfer.offset for transfer in transfer_records
         )
+    provision_ready = (
+        transaction is not None
+        and progress_valid
+        and phase == "ready"
+        and transaction.state == "ready"
+    )
+    seconds_without_progress = (
+        None
+        if provision_ready
+        else max(0.0, now - last_progress_at)
+    )
     payload["provisioning"] = {
         "phase": phase,
         "current_model": current_model,
@@ -921,7 +938,8 @@ def _session_payload(session, service=None):
         "installed_units": len(installed),
         "validated_units": (
             len(installed)
-            if session.state
+            if provision_ready
+            or session.state
             in {
                 SessionState.READY,
                 SessionState.RUNNING,
@@ -929,27 +947,71 @@ def _session_payload(session, service=None):
             }
             else 0
         ),
-        "seconds_without_progress": max(
-            0.0,
-            now - last_progress_at,
-        ),
+        "seconds_without_progress": seconds_without_progress,
         "stall_budget_seconds": 600,
+        "stall_active": (
+            seconds_without_progress is not None
+            and seconds_without_progress >= 600
+        ),
     }
     return payload
+
+
+_ACTIVE_SESSION_DETAILS_ERROR = (
+    "Active session details are temporarily unavailable."
+)
+
+
+def _minimal_session_safety_card(session):
+    error = session.sanitized_error
+    if (
+        error is not None
+        and (
+            not isinstance(error, str)
+            or len(error.encode("utf-8")) > 500
+            or any(ord(character) < 32 for character in error)
+        )
+    ):
+        error = None
+    rate = session.quote.dph_total if session.quote is not None else None
+    if (
+        isinstance(rate, bool)
+        or not isinstance(rate, (int, float))
+        or not math.isfinite(rate)
+        or rate < 0
+    ):
+        rate = None
+    return {
+        "session_id": session.session_id,
+        "instance_id": session.instance_id,
+        "status": session.state.value,
+        "billing_may_continue": session.billing_may_continue,
+        "can_destroy": session.can_destroy,
+        "rate": rate,
+        "error": error,
+    }
 
 
 def _active_session_payloads(service):
     repository = getattr(service, "session_repository", None)
     if not isinstance(repository, SessionRepository):
-        return []
+        return [], None
     try:
         sessions = repository.list_recoverable()[-20:]
-        return [
-            _session_payload(session, service)
-            for session in sessions
-        ]
     except Exception:
-        return []
+        return [], _ACTIVE_SESSION_DETAILS_ERROR
+    payloads = []
+    detail_error = None
+    for session in sessions:
+        try:
+            payload = _session_payload(session, service)
+            if not isinstance(payload, dict):
+                raise ValueError("Invalid active session payload.")
+        except Exception:
+            payload = _minimal_session_safety_card(session)
+            detail_error = _ACTIVE_SESSION_DETAILS_ERROR
+        payloads.append(payload)
+    return payloads, detail_error
 
 
 async def _request_payload(request, *, allowed, required):
@@ -1089,11 +1151,13 @@ def register_routes(service_factory=None):
             if isinstance(release, WorkerRelease)
             else None
         )
-        payload["active_sessions"] = (
+        active_sessions, active_sessions_error = (
             _active_session_payloads(service)
             if service is not None
-            else []
+            else ([], _ACTIVE_SESSION_DETAILS_ERROR)
         )
+        payload["active_sessions"] = active_sessions
+        payload["active_sessions_error"] = active_sessions_error
         return payload
 
     @routes.get("/cloud-run/api/settings")

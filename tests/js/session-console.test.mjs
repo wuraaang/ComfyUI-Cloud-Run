@@ -568,6 +568,69 @@ test("ambiguous rental is red, polls, blocks paid controls, and permits destroy"
 });
 
 
+test("settings fallback card stays destroyable after detailed polling fails", async () => {
+  const document = new FakeDocument();
+  const api = fakeApi();
+  api.getSession = async () => {
+    throw new Error("private transport detail");
+  };
+  const view = createSessionConsole(document, api, {
+    setTimeout() {
+      return 1;
+    },
+    clearTimeout() {},
+  });
+  document.body.appendChild(view.root);
+  view.renderSession({
+    session_id: "session-fallback",
+    instance_id: "46741738",
+    status: "failed",
+    billing_may_continue: true,
+    can_destroy: true,
+    rate: 0.73,
+    error: "Active session details are temporarily unavailable.",
+  });
+
+  await view.refresh();
+
+  assert.equal(view.destroyButton.hidden, false);
+  assert.match(view.root.textContent, /\$0\.73\/h/);
+  assert.match(view.sessionError.className, /cloud-run-danger/);
+  assert.match(
+    view.status.textContent,
+    /Session status is temporarily unavailable; safe polling continues\./,
+  );
+  assert.doesNotMatch(view.root.textContent, /private transport detail/);
+});
+
+
+test("active session detail error renders only the bounded red warning", () => {
+  const document = new FakeDocument();
+  const view = createSessionConsole(document, fakeApi());
+  document.body.appendChild(view.root);
+
+  view.renderSettings({
+    configured: true,
+    active_sessions_error:
+      "Active session details are temporarily unavailable.",
+  });
+
+  assert.equal(view.settingsError.hidden, false);
+  assert.match(view.settingsError.className, /cloud-run-danger/);
+  assert.equal(
+    view.settingsError.textContent,
+    "Active session details are temporarily unavailable.",
+  );
+
+  view.renderSettings({
+    configured: true,
+    active_sessions_error: "secret provider exception",
+  });
+  assert.equal(view.settingsError.hidden, true);
+  assert.doesNotMatch(view.root.textContent, /secret provider exception/);
+});
+
+
 test("verified absence clears paid review and unlocks only fresh offer search", async () => {
   const document = new FakeDocument();
   const api = fakeApi();
@@ -988,6 +1051,7 @@ test("provisioning shows the meaningful-progress clock and ten-minute stall", ()
       validated_units: 1,
       seconds_without_progress: 599,
       stall_budget_seconds: 600,
+      stall_active: false,
     },
   }));
 
@@ -1003,11 +1067,74 @@ test("provisioning shows the meaningful-progress clock and ten-minute stall", ()
       validated_units: 1,
       seconds_without_progress: 600,
       stall_budget_seconds: 600,
+      stall_active: true,
     },
   }));
 
   assert.match(view.root.textContent, /STALL DETECTED/);
   assert.match(view.provisioningStatus.className, /cloud-run-danger/);
+});
+
+
+test("ready provisioning is completed while Desktop readiness remains pending", () => {
+  const document = new FakeDocument();
+  const view = createSessionConsole(document, fakeApi());
+  document.body.appendChild(view.root);
+
+  view.renderSession(sessionPayload({
+    status: "validating",
+    desktop_ready: false,
+    readiness_report: {
+      attempt_number: 2,
+      checks: [
+        { name: "worker_authenticated", status: "passed" },
+        { name: "native_http_probe", status: "failed" },
+      ],
+    },
+    provisioning: {
+      phase: "ready",
+      current_model: null,
+      transferred_bytes: 8_192,
+      total_bytes: 8_192,
+      installed_units: 3,
+      validated_units: 3,
+      seconds_without_progress: null,
+      stall_budget_seconds: 600,
+      stall_active: false,
+    },
+  }));
+
+  assert.match(view.provisioningStatus.textContent, /Verified transfer\/install completed/);
+  assert.match(view.provisioningStatus.textContent, /Desktop readiness attempt 2: 1 of 2 checks passed/);
+  assert.doesNotMatch(view.provisioningStatus.textContent, /STALL DETECTED|aborts after|server limit/);
+  assert.doesNotMatch(view.provisioningStatus.className, /cloud-run-danger/);
+});
+
+
+test("null seconds without progress is not rendered as zero", () => {
+  const document = new FakeDocument();
+  const view = createSessionConsole(document, fakeApi());
+  document.body.appendChild(view.root);
+
+  view.renderSession(sessionPayload({
+    status: "provisioning",
+    provisioning: {
+      phase: "environment_validation",
+      transferred_bytes: 8_192,
+      total_bytes: 8_192,
+      installed_units: 3,
+      validated_units: 0,
+      seconds_without_progress: null,
+      stall_budget_seconds: 600,
+      stall_active: false,
+    },
+  }));
+
+  assert.doesNotMatch(
+    view.provisioningStatus.textContent,
+    /0 seconds since meaningful progress/,
+  );
+  assert.doesNotMatch(view.provisioningStatus.className, /cloud-run-danger/);
 });
 
 

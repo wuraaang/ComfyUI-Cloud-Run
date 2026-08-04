@@ -315,6 +315,7 @@ function isEmergencyRentalState(session) {
   const outcome = rentalOutcome(session);
   return (
     outcome === "unknown"
+    || (outcome === null && session?.billing_may_continue === true)
     || (
       outcome === "active"
       && (
@@ -376,6 +377,10 @@ export function createSessionConsole(document, api = {}, options = {}) {
   const settingsSummary = element(document, "div", {
     className: "cloud-run-configured-summary",
   });
+  const settingsError = element(document, "div", {
+    className: "cloud-run-active-session-error",
+  });
+  settingsError.hidden = true;
 
   const preflightTitle = element(document, "h4", {
     text: "Dependency preflight",
@@ -628,6 +633,7 @@ export function createSessionConsole(document, api = {}, options = {}) {
   root.append(
     title,
     settingsSummary,
+    settingsError,
     preflightTitle,
     summary,
     rows,
@@ -786,6 +792,16 @@ export function createSessionConsole(document, api = {}, options = {}) {
       `${configured}; ${cache}` +
       `${sources.length ? `; ${sources.join(", ")}` : ""}. ` +
       "Account keys remain write-only on this Mac.";
+    const activeSessionError =
+      payload?.active_sessions_error ===
+        "Active session details are temporarily unavailable."
+        ? "Active session details are temporarily unavailable."
+        : "";
+    settingsError.textContent = activeSessionError;
+    settingsError.className = activeSessionError
+      ? "cloud-run-active-session-error cloud-run-danger"
+      : "cloud-run-active-session-error";
+    settingsError.hidden = !activeSessionError;
   }
 
   function renderPreflight(payload) {
@@ -1038,7 +1054,7 @@ export function createSessionConsole(document, api = {}, options = {}) {
       digest_verification: "Digest verification",
       comfyui_startup: "ComfyUI startup",
       environment_validation: "Environment validation",
-      ready: "Provisioning ready",
+      ready: "Verified transfer/install completed",
     };
     const workerPhase = typeof progress?.phase === "string"
       && Object.hasOwn(workerPhases, progress.phase)
@@ -1075,15 +1091,46 @@ export function createSessionConsole(document, api = {}, options = {}) {
       : null;
     const installs = positiveInteger(progress?.installed_units);
     const validation = positiveInteger(progress?.validated_units);
-    const secondsWithoutProgress = Number(progress?.seconds_without_progress);
+    const secondsWithoutProgress = progress?.seconds_without_progress;
     const safeSeconds = (
-      Number.isSafeInteger(secondsWithoutProgress)
+      typeof secondsWithoutProgress === "number"
+      && Number.isFinite(secondsWithoutProgress)
       && secondsWithoutProgress >= 0
     )
-      ? secondsWithoutProgress
+      ? Math.floor(secondsWithoutProgress)
       : null;
     const stallBudget = positiveInteger(progress?.stall_budget_seconds) ?? 600;
-    const stalled = safeSeconds !== null && safeSeconds >= stallBudget;
+    const stalled = progress?.stall_active === true;
+    const provisionComplete = (
+      workerPhase === "ready"
+      && progress?.stall_active === false
+      && progress?.seconds_without_progress === null
+    );
+    let desktopReadiness = "";
+    if (provisionComplete) {
+      if (session?.desktop_ready === true) {
+        desktopReadiness = "Desktop readiness certified";
+      } else {
+        const report = session?.readiness_report;
+        const attempt = positiveInteger(report?.attempt_number);
+        const checks = Array.isArray(report?.checks)
+          && report.checks.length > 0
+          && report.checks.length <= 100
+          && report.checks.every(
+            (check) => check && typeof check === "object"
+              && ["passed", "failed", "not_required"].includes(check.status),
+          )
+          ? report.checks
+          : null;
+        desktopReadiness = attempt !== null && checks !== null
+          ? `Desktop readiness attempt ${attempt}: ${
+            checks.filter(
+              (check) => ["passed", "not_required"].includes(check.status),
+            ).length
+          } of ${checks.length} checks passed`
+          : "Desktop readiness checks pending";
+      }
+    }
     provisioningStatus.className = stalled
       ? "cloud-run-provisioning-status cloud-run-danger"
       : "cloud-run-provisioning-status";
@@ -1092,8 +1139,11 @@ export function createSessionConsole(document, api = {}, options = {}) {
       `${currentModel === null ? "" : ` — model ${currentModel}`}` +
       `${installs === null ? "" : ` — ${installs} install units`}` +
       `${validation === null ? "" : ` — ${validation} validations`}` +
+      `${desktopReadiness ? ` — ${desktopReadiness}` : ""}` +
       (
-        safeSeconds === null
+        provisionComplete
+          ? "."
+          : safeSeconds === null
           ? ` — aborts after ${stallBudget} seconds without meaningful progress.`
           : stalled
             ? ` — STALL DETECTED — ${safeSeconds} seconds since meaningful ` +
@@ -1418,7 +1468,8 @@ export function createSessionConsole(document, api = {}, options = {}) {
     } else {
       sessionStatus.textContent = `${sessionMessage(session)} ${identity}`;
     }
-    const rate = finiteNumber(session?.offer?.dph_total);
+    const rate = finiteNumber(session?.offer?.dph_total)
+      ?? finiteNumber(session?.rate);
     const elapsed = finiteNumber(session.elapsed_seconds)
       ?? (
         finiteNumber(session.created_at) !== null
@@ -1762,6 +1813,7 @@ export function createSessionConsole(document, api = {}, options = {}) {
   return {
     root,
     settingsSummary,
+    settingsError,
     outputAllowanceInput,
     preflightButton,
     searchButton,

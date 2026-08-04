@@ -31,6 +31,7 @@ function settingsPayload(overrides = {}) {
     huggingface_configured: false,
     civitai_configured: false,
     active_sessions: [],
+    active_sessions_error: null,
     recent_sessions: [],
     ...overrides,
   };
@@ -1058,6 +1059,35 @@ test("reload chooses active or unknown state before recent absent history", asyn
   const text = document.getElementById("cloud-run-dependency-console").textContent;
   assert.match(text, /session-newest-unknown/);
   assert.doesNotMatch(text, /session-recent-absent/);
+});
+
+
+test("reload selects a billable safety card without rental outcome", async () => {
+  const document = new FakeDocument();
+  mountLocalRunButton(document);
+  const fallback = {
+    session_id: "session-fallback",
+    instance_id: "46741738",
+    status: "failed",
+    billing_may_continue: true,
+    can_destroy: true,
+    rate: 0.73,
+    error: "Active session details are temporarily unavailable.",
+  };
+  mountCloudRun(document, async () => jsonResponse(settingsPayload({
+    active_sessions: [fallback],
+  })));
+
+  await document.getElementById("cloud-run-button").click();
+
+  const console = document.getElementById("cloud-run-dependency-console");
+  assert.match(console.textContent, /session-fallback/);
+  assert.match(console.textContent, /\$0\.73\/h/);
+  assert.equal(document.getElementById("cloud-run-destroy-gpu").hidden, false);
+  assert.match(
+    document.getElementById("cloud-run-preview-banner").className,
+    /cloud-run-danger/,
+  );
 });
 
 

@@ -38,7 +38,7 @@ from cloud_run.routes import (
     build_service,
     register_routes,
 )
-from cloud_run.repository import PaidRentalConflict
+from cloud_run.repository import PaidRentalConflict, SessionRepository
 from cloud_run.models import (
     AttemptState,
     CloudAttempt,
@@ -177,6 +177,7 @@ class SettingsRouteTests(unittest.TestCase):
                 "lifecycle_enabled": True,
                 "worker_release": None,
                 "active_sessions": [],
+                "active_sessions_error": None,
             },
         )
 
@@ -297,6 +298,181 @@ class SettingsRouteTests(unittest.TestCase):
         self.assertNotIn("a" * 64, repr(active))
         self.assertNotIn("d" * 64, repr(active))
 
+    def test_settings_preserves_minimal_destroy_card_when_detailed_rendering_fails(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            database = root / "private" / "sessions.sqlite3"
+            sessions = SessionRepository(database)
+            jobs = JobRepository(database)
+            selected = attempt().quote
+            ready = CloudSession.new(
+                "private-fallback-key",
+                session_id="session-fallback",
+                quote=selected,
+                manifest_digest=selected.manifest_digest,
+                deadline_at=7_300.0,
+                deadline_mode="finite",
+                disk_gb=80,
+                now=100.0,
+                state=SessionState.READY,
+            ).transition(
+                SessionState.READY,
+                now=100.0,
+                instance_id="77",
+                provider_token="a" * 64,
+                session_secret_hex="d" * 64,
+            )
+            sessions.create_or_get(ready)
+            service = types.SimpleNamespace(
+                session_repository=sessions,
+                job_repository=jobs,
+                session_service=types.SimpleNamespace(),
+                clock=lambda: 200.0,
+            )
+            handlers = captured_handlers(service_factory=lambda: service)
+            with mock.patch.dict(
+                os.environ,
+                {"COMFYUI_CLOUD_RUN_DATA_DIR": str(root / "settings")},
+                clear=False,
+            ), mock.patch(
+                "cloud_run.routes._session_payload",
+                side_effect=RuntimeError("private-detail-marker"),
+            ):
+                response = asyncio.run(
+                    handlers[("GET", "/cloud-run/api/settings")](
+                        FakeRequest()
+                    )
+                )
+
+        self.assertEqual(
+            response.payload["active_sessions"],
+            [
+                {
+                    "session_id": "session-fallback",
+                    "instance_id": "77",
+                    "status": "ready",
+                    "billing_may_continue": True,
+                    "can_destroy": True,
+                    "rate": selected.dph_total,
+                    "error": None,
+                }
+            ],
+        )
+        self.assertEqual(
+            response.payload["active_sessions_error"],
+            "Active session details are temporarily unavailable.",
+        )
+        self.assertNotIn("private-detail-marker", repr(response.payload))
+
+    def test_settings_reports_bounded_error_when_active_session_listing_fails(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            sessions = SessionRepository(root / "private" / "sessions.sqlite3")
+            service = types.SimpleNamespace(
+                session_repository=sessions,
+                release=None,
+            )
+            handlers = captured_handlers(service_factory=lambda: service)
+            with mock.patch.dict(
+                os.environ,
+                {"COMFYUI_CLOUD_RUN_DATA_DIR": str(root / "settings")},
+                clear=False,
+            ), mock.patch.object(
+                sessions,
+                "list_recoverable",
+                side_effect=RuntimeError("private-list-marker"),
+            ):
+                response = asyncio.run(
+                    handlers[("GET", "/cloud-run/api/settings")](
+                        FakeRequest()
+                    )
+                )
+
+        self.assertEqual(response.payload["active_sessions"], [])
+        self.assertEqual(
+            response.payload["active_sessions_error"],
+            "Active session details are temporarily unavailable.",
+        )
+        self.assertNotIn("private-list-marker", repr(response.payload))
+
+    def test_one_broken_session_does_not_hide_other_active_sessions(self):
+        from cloud_run.routes import _session_payload as detailed_payload
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            database = root / "private" / "sessions.sqlite3"
+            sessions = SessionRepository(database)
+            jobs = JobRepository(database)
+            for identifier, instance_id in (
+                ("session-broken", "77"),
+                ("session-healthy", "88"),
+            ):
+                session = CloudSession.new(
+                    "key-" + identifier,
+                    session_id=identifier,
+                    manifest_digest="c" * 64,
+                    deadline_at=7_300.0,
+                    deadline_mode="finite",
+                    disk_gb=80,
+                    now=100.0,
+                    state=SessionState.READY,
+                ).transition(
+                    SessionState.READY,
+                    now=100.0,
+                    instance_id=instance_id,
+                    provider_token="a" * 64,
+                    session_secret_hex="d" * 64,
+                )
+                sessions.create_or_get(session)
+            service = types.SimpleNamespace(
+                session_repository=sessions,
+                job_repository=jobs,
+                session_service=types.SimpleNamespace(
+                    alerts=lambda _session, now: []
+                ),
+                clock=lambda: 200.0,
+            )
+            handlers = captured_handlers(service_factory=lambda: service)
+
+            def render(session, observed_service):
+                if session.session_id == "session-broken":
+                    raise RuntimeError("private-one-session-marker")
+                return detailed_payload(session, observed_service)
+
+            with mock.patch.dict(
+                os.environ,
+                {"COMFYUI_CLOUD_RUN_DATA_DIR": str(root / "settings")},
+                clear=False,
+            ), mock.patch(
+                "cloud_run.routes._session_payload",
+                side_effect=render,
+            ):
+                response = asyncio.run(
+                    handlers[("GET", "/cloud-run/api/settings")](
+                        FakeRequest()
+                    )
+                )
+
+        active = response.payload["active_sessions"]
+        self.assertEqual(
+            [item["session_id"] for item in active],
+            ["session-broken", "session-healthy"],
+        )
+        self.assertEqual(set(active[0]), {
+            "session_id",
+            "instance_id",
+            "status",
+            "billing_may_continue",
+            "can_destroy",
+            "rate",
+            "error",
+        })
+        self.assertIn("current_job", active[1])
+        self.assertEqual(
+            response.payload["active_sessions_error"],
+            "Active session details are temporarily unavailable.",
+        )
+
     def test_put_saves_key_but_returns_only_public_settings(self):
         sensitive_marker = "synthetic-value"
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -332,6 +508,7 @@ class SettingsRouteTests(unittest.TestCase):
             "lifecycle_enabled": True,
             "worker_release": None,
             "active_sessions": [],
+            "active_sessions_error": None,
         }
         self.assertEqual(put_response.status, 200)
         self.assertEqual(put_response.payload, expected)
@@ -2067,6 +2244,7 @@ class RelayMediaRouteTests(unittest.TestCase):
                 "validated_units": 0,
                 "seconds_without_progress": 5.0,
                 "stall_budget_seconds": 600,
+                "stall_active": False,
             },
         )
         self.assertNotIn("huggingface.co", repr(response.payload))
@@ -2101,6 +2279,112 @@ class RelayMediaRouteTests(unittest.TestCase):
             hostile.payload["provisioning"]["total_bytes"],
             15,
         )
+
+    def test_ready_provision_transaction_reports_installed_units_as_validated_and_stops_stall_clock(self):
+        repository = self.service.job_repository
+        artifact = ArtifactSpec(
+            artifact_id="model-ready",
+            kind="model",
+            logical_name="ready.safetensors",
+            destination="models/checkpoints/ready.safetensors",
+            size_bytes=10,
+            sha256="b" * 64,
+            source=SourceSpec(
+                "huggingface",
+                (
+                    "https://huggingface.co/example/model/resolve/"
+                    + "a" * 40
+                    + "/ready.safetensors"
+                ),
+                immutable_revision="a" * 40,
+            ),
+        )
+        manifest = DependencyManifest(
+            schema_version=2,
+            protocol_version="2",
+            comfyui_core_version="0.29.0",
+            comfyui_frontend_version="1.47.10",
+            worker_version="a" * 40,
+            prompt_digest="d" * 64,
+            custom_nodes=(),
+            artifacts=(artifact,),
+            output_allowance_bytes=1024,
+            disk_gb=80,
+        )
+        repository.save_manifest(
+            manifest.digest,
+            manifest.canonical_bytes().decode("utf-8"),
+            created_at=100.0,
+        )
+        repository.record_provision_progress(
+            transaction_id="provision-" + manifest.digest,
+            session_id="session-1",
+            job_id="bootstrap:session-1",
+            manifest_digest=manifest.digest,
+            state="ready",
+            phase="ready",
+            current_dependency_id=None,
+            transferred_bytes=10,
+            total_bytes=10,
+            last_progress_at=100.0,
+        )
+        repository.replace_installed_set(
+            "session-1",
+            (
+                {
+                    "dependency_id": artifact.artifact_id,
+                    "digest": artifact.sha256,
+                    "revision": None,
+                    "destination": artifact.destination,
+                },
+            ),
+        )
+        validating = CloudSession.new(
+            "session-ready-progress",
+            session_id="session-1",
+            quote=replace(
+                attempt().quote,
+                manifest_digest=manifest.digest,
+                transfer_bytes=10,
+                output_allowance_bytes=1024,
+                disk_gb=80,
+            ),
+            manifest_digest=manifest.digest,
+            deadline_at=7_300.0,
+            deadline_mode="finite",
+            disk_gb=80,
+            now=100.0,
+            state=SessionState.VALIDATING,
+        ).transition(
+            SessionState.VALIDATING,
+            now=100.0,
+            instance_id="77",
+        )
+        self.service.refresh_session = mock.AsyncMock(
+            return_value=validating
+        )
+
+        response = asyncio.run(
+            self.handlers[
+                ("GET", "/cloud-run/api/sessions/{session_id}")
+            ](FakeRequest(match_info={"session_id": "session-1"}))
+        )
+
+        self.assertEqual(
+            response.payload["provisioning"],
+            {
+                "phase": "ready",
+                "current_model": None,
+                "transferred_bytes": 10,
+                "total_bytes": 10,
+                "installed_units": 1,
+                "validated_units": 1,
+                "seconds_without_progress": None,
+                "stall_budget_seconds": 600,
+                "stall_active": False,
+            },
+        )
+        self.assertFalse(response.payload["desktop_ready"])
 
     def test_wrong_session_cannot_read_an_existing_job(self):
         response = asyncio.run(
