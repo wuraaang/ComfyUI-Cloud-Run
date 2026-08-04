@@ -563,6 +563,10 @@ class ServiceConstructionTests(unittest.TestCase):
 
         self.assertIsNone(service.release)
         self.assertIsNone(service.session_service.release)
+        self.assertEqual(
+            service.desktop_relay.continue_guard,
+            service.session_service._raise_if_destroy_requested,
+        )
 
 
 def certified_baseline_fixture(root):

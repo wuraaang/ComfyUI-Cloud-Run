@@ -1178,6 +1178,18 @@ class CloudRunLifecycle:
                 destroy_requested=True,
                 sanitized_error=terminal_error,
             )
+        preempt_surfaces = getattr(
+            self.session_service,
+            "preempt_session_surfaces",
+            None,
+        )
+        if callable(preempt_surfaces):
+            try:
+                await preempt_surfaces(session.session_id)
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                raise
+            except Exception:
+                pass
         settings, api_key = self._api_key()
         settings_revision = self._settings_revision(settings)
         if not self._session_settings_revision_matches(

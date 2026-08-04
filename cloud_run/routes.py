@@ -470,6 +470,7 @@ def build_service():
         repository=job_repository,
         worker_factory=worker_factory,
         native_prompt=service.session_service.prepare_native_prompt,
+        continue_guard=service.session_service._raise_if_destroy_requested,
         agent_bridge=agent_bridge,
         local_comfy_root=lambda: str(
             ComfyHost.from_running_host().comfy_root

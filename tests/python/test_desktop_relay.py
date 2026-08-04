@@ -514,6 +514,85 @@ class DesktopRelayBoundaryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(controller.status, 404)
         self.assertEqual(provider.status, 404)
 
+    async def test_durable_guard_rechecks_after_body_before_worker_forward(self):
+        allowed = [True]
+
+        def continue_guard(_session_id):
+            if not allowed[0]:
+                raise asyncio.CancelledError()
+
+        self.relay.continue_guard = continue_guard
+        await self.relay.activate(
+            "session-1",
+            self.worker,
+            profile_revision=3,
+        )
+        navigation = await self.relay.handle(
+            FakeRequest("GET", "/", headers=self.host)
+        )
+        capability = cookie_value(navigation)
+        headers = {
+            **self.host,
+            "Cookie": "comfy_vast_session=" + capability,
+        }
+        forwarded_before = len(self.worker.envelopes)
+        allowed[0] = False
+        denied = await self.relay.handle(
+            FakeRequest("GET", "/object_info", headers=headers)
+        )
+
+        self.assertEqual(denied.status, 503)
+        self.assertEqual(len(self.worker.envelopes), forwarded_before)
+
+        allowed[0] = True
+
+        class DelayedBodyRequest(FakeRequest):
+            def __init__(inner_self):
+                super().__init__("GET", "/object_info", headers=headers)
+                inner_self.body = None
+
+            async def read(inner_self):
+                allowed[0] = False
+                await asyncio.sleep(0)
+                return b""
+
+        denied_after_await = await self.relay.handle(DelayedBodyRequest())
+
+        self.assertEqual(denied_after_await.status, 503)
+        self.assertEqual(len(self.worker.envelopes), forwarded_before)
+
+    async def test_terminal_preempt_wins_over_late_activation(self):
+        from cloud_run.desktop_relay import DesktopRelayError
+
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def blocked_allow(_session_id):
+            entered.set()
+            await release.wait()
+
+        self.agent_bridge.allow = blocked_allow
+        activation = asyncio.create_task(
+            self.relay.activate(
+                "session-1",
+                self.worker,
+                profile_revision=3,
+            )
+        )
+        await entered.wait()
+
+        preempted = await self.relay.preempt("session-1")
+        release.set()
+
+        with self.assertRaises(DesktopRelayError):
+            await activation
+        self.assertFalse(preempted.ready)
+        self.assertFalse(self.relay.status().ready)
+        self.assertIsNone(self.relay.status().active_session_id)
+        self.assertIsNone(
+            self.repository.get_desktop_relay().active_session_id
+        )
+
     async def test_navigation_mints_one_scoped_cookie_and_context_is_safe(self):
         from remote_worker.native_proxy import MAX_NATIVE_HTTP_RESPONSE_BYTES
 
@@ -804,6 +883,96 @@ class DesktopRelayBoundaryTests(unittest.IsolatedAsyncioTestCase):
 
         await self.relay.deactivate("session-1")
         self.assertEqual(self.agent_bridge.revoked, ["session-1"])
+
+
+class DesktopRelayTeardownTests(unittest.IsolatedAsyncioTestCase):
+    async def test_terminal_preempt_closes_native_websocket_and_blocks_worker(self):
+        from aiohttp import ClientSession, CookieJar, WSMsgType
+
+        from cloud_run.desktop_relay import DesktopRelay
+        from cloud_run.job_repository import JobRepository
+
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        repository = JobRepository(
+            Path(temporary.name) / "attempts.sqlite3"
+        )
+        worker = FakeWorker()
+        opened = asyncio.Event()
+
+        class Upstream:
+            def __init__(inner_self):
+                inner_self.messages = asyncio.Queue()
+                inner_self.close_codes = []
+
+            def __aiter__(inner_self):
+                return inner_self
+
+            async def __anext__(inner_self):
+                message = await inner_self.messages.get()
+                if message is None:
+                    raise StopAsyncIteration
+                return message
+
+            async def send_str(inner_self, _value):
+                return None
+
+            async def send_bytes(inner_self, _value):
+                return None
+
+            async def close(inner_self, *, code):
+                inner_self.close_codes.append(code)
+                await inner_self.messages.put(None)
+
+        upstream = Upstream()
+
+        async def native_websocket(_request):
+            opened.set()
+            return upstream
+
+        worker.native_websocket = native_websocket
+        relay = DesktopRelay(
+            repository=repository,
+            port_selector=lambda: 0,
+            worker_factory=lambda _session: worker,
+            native_prompt=lambda *_args, **_kwargs: {},
+            capability_factory=lambda: "capability-" + "a" * 48,
+            clock=lambda: 100.0,
+        )
+        await relay.start()
+        self.assertTrue(relay.status().bound)
+        await relay.activate("session-1", worker, profile_revision=3)
+        origin = relay.status().url
+
+        try:
+            async with ClientSession(
+                cookie_jar=CookieJar(unsafe=True)
+            ) as client:
+                async with client.get(origin + "/") as response:
+                    self.assertEqual(response.status, 200)
+                    await response.read()
+                websocket = await client.ws_connect(
+                    origin + "/ws?clientId=desktop-client-1",
+                    headers={"Origin": origin},
+                )
+                await asyncio.wait_for(opened.wait(), timeout=1)
+                forwarded_before = len(worker.envelopes)
+
+                status = await relay.preempt("session-1")
+
+                self.assertFalse(status.ready)
+                self.assertIsNone(status.active_session_id)
+                message = await websocket.receive(timeout=1)
+                self.assertIn(
+                    message.type,
+                    {WSMsgType.CLOSE, WSMsgType.CLOSED, WSMsgType.CLOSING},
+                )
+                async with client.get(origin + "/object_info") as denied:
+                    self.assertEqual(denied.status, 503)
+                self.assertEqual(len(worker.envelopes), forwarded_before)
+                self.assertIn(1001, upstream.close_codes)
+        finally:
+            await relay.close()
 
 
 class NativeWorkerEnvelopeTests(unittest.TestCase):

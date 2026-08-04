@@ -50,6 +50,7 @@ from cloud_run.session_service import (
     SessionExecutionError,
     SessionService,
     SessionServiceError,
+    SURFACE_PREEMPT_TIMEOUT_SECONDS,
     TerminalProvisioningError,
 )
 from cloud_run.worker_release import WorkerRelease
@@ -3690,6 +3691,10 @@ class ReusableSessionTests(unittest.TestCase):
                 observe("bridge")
                 await super().revoke(session_id)
 
+        class Relay:
+            async def preempt(inner_self, session_id):
+                observe("relay")
+
         async def sync_profile(_session_id, *, teardown=False):
             outer.assertTrue(teardown)
             observe("profile")
@@ -3697,6 +3702,7 @@ class ReusableSessionTests(unittest.TestCase):
         self.service.reconciler = Reconciler()
         self.service.lifecycle = Lifecycle()
         self.service.agent_bridge = Bridge()
+        self.service.desktop_relay = Relay()
         self.service.sync_profile = sync_profile
         review = asyncio.run(self.service.review_destroy("session-1"))
 
@@ -3713,8 +3719,144 @@ class ReusableSessionTests(unittest.TestCase):
         self.assertEqual(destroyed.state, SessionState.DESTROYED)
         self.assertEqual(
             events,
-            ["reconciler", "lifecycle", "bridge", "profile", "provider"],
+            [
+                "relay",
+                "bridge",
+                "reconciler",
+                "lifecycle",
+                "profile",
+                "provider",
+            ],
         )
+
+    def test_desktop_relay_preempt_failure_never_prevents_provider_teardown(self):
+        outer = self
+        provider_calls = []
+
+        class Relay:
+            async def preempt(inner_self, _session_id):
+                raise OSError("synthetic local relay failure with secret")
+
+        class Lifecycle:
+            async def preempt_session(inner_self, _session_id):
+                return None
+
+            async def destroy_session(inner_self, session_id):
+                provider_calls.append(session_id)
+                return outer._persist_destroyed(session_id)
+
+        self.service.desktop_relay = Relay()
+        self.service.lifecycle = Lifecycle()
+        review = asyncio.run(self.service.review_destroy("session-1"))
+
+        destroyed = asyncio.run(
+            self.service.destroy(
+                "session-1",
+                {
+                    "review_token": review.token,
+                    "acknowledge_data_loss": True,
+                },
+            )
+        )
+
+        self.assertEqual(destroyed.state, SessionState.DESTROYED)
+        self.assertEqual(provider_calls, ["session-1"])
+
+    def test_blocked_relay_cleanup_never_delays_provider_teardown(self):
+        outer = self
+
+        async def scenario():
+            entered = asyncio.Event()
+            release = asyncio.Event()
+            provider_calls = []
+
+            class Relay:
+                async def preempt(inner_self, _session_id):
+                    entered.set()
+                    await release.wait()
+
+            class Lifecycle:
+                async def preempt_session(inner_self, _session_id):
+                    return None
+
+                async def destroy_session(inner_self, session_id):
+                    provider_calls.append(session_id)
+                    return outer._persist_destroyed(session_id)
+
+            outer.service.desktop_relay = Relay()
+            outer.service.lifecycle = Lifecycle()
+            review = await outer.service.review_destroy("session-1")
+            destroyed = await asyncio.wait_for(
+                outer.service.destroy(
+                    "session-1",
+                    {
+                        "review_token": review.token,
+                        "acknowledge_data_loss": True,
+                    },
+                ),
+                timeout=1,
+            )
+            outer.assertTrue(entered.is_set())
+            outer.assertEqual(provider_calls, ["session-1"])
+            release.set()
+            await asyncio.sleep(0)
+            return destroyed
+
+        destroyed = asyncio.run(scenario())
+
+        self.assertEqual(destroyed.state, SessionState.DESTROYED)
+
+    def test_relay_owned_agent_bridge_is_revoked_once(self):
+        calls = []
+
+        class Bridge:
+            async def revoke(inner_self, session_id):
+                calls.append(session_id)
+
+        bridge = Bridge()
+
+        class Relay:
+            agent_bridge = bridge
+
+            async def preempt(inner_self, session_id):
+                await bridge.revoke(session_id)
+
+        self.service.agent_bridge = bridge
+        self.service.desktop_relay = Relay()
+
+        asyncio.run(self.service.preempt_session_surfaces("session-1"))
+
+        self.assertEqual(calls, ["session-1"])
+
+    def test_fallback_agent_bridge_revoke_is_time_bounded(self):
+        outer = self
+
+        async def scenario():
+            entered = asyncio.Event()
+            cancelled = asyncio.Event()
+
+            class Bridge:
+                async def revoke(inner_self, _session_id):
+                    entered.set()
+                    try:
+                        await asyncio.Event().wait()
+                    except asyncio.CancelledError:
+                        cancelled.set()
+                        raise
+
+            outer.service.desktop_relay = None
+            outer.service.agent_bridge = Bridge()
+            await outer.service.preempt_session_surfaces("session-1")
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            await asyncio.wait_for(cancelled.wait(), timeout=1)
+            await outer.service.close_surface_tasks()
+            outer.assertEqual(outer.service._surface_tasks, set())
+
+        with mock.patch(
+            "cloud_run.session_service.SURFACE_PREEMPT_TIMEOUT_SECONDS",
+            0.01,
+        ):
+            asyncio.run(scenario())
 
     def test_profile_timeout_or_failure_never_prevents_provider_teardown(self):
         outer = self
@@ -3759,7 +3901,10 @@ class ReusableSessionTests(unittest.TestCase):
             )
 
         self.assertEqual(destroyed.state, SessionState.DESTROYED)
-        self.assertEqual(timeouts, [5])
+        self.assertEqual(
+            timeouts,
+            [SURFACE_PREEMPT_TIMEOUT_SECONDS, 5],
+        )
         self.assertEqual(provider_calls, ["session-1"])
 
     def test_agent_bridge_revocation_failure_never_prevents_teardown(self):

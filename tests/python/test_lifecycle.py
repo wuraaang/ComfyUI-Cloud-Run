@@ -1607,6 +1607,54 @@ class SessionLifecycleTests(LifecycleTestCase):
             ["destroy", "list"],
         )
 
+    def test_direct_destroy_persists_intent_and_preempts_before_provider(self):
+        events = []
+        outer = self
+
+        class TrackingSessionService(RecoveringSessionService):
+            async def preempt_session_surfaces(inner_self, session_id):
+                stored = inner_self.repository.get(session_id)
+                events.append(
+                    (
+                        "preempt",
+                        stored.destroy_requested,
+                        stored.state,
+                    )
+                )
+
+        self.session_service = TrackingSessionService(self.sessions)
+        session = self.save_session(state=SessionState.READY)
+        self.provider.instances = [
+            self.worker_instance(session.instance_id, session.label)
+        ]
+        original_destroy = self.provider.destroy_instance
+
+        async def destroy_after_preempt(api_key, instance_id):
+            stored = outer.sessions.get(session.session_id)
+            events.append(
+                (
+                    "provider",
+                    stored.destroy_requested,
+                    stored.state,
+                )
+            )
+            return await original_destroy(api_key, instance_id)
+
+        self.provider.destroy_instance = destroy_after_preempt
+
+        destroyed = asyncio.run(
+            self.session_lifecycle().destroy_session(session.session_id)
+        )
+
+        self.assertEqual(destroyed.state, SessionState.DESTROYED)
+        self.assertEqual(
+            events,
+            [
+                ("preempt", True, SessionState.DESTROY_REQUESTED),
+                ("provider", True, SessionState.DESTROYING),
+            ],
+        )
+
     def test_recovery_delegates_destroy_request_to_common_teardown(self):
         self.session_service = ResumingTeardownSessionService(self.sessions)
         session = self.save_session(state=SessionState.READY)

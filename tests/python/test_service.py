@@ -2009,10 +2009,19 @@ class DesktopRelayServiceTests(unittest.TestCase):
         relay = Relay()
         worker = object()
         service = self.service(relay, lambda _session: worker)
+        surface_close_calls = []
+
+        async def close_surface_tasks():
+            surface_close_calls.append("surface")
+
+        service.session_service = types.SimpleNamespace(
+            close_surface_tasks=close_surface_tasks,
+        )
 
         asyncio.run(service.recover())
         asyncio.run(service.close())
 
+        self.assertEqual(surface_close_calls, ["surface"])
         self.assertEqual(
             relay.calls,
             [

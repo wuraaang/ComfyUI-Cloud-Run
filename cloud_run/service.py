@@ -1667,6 +1667,13 @@ class CloudRunService:
         close = getattr(reconciler, "close", None)
         if callable(close):
             await close()
+        close_surface_tasks = getattr(
+            self.session_service,
+            "close_surface_tasks",
+            None,
+        )
+        if callable(close_surface_tasks):
+            await close_surface_tasks()
         relay_close = getattr(self.desktop_relay, "close", None)
         if callable(relay_close):
             await relay_close()

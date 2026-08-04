@@ -1141,16 +1141,21 @@ class OfflineDesktopBridgeCampaign:
         assert len(rendered.encode("utf-8")) < 64 * 1024
         self.steps.append(14)
 
-        # 15. Closing both surfaces never ends billing; only the authorized path does.
-        asyncio.run(self.relay.close())
+        # 15. An open Remote Connection is preempted by the authorized path;
+        # closing Desktop itself is neither required nor a billing action.
+        assert self.relay.status().ready is True
         assert len(self.system.vast.inventory) == 1
         assert self.system.vast.destroy_count == 0
         destroy_intent_seen = []
+        relay_ready_at_provider_destroy = []
         original_destroy = self.system.vast.destroy_instance
 
         async def destroy_after_intent(api_key, instance_id):
             stored = self.system.sessions.get(self.session.session_id)
             destroy_intent_seen.append(stored.destroy_requested)
+            relay_ready_at_provider_destroy.append(
+                self.relay.status().ready
+            )
             return await original_destroy(api_key, instance_id)
 
         self.system.vast.destroy_instance = destroy_after_intent
@@ -1166,6 +1171,12 @@ class OfflineDesktopBridgeCampaign:
         assert destroyed.public_payload()["billing_may_continue"] is False
         assert self.system.vast.destroy_count == 1
         assert destroy_intent_seen == [True]
+        assert relay_ready_at_provider_destroy == [False]
+        assert self.relay.status().ready is False
+        forwarded_before_denial = len(self.system.worker.native_requests)
+        denied_after_destroy = self._desktop_get("/object_info", self.cookie)
+        assert denied_after_destroy.status == 503
+        assert len(self.system.worker.native_requests) == forwarded_before_denial
         self.steps.append(15)
 
         # 16. The ordinary local Run still reaches only the existing local backend.

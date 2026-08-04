@@ -128,6 +128,7 @@ DEADLINE_ACTION_SECONDS = {
 DESTROY_REVIEW_TTL_SECONDS = 5 * 60
 READINESS_MAX_ATTEMPTS = 6
 READINESS_WINDOW_SECONDS = 60
+SURFACE_PREEMPT_TIMEOUT_SECONDS = 1
 TEARDOWN_PROFILE_TIMEOUT_SECONDS = 5
 _MAX_PROFILE_ARCHIVE_BYTES = 128 * 1024 * 1024
 _EXTENSION_PATH = re.compile(
@@ -1408,6 +1409,8 @@ class SessionService:
         )
         self._native_prompt_locks = {}
         self._teardown_tasks = {}
+        self._surface_preemptions = set()
+        self._surface_tasks = set()
 
     def _native_prompt_lock(self, session_id):
         loop = asyncio.get_running_loop()
@@ -2207,6 +2210,81 @@ class SessionService:
                 "Agent Panel bridge revocation failed."
             ) from None
 
+    def _track_surface_task(self, task):
+        self._surface_tasks.add(task)
+
+        def finished(completed):
+            self._surface_tasks.discard(completed)
+            if not completed.cancelled():
+                try:
+                    completed.exception()
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+        task.add_done_callback(finished)
+        return task
+
+    @staticmethod
+    async def _bounded_surface_cleanup(awaitable):
+        try:
+            await asyncio.wait_for(
+                awaitable,
+                timeout=SURFACE_PREEMPT_TIMEOUT_SECONDS,
+            )
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            raise
+        except Exception:
+            pass
+
+    async def close_surface_tasks(self):
+        tasks = set(self._surface_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._surface_tasks.difference_update(tasks)
+
+    async def preempt_session_surfaces(self, session_id):
+        identifier = _strict_identifier(session_id, "session ID")
+        if identifier in self._surface_preemptions:
+            return
+        self._surface_preemptions.add(identifier)
+        relay = self.desktop_relay
+        relay_preempt = getattr(relay, "preempt", None)
+        relay_preemption_started = False
+        if callable(relay_preempt):
+            try:
+                result = relay_preempt(identifier)
+                relay_preemption_started = True
+                if inspect.isawaitable(result):
+                    self._track_surface_task(
+                        asyncio.create_task(
+                            result,
+                            name="cloud-vast-relay-preempt-" + identifier,
+                        )
+                    )
+            except Exception:
+                pass
+        bridge = self.agent_bridge
+        revoke = getattr(bridge, "revoke", None)
+        relay_owns_bridge = bool(
+            relay_preemption_started
+            and getattr(relay, "agent_bridge", None) is bridge
+        )
+        if callable(revoke) and not relay_owns_bridge:
+            try:
+                result = revoke(identifier)
+                if inspect.isawaitable(result):
+                    self._track_surface_task(
+                        asyncio.create_task(
+                            self._bounded_surface_cleanup(result),
+                            name="cloud-vast-agent-revoke-" + identifier,
+                        )
+                    )
+            except Exception:
+                pass
+        await asyncio.sleep(0)
+
     def _mark_profile_applied(self, session, profile):
         if profile is None or self.profile_store is None:
             return None
@@ -2714,6 +2792,7 @@ class SessionService:
 
     async def prepare_deadline_destroy(self, session_id):
         session = self._stored_session(session_id)
+        await self.preempt_session_surfaces(session.session_id)
         active = [
             job
             for job in self.job_repository.list_jobs(session.session_id)
@@ -2816,6 +2895,7 @@ class SessionService:
         return task
 
     async def _teardown_session(self, session_id):
+        await self.preempt_session_surfaces(session_id)
         preempt = getattr(self.reconciler, "preempt", None)
         if callable(preempt):
             try:
@@ -2832,12 +2912,6 @@ class SessionService:
                 raise
             except Exception:
                 pass
-        try:
-            await self._revoke_agent_bridge(session_id)
-        except (asyncio.CancelledError, KeyboardInterrupt):
-            raise
-        except Exception:
-            pass
         try:
             await asyncio.wait_for(
                 self.sync_profile(session_id, teardown=True),
@@ -2876,7 +2950,7 @@ class SessionService:
         if not callable(destroy):
             return None
         try:
-            await self._revoke_agent_bridge(session_id)
+            await self.preempt_session_surfaces(session_id)
             return await destroy(
                 session_id,
                 terminal_error=diagnostic,
