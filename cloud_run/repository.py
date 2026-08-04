@@ -393,7 +393,7 @@ def _create_readiness_v14_indexes(connection):
 
 
 def _migrate_readiness_v14(connection):
-    from .readiness import ReadinessCheck, ReadinessReport
+    from .readiness import ReadinessReport, readiness_message
 
     rows = connection.execute(
         """
@@ -412,43 +412,22 @@ def _migrate_readiness_v14(connection):
     for row in rows:
         try:
             stored_checks = json.loads(row["checks_json"])
-            checks = tuple(
-                ReadinessCheck._from_stored_record(
-                    {
-                        "name": item["name"],
-                        "status": item["status"],
-                        "evidence_digest": item["evidence_digest"],
-                        "message": item["message"],
-                        "diagnostic_code": (
-                            "legacy_readiness_failure"
-                            if item["status"] == "failed"
-                            else None
-                        ),
-                    }
-                )
-                for item in stored_checks
-                if isinstance(item, dict)
-                and set(item)
-                in (
-                    {
-                        "name",
-                        "status",
-                        "evidence_digest",
-                        "message",
-                    },
-                    {
-                        "name",
-                        "status",
-                        "evidence_digest",
-                        "message",
-                        "diagnostic_code",
-                    },
-                )
-            )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             raise ValueError("Stored readiness report is invalid.") from None
-        if not isinstance(stored_checks, list) or len(checks) != len(
-            stored_checks
+        if not isinstance(stored_checks, list) or not all(
+            isinstance(item, dict)
+            and set(item)
+            in (
+                {"name", "status", "evidence_digest", "message"},
+                {
+                    "name",
+                    "status",
+                    "evidence_digest",
+                    "message",
+                    "diagnostic_code",
+                },
+            )
+            for item in stored_checks
         ):
             raise ValueError("Stored readiness report is invalid.")
         legacy_identity = {
@@ -467,17 +446,37 @@ def _migrate_readiness_v14(connection):
         ).hexdigest()
         if not hmac.compare_digest(row["report_digest"], legacy_digest):
             raise ValueError("Stored readiness report is invalid.")
-        report = ReadinessReport.create(
-            session_id=row["session_id"],
-            instance_id=row["instance_id"],
-            worker_release_digest=row["worker_release_digest"],
-            manifest_digest=row["manifest_digest"],
-            profile_revision=int(row["profile_revision"]),
-            relay_origin=row["relay_origin"],
-            inventory_observed_at=float(row["inventory_observed_at"]),
-            created_at=float(row["created_at"]),
-            attempt_number=1,
-            checks=checks,
+        normalized_checks = [
+            {
+                "name": item["name"],
+                "status": item["status"],
+                "evidence_digest": item["evidence_digest"],
+                "message": readiness_message(item["name"], item["status"]),
+                "diagnostic_code": (
+                    "legacy_readiness_failure"
+                    if item["status"] == "failed"
+                    else None
+                ),
+            }
+            for item in stored_checks
+        ]
+        normalized_identity = {
+            "session_id": row["session_id"],
+            "instance_id": row["instance_id"],
+            "worker_release_digest": row["worker_release_digest"],
+            "manifest_digest": row["manifest_digest"],
+            "profile_revision": int(row["profile_revision"]),
+            "relay_origin": row["relay_origin"],
+            "inventory_observed_at": float(row["inventory_observed_at"]),
+            "created_at": float(row["created_at"]),
+            "attempt_number": 1,
+            "checks": normalized_checks,
+        }
+        normalized_digest = hashlib.sha256(
+            _canonical_json(normalized_identity).encode("utf-8")
+        ).hexdigest()
+        report = ReadinessReport._from_stored_record(
+            {**normalized_identity, "report_digest": normalized_digest}
         )
         if bool(row["ready"]) != report.ready:
             raise ValueError("Stored readiness report is invalid.")

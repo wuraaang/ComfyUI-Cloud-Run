@@ -12,10 +12,12 @@ class ReadinessValueTests(unittest.TestCase):
         from cloud_run.readiness import (
             REQUIRED_READINESS_CHECKS,
             ReadinessCheck,
+            readiness_message,
         )
 
         self.names = REQUIRED_READINESS_CHECKS
         self.ReadinessCheck = ReadinessCheck
+        self.readiness_message = readiness_message
 
     @staticmethod
     def digest(value):
@@ -26,11 +28,7 @@ class ReadinessValueTests(unittest.TestCase):
             name=name,
             status=status,
             evidence_digest=self.digest(name + ":" + status),
-            message=(
-                "Readiness proof passed."
-                if status == "passed"
-                else "Readiness proof failed."
-            ),
+            message=self.readiness_message(name, status),
             diagnostic_code=(
                 "profile_package_mismatch" if status == "failed" else None
             ),
@@ -45,7 +43,7 @@ class ReadinessValueTests(unittest.TestCase):
                     name=self.names[0],
                     status="failed",
                     evidence_digest="c" * 64,
-                    message="Readiness proof failed.",
+                    message=self.readiness_message(self.names[0], "failed"),
                     diagnostic_code=code,
                 )
         for code in (
@@ -61,14 +59,16 @@ class ReadinessValueTests(unittest.TestCase):
                         name=self.names[0],
                         status="failed",
                         evidence_digest="c" * 64,
-                        message="Readiness proof failed.",
+                        message=self.readiness_message(
+                            self.names[0], "failed"
+                        ),
                         diagnostic_code=code,
                     )
         legacy_record = {
             "name": self.names[0],
             "status": "failed",
             "evidence_digest": "c" * 64,
-            "message": "Readiness proof failed.",
+            "message": self.readiness_message(self.names[0], "failed"),
             "diagnostic_code": "legacy_readiness_failure",
         }
         with self.assertRaises(ValueError):
@@ -85,7 +85,7 @@ class ReadinessValueTests(unittest.TestCase):
                         name=name,
                         status=status,
                         evidence_digest="c" * 64,
-                        message="Readiness proof passed.",
+                        message=self.readiness_message(name, status),
                         diagnostic_code="profile_package_mismatch",
                     )
 
@@ -140,7 +140,7 @@ class ReadinessValueTests(unittest.TestCase):
                     name="unknown_probe",
                     status="passed",
                     evidence_digest="c" * 64,
-                    message="Readiness proof passed.",
+                    message=self.readiness_message("unknown_probe", "passed"),
                 ),
             ),
         ):
@@ -204,6 +204,10 @@ class ReadinessValueTests(unittest.TestCase):
             "X-Debug: internal-host",
             "RuntimeError from private worker.",
             "Traceback contains internal details.",
+            "API key sk-proj-ABC123",
+            "Password hunter2",
+            "AWS access key AKIAIOSFODNN7EXAMPLE",
+            "Credential ABCDEFGHIJKLMNOP",
         ):
             with self.subTest(unsafe_message=unsafe_message):
                 with self.assertRaises(ValueError):
@@ -229,10 +233,8 @@ class ReadinessValueTests(unittest.TestCase):
                     evidence_digest=evidence_digest(
                         private if index == 0 else {"passed": name}
                     ),
-                    message=(
-                        "Readiness proof failed."
-                        if index == 0
-                        else "Readiness proof passed."
+                    message=self.readiness_message(
+                        name, "failed" if index == 0 else "passed"
                     ),
                     diagnostic_code=(
                         "native_http_status" if index == 0 else None
@@ -259,6 +261,35 @@ class ReadinessValueTests(unittest.TestCase):
             "X-Worker-Secret",
         ):
             self.assertNotIn(forbidden, rendered)
+
+    def test_stored_legacy_check_cannot_be_reused_as_live_evidence(self):
+        from cloud_run.readiness import ReadinessCheck, ReadinessReport
+
+        legacy = ReadinessCheck._from_stored_record(
+            {
+                "name": self.names[0],
+                "status": "failed",
+                "evidence_digest": "c" * 64,
+                "message": "Provider instance identity failed.",
+                "diagnostic_code": "legacy_readiness_failure",
+            }
+        )
+        checks = (legacy,) + tuple(
+            self.check(name) for name in self.names[1:]
+        )
+
+        with self.assertRaises(ValueError):
+            ReadinessReport.create(
+                session_id="session-1",
+                instance_id="instance-1",
+                worker_release_digest="a" * 64,
+                manifest_digest="b" * 64,
+                profile_revision=3,
+                relay_origin="http://127.0.0.1:32145",
+                inventory_observed_at=100.0,
+                created_at=101.0,
+                checks=checks,
+            )
 
     def test_attempt_number_participates_in_report_digest(self):
         from cloud_run.readiness import ReadinessReport
@@ -306,6 +337,7 @@ class ReadinessValidatorTests(unittest.IsolatedAsyncioTestCase):
         from cloud_run.readiness import (
             REQUIRED_READINESS_CHECKS,
             ReadinessCheck,
+            readiness_message,
         )
 
         values = []
@@ -320,11 +352,7 @@ class ReadinessValidatorTests(unittest.IsolatedAsyncioTestCase):
                     name=name,
                     status=status,
                     evidence_digest=self.digest(name + ":" + status),
-                    message=(
-                        "Readiness proof passed."
-                        if status in {"passed", "not_required"}
-                        else "Readiness proof failed."
-                    ),
+                    message=readiness_message(name, status),
                     diagnostic_code=(
                         "profile_package_mismatch"
                         if status == "failed"
@@ -386,6 +414,7 @@ class ReadinessValidatorTests(unittest.IsolatedAsyncioTestCase):
             ReadinessCheck,
             ReadinessValidator,
             evidence_digest,
+            readiness_message,
         )
 
         release = SimpleNamespace(
@@ -462,7 +491,14 @@ class ReadinessValidatorTests(unittest.IsolatedAsyncioTestCase):
                             else "passed"
                         ),
                         evidence_digest=evidence_digest(name),
-                        message="Readiness proof passed.",
+                        message=readiness_message(
+                            name,
+                            (
+                                "not_required"
+                                if name == "agent_panel_capabilities"
+                                else "passed"
+                            ),
+                        ),
                     )
                     for name in (
                         "loopback_session_binding",
@@ -515,6 +551,7 @@ class ReadinessRepositoryTests(unittest.TestCase):
             REQUIRED_READINESS_CHECKS,
             ReadinessCheck,
             ReadinessReport,
+            readiness_message,
         )
 
         temporary = tempfile.TemporaryDirectory()
@@ -526,7 +563,7 @@ class ReadinessRepositoryTests(unittest.TestCase):
                 name=name,
                 status="passed",
                 evidence_digest=hashlib.sha256(name.encode("ascii")).hexdigest(),
-                message="Readiness proof passed.",
+                message=readiness_message(name, "passed"),
             )
             for name in self.names
         )

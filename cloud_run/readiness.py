@@ -12,9 +12,6 @@ import time
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
-from .run_errors import sanitize_text
-
-
 REQUIRED_READINESS_CHECKS = (
     "provider_instance_identity",
     "worker_authenticated",
@@ -50,20 +47,6 @@ _STORED_READINESS_DIAGNOSTIC_CODES = (
 )
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}")
 _HEX_64 = re.compile(r"[0-9a-f]{64}")
-_PUBLIC_MESSAGE = re.compile(r"[A-Za-z0-9][A-Za-z0-9 .,'()_-]{0,499}")
-_PRIVATE_MESSAGE_MARKERS = (
-    "authorization",
-    "bearer",
-    "cookie",
-    "exception",
-    "header",
-    "runtimeerror",
-    "secret",
-    "token",
-    "traceback",
-)
-
-
 def _canonical_json(value):
     return json.dumps(
         value,
@@ -132,16 +115,21 @@ def _relay_origin(value):
     return value
 
 
-def _safe_message(value):
-    if (
-        not isinstance(value, str)
-        or not value
-        or len(value.encode("utf-8")) > 500
-        or sanitize_text(value) != value
-        or any(ord(character) < 32 for character in value)
-        or _PUBLIC_MESSAGE.fullmatch(value) is None
-        or any(marker in value.casefold() for marker in _PRIVATE_MESSAGE_MARKERS)
-    ):
+def readiness_message(name, status):
+    """Return the sole public message permitted for one check outcome."""
+    identifier = _identifier(name, "readiness check name")
+    if status not in _STATUSES:
+        raise ValueError("Invalid readiness check status.")
+    suffix = {
+        "passed": "passed.",
+        "failed": "failed.",
+        "not_required": "not required.",
+    }[status]
+    return identifier.replace("_", " ").capitalize() + " " + suffix
+
+
+def _safe_message(value, *, name, status):
+    if value != readiness_message(name, status):
         raise ValueError("Invalid readiness message.")
     return value
 
@@ -162,7 +150,7 @@ class ReadinessCheck:
         ):
             raise ValueError("Invalid readiness check status.")
         _digest(self.evidence_digest, "readiness evidence digest")
-        _safe_message(self.message)
+        _safe_message(self.message, name=self.name, status=self.status)
         allowed_codes = (
             _STORED_READINESS_DIAGNOSTIC_CODES
             if allow_legacy
@@ -239,7 +227,7 @@ class ReadinessReport:
     checks: tuple[ReadinessCheck, ...]
     report_digest: str
 
-    def __post_init__(self):
+    def _validate(self, *, allow_legacy):
         _identifier(self.session_id, "readiness session ID")
         _identifier(self.instance_id, "readiness instance ID")
         _digest(self.worker_release_digest, "worker release digest")
@@ -268,12 +256,17 @@ class ReadinessReport:
             isinstance(item, ReadinessCheck) for item in self.checks
         ):
             raise ValueError("Invalid readiness checks.")
+        for item in self.checks:
+            item._validate(allow_legacy=allow_legacy)
         names = tuple(item.name for item in self.checks)
         if names != REQUIRED_READINESS_CHECKS or set(names) != _CHECK_SET:
             raise ValueError("Readiness checks are incomplete.")
         _digest(self.report_digest, "readiness report digest")
         if self.report_digest != self._calculated_digest():
             raise ValueError("Readiness report digest does not match.")
+
+    def __post_init__(self):
+        self._validate(allow_legacy=False)
 
     @property
     def ready(self):
@@ -336,6 +329,7 @@ class ReadinessReport:
                 or check.name in by_name
             ):
                 raise ValueError("Readiness checks are incomplete.")
+            check._validate(allow_legacy=False)
             by_name[check.name] = check
         if set(by_name) != _CHECK_SET:
             raise ValueError("Readiness checks are incomplete.")
@@ -448,7 +442,13 @@ class ReadinessReport:
             )
             for item in value["checks"]
         )
-        return cls(**normalized)
+        if not stored:
+            return cls(**normalized)
+        report = object.__new__(cls)
+        for name in fields:
+            object.__setattr__(report, name, normalized[name])
+        report._validate(allow_legacy=True)
+        return report
 
     def public_payload(self):
         return {
@@ -568,7 +568,7 @@ class ReadinessValidator:
                     evidence_digest=evidence_digest(
                         {"check": name, "status": "missing"}
                     ),
-                    message="Required readiness proof is unavailable.",
+                    message=readiness_message(name, "failed"),
                     diagnostic_code="profile_package_mismatch",
                 )
         created_at = _timestamp(self.clock(), "readiness creation timestamp")
@@ -643,16 +643,11 @@ class ControllerReadinessProbe:
         status = "not_required" if not_required else (
             "passed" if passed else "failed"
         )
-        label = name.replace("_", " ").capitalize()
         return ReadinessCheck(
             name=name,
             status=status,
             evidence_digest=evidence_digest(proof),
-            message=(
-                label + " passed."
-                if passed or not_required
-                else label + " failed."
-            ),
+            message=readiness_message(name, status),
             diagnostic_code=(
                 None
                 if passed or not_required

@@ -12,7 +12,7 @@ import re
 import secrets
 
 from .agent_bridge import AgentBridgeSession
-from .readiness import ReadinessCheck, evidence_digest
+from .readiness import ReadinessCheck, evidence_digest, readiness_message
 from .repository import DesktopRelayConfig
 from .worker_client import (
     MAX_WORKER_JSON_BYTES,
@@ -424,12 +424,12 @@ class DesktopRelay:
         ):
             raise DesktopRelayError("Desktop readiness probe was rejected.")
 
-        def check(name, status, proof, message, diagnostic_code=None):
+        def check(name, status, proof, diagnostic_code=None):
             return ReadinessCheck(
                 name=name,
                 status=status,
                 evidence_digest=evidence_digest(proof),
-                message=message,
+                message=readiness_message(name, status),
                 diagnostic_code=(
                     diagnostic_code if status == "failed" else None
                 ),
@@ -465,11 +465,6 @@ class DesktopRelay:
                     "session_id": session_id,
                     "profile_revision": profile_revision,
                 },
-                (
-                    "Loopback session binding passed."
-                    if binding_ok
-                    else "Loopback session binding failed."
-                ),
                 "profile_package_mismatch",
             )
 
@@ -521,11 +516,6 @@ class DesktopRelay:
                 "native_http_probe",
                 "passed" if http_ok else "failed",
                 http_proof,
-                (
-                    "Native HTTP readiness probe passed."
-                    if http_ok
-                    else "Native HTTP readiness probe failed."
-                ),
                 http_diagnostic,
             )
 
@@ -573,11 +563,6 @@ class DesktopRelay:
                 "native_websocket_probe",
                 "passed" if websocket_ok else "failed",
                 websocket_proof,
-                (
-                    "Native WebSocket readiness probe passed."
-                    if websocket_ok
-                    else "Native WebSocket readiness probe failed."
-                ),
                 "native_websocket_handshake",
             )
 
@@ -636,11 +621,6 @@ class DesktopRelay:
                 "agent_panel_capabilities",
                 agent_status,
                 agent_proof,
-                (
-                    "Agent Panel readiness probe passed."
-                    if agent_ok
-                    else "Agent Panel readiness probe failed."
-                ),
                 "agent_bridge_unavailable",
             )
             return (binding, http, websocket, agent)

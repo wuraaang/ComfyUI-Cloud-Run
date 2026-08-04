@@ -72,6 +72,7 @@ def readiness_report(
         ReadinessCheck,
         ReadinessReport,
         evidence_digest,
+        readiness_message,
     )
 
     observed = (
@@ -90,10 +91,8 @@ def readiness_report(
                     "status": "failed" if name == failed_check else "passed",
                 }
             ),
-            message=(
-                "Readiness proof failed."
-                if name == failed_check
-                else "Readiness proof passed."
+            message=readiness_message(
+                name, "failed" if name == failed_check else "passed"
             ),
             diagnostic_code=(
                 "native_http_status" if name == failed_check else None
@@ -532,7 +531,10 @@ class JobRepositoryTests(unittest.TestCase):
         )
 
     def test_v13_failed_report_migrates_without_blocking_retry(self):
-        from cloud_run.readiness import REQUIRED_READINESS_CHECKS
+        from cloud_run.readiness import (
+            REQUIRED_READINESS_CHECKS,
+            readiness_message,
+        )
 
         self.path.parent.mkdir(parents=True)
         checks = [
@@ -634,6 +636,12 @@ class JobRepositoryTests(unittest.TestCase):
                 if item.status == "failed"
             ),
             "legacy_readiness_failure",
+        )
+        self.assertTrue(
+            all(
+                item.message == readiness_message(item.name, item.status)
+                for item in migrated.checks
+            )
         )
         self.assertNotEqual(migrated.report_digest, old_digest)
         self.assertIsNone(

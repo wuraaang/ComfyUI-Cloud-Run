@@ -21,6 +21,7 @@ from cloud_run.readiness import (
     ReadinessCheck,
     ReadinessValidator,
     evidence_digest,
+    readiness_message,
 )
 from cloud_run.run_errors import RunErrorCode, RunJournalEntry, RunPhase
 from tests.python.test_fake_session_integration import (
@@ -437,7 +438,7 @@ class OfflineDesktopBridgeCampaign:
                 evidence_digest=evidence_digest(
                     {"check": name, "fixture": "offline-desktop-campaign"}
                 ),
-                message="Offline readiness proof passed.",
+                message=readiness_message(name, "passed"),
             )
             for name in REQUIRED_READINESS_CHECKS
         )
