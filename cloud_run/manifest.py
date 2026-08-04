@@ -17,6 +17,7 @@ PROTOCOL_VERSION = "2"
 
 _HEX_40 = re.compile(r"[0-9a-f]{40}")
 _HEX_64 = re.compile(r"[0-9a-f]{64}")
+_UI_REVISION = re.compile(r"(?:[0-9a-f]{40}|sha256:[0-9a-f]{64})")
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}")
 _GITHUB_PART = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}")
 _R2_BUCKET = re.compile(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]")
@@ -345,6 +346,20 @@ def _validated_identifier(value, name):
     return value
 
 
+def _validated_class_type(value):
+    if (
+        not isinstance(value, str)
+        or not 1 <= len(value) <= 200
+        or value != value.strip()
+        or any(
+            not 32 <= ord(character) <= 126
+            for character in value
+        )
+    ):
+        raise ManifestValidationError("Invalid provided class type.")
+    return value
+
+
 def normalize_github_repository(locator):
     if not isinstance(locator, str) or "%" in locator:
         raise ManifestValidationError("Invalid GitHub repository URL.")
@@ -560,7 +575,7 @@ def _validate_custom_node(node):
         raise ManifestValidationError("Custom node must declare class types.")
     class_types = set()
     for class_type in node.provided_class_types:
-        _validated_identifier(class_type, "provided class type")
+        _validated_class_type(class_type)
         if class_type in class_types:
             raise ManifestValidationError("Provided class types must be unique.")
         class_types.add(class_type)
@@ -571,10 +586,10 @@ def _validate_ui_package(package):
         raise ManifestValidationError("Invalid UI-only package.")
     _validated_identifier(package.package_id, "UI package ID")
     normalize_github_repository(package.repository_url)
-    if not isinstance(package.revision, str) or not _HEX_40.fullmatch(
+    if not isinstance(package.revision, str) or not _UI_REVISION.fullmatch(
         package.revision
     ):
-        raise ManifestValidationError("UI package requires an immutable commit.")
+        raise ManifestValidationError("UI package requires an immutable revision.")
     _validate_artifact(package.archive)
     if package.archive.kind != "ui_package_archive":
         raise ManifestValidationError("UI package archive kind is invalid.")

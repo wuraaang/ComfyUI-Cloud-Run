@@ -137,6 +137,52 @@ def profile(*, path="workflows/example.json", revision=1):
 
 
 class DependencyManifestTests(unittest.TestCase):
+    def test_custom_node_class_types_accept_exact_native_display_names(self):
+        native_names = (
+            "KSampler (Efficient)",
+            "XY Input: Seeds++ Batch",
+            "XY Input: Sampler/Scheduler",
+        )
+        node = custom_node(class_types=native_names)
+
+        try:
+            validated = validate_dependency(node)
+        except ManifestValidationError as exc:
+            self.fail(f"native class type was rejected: {exc}")
+
+        self.assertIs(validated, node)
+
+        for invalid in ("", "line\nbreak", "nul\0byte", "é", "x" * 201):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ManifestValidationError):
+                    validate_dependency(custom_node(class_types=(invalid,)))
+
+    def test_ui_revision_accepts_git_commit_or_explicit_sha256_only(self):
+        for revision in ("a" * 40, "sha256:" + "b" * 64):
+            with self.subTest(revision=revision):
+                package = replace(ui_package(), revision=revision)
+                try:
+                    validated = validate_dependency(package)
+                except ManifestValidationError as exc:
+                    self.fail(f"immutable UI revision was rejected: {exc}")
+                self.assertIs(validated, package)
+
+        for revision in (
+            "main",
+            "b" * 64,
+            "sha256:" + "B" * 64,
+            "sha256:" + "b" * 63,
+            "sha512:" + "b" * 64,
+        ):
+            with self.subTest(revision=revision):
+                with self.assertRaises(ManifestValidationError):
+                    validate_dependency(replace(ui_package(), revision=revision))
+
+        with self.assertRaises(ManifestValidationError):
+            validate_dependency(
+                replace(custom_node(), revision="sha256:" + "b" * 64)
+            )
+
     def test_ui_packages_and_safe_profile_are_distinct_immutable_contracts(self):
         panel = ui_package()
         safe_profile = profile()

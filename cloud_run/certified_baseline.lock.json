@@ -1,0 +1,1119 @@
+{
+  "comfyui_frontend_version": "1.47.10",
+  "custom_nodes": [
+    {
+      "class_types": [
+        "KSampler (Efficient)",
+        "KSampler Adv. (Efficient)",
+        "KSampler SDXL (Eff.)",
+        "Efficient Loader",
+        "Eff. Loader SDXL",
+        "LoRA Stacker",
+        "Control Net Stacker",
+        "Apply ControlNet Stack",
+        "Unpack SDXL Tuple",
+        "Pack SDXL Tuple",
+        "XY Plot",
+        "XY Input: Seeds++ Batch",
+        "XY Input: Add/Return Noise",
+        "XY Input: Steps",
+        "XY Input: CFG Scale",
+        "XY Input: Sampler/Scheduler",
+        "XY Input: Denoise",
+        "XY Input: VAE",
+        "XY Input: Prompt S/R",
+        "XY Input: Aesthetic Score",
+        "XY Input: Refiner On/Off",
+        "XY Input: Checkpoint",
+        "XY Input: Clip Skip",
+        "XY Input: LoRA",
+        "XY Input: LoRA Plot",
+        "XY Input: LoRA Stacks",
+        "XY Input: Control Net",
+        "XY Input: Control Net Plot",
+        "XY Input: Manual XY Entry",
+        "Manual XY Entry Info",
+        "Join XY Inputs of Same Type",
+        "Image Overlay",
+        "Noise Control Script",
+        "HighRes-Fix Script",
+        "Tiled Upscaler Script",
+        "LoRA Stack to String converter",
+        "Evaluate Integers",
+        "Evaluate Floats",
+        "Evaluate Strings",
+        "Simple Eval Examples"
+      ],
+      "curated_archive": {
+        "file_count": 36,
+        "sha256": "0fc239d03f09fc9a78a087b7a6514dafb7b0a614ed5f73ef24f22dd56006eebe",
+        "size_bytes": 26173440
+      },
+      "dropped_dependencies": [
+        "clip-interrogator"
+      ],
+      "package_id": "efficiency-nodes-comfyui",
+      "permitted_paths": [
+        "LICENSE",
+        "__init__.py",
+        "efficiency_nodes.py",
+        "tsc_utils.py",
+        "arial.ttf",
+        "node_settings.json",
+        "js/**",
+        "py/**",
+        "workflows/SimpleEval_Node_Examples.txt"
+      ],
+      "registry_version_id": "03cae633-3466-451d-b479-4ad1e1fbba04",
+      "repository": "https://github.com/jags111/efficiency-nodes-comfyui",
+      "revision": "835bbe14627cccc871822e804c65c734960d3c6e",
+      "source_archive": {
+        "files": [
+          {
+            "path": ".github/FUNDING.yml",
+            "sha256": "ae7be7a17dcb1c5707530994431cc107058ea1f4ac008b431fe0ea669940d984",
+            "size_bytes": 699
+          },
+          {
+            "path": ".github/workflows/publish.yml",
+            "sha256": "ff221e3a4aa306ac947670f8523bb83a47b18420e9e3be4685906d839ca6514e",
+            "size_bytes": 646
+          },
+          {
+            "path": "LICENSE",
+            "sha256": "230184f60bae2feaf244f10a8bac053c8ff33a183bcc365b4d8b876d2b7f4809",
+            "size_bytes": 35823
+          },
+          {
+            "path": "README.md",
+            "sha256": "5de9fbd2009a89e4aa831078af9b02af2778912169f737f001994f41d928540f",
+            "size_bytes": 34351
+          },
+          {
+            "path": "__init__.py",
+            "sha256": "5ed01e337aa8b7eccb9f4ab668a63da08bad5d55e2f25170d213128375436935",
+            "size_bytes": 424
+          },
+          {
+            "path": "arial.ttf",
+            "sha256": "413c78f91bd39e134f3c0bb204b1d5a90f29df9efddc8fd26950a178058d5d74",
+            "size_bytes": 367112
+          },
+          {
+            "path": "efficiency_nodes.py",
+            "sha256": "62a662983fbdfd65cfa25709dabd8af5c2d637c8e03ed19071a9842f84b2c83f",
+            "size_bytes": 237755
+          },
+          {
+            "path": "funding.yml",
+            "sha256": "204aac3959600920bcca68fd8ff8a894ce7c01ab78219dd1dd6513242a4707d7",
+            "size_bytes": 134
+          },
+          {
+            "path": "images/2023-10-31_22-43-17.png",
+            "sha256": "b5a7fc60af089c2cf16a0c6e279e11c2c784e44d9bf3b07fa21a3f6743976862",
+            "size_bytes": 1219515
+          },
+          {
+            "path": "images/2023-11-01_14-25-01.png",
+            "sha256": "7943ae6f9936f7b48e2833e0e49d293157e3f8346fce3bf12bafd92dc8d4fc4a",
+            "size_bytes": 600336
+          },
+          {
+            "path": "images/2023-11-01_19-54-59.png",
+            "sha256": "4b55f115126229e54ec29fbb6d2cefa2ece82e128445fee5755fecdca5519bad",
+            "size_bytes": 627521
+          },
+          {
+            "path": "images/2023-11-04_22-32-57.png",
+            "sha256": "3bc213511bc8fb1114ba5cfbbef35a8421f6bda42cc50c6796128a276c2f0016",
+            "size_bytes": 1655600
+          },
+          {
+            "path": "images/2023-11-04_22-33-57.png",
+            "sha256": "c90961995b0a5a720059f2a38489f29d967782631ed21cb709d9a16caf5f09f6",
+            "size_bytes": 285996
+          },
+          {
+            "path": "images/2023-11-04_22-46-20.png",
+            "sha256": "418fd34689a838eef9a31690fd7bbf636e5b2a2e3177d622670c74c75f80bab5",
+            "size_bytes": 1979121
+          },
+          {
+            "path": "images/2023-11-04_22-47-09.png",
+            "sha256": "87fcbac500ba9a65ba59738ac82cf4d7c228902f9115ec380a49cbab132e8fb4",
+            "size_bytes": 1325680
+          },
+          {
+            "path": "images/2023-11-04_22-57-28.png",
+            "sha256": "2899271284256a2cc516bce60757a12f84400c42302c6ecbda45a15edf07dc5c",
+            "size_bytes": 1018241
+          },
+          {
+            "path": "images/2023-11-04_23-10-03.png",
+            "sha256": "ee638f9712abae2be5f4ecbd94f1de6c6d9ce8cfe8f84bfe80e9923b61b5cc65",
+            "size_bytes": 688086
+          },
+          {
+            "path": "images/2023-11-05_00-02-07.png",
+            "sha256": "99158a881d2268c4393c3d0581b7879e81ca4fcb1a2e1d23956b87e1a2b6b54d",
+            "size_bytes": 235165
+          },
+          {
+            "path": "images/2023-11-05_00-02-34.png",
+            "sha256": "82ab19aa487831aa3ae55012c8e0fc9fbf6c1333c605e82dd6c81213d6e19d48",
+            "size_bytes": 1178567
+          },
+          {
+            "path": "images/2023-12-08_19-53-37.png",
+            "sha256": "dd511dbdf8438582022afba7a0b765355c01cc7f290ab073f0383bcd4256f5ef",
+            "size_bytes": 59438
+          },
+          {
+            "path": "images/2023-12-08_19-54-11.png",
+            "sha256": "d67a3b81c7bf775cdb34562793494cf8da6ca558ff90724289a619a2b7074fc8",
+            "size_bytes": 485527
+          },
+          {
+            "path": "images/2024-01-19_22-39-03.png",
+            "sha256": "c5ab23684f1b37d1b6ad4feb5619cb41fdedcf5393a0b298dab1eed78e482aff",
+            "size_bytes": 321375
+          },
+          {
+            "path": "images/2024-01-19_22-39-26.png",
+            "sha256": "e8294f7483af88dd2b1507a6a8e6511bd85a7e58a45234a30dfb1278fb26c939",
+            "size_bytes": 639281
+          },
+          {
+            "path": "images/2024-01-19_22-39-50.png",
+            "sha256": "7d637f50a14ba6c495ae8922f7b0ab50e9b830793a35dbce91b2c29105db0937",
+            "size_bytes": 515083
+          },
+          {
+            "path": "images/ComfyUI_temp_vpose_00005_.png",
+            "sha256": "84661dabb42054b900dea3c9f3b63c3667d9fb432c51ea4f3b20dbb680c29d9f",
+            "size_bytes": 11000334
+          },
+          {
+            "path": "images/Mgazinelogo01_600.jpg",
+            "sha256": "cae2b1612ad1ec8683adc69a0d071631082202e8b3796ca4f1a1810aea83cef8",
+            "size_bytes": 295155
+          },
+          {
+            "path": "images/README.md",
+            "sha256": "8412e98d59d63d3ab6f02fdc37507de66d9e891f9a6b5ed62806f29235ffa646",
+            "size_bytes": 2121
+          },
+          {
+            "path": "images/jagsP1.png",
+            "sha256": "d8456aa5e941ce76ab03f386ccb520acd05177c115c9fe3eb046a68a344212bf",
+            "size_bytes": 488974
+          },
+          {
+            "path": "images/nodes/AnimateDiff & HiResFix Scripts.gif",
+            "sha256": "d4332dda6b5a323359de760cb57930ad9ca613eb65632e85e93a938be14e57c8",
+            "size_bytes": 6631509
+          },
+          {
+            "path": "images/nodes/AnimateDiff - Node Example.gif",
+            "sha256": "fa88ea5d256f8f4e2dfed6aa387257a6b434ca81540af2fe64370a75104872fb",
+            "size_bytes": 4283195
+          },
+          {
+            "path": "images/nodes/HighResFix - Node Example.gif",
+            "sha256": "339559d35e18ad532d5b255ea268fca6eba2eb046c215c588520b4bf3293112d",
+            "size_bytes": 16751370
+          },
+          {
+            "path": "images/nodes/Image Overlay - Node Example.png",
+            "sha256": "ad1684e6413a1b5435169b8abb388a4c0e39014b6af74bc3e8d6c216bc9b0802",
+            "size_bytes": 1329617
+          },
+          {
+            "path": "images/nodes/NODE - AnimateDiff Script.png",
+            "sha256": "e7836b1ff120ca1c1b1ed16608a2d75fc20192fafb17ee5920de843dce094fe2",
+            "size_bytes": 31421
+          },
+          {
+            "path": "images/nodes/NODE - Eff. Loader SDXL.png",
+            "sha256": "0cebdbf20c7bb35e452fa286bb1b756a2447ff85f52c89214a8c0b12548a868b",
+            "size_bytes": 45975
+          },
+          {
+            "path": "images/nodes/NODE - Efficient Loader.png",
+            "sha256": "bf14e7c0872fe3f575cd2cd63196bb69db3b9425e111c58663a75e1b590ad606",
+            "size_bytes": 52593
+          },
+          {
+            "path": "images/nodes/NODE - Evaluate Floats.png",
+            "sha256": "ae4b23aa4cae76d51b1a7e6b6190dd558904fc9d921ab091ffb3a7358a8d72da",
+            "size_bytes": 20794
+          },
+          {
+            "path": "images/nodes/NODE - Evaluate Integers.png",
+            "sha256": "7fd2ccd566eccbca38c90d289a6f9e2d609c6572f1de3543b6951cfda83c38f1",
+            "size_bytes": 14721
+          },
+          {
+            "path": "images/nodes/NODE - Evaluate Strings.png",
+            "sha256": "7138f60d2caf56bb888dad8b8b3ca19d1e2be9bc76e48ab770e7fba9236259b4",
+            "size_bytes": 17211
+          },
+          {
+            "path": "images/nodes/NODE - HighRes-Fix Script.png",
+            "sha256": "a23ef329454efd9db51baf4d39c08b8ce80402cbac080dbc9447e2770157bfae",
+            "size_bytes": 36677
+          },
+          {
+            "path": "images/nodes/NODE - Image Overlay.png",
+            "sha256": "2760e0de33cfdc8d295d696c54869d991db384b545c2d80dcdb7b7b979acbeb8",
+            "size_bytes": 23799
+          },
+          {
+            "path": "images/nodes/NODE - KSampler (Efficient).png",
+            "sha256": "7a985629f7d33ebd777512d327276e1adf322a1b6abbaf8f6687d35f0a28bcd4",
+            "size_bytes": 48214
+          },
+          {
+            "path": "images/nodes/NODE - KSampler Adv. (Efficient).png",
+            "sha256": "cc9103b249713bf45076dfc88813b5c6424b9e3020fbe979f2d8619980cd7c45",
+            "size_bytes": 59455
+          },
+          {
+            "path": "images/nodes/NODE - KSampler SDXL (Eff.).png",
+            "sha256": "da34afe4be06489cb0d0c27992724c057e59f9e092c668c1bac072e5c55f2227",
+            "size_bytes": 46228
+          },
+          {
+            "path": "images/nodes/NODE - Noise Control Script.png",
+            "sha256": "a2e1a905b4152cb334926b06529175b941c5b7e5436ca9ff07cdbd5f362b0580",
+            "size_bytes": 17300
+          },
+          {
+            "path": "images/nodes/NODE - Tiled Upscaler Script.png",
+            "sha256": "7e6f42d38a42f05a7a8d78c57b4e5410b8d3115debc97aedc5cf906e88060632",
+            "size_bytes": 32291
+          },
+          {
+            "path": "images/nodes/NODE - XY Plot Script.png",
+            "sha256": "4131f95dc338cfd826d23f4a9b90121b53c1344e74c481eebbf6ca9bf924b11d",
+            "size_bytes": 24379
+          },
+          {
+            "path": "images/nodes/NODE - XY Plot.png",
+            "sha256": "58e414eae6414d2b9f1061a8a6dc71cbd2eaa52364ffd927224dfd8a01e71790",
+            "size_bytes": 16107
+          },
+          {
+            "path": "images/nodes/NodeMenu - Efficient Loaders.png",
+            "sha256": "f3141936bed0e1cd9f6bf626e59ac6ea8d218d8977ba10aaf90db4ac124ca50f",
+            "size_bytes": 5609
+          },
+          {
+            "path": "images/nodes/ScriptChain.png",
+            "sha256": "144e4cc9c34178e37a2af1042b2f14ea9424eda5e9a69f6de71004ce83d7d961",
+            "size_bytes": 331011
+          },
+          {
+            "path": "images/nodes/Tiled Upscaler - Node Example.gif",
+            "sha256": "5cb52aa4fcfdd886aa86807f6a93b1d7ec11d762fbadf9f72770ee797bc9043f",
+            "size_bytes": 15109903
+          },
+          {
+            "path": "images/nodes/XY Plot - Node Example.png",
+            "sha256": "0fe94a6c59975487dfed24059ff8fcdcc4d706afd572d9a4bc22cf0455dcb20c",
+            "size_bytes": 1097982
+          },
+          {
+            "path": "images/nodes/readme.md",
+            "sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+            "size_bytes": 1
+          },
+          {
+            "path": "js/appearance.js",
+            "sha256": "0738488f32f5f261435043264114a5076e43f76d7f140887cdf1584e3c8b5317",
+            "size_bytes": 3472
+          },
+          {
+            "path": "js/gif_preview.js",
+            "sha256": "2c64d9d1959a362951cdb973014ee80edf5630e88d576a94bbfc69e3913d1f05",
+            "size_bytes": 4612
+          },
+          {
+            "path": "js/node_options/addLinks.js",
+            "sha256": "4e47a071ed7c407dc9260c41c149f4524c777fd912ed4bd88226042764533e14",
+            "size_bytes": 6436
+          },
+          {
+            "path": "js/node_options/addScripts.js",
+            "sha256": "dcfb5774de43966d3803c0533efd46c7284ac2f1ab6506b0c0afcb3945f74914",
+            "size_bytes": 6150
+          },
+          {
+            "path": "js/node_options/addXYinputs.js",
+            "sha256": "d22c02457897c87906b5d0a3476f21adf98098b3d123be89ac68156f9158c86f",
+            "size_bytes": 2996
+          },
+          {
+            "path": "js/node_options/common/modelInfoDialog.css",
+            "sha256": "8d73b8d86d385ae874297e57514c98b956e884a1f539ea4998276669a190d447",
+            "size_bytes": 1856
+          },
+          {
+            "path": "js/node_options/common/modelInfoDialog.js",
+            "sha256": "6bab196aab12fb3ae2651123c3afa531e5fbee277e57952546916ed4d108f1c5",
+            "size_bytes": 7338
+          },
+          {
+            "path": "js/node_options/common/utils.js",
+            "sha256": "8c2b806fb6ff5624097632b4b324a9af5f487548e924ec5debd54af21bca2115",
+            "size_bytes": 2867
+          },
+          {
+            "path": "js/node_options/modelInfo.js",
+            "sha256": "6377dc6fdb37ba62fa7d810bd39d37e7bc781b0870d7592f03db3b4ff8870811",
+            "size_bytes": 8981
+          },
+          {
+            "path": "js/node_options/setResolution.js",
+            "sha256": "a62aca389e73d66906051af1936c2e177f7bb06a8da3191d9951c1dace959287",
+            "size_bytes": 2709
+          },
+          {
+            "path": "js/node_options/swapLoaders.js",
+            "sha256": "51bd3fe4ab1200c5cb840a255177cc644795ce11936c9276cda80c19b1a011d7",
+            "size_bytes": 4637
+          },
+          {
+            "path": "js/node_options/swapSamplers.js",
+            "sha256": "4580909d4663d3f2fb5f4bf5c35349b802cbbd8ecc521f4decff4026d65be137",
+            "size_bytes": 7687
+          },
+          {
+            "path": "js/node_options/swapScripts.js",
+            "sha256": "bb863cd44f701da255c96e25058ab2b0a2629b1b136acace029b35e04ef58a64",
+            "size_bytes": 3476
+          },
+          {
+            "path": "js/node_options/swapXYinputs.js",
+            "sha256": "21dfd361cb2c1f3cf8514848f90a4357a0fca3834dae9d98152fb085e197a482",
+            "size_bytes": 3118
+          },
+          {
+            "path": "js/previewfix.js",
+            "sha256": "c151209ac1c694d00c8542490cf444c4a75dffd50bb1ad617e5f3cb8456ceba1",
+            "size_bytes": 2435
+          },
+          {
+            "path": "js/seedcontrol.js",
+            "sha256": "f87a175ccd18940857e3db474c7a51642cfe5979236090a77a161ca28e51e202",
+            "size_bytes": 9581
+          },
+          {
+            "path": "js/widgethider.js",
+            "sha256": "3a6024ffd021b9e62c02b4c81dbaa928fac9e21a1e75eee094631cb6eb8bcc4f",
+            "size_bytes": 28598
+          },
+          {
+            "path": "js/workflowfix.js",
+            "sha256": "2e90ac4ad907ad495632445a80c9df66f56f0c13f9c1bc6a56c36955a5013075",
+            "size_bytes": 6622
+          },
+          {
+            "path": "models/readme.md",
+            "sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+            "size_bytes": 1
+          },
+          {
+            "path": "node_settings.json",
+            "sha256": "0f8593e080ca264aeffa3ffa412669885ef9c4ff8706d75355ffb76e0ae4b38c",
+            "size_bytes": 330
+          },
+          {
+            "path": "py/__init__.py",
+            "sha256": "334359b90efed75da5f0ada1d5e6b256f4a6bd0aee7eb39c0f90182a021ffc8b",
+            "size_bytes": 1
+          },
+          {
+            "path": "py/bnk_adv_encode.py",
+            "sha256": "dde7d0b111f47ce76c6aa5c5092db31f27ed31529fbb1280583248e5d8bc4bcb",
+            "size_bytes": 15402
+          },
+          {
+            "path": "py/bnk_tiled_samplers.py",
+            "sha256": "5ca9e552de8da85641139bb688077d92f6a557a8b5b927338edd9160e78e2172",
+            "size_bytes": 17947
+          },
+          {
+            "path": "py/bnk_tiling.py",
+            "sha256": "195352d36406dcf34f6e20ffdab0258331d5e897bc0aaf9b1900efbdd4e5b25b",
+            "size_bytes": 7224
+          },
+          {
+            "path": "py/cg_mixed_seed_noise.py",
+            "sha256": "41e1092cb51ca3adf2639da09d3a1cd92ceb8a14c7eab66930e8aa48681c6f64",
+            "size_bytes": 921
+          },
+          {
+            "path": "py/city96_latent_upscaler.py",
+            "sha256": "4e82d84ea657f45ecd713dd2fa0b50503563bbc0432169f26a04c6e9ee63a528",
+            "size_bytes": 2636
+          },
+          {
+            "path": "py/sd15_resizer.pt",
+            "sha256": "8fa1cb8168b305d556f2e8178c820b0a6956f4ba84ebc9443fac69be43ffd6fe",
+            "size_bytes": 12628977
+          },
+          {
+            "path": "py/sdxl_resizer.pt",
+            "sha256": "0bca261c96e136cb9e2f330f40386e6cbcaaf464cd39e9f7752c9e7b32e825e8",
+            "size_bytes": 12628977
+          },
+          {
+            "path": "py/smZ_cfg_denoiser.py",
+            "sha256": "c2e3d280f84a97fbd5039bfca4a3b76182a9efd0ebdd7ab79dcdb49a0ff5588b",
+            "size_bytes": 39429
+          },
+          {
+            "path": "py/smZ_rng_source.py",
+            "sha256": "ced5860f4103e71b5652ae9fbc15411991dbd59adec75bc16fbef10319f7dff9",
+            "size_bytes": 5114
+          },
+          {
+            "path": "py/ttl_nn_latent_upscaler.py",
+            "sha256": "03aab7c9298e5613ff0cab267d6c3de86226bc40e32e700ab7a068a8516656cf",
+            "size_bytes": 10615
+          },
+          {
+            "path": "pyproject.toml",
+            "sha256": "0f66cbd7303605bd8a09802ae904eb6006091101e35cca58c7d8614ec08ab28e",
+            "size_bytes": 657
+          },
+          {
+            "path": "requirements.txt",
+            "sha256": "dc2e8242538b479d8ddf2a976e94ec10848e6de398d6e752fc56c683f1b9e2f4",
+            "size_bytes": 29
+          },
+          {
+            "path": "tsc_utils.py",
+            "sha256": "dbd2f8986b0c5cdf77a455e4e20e2daf61f91d73dbf3b4b05860ab669b8aaa79",
+            "size_bytes": 23914
+          },
+          {
+            "path": "workflows/AnimateDiff & HiResFix Scripts.gif",
+            "sha256": "d4332dda6b5a323359de760cb57930ad9ca613eb65632e85e93a938be14e57c8",
+            "size_bytes": 6631509
+          },
+          {
+            "path": "workflows/EFF_TiledscriptWorkflow.png",
+            "sha256": "6e4f4df1c61c8ffa86112d81f7d154a9a1b6f3a7474756849cd9908e1d8b6b13",
+            "size_bytes": 541767
+          },
+          {
+            "path": "workflows/Eff_XYPlot - LoRA Model vs Clip Strengths01.png",
+            "sha256": "bd5564042d47898777555cef925d9270a8f1d8ae2c166556badc4dbdada30152",
+            "size_bytes": 1473257
+          },
+          {
+            "path": "workflows/Eff_animatediff_script_wf001.png",
+            "sha256": "5dd5fa90eaa9315935123e7ef02ea08ffed81a87549bde79d223c0bee1efe570",
+            "size_bytes": 313651
+          },
+          {
+            "path": "workflows/Eff_multiKsampler_withScriptsSDXL.png",
+            "sha256": "fd89b5ab9501928c852d6760c20fd2debd9e4f16573fda6aeb00d2d87b0f6674",
+            "size_bytes": 6035640
+          },
+          {
+            "path": "workflows/HiResFix Script.png",
+            "sha256": "13220cef9a2371592cee86c494e0c58b95a9b4e5258e9a06fdb2d73930fafff9",
+            "size_bytes": 1046496
+          },
+          {
+            "path": "workflows/HiResfix_workflow.png",
+            "sha256": "96e0ae538673a8d06e767d0883a4fed52c111e48d780c709b84be9fa556b3b61",
+            "size_bytes": 779446
+          },
+          {
+            "path": "workflows/SDXL Refining & Noise Control Script.png",
+            "sha256": "020fbd729fa01793b214b315ca5f8e9102f3600199810755e360ed28fe6104fa",
+            "size_bytes": 1088960
+          },
+          {
+            "path": "workflows/SDXL_base_refine_noise_workflow.png",
+            "sha256": "57070784efece2cf03396e4512d7723cf0384fe5d8f3ba25ad7d329f33f5a6d6",
+            "size_bytes": 1731313
+          },
+          {
+            "path": "workflows/SimpleEval_Node_Examples.txt",
+            "sha256": "3a2e104bba99745df0bcd467574efebdfc9e97bbbca449d88d362b31c4c187ed",
+            "size_bytes": 2152
+          },
+          {
+            "path": "workflows/Tiled Upscaler Script.png",
+            "sha256": "da8095a7c844893cc69dd1ee161147ba7d92ad0f37a8bcc96ef3bb1a7a53a7d3",
+            "size_bytes": 2391389
+          },
+          {
+            "path": "workflows/XY Plot Input Manual Entry Notes.txt",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "size_bytes": 0
+          },
+          {
+            "path": "workflows/XYPlot - LoRA Model vs Clip Strengths.png",
+            "sha256": "94ac42ed71cb0da01489897c23cb3cbcac07c90891cd33c3ab2697c251f8c886",
+            "size_bytes": 1619439
+          },
+          {
+            "path": "workflows/XYPlot - Seeds vs Checkpoints & Stacked Scripts.png",
+            "sha256": "c8b49cc06c71eee5a911740321126e976dc47fd4f356f1974b117047a4e21ab9",
+            "size_bytes": 1189821
+          },
+          {
+            "path": "workflows/eff_animatescriptWF001.gif",
+            "sha256": "f8d9caa168bda753ab909e8a5da766867371d359d7e168f0e97431bf51ba42b0",
+            "size_bytes": 13015298
+          }
+        ],
+        "sha256": "3061180cbe2afd1c8301875af9bff555e1462814020de791019162767bd64c8f",
+        "size_bytes": 131210938,
+        "url": "https://cdn.comfy.org/jags111/efficiency-nodes-comfyui/1.0.9/node.zip"
+      },
+      "version": "1.0.9",
+      "web": {
+        "file_count": 18,
+        "root": "js",
+        "sha256": "c91b4a8c3a944e40e248990c3ef2f8f12971e466fbfb67265f50d60bbfd64351",
+        "size_bytes": 113571
+      },
+      "wheels": [
+        {
+          "distribution": "simpleeval",
+          "filename": "simpleeval-1.0.7-py3-none-any.whl",
+          "sha256": "97ac271bfd8f2af9e7b9a36ceea67617f26fa873f9d5ae1922f64d4c1442534b",
+          "size_bytes": 18792,
+          "url": "https://files.pythonhosted.org/packages/0f/2f/f32aa85591882378bb43caa09363f3ed97df399369a5144c7f19f2275bc0/simpleeval-1.0.7-py3-none-any.whl"
+        }
+      ]
+    }
+  ],
+  "protected_distributions": [
+    "accelerate",
+    "aiohttp",
+    "comfyui",
+    "comfyui-frontend-package",
+    "numpy",
+    "open-clip-torch",
+    "pillow",
+    "pip",
+    "requests",
+    "safetensors",
+    "setuptools",
+    "torch",
+    "torchaudio",
+    "torchvision",
+    "transformers",
+    "wheel"
+  ],
+  "schema_version": 1,
+  "ui_packages": [
+    {
+      "curated_archive": {
+        "sha256": "c0e05111db15e8bc040c63ff9457fc142326afab66532f942b631f268fb606be",
+        "size_bytes": 2908160
+      },
+      "package_id": "comfyui-agent-panel",
+      "permitted_paths": [
+        "LICENSE",
+        "web/**"
+      ],
+      "registry_version_id": "e4ad28a2-549e-4804-9927-b4699ad5ec0f",
+      "repository": "https://github.com/artokun/comfyui-mcp-panel",
+      "required_capabilities": [
+        "graph_read",
+        "graph_edit",
+        "native_run",
+        "native_batch"
+      ],
+      "revision": "e4de6a5a2e8fbcde166b5fe2983bf3404ca10e0b",
+      "source_archive": {
+        "files": [
+          {
+            "path": ".comfyignore",
+            "sha256": "0998cbf9e30c20e8cdb4c31e2bc9f9ec5839ae6da6651a67f2ad3c3bb4bc83df",
+            "size_bytes": 1655
+          },
+          {
+            "path": ".gitignore",
+            "sha256": "c3c42f88ccf31f94ea7af70d1b5e762a20c456d7238047574e9386904a3fd4ef",
+            "size_bytes": 369
+          },
+          {
+            "path": "LICENSE",
+            "sha256": "5110e81ef1f46c9a942c912ec517092ba9e5384c37891a9d70adefc37f17074a",
+            "size_bytes": 1087
+          },
+          {
+            "path": "README.md",
+            "sha256": "38a84e6e7397191033b9410907aa342f78bf3fb55e5aeb224fba3b432dbb87d1",
+            "size_bytes": 18022
+          },
+          {
+            "path": "__init__.py",
+            "sha256": "eb48cba62081aa71bf317ead679eaa8225679d377c8c709c528ce2263495b6f2",
+            "size_bytes": 30148
+          },
+          {
+            "path": "assets/banner.png",
+            "sha256": "82e5230949d607676978f5ae7d7e431d07001f7703d92ab648ebc542b8f9564b",
+            "size_bytes": 294185
+          },
+          {
+            "path": "assets/icon.png",
+            "sha256": "f467bf6c68555cd2cb5d49a24ba167b8841caf0b4a69de32550f4c0255cc04ca",
+            "size_bytes": 14709
+          },
+          {
+            "path": "assets/legacy/banner-v1-mcp-panel.png",
+            "sha256": "f252ce8833e9c4eeb5c55d1afc0aec136115e686891acfd450099819f783a521",
+            "size_bytes": 91122
+          },
+          {
+            "path": "assets/legacy/banner-v2-pillow.png",
+            "sha256": "780c712072f0104fc1bfb427ff934001ee210c00350a90d2548dc5cf17dd2e3c",
+            "size_bytes": 356690
+          },
+          {
+            "path": "assets/legacy/icon-v1-mcp-panel.png",
+            "sha256": "f467bf6c68555cd2cb5d49a24ba167b8841caf0b4a69de32550f4c0255cc04ca",
+            "size_bytes": 14709
+          },
+          {
+            "path": "assets/legacy/icon-v2-pillow.png",
+            "sha256": "8510f296c9f8c06c00fdc4bb763f038ac13c57af373e345ce2dcb7cb6a0e45f4",
+            "size_bytes": 75475
+          },
+          {
+            "path": "assets/legacy/og-v2-pillow.png",
+            "sha256": "f3df35b460744253865a53562b4e739b8640df52a98034ec2da33c8deb68d309",
+            "size_bytes": 284847
+          },
+          {
+            "path": "assets/og.png",
+            "sha256": "22eb4a31cf7bfc6e783421caef76597da16980a5659aeb8c2618c75aa981569f",
+            "size_bytes": 763961
+          },
+          {
+            "path": "py/__init__.py",
+            "sha256": "aff6d376f837056123b4e9652a10b79ac7facb031b50ed1e0a9429dae1b2063d",
+            "size_bytes": 77
+          },
+          {
+            "path": "py/apps_routes.py",
+            "sha256": "02b3c8f5fe4e21b1136bd61924d9c228f065803c0f600e582a3ec9d44d32b730",
+            "size_bytes": 25009
+          },
+          {
+            "path": "py/civitai_proxy.py",
+            "sha256": "04ff500f9fc319f026aac51f0006ed88c416c128e9ed8f363295e93ef7890000",
+            "size_bytes": 23615
+          },
+          {
+            "path": "py/training_routes.py",
+            "sha256": "70c2e19f476e8b7f74bd1f0197555bbee74bd8c075c44dfc0e4c2d6624cfa82a",
+            "size_bytes": 9106
+          },
+          {
+            "path": "pyproject.toml",
+            "sha256": "18d5b43b6ade357203063cca475cada88012a3a7f4c5f751e8adf0bedbe9bf4e",
+            "size_bytes": 1747
+          },
+          {
+            "path": "web/img/comfyui-mcp-logo.png",
+            "sha256": "025870b0fc4c8a04aec9f0d83e278e852864c89f58b71c5409cc8d539277e72e",
+            "size_bytes": 9663
+          },
+          {
+            "path": "web/img/comfyui-mcp-wordmark.svg",
+            "sha256": "97e15ba44c1bb961839fc60240667790a680d96e3585d54f782b8d789b380a08",
+            "size_bytes": 778
+          },
+          {
+            "path": "web/js/cmcp-a2ui-lit-adapter.js",
+            "sha256": "f855eb001a7fa9b63fdcd315a98589946ea957a23c4461aa3705bda3160c1f93",
+            "size_bytes": 6498
+          },
+          {
+            "path": "web/js/cmcp-a2ui.js",
+            "sha256": "14a5e44fc53fc0fb09a257b5ea2c2ab5a2772795fe0f1245409bb4a5fdc0bddd",
+            "size_bytes": 30991
+          },
+          {
+            "path": "web/js/cmcp-apps-ui.js",
+            "sha256": "a4f54bd4cc1bdcfe6bb1eff7db9ffbc216487c5e296c4536dd79b178061bc66d",
+            "size_bytes": 86670
+          },
+          {
+            "path": "web/js/cmcp-apps.js",
+            "sha256": "29decc14428115bc41fc312d2982a28dad8cecde9dc3cefc4157359a409eff7c",
+            "size_bytes": 13708
+          },
+          {
+            "path": "web/js/cmcp-civitai-ui.js",
+            "sha256": "4ce9bfa211f1f592122811fecc173ee940ccf66243dc9a3e109f503e5a0d6182",
+            "size_bytes": 108604
+          },
+          {
+            "path": "web/js/cmcp-civitai.js",
+            "sha256": "ebc229c8d60bc290f025200a15a3a9ddc324c2b29ae0195dec3e0361906b1603",
+            "size_bytes": 47268
+          },
+          {
+            "path": "web/js/cmcp-filter.js",
+            "sha256": "cba5a82d1d72d82405dc11ba60e59eed748ee5527d4364eb67e57bb708ce5f03",
+            "size_bytes": 4667
+          },
+          {
+            "path": "web/js/cmcp-modal.js",
+            "sha256": "81c8e4cd59cfe7ad5f8c443f17cd77d22d17655a69dd4dbc5deffe3ea1c2d4f4",
+            "size_bytes": 8883
+          },
+          {
+            "path": "web/js/cmcp-runpod-ui.js",
+            "sha256": "ee469966b4c35cf45985c4345bc34d5e68249f1cb99870cf61ab8f6eb7501055",
+            "size_bytes": 19864
+          },
+          {
+            "path": "web/js/cmcp-sidepanel-ui.js",
+            "sha256": "00e85995ec29ed7e6ab3ee563913e8c2aac9a01ae25a11b5ddc5723d8a281d73",
+            "size_bytes": 20606
+          },
+          {
+            "path": "web/js/cmcp-training-ui.js",
+            "sha256": "ce2a4431e7d00c1d61c9e8f8ffab425aa8606c66862e3bff5a917891a2d3275e",
+            "size_bytes": 82806
+          },
+          {
+            "path": "web/js/comfyui-mcp-panel.js",
+            "sha256": "9b17b0a71e315a86b42a114d8f1ea38837da9debcfd2444fafa6e0e50b5728d2",
+            "size_bytes": 1085806
+          },
+          {
+            "path": "web/js/lib/asset-staleness.js",
+            "sha256": "af457d34ba215d506ac2fc7edc3aaffff65b54c9cd2023083f0b3ed9671042c8",
+            "size_bytes": 31561
+          },
+          {
+            "path": "web/js/lib/chat-history-store.js",
+            "sha256": "e915d589cb3b8d11632699f783f1173b1c4d4f806dd7de24ddc7826df0f3553a",
+            "size_bytes": 73065
+          },
+          {
+            "path": "web/js/lib/chat-media.js",
+            "sha256": "cd67355af26ea2b4178ff498094e00ff974fdd8465f507548294b720de8df630",
+            "size_bytes": 3805
+          },
+          {
+            "path": "web/js/lib/chat-serialize.js",
+            "sha256": "0d56e31a577ef69e1009b7f8393d23ffc93de0ca742cc476747ceb13673cdf9c",
+            "size_bytes": 6351
+          },
+          {
+            "path": "web/js/lib/clipboard-store.js",
+            "sha256": "a3209058193354573886ae37013606f2c9f93b0861e85cc4cdbdfa9547c760b2",
+            "size_bytes": 8580
+          },
+          {
+            "path": "web/js/lib/command-dedupe.js",
+            "sha256": "80b8b81fcf1b4379885142c2c4f688d7028f0bf6c43dece01269016a6ae7d924",
+            "size_bytes": 10039
+          },
+          {
+            "path": "web/js/lib/command-liveness.js",
+            "sha256": "a1cd908dcaaf6790b468241666bf7eb97ce1d14221e2aaf1eaa224f053695571",
+            "size_bytes": 14747
+          },
+          {
+            "path": "web/js/lib/connect-match.js",
+            "sha256": "c1f711fa3181a9be332580796c1595a6d6e444f03fd6f08e8ba51b204ae3c362",
+            "size_bytes": 16870
+          },
+          {
+            "path": "web/js/lib/connect-verify.js",
+            "sha256": "03b9c7c1aa3259ea7abb71b6de39812a8a30fd22b411f6fc7906a6791571f173",
+            "size_bytes": 4894
+          },
+          {
+            "path": "web/js/lib/control-after-generate.js",
+            "sha256": "f67b12e26dee843fbcea0f6cfd9cdf6e884944579b1f3694fb39ee4c9c25a3d2",
+            "size_bytes": 7650
+          },
+          {
+            "path": "web/js/lib/download-refresh.js",
+            "sha256": "b746b0f4f8037a958dac09778779f5741289ec575ac02d51e556aa39261a1650",
+            "size_bytes": 2782
+          },
+          {
+            "path": "web/js/lib/graph-binding.js",
+            "sha256": "cdcd7fa46a39897acf722182379e1857b61ae7705d21a4229dcc2dfebd66cc14",
+            "size_bytes": 23573
+          },
+          {
+            "path": "web/js/lib/graph-read.js",
+            "sha256": "613bb1a7f69b77bbfe09ff1604ebd0923e87a8c7d8bb2821510cf585696e6c79",
+            "size_bytes": 9725
+          },
+          {
+            "path": "web/js/lib/graph-revert.js",
+            "sha256": "0ebd259e674587733979e303706fb2d1df90c0c4c438eb5613026d2e056b4943",
+            "size_bytes": 3307
+          },
+          {
+            "path": "web/js/lib/group-geometry.js",
+            "sha256": "a531377264158d83865880e51315dd49b456929f4c5889dc10e1c0040ddcee02",
+            "size_bytes": 11591
+          },
+          {
+            "path": "web/js/lib/history-reconcile.js",
+            "sha256": "2b0acf8433d095b03543a79f9a9efba56d877a6fc634b1e7d161a21e6fa034f2",
+            "size_bytes": 9030
+          },
+          {
+            "path": "web/js/lib/ime.js",
+            "sha256": "e806f79dec815320f5f27d3b744e032fcc4286b55e8caf80cfd9ded199922e09",
+            "size_bytes": 1105
+          },
+          {
+            "path": "web/js/lib/input-asset.js",
+            "sha256": "01e60f070574079d6deb4e32cbee97695556115ae0dd02e9aa8d6155606c75f1",
+            "size_bytes": 14646
+          },
+          {
+            "path": "web/js/lib/layout-engine.js",
+            "sha256": "1fadc1f2b8a53a00d06ecfdcf97dd6b977b9e1a44b46b6391327b10a2c2dc17f",
+            "size_bytes": 15331
+          },
+          {
+            "path": "web/js/lib/lightbox-gallery.js",
+            "sha256": "0fcf76319362e13a00559a875dc7ca9954a64842922fcb337730c090e3f685ca",
+            "size_bytes": 6347
+          },
+          {
+            "path": "web/js/lib/ltx-director.js",
+            "sha256": "d13fc0e37c089be1d2f1613c2eea7084b1e7cdd254986ddc64150d5ded635fcd",
+            "size_bytes": 16390
+          },
+          {
+            "path": "web/js/lib/manager-install.js",
+            "sha256": "e0ad1a2b3dc78fca5eddd8de5aa707b7c0a26f7ed2173e0506bb378695f73636",
+            "size_bytes": 34703
+          },
+          {
+            "path": "web/js/lib/manual-change-gate.js",
+            "sha256": "3299c4875d0a1d2cb52a796374bc8fbfde17af89b85c01e7175ff216494e905d",
+            "size_bytes": 3503
+          },
+          {
+            "path": "web/js/lib/model-catalog.js",
+            "sha256": "9eaad9615ae692180aab34af88c6db13660966c02568d950c2f4f7e76e834c1b",
+            "size_bytes": 9040
+          },
+          {
+            "path": "web/js/lib/node-resolve.js",
+            "sha256": "2c525cfe5d83510f97f74345844736107023ce8007875917887d252078d2ef37",
+            "size_bytes": 40252
+          },
+          {
+            "path": "web/js/lib/object-info-history.js",
+            "sha256": "88b578b230abaeeaff937c0c7da0c3733c7a7cd1863de6b6edfaae8111b59817",
+            "size_bytes": 9129
+          },
+          {
+            "path": "web/js/lib/open-outcome.js",
+            "sha256": "0b9dd471206c9d385098bece4e13c50f286abffcb549256bb7a7ecaf7f596749",
+            "size_bytes": 18357
+          },
+          {
+            "path": "web/js/lib/paste-report.js",
+            "sha256": "91887ffd294fb00e1098b7ebfd51715344fa4f22b21c7f8b85c9d10d743ed0d4",
+            "size_bytes": 9795
+          },
+          {
+            "path": "web/js/lib/pi-readiness.js",
+            "sha256": "8e5cb9682a0612635fd2ab5ef1f57285f09cf85efb9b05af6fadd3beff4db19b",
+            "size_bytes": 424
+          },
+          {
+            "path": "web/js/lib/plan-glyph.js",
+            "sha256": "b73e8bcbb41dcd0eab2e996a1a2d00da92f0dc40329e3d9a47956056bbc20bb8",
+            "size_bytes": 1210
+          },
+          {
+            "path": "web/js/lib/prompt-relay-timeline.js",
+            "sha256": "dbc3bfeef174ce703ff7ef2e3f84b201b63084bbc32be12edd7a85597363b3d1",
+            "size_bytes": 60959
+          },
+          {
+            "path": "web/js/lib/queue-rejection.js",
+            "sha256": "dfd3f04acff036fd3bea06c41a1369c9ad6eecc67b55b5998c25b89554ca32ce",
+            "size_bytes": 5090
+          },
+          {
+            "path": "web/js/lib/reconnect-staleness.js",
+            "sha256": "6620d15d7f708fb809601ee3c3777c2eba2a6e44c4461585e09688321c46835b",
+            "size_bytes": 3905
+          },
+          {
+            "path": "web/js/lib/refresh-coalesce.js",
+            "sha256": "a21094e8d464a992ac2007a51097c106201fba27915539ed8979cfa1a62060dc",
+            "size_bytes": 3968
+          },
+          {
+            "path": "web/js/lib/restart-tab-identity.js",
+            "sha256": "388aa03f5073a9c5cfa2f06fb510e439b1dcfe426a9a99f3f2535072c96c16dc",
+            "size_bytes": 3643
+          },
+          {
+            "path": "web/js/lib/run-completion-frame.js",
+            "sha256": "e9e31ed8eb9362fdb16aa4fc2742ca10a37cd3f1ad4e336ca8b2a87354575f85",
+            "size_bytes": 15324
+          },
+          {
+            "path": "web/js/lib/run-completion.js",
+            "sha256": "b8bd102504d747b8c18f5896b13a04d276be32b812dc7fbdb0858e4ea60efa64",
+            "size_bytes": 36235
+          },
+          {
+            "path": "web/js/lib/run-reconcile-sweep.js",
+            "sha256": "877a930276e2429c2423c8f90265e4e6b080c3afc685ccebf730e604389af38f",
+            "size_bytes": 3319
+          },
+          {
+            "path": "web/js/lib/run-scope-guard.js",
+            "sha256": "caf03dda79673a11666d2a1bc7fcfebab459064a10142bfc0d5efb731f4bd743",
+            "size_bytes": 37378
+          },
+          {
+            "path": "web/js/lib/safe-remove-node.js",
+            "sha256": "2b6ee6688d69f41e03d405cd941ab13bc66492cd4449b88bead22d30005dc77a",
+            "size_bytes": 13321
+          },
+          {
+            "path": "web/js/lib/screenshot-capture.js",
+            "sha256": "f976e841baa585b7dd4184fa637e0be2fc5500b289efb4cc44c2d5f47ffc64dd",
+            "size_bytes": 4113
+          },
+          {
+            "path": "web/js/lib/session-rebind.js",
+            "sha256": "f0557756672c76b0305776bc33d9c92249fe1a40d7d8daf3b725fbbd3e451435",
+            "size_bytes": 17965
+          },
+          {
+            "path": "web/js/lib/set-widget.js",
+            "sha256": "0aa17c2e28ed5ac9da1326c45f0bf940a81a36af0ee89dc36e6af0fe556f8cd0",
+            "size_bytes": 25293
+          },
+          {
+            "path": "web/js/lib/subgraph-scope.js",
+            "sha256": "4aaa0184622ed9b2e413a91136bee18825466c37c01814f40451c15cd2c5afc4",
+            "size_bytes": 17916
+          },
+          {
+            "path": "web/js/lib/widget-null-safety.js",
+            "sha256": "b0bec032c1405ee203ae67ab3a3241d701e3deedf47530a45661fcd601a70530",
+            "size_bytes": 8516
+          },
+          {
+            "path": "web/js/lib/widget-write.js",
+            "sha256": "e50e18db5e911f53b35319a7be86af5ae5f737d0fbb3a0c078007612e1645f00",
+            "size_bytes": 73589
+          },
+          {
+            "path": "web/js/lib/workflow-chat-identity.js",
+            "sha256": "c928e5b4a3f474b152f9c64925c8b4ccca731dbff82f2fca5cfc5e9a22a7efb2",
+            "size_bytes": 22736
+          },
+          {
+            "path": "web/js/lib/workflow-open-staleness.js",
+            "sha256": "6d0142bbbca26dab5ef2cd923a8e18fa8163eb4936cb094ef6d872f74595073d",
+            "size_bytes": 5783
+          },
+          {
+            "path": "web/js/lib/workflow-save.js",
+            "sha256": "43c4b25e3cb77bc3578844d8c57efab70080eb8951226bed244dbb507099a705",
+            "size_bytes": 77017
+          },
+          {
+            "path": "web/js/vendor/a2ui-lit.bundle.js",
+            "sha256": "302f2d2fe931e220ba89c5b5cddcef9964017baada45237f7b593579a18f2685",
+            "size_bytes": 234639
+          },
+          {
+            "path": "web/js/vendor/marked.esm.js",
+            "sha256": "29e25cdf1a06075c90e9885af06ddd23fb22a5424ed23a61dda986c73a8af641",
+            "size_bytes": 71905
+          },
+          {
+            "path": "web/js/vendor/purify.es.js",
+            "sha256": "4da5e17710e05de201a39f5a432e8e692e106e491d093a11f361b09a562c308a",
+            "size_bytes": 108254
+          },
+          {
+            "path": "web/js/vendor/qrcode.esm.js",
+            "sha256": "095bad3c31c18d188a867694320fdc6d3c4a3449a9447e884dc1e732a19f0581",
+            "size_bytes": 56859
+          }
+        ],
+        "sha256": "81e33c49cd65cfb85cf42e604629e25e237f3903958329f015eeb785eb913df1",
+        "size_bytes": 2807293,
+        "url": "https://cdn.comfy.org/artokun/comfyui-agent-panel/0.11.38/node.zip"
+      },
+      "version": "0.11.38",
+      "web": {
+        "file_count": 67,
+        "root": "web",
+        "sha256": "8c6d1072e7c1f1e528c9ad5a52998ebc7626916f76b2374d1d4c21833f2b25cd",
+        "size_bytes": 2852341
+      }
+    },
+    {
+      "curated_archive": {
+        "sha256": "d332e736ed8d98dece91a697d359eddd2ee37b0ac8f2d2cd1898332adf78f23e",
+        "size_bytes": 40960
+      },
+      "files": [
+        {
+          "path": "__init__.py",
+          "sha256": "2265b256b8cecdebef252f99fef03dbcdcd4ac29f089c1f0cbca3e3bde8f13be",
+          "size_bytes": 163
+        },
+        {
+          "path": "web/hermes-nous.css",
+          "sha256": "cd55d3eeb3acff8ccc4cf0bdebf16a828da9d4ad9191f768a671697cfacc7c0d",
+          "size_bytes": 17083
+        },
+        {
+          "path": "web/hermes-nous.js",
+          "sha256": "da2b4f3ab8b60c6dfc0942f6a43066a0b3e032084b71f5f021a81e014e4f4a4d",
+          "size_bytes": 15050
+        }
+      ],
+      "package_id": "hermes-nous",
+      "permitted_paths": [
+        "__init__.py",
+        "web/hermes-nous.css",
+        "web/hermes-nous.js"
+      ],
+      "repository": "https://github.com/wuraaang/ComfyUI-Cloud-Run",
+      "required_capabilities": [],
+      "revision": "sha256:743a5a2505cab78c3502c0fcf50b83780790a5a5b14e7fc1be3e438a3ca7c82f",
+      "source_tree_sha256": "743a5a2505cab78c3502c0fcf50b83780790a5a5b14e7fc1be3e438a3ca7c82f",
+      "web": {
+        "file_count": 2,
+        "root": "web",
+        "sha256": "cf27b215865ecd50d5db03c120be880720200ea3c8e2b8489839c42bd7a99c38",
+        "size_bytes": 32133
+      }
+    }
+  ]
+}

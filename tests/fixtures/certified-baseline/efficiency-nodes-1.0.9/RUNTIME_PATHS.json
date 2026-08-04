@@ -1,0 +1,16 @@
+{
+  "permitted_paths": [
+    "LICENSE",
+    "__init__.py",
+    "efficiency_nodes.py",
+    "tsc_utils.py",
+    "arial.ttf",
+    "node_settings.json",
+    "js/**",
+    "py/**",
+    "workflows/SimpleEval_Node_Examples.txt"
+  ],
+  "wheel_distributions": [
+    "simpleeval"
+  ]
+}
