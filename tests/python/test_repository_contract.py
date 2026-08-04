@@ -354,6 +354,8 @@ class RepositoryContractTests(unittest.TestCase):
             "tests/fixtures/frontend-1.47.10/",
             '"agent-panel-"',
             "c0e05111db15e8bc040c63ff9457fc142326afab66532f942b631f268fb606be",
+            '"efficiency-frontend-"',
+            "27862272e5ba1bc7b7066dd8475cb3234ba496ba57967358f5a636c16bad1a21",
             'Path("tests/fixtures/native-model-metadata-workflow.json")',
             'Path("tests/fixtures/cloud-run-core-output-smoke.json")',
         ):

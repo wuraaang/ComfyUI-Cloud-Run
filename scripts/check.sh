@@ -721,6 +721,14 @@ allowed_public_binary_artifacts = {
         2_908_160,
         "c0e05111db15e8bc040c63ff9457fc142326afab66532f942b631f268fb606be",
     ),
+    Path(
+        "tests/fixtures/frontend-1.47.10/"
+        "efficiency-frontend-"
+        "27862272e5ba1bc7b7066dd8475cb3234ba496ba57967358f5a636c16bad1a21.tar"
+    ): (
+        40_960,
+        "27862272e5ba1bc7b7066dd8475cb3234ba496ba57967358f5a636c16bad1a21",
+    ),
 }
 allowed_suffixes = {
     "",

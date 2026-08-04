@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import {
-  access,
   mkdir,
   mkdtemp,
   readFile,
@@ -9,8 +8,8 @@ import {
   rm,
   writeFile,
 } from "node:fs/promises";
-import { homedir, tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
 
@@ -36,13 +35,25 @@ const FIXTURE_MODULE_URL = new URL(
   "../fixtures/frontend-1.47.10/extension-api.mjs",
   import.meta.url,
 );
-const AGENT_PANEL_CURATED_ARCHIVE = join(
+const FRONTEND_FIXTURE_ROOT = join(
   REPOSITORY_ROOT,
   "tests",
   "fixtures",
   "frontend-1.47.10",
+);
+const AGENT_PANEL_CURATED_ARCHIVE = join(
+  FRONTEND_FIXTURE_ROOT,
   "agent-panel-c0e05111db15e8bc040c63ff9457fc142326afab66532f942b631f268fb606be.tar",
 );
+const EFFICIENCY_FRONTEND_ARCHIVE = Object.freeze({
+  file_count: 2,
+  path: join(
+    FRONTEND_FIXTURE_ROOT,
+    "efficiency-frontend-27862272e5ba1bc7b7066dd8475cb3234ba496ba57967358f5a636c16bad1a21.tar",
+  ),
+  sha256: "27862272e5ba1bc7b7066dd8475cb3234ba496ba57967358f5a636c16bad1a21",
+  size_bytes: 40960,
+});
 const ENTRYPOINTS = Object.freeze({
   "comfyui-agent-panel": "web/js/comfyui-mcp-panel.js",
   "efficiency-nodes-comfyui": "js/previewfix.js",
@@ -64,46 +75,6 @@ function lockedRecord(lock, packageId) {
 }
 
 
-async function isDirectory(path) {
-  try {
-    await access(path);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-
-async function findCertifiedCustomNodes() {
-  const candidates = [
-    process.env.COMFYUI_CERTIFIED_CUSTOM_NODES,
-    process.env.COMFYUI_ROOT
-      ? join(process.env.COMFYUI_ROOT, "custom_nodes")
-      : null,
-    join(
-      homedir(),
-      "ComfyUI-Installs",
-      "ComfyUI",
-      "ComfyUI",
-      "custom_nodes",
-    ),
-  ].filter(Boolean).map((candidate) => resolve(candidate));
-
-  for (const candidate of [...new Set(candidates)]) {
-    if (
-      await isDirectory(join(candidate, "comfyui-agent-panel"))
-      && await isDirectory(join(candidate, "efficiency-nodes-comfyui"))
-    ) {
-      return candidate;
-    }
-  }
-  assert.fail(
-    "locked Agent Panel and Efficiency sources are unavailable; set "
-      + "COMFYUI_CERTIFIED_CUSTOM_NODES to the audited custom_nodes directory",
-  );
-}
-
-
 function lockedFiles(record) {
   const files = record.source_archive?.files ?? record.files;
   assert.ok(Array.isArray(files), `${record.package_id} has no locked file list`);
@@ -111,19 +82,10 @@ function lockedFiles(record) {
 }
 
 
-async function lockedTreeMatches({ prefix, record, source }) {
-  try {
-    for (const item of lockedFiles(record)) {
-      if (!item.path.startsWith(prefix)) continue;
-      const body = await readFile(join(source, item.path));
-      if (body.byteLength !== item.size_bytes || sha256(body) !== item.sha256) {
-        return false;
-      }
-    }
-    return true;
-  } catch {
-    return false;
-  }
+function lockedFile(record, path) {
+  const matches = lockedFiles(record).filter((item) => item.path === path);
+  assert.equal(matches.length, 1, `${record.package_id}/${path} is not uniquely locked`);
+  return matches[0];
 }
 
 
@@ -134,29 +96,36 @@ function tarText(header, offset, length) {
 }
 
 
-function tarSize(header) {
+function tarSize(header, label) {
   const value = tarText(header, 124, 12).trim();
-  assert.match(value, /^[0-7]+$/, "invalid curated Agent Panel tar size");
+  assert.match(value, /^[0-7]+$/, `invalid ${label} tar size`);
   const size = Number.parseInt(value, 8);
-  assert.ok(Number.isSafeInteger(size), "unsafe curated Agent Panel tar size");
+  assert.ok(Number.isSafeInteger(size), `unsafe ${label} tar size`);
   return size;
 }
 
 
-async function extractCuratedAgentPanel(record, destination) {
-  const archive = await readFile(AGENT_PANEL_CURATED_ARCHIVE);
+async function extractCuratedArchive({
+  archivePath,
+  archiveRecord,
+  destination,
+  directoryName,
+  expectedFileCount,
+  label,
+}) {
+  const archive = await readFile(archivePath);
   assert.equal(
     archive.byteLength,
-    record.curated_archive.size_bytes,
-    "curated Agent Panel archive byte length changed",
+    archiveRecord.size_bytes,
+    `${label} archive byte length changed`,
   );
   assert.equal(
     sha256(archive),
-    record.curated_archive.sha256,
-    "curated Agent Panel archive SHA-256 changed",
+    archiveRecord.sha256,
+    `${label} archive SHA-256 changed`,
   );
 
-  const source = join(destination, "audited-agent-panel");
+  const source = join(destination, directoryName);
   await mkdir(source, { recursive: true });
   let cursor = 0;
   let copied = 0;
@@ -172,38 +141,36 @@ async function extractCuratedAgentPanel(record, destination) {
         && !path.startsWith("/")
         && !path.includes("\\")
         && path.split("/").every((part) => part && part !== "." && part !== ".."),
-      "unsafe curated Agent Panel tar path",
+      `unsafe ${label} tar path`,
     );
-    assert.ok(!seen.has(path), "duplicate curated Agent Panel tar path");
+    assert.ok(!seen.has(path), `duplicate ${label} tar path`);
     seen.add(path);
     const type = header[156];
-    assert.ok(type === 0 || type === 48, "non-file curated Agent Panel tar entry");
-    const size = tarSize(header);
+    assert.ok(type === 0 || type === 48, `non-file ${label} tar entry`);
+    const size = tarSize(header, label);
     const bodyStart = cursor + 512;
     const bodyEnd = bodyStart + size;
-    assert.ok(bodyEnd <= archive.byteLength, "truncated curated Agent Panel tar");
+    assert.ok(bodyEnd <= archive.byteLength, `truncated ${label} tar`);
     const destinationPath = join(source, path);
     await mkdir(dirname(destinationPath), { recursive: true });
     await writeFile(destinationPath, archive.subarray(bodyStart, bodyEnd));
     copied += 1;
     cursor = bodyStart + Math.ceil(size / 512) * 512;
   }
-  assert.equal(copied, 69, "curated Agent Panel tar file count changed");
+  assert.equal(copied, expectedFileCount, `${label} tar file count changed`);
   return source;
 }
 
 
-async function findExactAgentPanelSource(record, customNodes, destination) {
-  const candidates = [
-    process.env.COMFYUI_CERTIFIED_AGENT_PANEL_ROOT,
-    join(customNodes, "comfyui-agent-panel"),
-  ].filter(Boolean);
-  for (const candidate of [...new Set(candidates.map((path) => resolve(path)))]) {
-    if (await lockedTreeMatches({ prefix: "web/", record, source: candidate })) {
-      return candidate;
-    }
-  }
-  return extractCuratedAgentPanel(record, destination);
+async function extractCuratedAgentPanel(record, destination) {
+  return extractCuratedArchive({
+    archivePath: AGENT_PANEL_CURATED_ARCHIVE,
+    archiveRecord: record.curated_archive,
+    destination,
+    directoryName: "audited-agent-panel",
+    expectedFileCount: 69,
+    label: "curated Agent Panel",
+  });
 }
 
 
@@ -233,8 +200,31 @@ async function copyLockedTree({ destination, prefix, record, source }) {
 }
 
 
+async function readLockedFile({ path, record, source }) {
+  const item = lockedFile(record, path);
+  const body = await readFile(join(source, path));
+  assert.equal(
+    body.byteLength,
+    item.size_bytes,
+    `${record.package_id}/${path} byte length changed`,
+  );
+  assert.equal(
+    sha256(body),
+    item.sha256,
+    `${record.package_id}/${path} SHA-256 changed`,
+  );
+  return body;
+}
+
+
+async function copyLockedFile({ destination, path, record, source }) {
+  const body = await readLockedFile({ path, record, source });
+  await mkdir(dirname(destination), { recursive: true });
+  await writeFile(destination, body);
+}
+
+
 async function createBrowserModuleHarness(lock) {
-  const customNodes = await findCertifiedCustomNodes();
   const root = await mkdtemp(join(tmpdir(), "cloud-run-frontend-14710-"));
   const extensions = join(root, "extensions");
   const scripts = join(root, "scripts");
@@ -252,22 +242,38 @@ async function createBrowserModuleHarness(lock) {
     ),
     "hermes-nous": lockedRecord(lock, "hermes-nous"),
   };
-  const agentPanelSource = await findExactAgentPanelSource(
+  const agentPanelSource = await extractCuratedAgentPanel(
     records["comfyui-agent-panel"],
-    customNodes,
     root,
   );
+  const efficiencySource = await extractCuratedArchive({
+    archivePath: EFFICIENCY_FRONTEND_ARCHIVE.path,
+    archiveRecord: EFFICIENCY_FRONTEND_ARCHIVE,
+    destination: root,
+    directoryName: "audited-efficiency-frontend",
+    expectedFileCount: EFFICIENCY_FRONTEND_ARCHIVE.file_count,
+    label: "minimal Efficiency frontend",
+  });
   await copyLockedTree({
     destination: join(extensions, "comfyui-agent-panel"),
     prefix: "web/",
     record: records["comfyui-agent-panel"],
     source: agentPanelSource,
   });
-  await copyLockedTree({
-    destination: join(extensions, "efficiency-nodes-comfyui"),
-    prefix: "js/",
+  await readLockedFile({
+    path: "LICENSE",
     record: records["efficiency-nodes-comfyui"],
-    source: join(customNodes, "efficiency-nodes-comfyui"),
+    source: efficiencySource,
+  });
+  await copyLockedFile({
+    destination: join(
+      extensions,
+      "efficiency-nodes-comfyui",
+      "previewfix.js",
+    ),
+    path: "js/previewfix.js",
+    record: records["efficiency-nodes-comfyui"],
+    source: efficiencySource,
   });
   await copyLockedTree({
     destination: join(extensions, "hermes-nous"),
