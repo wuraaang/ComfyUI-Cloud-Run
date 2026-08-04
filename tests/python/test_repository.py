@@ -1547,6 +1547,30 @@ class SessionRepositoryTests(unittest.TestCase):
 
         self.assertEqual(sessions.list_recoverable(), [])
 
+    def test_recoverable_filter_ignores_unreadable_terminal_quote(self):
+        sessions = repository.SessionRepository(self.database_path)
+        confirming = CloudSession.new(
+            "confirming-key",
+            session_id="confirming-session",
+            now=100.0,
+            state=SessionState.CONFIRMING,
+        )
+        sessions.create_or_get(confirming)
+        self._insert_legacy_terminal_quote(sessions)
+
+        try:
+            recoverable = sessions.list_recoverable()
+        except ValueError as error:
+            self.fail(
+                "a terminal quote that cannot affect billing must not abort "
+                f"recovery: {error}"
+            )
+
+        self.assertEqual(
+            [item.session_id for item in recoverable],
+            ["confirming-session"],
+        )
+
     def test_recent_sessions_query_is_bounded(self):
         sessions = repository.SessionRepository(self.database_path)
         for index in range(25):

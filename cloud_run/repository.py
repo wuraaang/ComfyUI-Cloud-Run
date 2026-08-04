@@ -262,6 +262,53 @@ def _stored_session_blocks_paid_claim(row):
         return True
 
 
+def _stored_session_may_require_recovery(row):
+    """Select possible provider state before parsing versioned quote JSON."""
+    try:
+        state = SessionState(row["state"])
+        residual_inventory = json.loads(
+            row["residual_inventory_json"] or "[]"
+        )
+        post_start_evidence = bool(
+            row["destroy_requested"]
+            or row["installed_manifest_digest"] is not None
+            or row["worker_base_url"] is not None
+            or row["pending_deadline_at"] is not None
+            or row["pending_deadline_mode"] is not None
+            or row["pending_deadline_action"] is not None
+        )
+        unverified_create_evidence = bool(
+            post_start_evidence
+            or row["create_settings_revision"] is not None
+            or row["create_configuration_revision"] is not None
+            or row["create_reconcile_started_at"] is not None
+            or row["create_empty_observations"]
+            or row["create_first_empty_at"] is not None
+            or row["create_last_empty_at"] is not None
+            or row["retry_count"]
+        )
+    except (IndexError, KeyError, TypeError, ValueError):
+        return True
+    if not isinstance(residual_inventory, list):
+        return True
+    if (
+        row["instance_id"] is not None
+        or row["provider_token"] is not None
+        or row["session_secret_hex"] is not None
+        or residual_inventory
+    ):
+        return True
+    if state == SessionState.CONFIRMING:
+        return True
+    if state in _PRE_PROVIDER_STATES:
+        return unverified_create_evidence
+    if state == SessionState.FAILED:
+        return post_start_evidence
+    if state == SessionState.DESTROYED:
+        return False
+    return True
+
+
 def _randomized_seed_node_ids(value):
     try:
         parsed = json.loads(value or "[]")
@@ -2336,7 +2383,11 @@ class SessionRepository:
                 ORDER BY created_at, session_id
                 """
             ).fetchall()
-        sessions = [self._row_to_session(row) for row in rows]
+        sessions = [
+            self._row_to_session(row)
+            for row in rows
+            if _stored_session_may_require_recovery(row)
+        ]
         return [
             session
             for session in sessions
