@@ -11,12 +11,26 @@ import types
 import unittest
 from unittest import mock
 
-from cloud_run.artifacts import FileInputMetadata
+from cloud_run.artifacts import FileInputMetadata, ResolvedLocalArtifact
 from cloud_run.capture import CompiledCapture
-from cloud_run.dependency_repository import DependencyRepository
+from cloud_run.certified_baseline import (
+    CertifiedBaselineResolution,
+    CertifiedBaselineUnavailable,
+)
+from cloud_run.dependency_repository import (
+    DependencyRepository,
+    MappingValidationError,
+)
 from cloud_run.desktop_profile import DesktopProfileStore
 from cloud_run.job_repository import JobRepository
-from cloud_run.manifest import ArtifactSpec, DependencyManifest, SourceSpec
+from cloud_run.manifest import (
+    ArtifactSpec,
+    CustomNodeSpec,
+    DependencyManifest,
+    PythonWheelSpec,
+    SourceSpec,
+    UiPackageSpec,
+)
 from cloud_run.model_sources import ModelSourceResolution
 from cloud_run.routes import (
     _RuntimeResolver,
@@ -374,6 +388,105 @@ class ServiceConstructionTests(unittest.TestCase):
         self.assertIsNone(service.session_service.release)
 
 
+def certified_baseline_fixture(root):
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    records = []
+
+    def archive(artifact_id, kind, destination, body):
+        path = root / (artifact_id + ".bin")
+        path.write_bytes(body)
+        digest = hashlib.sha256(body).hexdigest()
+        spec = ArtifactSpec(
+            artifact_id=artifact_id,
+            kind=kind,
+            logical_name=artifact_id + ".tar",
+            destination=destination,
+            size_bytes=len(body),
+            sha256=digest,
+            source=SourceSpec(
+                "local-upload",
+                "local-upload:" + artifact_id,
+            ),
+        )
+        records.append(
+            ResolvedLocalArtifact(
+                artifact_id=artifact_id,
+                private_path=str(path),
+                size_bytes=len(body),
+                sha256=digest,
+            )
+        )
+        return spec
+
+    agent = UiPackageSpec(
+        package_id="comfyui-agent-panel",
+        repository_url="https://github.com/artokun/comfyui-mcp-panel",
+        revision="a" * 40,
+        archive=archive(
+            "ui-agent-panel",
+            "ui_package_archive",
+            "custom_nodes/comfyui-agent-panel",
+            b"agent",
+        ),
+        web_sha256="1" * 64,
+        required_capabilities=("graph_read", "native_run"),
+    )
+    hermes = UiPackageSpec(
+        package_id="hermes-nous",
+        repository_url="https://github.com/wuraaang/ComfyUI-Cloud-Run",
+        revision="sha256:" + "2" * 64,
+        archive=archive(
+            "ui-hermes-nous",
+            "ui_package_archive",
+            "custom_nodes/hermes-nous",
+            b"hermes",
+        ),
+        web_sha256="3" * 64,
+        required_capabilities=(),
+    )
+    wheel_path = root / "simpleeval.whl"
+    wheel_path.write_bytes(b"simpleeval")
+    wheel_digest = hashlib.sha256(b"simpleeval").hexdigest()
+    records.append(
+        ResolvedLocalArtifact(
+            artifact_id="wheel-simpleeval",
+            private_path=str(wheel_path),
+            size_bytes=len(b"simpleeval"),
+            sha256=wheel_digest,
+        )
+    )
+    efficiency = CustomNodeSpec(
+        package_id="efficiency-nodes-comfyui",
+        repository_url="https://github.com/jags111/efficiency-nodes-comfyui",
+        revision="b" * 40,
+        archive=archive(
+            "custom-efficiency-nodes",
+            "custom_node_archive",
+            "custom_nodes/efficiency-nodes-comfyui",
+            b"efficiency",
+        ),
+        wheels=(
+            PythonWheelSpec(
+                filename="simpleeval-1.0.7-py3-none-any.whl",
+                size_bytes=len(b"simpleeval"),
+                sha256=wheel_digest,
+                source=SourceSpec(
+                    "local-upload",
+                    "local-upload:wheel-simpleeval",
+                ),
+            ),
+        ),
+        provided_class_types=("KSampler (Efficient)",),
+    )
+    return CertifiedBaselineResolution(
+        ui_packages=(agent, hermes),
+        custom_nodes=(efficiency,),
+        local_artifacts=tuple(records),
+        digest="4" * 64,
+    )
+
+
 class RuntimeResolverTests(unittest.TestCase):
     def test_runtime_context_keeps_category_when_local_listing_fails(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -414,7 +527,130 @@ class RuntimeResolverTests(unittest.TestCase):
             {"upscale_models": (model_root,)},
         )
 
-    def test_injected_model_source_resolver_keeps_route_tests_offline(self):
+    def test_missing_or_changed_baseline_blocks_rentability(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            baseline_resolver = types.SimpleNamespace(
+                resolve=mock.AsyncMock(
+                    side_effect=CertifiedBaselineUnavailable()
+                )
+            )
+            runtime = _RuntimeResolver(
+                object(),
+                profile_store=types.SimpleNamespace(
+                    private_root=root / "profiles"
+                ),
+                baseline_resolver=baseline_resolver,
+                baseline_fetcher=mock.AsyncMock(),
+                baseline_cache_root=root / "baseline",
+            )
+            host = types.SimpleNamespace(comfy_root=root / "ComfyUI")
+            context = {
+                "metadata": {},
+                "model_roots": {},
+                "input_root": root / "input",
+                "source_mappings": {},
+                "base_bytes": 40,
+            }
+
+            with mock.patch(
+                "cloud_run.routes.ComfyHost.from_running_host",
+                return_value=host,
+            ), mock.patch(
+                "cloud_run.routes._runtime_resolution_context",
+                return_value=lambda _capture: context,
+            ):
+                with self.assertRaisesRegex(
+                    MappingValidationError,
+                    "Certified Desktop baseline is unavailable",
+                ):
+                    asyncio.run(
+                        runtime.resolve_preflight(types.SimpleNamespace())
+                    )
+
+        self.assertEqual(baseline_resolver.resolve.await_count, 1)
+
+    def test_agent_panel_is_required_from_production_profile(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            baseline = certified_baseline_fixture(root / "baseline-fixture")
+            baseline_resolver = types.SimpleNamespace(
+                resolve=mock.AsyncMock(return_value=baseline)
+            )
+            profile = types.SimpleNamespace(
+                ui_packages=baseline.ui_packages,
+                manifest_spec=lambda: None,
+            )
+            profile_store = types.SimpleNamespace(
+                private_root=root / "profiles",
+                capture=mock.Mock(return_value=profile),
+            )
+            observed = {}
+
+            class ResolverProbe:
+                def __init__(self, **kwargs):
+                    observed.update(kwargs)
+
+                async def resolve_preflight(self, capture, **_kwargs):
+                    return observed["profile_provider"](capture)
+
+            runtime = _RuntimeResolver(
+                object(),
+                artifact_catalog=object(),
+                profile_store=profile_store,
+                baseline_resolver=baseline_resolver,
+                baseline_fetcher=mock.AsyncMock(),
+                baseline_cache_root=root / "baseline-cache",
+            )
+            host = types.SimpleNamespace(comfy_root=root / "ComfyUI")
+            context = {
+                "metadata": {},
+                "model_roots": {},
+                "input_root": root / "input",
+                "source_mappings": {},
+                "base_bytes": 40,
+            }
+            capture = types.SimpleNamespace()
+
+            with mock.patch(
+                "cloud_run.routes.ComfyHost.from_running_host",
+                return_value=host,
+            ), mock.patch(
+                "cloud_run.routes._runtime_resolution_context",
+                return_value=lambda _capture: context,
+            ), mock.patch(
+                "cloud_run.routes.certified_bootstrap_workflow",
+                return_value={"nodes": []},
+            ), mock.patch(
+                "cloud_run.routes.DependencyResolver",
+                ResolverProbe,
+            ):
+                payload = asyncio.run(runtime.resolve_preflight(capture))
+
+        self.assertEqual(
+            set(payload),
+            {
+                "ui_packages",
+                "custom_nodes",
+                "local_artifacts",
+                "profile",
+                "minimum_vram_gb",
+            },
+        )
+        self.assertIn(
+            "comfyui-agent-panel",
+            {item.package_id for item in payload["ui_packages"]},
+        )
+        profile_store.capture.assert_called_once_with(
+            user_root=host.comfy_root / "user",
+            profile_name="default",
+            input_root=context["input_root"],
+            bootstrap_workflow={"nodes": []},
+            ui_packages=baseline.ui_packages,
+            ui_assets=(),
+        )
+
+    def test_runtime_preflight_discovers_certified_baseline_without_injected_ui_packages(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             model_root = root / "models"
@@ -440,6 +676,10 @@ class RuntimeResolverTests(unittest.TestCase):
                     root / "private" / "sessions.sqlite3"
                 ),
                 private_root=root / "private" / "profiles",
+            )
+            baseline = certified_baseline_fixture(root / "baseline-fixture")
+            baseline_resolver = types.SimpleNamespace(
+                resolve=mock.AsyncMock(return_value=baseline)
             )
             revision = "a" * 40
             digest = "c" * 64
@@ -535,8 +775,12 @@ class RuntimeResolverTests(unittest.TestCase):
 
             resolver = _RuntimeResolver(
                 repository,
+                artifact_catalog=profile_store.repository,
                 model_source_resolver=model_source_resolver,
                 profile_store=profile_store,
+                baseline_resolver=baseline_resolver,
+                baseline_fetcher=mock.AsyncMock(),
+                baseline_cache_root=root / "private" / "baseline-cache",
             )
 
             with mock.patch.dict(
@@ -561,6 +805,14 @@ class RuntimeResolverTests(unittest.TestCase):
                 profile_archive_exists = profile_store.archive_path(
                     profile_store.latest()
                 ).is_file()
+                registered_baseline_ids = tuple(
+                    item.artifact_id
+                    for item in baseline.local_artifacts
+                    if profile_store.repository.get_local_artifact(
+                        item.artifact_id
+                    )
+                    is not None
+                )
 
         self.assertTrue(first_result.rentable)
         self.assertTrue(second_result.rentable)
@@ -577,6 +829,19 @@ class RuntimeResolverTests(unittest.TestCase):
         )
         self.assertTrue(profile_archive_exists)
         self.assertEqual(model_source_resolver.resolve.await_count, 2)
+        self.assertEqual(
+            tuple(item.package_id for item in first_result.ui_packages),
+            ("comfyui-agent-panel", "hermes-nous"),
+        )
+        self.assertEqual(
+            tuple(item.package_id for item in first_result.custom_nodes),
+            ("efficiency-nodes-comfyui",),
+        )
+        self.assertEqual(baseline_resolver.resolve.await_count, 2)
+        self.assertEqual(
+            registered_baseline_ids,
+            tuple(item.artifact_id for item in baseline.local_artifacts),
+        )
 
 
 class OffersRouteTests(unittest.TestCase):

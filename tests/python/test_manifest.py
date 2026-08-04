@@ -137,6 +137,56 @@ def profile(*, path="workflows/example.json", revision=1):
 
 
 class DependencyManifestTests(unittest.TestCase):
+    def test_archive_wheel_web_or_class_variation_changes_manifest_digest(self):
+        node = custom_node(class_types=("KSampler (Efficient)",))
+        package = ui_package()
+        baseline = replace(
+            dependency_manifest(custom_nodes=(node,)),
+            schema_version=2,
+            protocol_version="2",
+            ui_packages=(package,),
+        )
+        variants = (
+            replace(
+                baseline,
+                custom_nodes=(
+                    replace(
+                        node,
+                        archive=replace(node.archive, sha256="1" * 64),
+                    ),
+                ),
+            ),
+            replace(
+                baseline,
+                custom_nodes=(
+                    replace(
+                        node,
+                        wheels=(
+                            replace(node.wheels[0], sha256="2" * 64),
+                        ),
+                    ),
+                ),
+            ),
+            replace(
+                baseline,
+                ui_packages=(replace(package, web_sha256="3" * 64),),
+            ),
+            replace(
+                baseline,
+                custom_nodes=(
+                    replace(
+                        node,
+                        provided_class_types=(
+                            "KSampler (Efficient)",
+                            "XY Plot",
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+        self.assertEqual(len({baseline.digest, *(item.digest for item in variants)}), 5)
+
     def test_custom_node_class_types_accept_exact_native_display_names(self):
         native_names = (
             "KSampler (Efficient)",

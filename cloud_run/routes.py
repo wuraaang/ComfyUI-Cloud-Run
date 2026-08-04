@@ -10,6 +10,11 @@ import stat
 from .artifacts import GIB
 from .agent_bridge import AgentBridge
 from .capture import CaptureValidationError, certified_bootstrap_workflow
+from .certified_baseline import (
+    CertifiedBaselineResolution,
+    CertifiedBaselineResolver,
+    CertifiedBaselineUnavailable,
+)
 from .comfy_host import ComfyHost, FORBIDDEN_TREE, HostCompatibilityError
 from .dependency_repository import (
     DependencyRepository,
@@ -91,6 +96,63 @@ _ARTIFACT_PROVISION_PHASES = {
     "model_transfer",
     "digest_verification",
 }
+_MAX_BASELINE_DOWNLOAD_BYTES = 192 * 1024 * 1024
+_BASELINE_DOWNLOAD_HOSTS = frozenset(
+    {"cdn.comfy.org", "files.pythonhosted.org"}
+)
+
+
+async def _fetch_certified_baseline(url):
+    """Fetch one locked baseline object without redirects or ambient auth."""
+    from urllib.parse import urlsplit
+
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port
+    except (TypeError, ValueError):
+        raise CertifiedBaselineUnavailable() from None
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname not in _BASELINE_DOWNLOAD_HOSTS
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in {None, 443}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise CertifiedBaselineUnavailable()
+    try:
+        import aiohttp
+    except ImportError:
+        raise CertifiedBaselineUnavailable() from None
+    timeout = aiohttp.ClientTimeout(total=180)
+    try:
+        async with aiohttp.ClientSession(
+            timeout=timeout,
+            trust_env=False,
+        ) as session:
+            async with session.get(
+                url,
+                allow_redirects=False,
+                headers={"Accept": "application/octet-stream"},
+            ) as response:
+                if response.status != 200:
+                    raise CertifiedBaselineUnavailable()
+                length = response.content_length
+                if length is not None and not 0 <= length <= (
+                    _MAX_BASELINE_DOWNLOAD_BYTES
+                ):
+                    raise CertifiedBaselineUnavailable()
+                body = bytearray()
+                async for chunk in response.content.iter_chunked(1024 * 1024):
+                    body.extend(chunk)
+                    if len(body) > _MAX_BASELINE_DOWNLOAD_BYTES:
+                        raise CertifiedBaselineUnavailable()
+                return bytes(body)
+    except CertifiedBaselineUnavailable:
+        raise
+    except Exception:
+        raise CertifiedBaselineUnavailable() from None
 
 
 def _lexical_path(value):
@@ -202,11 +264,17 @@ class _RuntimeResolver:
         artifact_catalog=None,
         model_source_resolver=None,
         profile_store=None,
+        baseline_resolver=None,
+        baseline_fetcher=None,
+        baseline_cache_root=None,
     ):
         self.dependency_repository = dependency_repository
         self.artifact_catalog = artifact_catalog
         self.model_source_resolver = model_source_resolver
         self.profile_store = profile_store
+        self.baseline_resolver = baseline_resolver
+        self.baseline_fetcher = baseline_fetcher
+        self.baseline_cache_root = baseline_cache_root
 
     async def resolve_preflight(
         self,
@@ -221,11 +289,36 @@ class _RuntimeResolver:
                 HuggingFaceClient()
             )
         context = _runtime_resolution_context(host)(capture)
+        try:
+            baseline_resolver = self.baseline_resolver
+            if baseline_resolver is None:
+                baseline_resolver = CertifiedBaselineResolver()
+            fetcher = self.baseline_fetcher or _fetch_certified_baseline
+            cache_root = self.baseline_cache_root
+            if cache_root is None and self.profile_store is not None:
+                cache_root = (
+                    Path(self.profile_store.private_root)
+                    / "certified-baseline"
+                )
+            if cache_root is None:
+                raise CertifiedBaselineUnavailable()
+            baseline = await baseline_resolver.resolve(
+                fetcher=fetcher,
+                cache_root=cache_root,
+            )
+            if not isinstance(baseline, CertifiedBaselineResolution):
+                raise CertifiedBaselineUnavailable()
+        except CertifiedBaselineUnavailable:
+            raise MappingValidationError(
+                "Certified Desktop baseline is unavailable."
+            ) from None
 
         def profile_provider(observed_capture):
             if self.profile_store is None:
                 return {
-                    "ui_packages": (),
+                    "ui_packages": baseline.ui_packages,
+                    "custom_nodes": baseline.custom_nodes,
+                    "local_artifacts": baseline.local_artifacts,
                     "profile": None,
                     "minimum_vram_gb": 0.0,
                 }
@@ -236,9 +329,13 @@ class _RuntimeResolver:
                 bootstrap_workflow=certified_bootstrap_workflow(
                     observed_capture
                 ),
+                ui_packages=baseline.ui_packages,
+                ui_assets=(),
             )
             return {
-                "ui_packages": profile.ui_packages,
+                "ui_packages": baseline.ui_packages,
+                "custom_nodes": baseline.custom_nodes,
+                "local_artifacts": baseline.local_artifacts,
                 "profile": profile.manifest_spec(),
                 "minimum_vram_gb": 0.0,
             }

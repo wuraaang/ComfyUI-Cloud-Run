@@ -4,13 +4,21 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from cloud_run.artifacts import FileInputMetadata, GIB, StaticFileRequirement
+from cloud_run.artifacts import (
+    ArtifactCollisionError,
+    FileInputMetadata,
+    GIB,
+    ResolvedLocalArtifact,
+    StaticFileRequirement,
+)
 from cloud_run.comfy_host import NodeDescription, NodeNotFound
 from cloud_run.dependency_repository import DependencyRepository
 from cloud_run.manifest import (
     ArtifactSpec,
+    CustomNodeSpec,
     ProfileFileSpec,
     ProfileSpec,
+    PythonWheelSpec,
     SourceSpec,
     UiPackageSpec,
 )
@@ -42,6 +50,51 @@ def pending_candidate(revision="a" * 40):
         "revision": revision,
         "package_id": "acme.nodes",
     }
+
+
+def package_artifact(
+    artifact_id,
+    kind,
+    destination,
+    digest,
+    *,
+    size_bytes=10,
+):
+    return ArtifactSpec(
+        artifact_id=artifact_id,
+        kind=kind,
+        logical_name=artifact_id + ".tar",
+        destination=destination,
+        size_bytes=size_bytes,
+        sha256=digest,
+        source=SourceSpec("local-upload", "local-upload:" + artifact_id),
+    )
+
+
+def baseline_efficiency(*, package_id="efficiency-nodes-comfyui", digest="8" * 64):
+    return CustomNodeSpec(
+        package_id=package_id,
+        repository_url="https://github.com/jags111/efficiency-nodes-comfyui",
+        revision="8" * 40,
+        archive=package_artifact(
+            "custom-efficiency-nodes",
+            "custom_node_archive",
+            "custom_nodes/" + package_id,
+            digest,
+        ),
+        wheels=(
+            PythonWheelSpec(
+                filename="simpleeval-1.0.7-py3-none-any.whl",
+                size_bytes=5,
+                sha256="9" * 64,
+                source=SourceSpec(
+                    "local-upload",
+                    "local-upload:wheel-simpleeval",
+                ),
+            ),
+        ),
+        provided_class_types=("KSampler (Efficient)",),
+    )
 
 
 class FakeCapture:
@@ -357,6 +410,8 @@ class DependencyResolverTests(unittest.TestCase):
             registry=FakeRegistry({}),
             profile_provider=lambda observed: {
                 "ui_packages": (panel,),
+                "custom_nodes": (),
+                "local_artifacts": (),
                 "profile": profile,
                 "minimum_vram_gb": 12.0,
             },
@@ -378,6 +433,150 @@ class DependencyResolverTests(unittest.TestCase):
         self.assertEqual(result.profile, profile)
         self.assertEqual(result.minimum_vram_gb, 12.0)
         self.assertEqual(result.custom_nodes, ())
+
+    def test_certified_efficiency_is_required_even_for_core_only_workflow(self):
+        input_root = Path(self.temporary_directory.name) / "baseline-input"
+        input_root.mkdir()
+        efficiency = baseline_efficiency()
+        resolver = DependencyResolver(
+            host=FakeHost({"KSampler": core("KSampler")}),
+            repository=self.repository,
+            registry=FakeRegistry({}),
+            profile_provider=lambda _capture: {
+                "ui_packages": (),
+                "custom_nodes": (efficiency,),
+                "local_artifacts": (),
+                "profile": None,
+                "minimum_vram_gb": 0.0,
+            },
+        )
+
+        result = asyncio.run(
+            resolver.resolve_dependencies(
+                FakeCapture(
+                    "KSampler",
+                    output={"1": {"class_type": "SaveImage", "inputs": {}}},
+                ),
+                metadata={},
+                model_roots={},
+                input_root=input_root,
+                source_mappings={},
+                base_bytes=40 * GIB,
+                explicit_output_allowance_bytes=1024,
+            )
+        )
+
+        self.assertTrue(result.rentable)
+        self.assertEqual(result.custom_nodes, (efficiency,))
+
+    def test_baseline_and_workflow_package_collision_fails_closed(self):
+        approved = self.repository.save_candidate(
+            "ApprovedNode",
+            "manual",
+            complete_candidate(),
+            approved=False,
+        )
+        self.repository.approve("ApprovedNode", approved.candidate_digest)
+        input_root = Path(self.temporary_directory.name) / "collision-input"
+        input_root.mkdir()
+        resolver = DependencyResolver(
+            host=FakeHost({"ApprovedNode": custom("ApprovedNode")}),
+            repository=self.repository,
+            registry=FakeRegistry({}),
+            profile_provider=lambda _capture: {
+                "ui_packages": (),
+                "custom_nodes": (
+                    baseline_efficiency(
+                        package_id="acme.nodes",
+                        digest="7" * 64,
+                    ),
+                ),
+                "local_artifacts": (),
+                "profile": None,
+                "minimum_vram_gb": 0.0,
+            },
+        )
+
+        with self.assertRaises(ArtifactCollisionError):
+            asyncio.run(
+                resolver.resolve_dependencies(
+                    FakeCapture(
+                        "ApprovedNode",
+                        output={
+                            "1": {"class_type": "SaveImage", "inputs": {}}
+                        },
+                    ),
+                    metadata={},
+                    model_roots={},
+                    input_root=input_root,
+                    source_mappings={},
+                    base_bytes=40 * GIB,
+                    explicit_output_allowance_bytes=1024,
+                )
+            )
+
+    def test_baseline_local_artifacts_are_registered_for_upload(self):
+        input_root = Path(self.temporary_directory.name) / "local-input"
+        input_root.mkdir()
+        archive_path = Path(self.temporary_directory.name) / "agent-panel.tar"
+        archive_path.write_bytes(b"agent-panel")
+        digest = hashlib.sha256(b"agent-panel").hexdigest()
+        artifact = package_artifact(
+            "ui-agent-panel",
+            "ui_package_archive",
+            "custom_nodes/comfyui-agent-panel",
+            digest,
+            size_bytes=len(b"agent-panel"),
+        )
+        panel = UiPackageSpec(
+            package_id="comfyui-agent-panel",
+            repository_url="https://github.com/artokun/comfyui-mcp-panel",
+            revision="a" * 40,
+            archive=artifact,
+            web_sha256="b" * 64,
+            required_capabilities=("graph_read",),
+        )
+        local = ResolvedLocalArtifact(
+            artifact_id=artifact.artifact_id,
+            private_path=str(archive_path),
+            size_bytes=artifact.size_bytes,
+            sha256=artifact.sha256,
+        )
+        cache_catalog = FakeCacheCatalog()
+        resolver = DependencyResolver(
+            host=FakeHost({"KSampler": core("KSampler")}),
+            repository=self.repository,
+            registry=FakeRegistry({}),
+            cache_catalog=cache_catalog,
+            profile_provider=lambda _capture: {
+                "ui_packages": (panel,),
+                "custom_nodes": (),
+                "local_artifacts": (local,),
+                "profile": None,
+                "minimum_vram_gb": 0.0,
+            },
+        )
+
+        result = asyncio.run(
+            resolver.resolve_dependencies(
+                FakeCapture(
+                    "KSampler",
+                    output={"1": {"class_type": "SaveImage", "inputs": {}}},
+                ),
+                metadata={},
+                model_roots={},
+                input_root=input_root,
+                source_mappings={},
+                base_bytes=40 * GIB,
+                explicit_output_allowance_bytes=1024,
+            )
+        )
+
+        self.assertEqual(result.local_artifacts, (local,))
+        self.assertEqual(
+            [item.artifact_id for item in cache_catalog.registered],
+            [artifact.artifact_id],
+        )
 
     def test_dependency_preflight_assembles_verified_artifacts_and_disk(self):
         approved = self.repository.save_candidate(
