@@ -2289,8 +2289,16 @@ class SessionService:
             ],
         }
 
-    async def sync_profile(self, session_id, *, worker=None):
+    async def sync_profile(
+        self,
+        session_id,
+        *,
+        worker=None,
+        teardown=False,
+    ):
         session = self._stored_session(session_id)
+        if teardown is not True:
+            self._raise_if_destroy_requested(session.session_id)
         if self.profile_store is None:
             return self._profile_status(session)
         try:
@@ -2313,7 +2321,11 @@ class SessionService:
                 raise SessionExecutionError(
                     "Remote Desktop profile is unavailable."
                 )
+            if teardown is not True:
+                self._raise_if_destroy_requested(session.session_id)
             payload = await snapshot_method(sync["remote_revision"])
+            if teardown is not True:
+                self._raise_if_destroy_requested(session.session_id)
             if payload is not None:
                 if payload.get("profile_id") != manifest_profile.profile_id:
                     raise SessionExecutionError(
@@ -2335,11 +2347,15 @@ class SessionService:
                         )
                     chunks.append(chunk)
 
+                if teardown is not True:
+                    self._raise_if_destroy_requested(session.session_id)
                 receipt = await download(
                     payload["archive_artifact_id"],
                     start=0,
                     on_chunk=on_chunk,
                 )
+                if teardown is not True:
+                    self._raise_if_destroy_requested(session.session_id)
                 archive = b"".join(chunks)
                 if (
                     getattr(receipt, "artifact_id", None)
@@ -2824,7 +2840,7 @@ class SessionService:
             pass
         try:
             await asyncio.wait_for(
-                self.sync_profile(session_id),
+                self.sync_profile(session_id, teardown=True),
                 timeout=TEARDOWN_PROFILE_TIMEOUT_SECONDS,
             )
         except (asyncio.CancelledError, KeyboardInterrupt):

@@ -1743,6 +1743,31 @@ class ReusableSessionTests(unittest.TestCase):
             sanitized_error=None,
         )
 
+    def _configure_profile_sync_guard_fixture(self):
+        class ProfileStore:
+            @staticmethod
+            def latest():
+                return None
+
+            @staticmethod
+            def conflicts(*, unresolved_only=False):
+                return ()
+
+        profile = types.SimpleNamespace(profile_id="desktop-profile")
+        self.service.profile_store = ProfileStore()
+        self.service._profile_manifest = lambda _session: (None, profile)
+        self.jobs.save_profile_sync_state(
+            {
+                "session_id": "session-1",
+                "profile_id": profile.profile_id,
+                "remote_revision": 1,
+                "archive_sha256": "a" * 64,
+                "warning": None,
+                "updated_at": 100.0,
+            }
+        )
+        return profile
+
     def test_apply_manifest_polls_and_persists_only_sanitized_progress(self):
         service = self.service
         service.job_poll_interval_seconds = 0
@@ -3579,6 +3604,65 @@ class ReusableSessionTests(unittest.TestCase):
                 )
             )
 
+    def test_ordinary_profile_sync_stops_before_snapshot_after_destroy_intent(self):
+        self._configure_profile_sync_guard_fixture()
+        self.sessions.transition(
+            "session-1",
+            SessionState.DESTROY_REQUESTED,
+            now=101.0,
+            destroy_requested=True,
+        )
+
+        class Worker:
+            async def profile_snapshot(inner_self, _cursor):
+                raise AssertionError(
+                    "profile snapshot started after durable destroy intent"
+                )
+
+            async def download_profile_artifact(inner_self, *_args, **_kwargs):
+                raise AssertionError(
+                    "profile download started after durable destroy intent"
+                )
+
+        with self.assertRaises(asyncio.CancelledError):
+            asyncio.run(
+                self.service.sync_profile("session-1", worker=Worker())
+            )
+
+    def test_ordinary_profile_sync_rechecks_destroy_before_download(self):
+        profile = self._configure_profile_sync_guard_fixture()
+        outer = self
+        download_calls = []
+
+        class Worker:
+            async def profile_snapshot(inner_self, _cursor):
+                outer.sessions.transition(
+                    "session-1",
+                    SessionState.DESTROY_REQUESTED,
+                    now=101.0,
+                    destroy_requested=True,
+                )
+                return {
+                    "profile_id": profile.profile_id,
+                    "revision": 2,
+                    "archive_artifact_id": "profile-" + "b" * 64,
+                    "archive_size_bytes": 1,
+                    "archive_sha256": "b" * 64,
+                }
+
+            async def download_profile_artifact(inner_self, *_args, **_kwargs):
+                download_calls.append(True)
+                raise AssertionError(
+                    "profile download started after durable destroy intent"
+                )
+
+        with self.assertRaises(asyncio.CancelledError):
+            asyncio.run(
+                self.service.sync_profile("session-1", worker=Worker())
+            )
+
+        self.assertEqual(download_calls, [])
+
     def test_destroy_persists_intent_before_reconciler_profile_bridge_or_provider_work(self):
         events = []
         outer = self
@@ -3606,7 +3690,8 @@ class ReusableSessionTests(unittest.TestCase):
                 observe("bridge")
                 await super().revoke(session_id)
 
-        async def sync_profile(_session_id):
+        async def sync_profile(_session_id, *, teardown=False):
+            outer.assertTrue(teardown)
             observe("profile")
 
         self.service.reconciler = Reconciler()
@@ -3648,7 +3733,8 @@ class ReusableSessionTests(unittest.TestCase):
                 provider_calls.append(session_id)
                 return outer._persist_destroyed(session_id)
 
-        async def blocked_profile(_session_id):
+        async def blocked_profile(_session_id, *, teardown=False):
+            self.assertTrue(teardown)
             await asyncio.Event().wait()
 
         async def timeout(awaitable, *, timeout):
