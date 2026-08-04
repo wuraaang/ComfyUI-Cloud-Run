@@ -6,7 +6,10 @@ import {
   SETTINGS_ENDPOINT,
   SESSIONS_ENDPOINT,
 } from "./cloud-run-api.js";
-import { createSessionConsole } from "./session-console.js";
+import {
+  createSessionConsole,
+  safeSessionPayload,
+} from "./session-console.js";
 import {
   installNativePromptIdentity,
   isVastRole,
@@ -770,8 +773,11 @@ export function mountCloudRun(
       const active = Array.isArray(payload.active_sessions)
         ? [...payload.active_sessions].reverse().find(
           (session) => (
-            session?.billing_may_continue === true
-            || ["unknown", "active"].includes(session?.rental_outcome)
+            safeSessionPayload(session)
+            && (
+              session.billing_may_continue === true
+              || ["unknown", "active"].includes(session.rental_outcome)
+            )
           ),
         )
         : null;

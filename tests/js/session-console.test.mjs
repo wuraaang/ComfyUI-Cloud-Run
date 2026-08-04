@@ -604,6 +604,109 @@ test("settings fallback card stays destroyable after detailed polling fails", as
 });
 
 
+test("malformed polling success preserves the durable destroy card and polling", async () => {
+  const document = new FakeDocument();
+  const timers = [];
+  const api = fakeApi();
+  api.getSession = async () => ({});
+  const view = createSessionConsole(document, api, {
+    setTimeout(callback) {
+      timers.push(callback);
+      return timers.length;
+    },
+    clearTimeout() {},
+  });
+  document.body.appendChild(view.root);
+  view.renderSession({
+    session_id: "session-fallback",
+    instance_id: "46741738",
+    status: "failed",
+    billing_may_continue: true,
+    can_destroy: true,
+    rate: 0.73,
+    error: "Active session details are temporarily unavailable.",
+  });
+
+  await view.refresh();
+
+  assert.equal(view.session.session_id, "session-fallback");
+  assert.equal(view.destroyButton.hidden, false);
+  assert.equal(view.destroyButton.disabled, false);
+  assert.ok(timers.length >= 2);
+  assert.match(
+    view.status.textContent,
+    /Session status is temporarily unavailable; safe polling continues\./,
+  );
+});
+
+
+test("mismatched polling success preserves the durable destroy card and polling", async () => {
+  const document = new FakeDocument();
+  const timers = [];
+  const api = fakeApi();
+  api.getSession = async () => sessionPayload({
+    session_id: "different-session",
+    status: "destroyed",
+    rental_outcome: "absent",
+    instance_id: null,
+    billing_may_continue: false,
+    can_destroy: false,
+  });
+  const view = createSessionConsole(document, api, {
+    setTimeout(callback) {
+      timers.push(callback);
+      return timers.length;
+    },
+    clearTimeout() {},
+  });
+  document.body.appendChild(view.root);
+  view.renderSession({
+    session_id: "session-fallback",
+    instance_id: "46741738",
+    status: "failed",
+    billing_may_continue: true,
+    can_destroy: true,
+    rate: 0.73,
+    error: "Active session details are temporarily unavailable.",
+  });
+
+  await view.refresh();
+
+  assert.equal(view.session.session_id, "session-fallback");
+  assert.equal(view.destroyButton.hidden, false);
+  assert.equal(view.destroyButton.disabled, false);
+  assert.ok(timers.length >= 2);
+  assert.match(
+    view.status.textContent,
+    /Session status is temporarily unavailable; safe polling continues\./,
+  );
+});
+
+
+test("fallback rate distinguishes unavailable from numeric zero", () => {
+  const document = new FakeDocument();
+  const view = createSessionConsole(document, fakeApi());
+  document.body.appendChild(view.root);
+  const fallback = {
+    session_id: "session-fallback",
+    instance_id: "46741738",
+    status: "failed",
+    billing_may_continue: true,
+    can_destroy: true,
+    error: "Active session details are temporarily unavailable.",
+  };
+
+  view.renderSession({ ...fallback, rate: null });
+
+  assert.match(view.root.textContent, /Rate: unknown\./);
+  assert.doesNotMatch(view.root.textContent, /Rate: \$0\.00\/h/);
+
+  view.renderSession({ ...fallback, rate: 0 });
+
+  assert.match(view.root.textContent, /Rate: \$0\.00\/h\./);
+});
+
+
 test("active session detail error renders only the bounded red warning", () => {
   const document = new FakeDocument();
   const view = createSessionConsole(document, fakeApi());

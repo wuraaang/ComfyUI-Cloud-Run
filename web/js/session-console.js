@@ -14,6 +14,15 @@ function finiteNumber(value) {
 }
 
 
+function finiteNonnegativeNumber(value) {
+  return typeof value === "number"
+    && Number.isFinite(value)
+    && value >= 0
+    ? value
+    : null;
+}
+
+
 function positiveInteger(value) {
   const number = Number(value);
   return Number.isSafeInteger(number) && number > 0 ? number : null;
@@ -32,6 +41,41 @@ function safeId(value) {
   )
     ? value
     : null;
+}
+
+
+const SESSION_STATUSES = new Set([
+  "preflight",
+  "offer_selected",
+  "confirming",
+  "creating",
+  "reconciling_create",
+  "bootstrapping",
+  "provisioning",
+  "validating",
+  "repairing",
+  "ready",
+  "running",
+  "harvesting",
+  "destroy_requested",
+  "destroying",
+  "destroyed",
+  "failed",
+]);
+
+
+export function safeSessionPayload(session, expectedSessionId = null) {
+  const sessionId = safeId(session?.session_id);
+  return Boolean(
+    session
+    && typeof session === "object"
+    && !Array.isArray(session)
+    && sessionId !== null
+    && (expectedSessionId === null || sessionId === expectedSessionId)
+    && SESSION_STATUSES.has(session.status)
+    && typeof session.billing_may_continue === "boolean"
+    && typeof session.can_destroy === "boolean"
+  );
 }
 
 
@@ -1439,8 +1483,8 @@ export function createSessionConsole(document, api = {}, options = {}) {
     return setup;
   }
 
-  function renderSession(session) {
-    if (!session || typeof session !== "object") return;
+  function renderSession(session, expectedSessionId = null) {
+    if (!safeSessionPayload(session, expectedSessionId)) return false;
     currentSession = session;
     if (session.offer) renderQuote(session, {
       idempotencyKey: sessionIdempotencyKey,
@@ -1468,8 +1512,8 @@ export function createSessionConsole(document, api = {}, options = {}) {
     } else {
       sessionStatus.textContent = `${sessionMessage(session)} ${identity}`;
     }
-    const rate = finiteNumber(session?.offer?.dph_total)
-      ?? finiteNumber(session?.rate);
+    const rate = finiteNonnegativeNumber(session?.offer?.dph_total)
+      ?? finiteNonnegativeNumber(session?.rate);
     const elapsed = finiteNumber(session.elapsed_seconds)
       ?? (
         finiteNumber(session.created_at) !== null
@@ -1534,6 +1578,7 @@ export function createSessionConsole(document, api = {}, options = {}) {
     notifySession(session);
     if (ready) void refreshDesktopSetup();
     schedulePoll();
+    return true;
   }
 
   async function refresh() {
@@ -1543,7 +1588,11 @@ export function createSessionConsole(document, api = {}, options = {}) {
         safeId(currentSession?.session_id)
         && typeof api.getSession === "function"
       ) {
-        renderSession(await api.getSession(currentSession.session_id));
+        const expectedSessionId = currentSession.session_id;
+        const refreshed = await api.getSession(expectedSessionId);
+        if (!renderSession(refreshed, expectedSessionId)) {
+          throw new Error("Invalid session status response.");
+        }
       }
       if (
         safeId(currentSession?.session_id)

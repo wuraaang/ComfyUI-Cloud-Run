@@ -1076,7 +1076,12 @@ test("reload selects a billable safety card without rental outcome", async () =>
   };
   mountCloudRun(document, async () => jsonResponse(settingsPayload({
     active_sessions: [fallback],
-  })));
+  })), {
+    setTimeout() {
+      return 1;
+    },
+    clearTimeout() {},
+  });
 
   await document.getElementById("cloud-run-button").click();
 
@@ -1088,6 +1093,38 @@ test("reload selects a billable safety card without rental outcome", async () =>
     document.getElementById("cloud-run-preview-banner").className,
     /cloud-run-danger/,
   );
+});
+
+
+test("malformed later active entry cannot shadow a valid destroyable card", async () => {
+  const document = new FakeDocument();
+  mountLocalRunButton(document);
+  const fallback = {
+    session_id: "session-fallback",
+    instance_id: "46741738",
+    status: "failed",
+    billing_may_continue: true,
+    can_destroy: true,
+    rate: 0.73,
+    error: "Active session details are temporarily unavailable.",
+  };
+  mountCloudRun(document, async () => jsonResponse(settingsPayload({
+    active_sessions: [
+      fallback,
+      { billing_may_continue: true },
+    ],
+  })), {
+    setTimeout() {
+      return 1;
+    },
+    clearTimeout() {},
+  });
+
+  await document.getElementById("cloud-run-button").click();
+
+  const console = document.getElementById("cloud-run-dependency-console");
+  assert.match(console.textContent, /session-fallback/);
+  assert.equal(document.getElementById("cloud-run-destroy-gpu").hidden, false);
 });
 
 
