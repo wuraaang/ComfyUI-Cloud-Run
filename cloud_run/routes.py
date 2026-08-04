@@ -508,6 +508,9 @@ def build_service():
             release=release,
             required_class_types=required_class_types,
             local_execution_counter=local_execution_guard.count,
+            continue_guard=(
+                service.session_service._raise_if_destroy_requested
+            ),
         )
         service.session_service.readiness_validator = ReadinessValidator(
             probe=readiness_probe,

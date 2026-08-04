@@ -60,6 +60,27 @@ def quote(OfferQuote):
 
 
 class LifecycleModelTests(unittest.TestCase):
+    def test_failed_destroy_intent_without_identity_remains_billing_unknown(self):
+        from cloud_run.models import CloudSession, SessionState
+
+        failed = CloudSession.new(
+            "destroy-intent-key",
+            session_id="destroy-intent-session",
+            now=100.0,
+            state=SessionState.FAILED,
+        ).transition(
+            SessionState.FAILED,
+            now=101.0,
+            destroy_requested=True,
+            create_settings_revision=(
+                "11111111-1111-4111-8111-111111111111"
+            ),
+        )
+
+        self.assertEqual(failed.rental_outcome, "unknown")
+        self.assertTrue(failed.billing_may_continue)
+        self.assertTrue(failed.can_destroy)
+
     def test_model_representations_omit_boundary_tokens(self):
         from cloud_run.models import (
             AttemptState,

@@ -47,6 +47,22 @@ _STORED_READINESS_DIAGNOSTIC_CODES = (
 )
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}")
 _HEX_64 = re.compile(r"[0-9a-f]{64}")
+_EXTENSION_PATH = re.compile(
+    r"/extensions/[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}/"
+    r"[A-Za-z0-9._@+/-]+"
+)
+_RUNTIME_PACKAGE_NAMES = frozenset({"aiohttp", "torch"})
+
+
+def _valid_class_type(value):
+    return bool(
+        isinstance(value, str)
+        and 1 <= len(value) <= 200
+        and value == value.strip()
+        and all(32 <= ord(character) <= 126 for character in value)
+    )
+
+
 def _canonical_json(value):
     return json.dumps(
         value,
@@ -610,12 +626,14 @@ class ControllerReadinessProbe:
         release,
         required_class_types,
         local_execution_counter,
+        continue_guard,
     ):
         callables = (
             worker_factory,
             inventory_probe,
             required_class_types,
             local_execution_counter,
+            continue_guard,
         )
         if not all(callable(item) for item in callables) or not callable(
             getattr(desktop_relay, "probe_readiness", None)
@@ -637,6 +655,12 @@ class ControllerReadinessProbe:
         self.release = release
         self.required_class_types = required_class_types
         self.local_execution_counter = local_execution_counter
+        self.continue_guard = continue_guard
+
+    async def _continue(self, session):
+        result = self.continue_guard(session.session_id)
+        if inspect.isawaitable(result):
+            await result
 
     @staticmethod
     def _check(name, passed, proof, *, not_required=False):
@@ -668,6 +692,8 @@ class ControllerReadinessProbe:
             "profile_digest",
             "bootstrap_digest",
             "ui_package_digests",
+            "served_extension_paths",
+            "runtime_package_versions",
             "comfy_process_healthy",
             "completed_at",
         }
@@ -677,15 +703,20 @@ class ControllerReadinessProbe:
         artifacts = value.get("validated_artifacts")
         completed = value.get("completed_at")
         ui = value.get("ui_package_digests")
+        extension_paths = value.get("served_extension_paths")
+        runtime_versions = value.get("runtime_package_versions")
         if (
             not isinstance(classes, list)
+            or len(classes) > 100_000
+            or not all(_valid_class_type(item) for item in classes)
             or classes != sorted(set(classes))
             or not isinstance(artifacts, list)
-            or len(artifacts) != len(set(artifacts))
+            or len(artifacts) > 100_000
             or not all(
                 isinstance(item, str) and _IDENTIFIER.fullmatch(item)
-                for item in (*classes, *artifacts)
+                for item in artifacts
             )
+            or len(artifacts) != len(set(artifacts))
             or not isinstance(ui, dict)
             or any(
                 not isinstance(key, str)
@@ -693,6 +724,30 @@ class ControllerReadinessProbe:
                 or not isinstance(digest, str)
                 or _HEX_64.fullmatch(digest) is None
                 for key, digest in ui.items()
+            )
+            or not isinstance(extension_paths, list)
+            or len(extension_paths) > 100_000
+            or any(
+                not isinstance(path, str)
+                or _EXTENSION_PATH.fullmatch(path) is None
+                or "//" in path
+                or "/./" in path
+                or "/../" in path
+                or any(
+                    component in {".", ".."}
+                    for component in path.split("/")
+                )
+                for path in extension_paths
+            )
+            or extension_paths != sorted(set(extension_paths))
+            or not isinstance(runtime_versions, dict)
+            or set(runtime_versions) != _RUNTIME_PACKAGE_NAMES
+            or any(
+                not isinstance(version, str)
+                or not 1 <= len(version) <= 200
+                or version != version.strip()
+                or any(ord(character) < 32 for character in version)
+                for version in runtime_versions.values()
             )
             or isinstance(completed, bool)
             or not isinstance(completed, (int, float))
@@ -706,6 +761,7 @@ class ControllerReadinessProbe:
     async def __call__(self, session, manifest, profile):
         checks = {}
 
+        await self._continue(session)
         try:
             observation = self.inventory_probe(session)
             if inspect.isawaitable(observation):
@@ -735,17 +791,26 @@ class ControllerReadinessProbe:
         worker = None
         health = None
         transaction = None
+        await self._continue(session)
         try:
             worker = self.worker_factory(session)
             health = await worker.health()
-            transaction = await worker.transaction(
-                "provision-" + manifest.digest
-            )
         except (KeyboardInterrupt, asyncio.CancelledError):
             raise
         except Exception:
             health = None
             transaction = None
+        else:
+            await self._continue(session)
+            try:
+                transaction = await worker.transaction(
+                    "provision-" + manifest.digest
+                )
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                raise
+            except Exception:
+                health = None
+                transaction = None
         authenticated = bool(
             isinstance(health, dict)
             and health.get("claimed") is True
@@ -922,6 +987,7 @@ class ControllerReadinessProbe:
             item.package_id == "comfyui-agent-panel"
             for item in manifest.ui_packages
         )
+        await self._continue(session)
         try:
             relay_checks = await self.desktop_relay.probe_readiness(
                 session.session_id,

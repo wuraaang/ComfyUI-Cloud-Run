@@ -36,7 +36,7 @@ from cloud_run.relay import (
     RelaySyncResult,
     RelayValidationError,
 )
-from cloud_run.run_errors import RunErrorCode
+from cloud_run.run_errors import RunErrorCode, RunPhase
 from cloud_run.repository import SessionRepository
 from cloud_run.resolver import NodeResolution
 from cloud_run.session_service import (
@@ -1168,6 +1168,179 @@ class SessionProvisioningTests(unittest.TestCase):
             "Remote deadline enforcement failed.",
         )
 
+    def test_worker_readiness_payload_is_strictly_validated(self):
+        readiness = {
+            "protocol_version": self.manifest.protocol_version,
+            "comfyui_core_version": self.manifest.comfyui_core_version,
+            "comfyui_frontend_version": (
+                self.manifest.comfyui_frontend_version
+            ),
+            "worker_version": self.manifest.worker_version,
+            "validated_class_types": [],
+            "validated_artifacts": [self.artifact.artifact_id],
+            "profile_revision": None,
+            "profile_digest": None,
+            "bootstrap_digest": None,
+            "ui_package_digests": {},
+            "served_extension_paths": [
+                "/extensions/comfyui-agent-panel/panel.js",
+                "/extensions/hermes-nous/hermes-nous.js",
+            ],
+            "runtime_package_versions": {
+                "aiohttp": "3.11.18",
+                "torch": "2.8.0",
+            },
+            "comfy_process_healthy": True,
+            "completed_at": 100.0,
+        }
+        worker = SequentialWorker()
+
+        async def accepted(_payload):
+            return self.response(readiness=readiness)
+
+        worker.apply_manifest = accepted
+        result = asyncio.run(self.apply(worker))
+        self.assertEqual(result["readiness"], readiness)
+
+        for field in ("validated_class_types", "validated_artifacts"):
+            with self.subTest(field=field):
+                invalid_worker = SequentialWorker()
+
+                async def malformed(_payload, selected=field):
+                    return self.response(
+                        readiness={
+                            **readiness,
+                            selected: [{}],
+                        }
+                    )
+
+                invalid_worker.apply_manifest = malformed
+                self.assert_terminal(
+                    self.apply(invalid_worker),
+                    "Remote provisioning response was invalid.",
+                )
+
+        invalid_paths = (
+            list(reversed(readiness["served_extension_paths"])),
+            [readiness["served_extension_paths"][0]] * 2,
+            [{}],
+            ["/extensions/comfyui-agent-panel/../secret.js"],
+            ["/extensions/comfyui-agent-panel/.."],
+            ["https://example.com/extensions/panel.js"],
+        )
+        for paths in invalid_paths:
+            with self.subTest(paths=paths):
+                invalid_worker = SequentialWorker()
+
+                async def invalid(_payload, value=paths):
+                    return self.response(
+                        readiness={
+                            **readiness,
+                            "served_extension_paths": value,
+                        }
+                    )
+
+                invalid_worker.apply_manifest = invalid
+                self.assert_terminal(
+                    self.apply(invalid_worker),
+                    "Remote provisioning response was invalid.",
+                )
+
+    def test_worker_readiness_accepts_locked_efficiency_class_types(self):
+        from cloud_run.certified_baseline import CertifiedBaselineResolver
+
+        class_types = tuple(
+            CertifiedBaselineResolver()._lock["custom_nodes"][0][
+                "class_types"
+            ]
+        )
+        archive = ArtifactSpec(
+            artifact_id="custom-efficiency-nodes",
+            kind="custom_node_archive",
+            logical_name="efficiency-nodes-comfyui.tar",
+            destination="custom_nodes/efficiency-nodes-comfyui",
+            size_bytes=10,
+            sha256="e" * 64,
+            source=SourceSpec(
+                "local-upload",
+                "local-upload:custom-efficiency-nodes",
+            ),
+        )
+        manifest = replace(
+            self.manifest,
+            custom_nodes=(
+                CustomNodeSpec(
+                    package_id="efficiency-nodes-comfyui",
+                    repository_url=(
+                        "https://github.com/jags111/efficiency-nodes-comfyui"
+                    ),
+                    revision="8" * 40,
+                    archive=archive,
+                    wheels=(),
+                    provided_class_types=class_types,
+                ),
+            ),
+        )
+        readiness = {
+            "protocol_version": manifest.protocol_version,
+            "comfyui_core_version": manifest.comfyui_core_version,
+            "comfyui_frontend_version": manifest.comfyui_frontend_version,
+            "worker_version": manifest.worker_version,
+            "validated_class_types": sorted(class_types),
+            "validated_artifacts": [self.artifact.artifact_id],
+            "profile_revision": None,
+            "profile_digest": None,
+            "bootstrap_digest": None,
+            "ui_package_digests": {},
+            "served_extension_paths": [],
+            "runtime_package_versions": {
+                "aiohttp": "3.11.18",
+                "torch": "2.8.0",
+            },
+            "comfy_process_healthy": True,
+            "completed_at": 100.0,
+        }
+        worker = SequentialWorker()
+
+        async def accepted(_payload):
+            return self.response(manifest=manifest, readiness=readiness)
+
+        worker.apply_manifest = accepted
+
+        result = asyncio.run(self.apply(worker, manifest))
+
+        self.assertEqual(result["readiness"], readiness)
+
+        invalid_runtime_versions = (
+            {"aiohttp": "3.11.18"},
+            {
+                "aiohttp": "3.11.18",
+                "torch": "2.8.0",
+                "requests": "2.32.4",
+            },
+            {"aiohttp": "3.11.18", "torch": 2},
+            {"aiohttp": "3.11.18", "torch": " 2.8.0"},
+            {"aiohttp": "3.11.18", "torch": "2.8.0\n"},
+            {"aiohttp": "3.11.18", "torch": "x" * 201},
+        )
+        for versions in invalid_runtime_versions:
+            with self.subTest(runtime_package_versions=versions):
+                invalid_worker = SequentialWorker()
+
+                async def invalid(_payload, value=versions):
+                    return self.response(
+                        readiness={
+                            **readiness,
+                            "runtime_package_versions": value,
+                        }
+                    )
+
+                invalid_worker.apply_manifest = invalid
+                self.assert_terminal(
+                    self.apply(invalid_worker),
+                    "Remote provisioning response was invalid.",
+                )
+
     def test_transport_unavailability_and_cancellation_are_not_terminal(self):
         worker = SequentialWorker()
 
@@ -1419,6 +1592,156 @@ class ReusableSessionTests(unittest.TestCase):
             session_secret_hex="e" * 64,
         )
         return self.sessions.create_or_get(session)[0]
+
+    def _save_remote_job(self, *, state):
+        session = self.sessions.get("session-1")
+        candidate = self.service._new_job(
+            session,
+            self.first_capture,
+            self.initial_manifest.digest,
+            "guarded-" + state.value,
+        )
+        job, created = self.jobs.create_job(candidate)
+        self.assertTrue(created)
+        job = self.service._transition_job(job, JobState.RESOLVING)
+        job = self.service._transition_job(
+            job,
+            JobState.QUEUED,
+            execution_state=ExecutionState.QUEUED,
+        )
+        if state == JobState.RUNNING:
+            job = self.service._transition_job(
+                job,
+                JobState.RUNNING,
+                remote_prompt_id=(
+                    "11111111-1111-1111-1111-111111111111"
+                ),
+                execution_state=ExecutionState.RUNNING,
+            )
+        self.sessions.transition_if_state(
+            session.session_id,
+            SessionState.READY,
+            SessionState.RUNNING,
+            now=100.0,
+        )
+        return job
+
+    def _configure_readiness(self, service, outcomes, now=None):
+        from cloud_run.readiness import (
+            REQUIRED_READINESS_CHECKS,
+            ReadinessCheck,
+            ReadinessValidator,
+            evidence_digest,
+            readiness_message,
+        )
+
+        timeline = now or [100.0]
+        probe_calls = []
+        sleep_calls = []
+
+        async def probe(_session, _manifest, _profile):
+            ready = outcomes[min(len(probe_calls), len(outcomes) - 1)]
+            probe_calls.append(ready)
+            return tuple(
+                ReadinessCheck(
+                    name=name,
+                    status=(
+                        "failed"
+                        if not ready and name == "native_websocket_probe"
+                        else "passed"
+                    ),
+                    evidence_digest=evidence_digest(
+                        {"name": name, "attempt": len(probe_calls)}
+                    ),
+                    message=readiness_message(
+                        name,
+                        (
+                            "failed"
+                            if not ready and name == "native_websocket_probe"
+                            else "passed"
+                        ),
+                    ),
+                    diagnostic_code=(
+                        "native_websocket_handshake"
+                        if not ready and name == "native_websocket_probe"
+                        else None
+                    ),
+                )
+                for name in REQUIRED_READINESS_CHECKS
+            )
+
+        class Relay:
+            def __init__(inner_self):
+                inner_self.activations = 0
+                inner_self.active = False
+
+            async def start(inner_self):
+                return inner_self.status()
+
+            async def activate(
+                inner_self,
+                session_id,
+                _worker,
+                profile_revision,
+            ):
+                inner_self.activations += 1
+                inner_self.active = True
+                inner_self.session_id = session_id
+                inner_self.profile_revision = profile_revision
+                return inner_self.status()
+
+            def status(inner_self):
+                return types.SimpleNamespace(
+                    bound=True,
+                    ready=inner_self.active,
+                    active_session_id=(
+                        inner_self.session_id if inner_self.active else None
+                    ),
+                    profile_revision=(
+                        inner_self.profile_revision
+                        if inner_self.active
+                        else None
+                    ),
+                    url="http://127.0.0.1:32145",
+                )
+
+        async def sleep(delay):
+            sleep_calls.append(delay)
+            timeline[0] += delay
+
+        relay = Relay()
+        service.clock = lambda: timeline[0]
+        service.sleep = sleep
+        service.desktop_relay = relay
+        service.readiness_validator = ReadinessValidator(
+            probe=probe,
+            worker_release_digest=worker_release().worker_archive_sha256,
+            relay_origin="http://127.0.0.1:32145",
+            clock=lambda: timeline[0],
+        )
+        return timeline, probe_calls, sleep_calls, relay
+
+    def _persist_destroyed(self, session_id):
+        current = self.sessions.get(session_id)
+        if current.state != SessionState.DESTROYING:
+            current = self.sessions.transition(
+                session_id,
+                SessionState.DESTROYING,
+                now=current.updated_at + 1,
+                destroy_requested=True,
+            )
+        return self.sessions.transition(
+            session_id,
+            SessionState.DESTROYED,
+            now=current.updated_at + 1,
+            destroy_requested=True,
+            instance_id=None,
+            worker_base_url=None,
+            provider_token=None,
+            session_secret_hex=None,
+            residual_inventory=(),
+            sanitized_error=None,
+        )
 
     def test_apply_manifest_polls_and_persists_only_sanitized_progress(self):
         service = self.service
@@ -2046,96 +2369,194 @@ class ReusableSessionTests(unittest.TestCase):
             ["input-a.jpg", "model-a.safetensors"],
         )
 
-    def test_failed_readiness_is_durable_blocks_activation_and_never_mutates_provider(self):
-        from cloud_run.readiness import (
-            REQUIRED_READINESS_CHECKS,
-            ReadinessCheck,
-            ReadinessValidator,
-            evidence_digest,
-        )
-
-        class Relay:
-            def __init__(inner_self):
-                inner_self.activations = 0
-
-            async def start(inner_self):
-                return types.SimpleNamespace(
-                    bound=True,
-                    url="http://127.0.0.1:32145",
-                )
-
-            async def activate(inner_self, *_args):
-                inner_self.activations += 1
-                raise AssertionError("failed readiness must not activate")
-
-            def status(inner_self):
-                return types.SimpleNamespace(
-                    ready=False,
-                    active_session_id=None,
-                    profile_revision=None,
-                    url="http://127.0.0.1:32145",
-                )
-
-        class ProviderLifecycle:
-            def __init__(inner_self):
-                inner_self.create_calls = 0
-                inner_self.destroy_calls = 0
-
-            async def create_session(inner_self, *_args, **_kwargs):
-                inner_self.create_calls += 1
-
-            async def destroy_session(inner_self, *_args, **_kwargs):
-                inner_self.destroy_calls += 1
-
-        probe_calls = []
-
-        async def probe(_session, _manifest, _profile):
-            probe_calls.append(True)
-            return tuple(
-                ReadinessCheck(
-                    name=name,
-                    status=(
-                        "failed"
-                        if name == "native_websocket_probe"
-                        else "passed"
-                    ),
-                    evidence_digest=evidence_digest(name),
-                    message=(
-                        "Native WebSocket readiness probe failed."
-                        if name == "native_websocket_probe"
-                        else "Readiness proof passed."
-                    ),
-                )
-                for name in REQUIRED_READINESS_CHECKS
-            )
-
-        relay = Relay()
-        lifecycle = ProviderLifecycle()
-        self.service.desktop_relay = relay
-        self.service.lifecycle = lifecycle
-        self.service.readiness_validator = ReadinessValidator(
-            probe=probe,
-            worker_release_digest=worker_release().worker_archive_sha256,
-            relay_origin="http://127.0.0.1:32145",
-            clock=lambda: 100.0,
+    def test_readiness_failure_then_success_reprobes_and_activates_once(self):
+        _now, calls, sleeps, relay = self._configure_readiness(
+            self.service,
+            [False, True],
         )
         self._save_bootstrapping_session()
 
-        first = asyncio.run(self.service.bootstrap_session("session-boot"))
-        second = asyncio.run(self.service.bootstrap_session("session-boot"))
+        ready = asyncio.run(self.service.bootstrap_session("session-boot"))
 
-        self.assertEqual(first.state, SessionState.VALIDATING)
-        self.assertEqual(second.state, SessionState.VALIDATING)
-        self.assertEqual(probe_calls, [True])
-        self.assertEqual(relay.activations, 0)
-        self.assertEqual(lifecycle.create_calls, 0)
-        self.assertEqual(lifecycle.destroy_calls, 0)
-        self.assertEqual(len(self.worker.manifest_calls), 1)
-        entries = self.jobs.list_journal(session_id="session-boot")
+        identity = self.service.readiness_validator.identity(
+            ready,
+            self.initial_manifest,
+            self.initial_manifest.profile,
+        )
+        attempts = self.jobs.list_readiness_attempts(**identity)
+        self.assertEqual(ready.state, SessionState.READY)
+        self.assertEqual(calls, [False, True])
+        self.assertEqual([item.attempt_number for item in attempts], [1, 2])
+        self.assertEqual([item.ready for item in attempts], [False, True])
+        self.assertEqual(sleeps, [1.0])
+        self.assertEqual(relay.activations, 1)
+
+    def test_successful_readiness_is_reused_without_probe(self):
+        _now, calls, _sleeps, _relay = self._configure_readiness(
+            self.service,
+            [True],
+        )
+        session = self._save_bootstrapping_session()
+
+        first = asyncio.run(
+            self.service._certify_readiness(session, self.initial_manifest)
+        )
+        second = asyncio.run(
+            self.service._certify_readiness(session, self.initial_manifest)
+        )
+
+        self.assertTrue(first.ready)
+        self.assertEqual(second, first)
+        self.assertEqual(calls, [True])
+
+    def test_readiness_exhausts_six_attempts_within_sixty_seconds(self):
+        now, calls, sleeps, _relay = self._configure_readiness(
+            self.service,
+            [False],
+        )
+        self.service.job_poll_interval_seconds = 10
+        session = self._save_bootstrapping_session()
+
+        report = asyncio.run(
+            self.service._certify_readiness(session, self.initial_manifest)
+        )
+
+        identity = self.service.readiness_validator.identity(
+            session,
+            self.initial_manifest,
+            self.initial_manifest.profile,
+        )
+        attempts = self.jobs.list_readiness_attempts(**identity)
+        self.assertFalse(report.ready)
+        self.assertEqual(len(calls), 6)
+        self.assertEqual(
+            [item.attempt_number for item in attempts],
+            list(range(1, 7)),
+        )
+        self.assertEqual(sleeps, [10.0] * 5)
+        self.assertLessEqual(now[0] - attempts[0].created_at, 60.0)
+        entries = self.jobs.list_journal(session_id=session.session_id)
         self.assertEqual(len(entries), 1)
-        self.assertEqual(entries[0].phase.value, "readiness")
-        self.assertEqual(entries[0].code.value, "validation_error")
-        self.assertEqual(entries[0].last_probe, "native_websocket_probe")
+        self.assertEqual(entries[0].phase, RunPhase.READINESS)
+        self.assertFalse(entries[0].details["retryable"])
+
+    def test_exhausted_readiness_reentry_reuses_one_terminal_journal(self):
+        now, calls, _sleeps, _relay = self._configure_readiness(
+            self.service,
+            [False],
+        )
+        session = self._save_bootstrapping_session()
+
+        first = asyncio.run(
+            self.service._certify_readiness(session, self.initial_manifest)
+        )
+        original_entry = self.jobs.list_journal(
+            session_id=session.session_id
+        )[0]
+        now[0] += 1
+        restarted = SessionService(
+            job_repository=self.jobs,
+            session_repository=self.sessions,
+            resolver=FakeResolver(self.first_resolution),
+            release=worker_release(),
+            worker_factory=lambda _session: self.worker,
+            relay_factory=lambda worker, _session: SequentialRelay(worker),
+            clock=lambda: now[0],
+        )
+        _timeline, restart_calls, _restart_sleeps, _ = (
+            self._configure_readiness(restarted, [True], now)
+        )
+
+        replayed = asyncio.run(
+            restarted._certify_readiness(session, self.initial_manifest)
+        )
+
+        entries = self.jobs.list_journal(session_id=session.session_id)
+        self.assertEqual(replayed, first)
+        self.assertEqual(len(calls), 6)
+        self.assertEqual(restart_calls, [])
+        self.assertEqual(entries, [original_entry])
+
+    def test_restart_resumes_remaining_attempt_budget_without_reset(self):
+        now, calls, _sleeps, relay = self._configure_readiness(
+            self.service,
+            [False],
+        )
+        session = self._save_bootstrapping_session()
+
+        async def interrupt_after_second(delay):
+            now[0] += delay
+            if len(calls) >= 2:
+                raise asyncio.CancelledError()
+
+        self.service.sleep = interrupt_after_second
+        with self.assertRaises(asyncio.CancelledError):
+            asyncio.run(
+                self.service._certify_readiness(
+                    session,
+                    self.initial_manifest,
+                )
+            )
+
+        restarted = SessionService(
+            job_repository=self.jobs,
+            session_repository=self.sessions,
+            resolver=FakeResolver(self.first_resolution),
+            release=worker_release(),
+            worker_factory=lambda _session: self.worker,
+            relay_factory=lambda worker, _session: SequentialRelay(worker),
+            clock=lambda: now[0],
+        )
+        _timeline, restart_calls, _restart_sleeps, _ = (
+            self._configure_readiness(restarted, [True], now)
+        )
+        restarted.desktop_relay = relay
+
+        report = asyncio.run(
+            restarted._certify_readiness(session, self.initial_manifest)
+        )
+
+        identity = restarted.readiness_validator.identity(
+            session,
+            self.initial_manifest,
+            self.initial_manifest.profile,
+        )
+        attempts = self.jobs.list_readiness_attempts(**identity)
+        self.assertTrue(report.ready)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(restart_calls, [True])
+        self.assertEqual([item.attempt_number for item in attempts], [1, 2, 3])
+
+    def test_readiness_retry_stops_immediately_after_destroy_intent(self):
+        now, calls, _sleeps, _relay = self._configure_readiness(
+            self.service,
+            [False],
+        )
+        session = self._save_bootstrapping_session()
+
+        async def request_destroy(_delay):
+            now[0] += 1
+            self.sessions.transition(
+                session.session_id,
+                SessionState.DESTROY_REQUESTED,
+                now=now[0],
+                destroy_requested=True,
+            )
+
+        self.service.sleep = request_destroy
+        with self.assertRaises(asyncio.CancelledError):
+            asyncio.run(
+                self.service._certify_readiness(
+                    session,
+                    self.initial_manifest,
+                )
+            )
+
+        self.assertEqual(calls, [False])
+        self.assertEqual(
+            self.sessions.get(session.session_id).state,
+            SessionState.DESTROY_REQUESTED,
+        )
 
     def test_complete_report_commits_before_ready_relay_activation(self):
         from cloud_run.readiness import (
@@ -2143,6 +2564,7 @@ class ReusableSessionTests(unittest.TestCase):
             ReadinessCheck,
             ReadinessValidator,
             evidence_digest,
+            readiness_message,
         )
 
         outer = self
@@ -2197,7 +2619,14 @@ class ReusableSessionTests(unittest.TestCase):
                         else "passed"
                     ),
                     evidence_digest=evidence_digest(name),
-                    message="Readiness proof passed.",
+                    message=readiness_message(
+                        name,
+                        (
+                            "not_required"
+                            if name == "agent_panel_capabilities"
+                            else "passed"
+                        ),
+                    ),
                 )
                 for name in REQUIRED_READINESS_CHECKS
             )
@@ -3150,6 +3579,543 @@ class ReusableSessionTests(unittest.TestCase):
                 )
             )
 
+    def test_destroy_persists_intent_before_reconciler_profile_bridge_or_provider_work(self):
+        events = []
+        outer = self
+
+        def observe(name):
+            current = outer.sessions.get("session-1")
+            outer.assertEqual(current.state, SessionState.DESTROY_REQUESTED)
+            outer.assertTrue(current.destroy_requested)
+            events.append(name)
+
+        class Reconciler:
+            async def preempt(inner_self, _session_id):
+                observe("reconciler")
+
+        class Lifecycle:
+            async def preempt_session(inner_self, _session_id):
+                observe("lifecycle")
+
+            async def destroy_session(inner_self, session_id):
+                observe("provider")
+                return outer._persist_destroyed(session_id)
+
+        class Bridge(FakeSessionAgentBridge):
+            async def revoke(inner_self, session_id):
+                observe("bridge")
+                await super().revoke(session_id)
+
+        async def sync_profile(_session_id):
+            observe("profile")
+
+        self.service.reconciler = Reconciler()
+        self.service.lifecycle = Lifecycle()
+        self.service.agent_bridge = Bridge()
+        self.service.sync_profile = sync_profile
+        review = asyncio.run(self.service.review_destroy("session-1"))
+
+        destroyed = asyncio.run(
+            self.service.destroy(
+                "session-1",
+                {
+                    "review_token": review.token,
+                    "acknowledge_data_loss": True,
+                },
+            )
+        )
+
+        self.assertEqual(destroyed.state, SessionState.DESTROYED)
+        self.assertEqual(
+            events,
+            ["reconciler", "lifecycle", "bridge", "profile", "provider"],
+        )
+
+    def test_profile_timeout_or_failure_never_prevents_provider_teardown(self):
+        outer = self
+        provider_calls = []
+        timeouts = []
+
+        class Reconciler:
+            async def preempt(inner_self, _session_id):
+                return None
+
+        class Lifecycle:
+            async def preempt_session(inner_self, _session_id):
+                return None
+
+            async def destroy_session(inner_self, session_id):
+                provider_calls.append(session_id)
+                return outer._persist_destroyed(session_id)
+
+        async def blocked_profile(_session_id):
+            await asyncio.Event().wait()
+
+        async def timeout(awaitable, *, timeout):
+            timeouts.append(timeout)
+            awaitable.close()
+            raise asyncio.TimeoutError()
+
+        self.service.reconciler = Reconciler()
+        self.service.lifecycle = Lifecycle()
+        self.service.sync_profile = blocked_profile
+        review = asyncio.run(self.service.review_destroy("session-1"))
+
+        with mock.patch("cloud_run.session_service.asyncio.wait_for", timeout):
+            destroyed = asyncio.run(
+                self.service.destroy(
+                    "session-1",
+                    {
+                        "review_token": review.token,
+                        "acknowledge_data_loss": True,
+                    },
+                )
+            )
+
+        self.assertEqual(destroyed.state, SessionState.DESTROYED)
+        self.assertEqual(timeouts, [5])
+        self.assertEqual(provider_calls, ["session-1"])
+
+    def test_agent_bridge_revocation_failure_never_prevents_teardown(self):
+        outer = self
+        provider_calls = []
+
+        class Reconciler:
+            async def preempt(inner_self, _session_id):
+                return None
+
+        class Lifecycle:
+            async def preempt_session(inner_self, _session_id):
+                return None
+
+            async def destroy_session(inner_self, session_id):
+                provider_calls.append(session_id)
+                return outer._persist_destroyed(session_id)
+
+        class Bridge(FakeSessionAgentBridge):
+            async def revoke(inner_self, _session_id):
+                raise OSError("synthetic bridge failure with secret")
+
+        self.service.reconciler = Reconciler()
+        self.service.lifecycle = Lifecycle()
+        self.service.agent_bridge = Bridge()
+        review = asyncio.run(self.service.review_destroy("session-1"))
+
+        destroyed = asyncio.run(
+            self.service.destroy(
+                "session-1",
+                {
+                    "review_token": review.token,
+                    "acknowledge_data_loss": True,
+                },
+            )
+        )
+
+        self.assertEqual(destroyed.state, SessionState.DESTROYED)
+        self.assertEqual(provider_calls, ["session-1"])
+
+    def test_provision_poll_observes_destroy_intent_before_next_worker_request(self):
+        session = self.sessions.get("session-1")
+        self.service.job_poll_interval_seconds = 0
+
+        class Worker:
+            def __init__(inner_self):
+                inner_self.transactions = 0
+
+            async def apply_manifest(inner_self, _request):
+                await asyncio.Event().wait()
+
+            async def transaction(inner_self, _transaction_id):
+                inner_self.transactions += 1
+                self.sessions.transition(
+                    session.session_id,
+                    SessionState.DESTROY_REQUESTED,
+                    now=101.0,
+                    destroy_requested=True,
+                )
+                return None
+
+        worker = Worker()
+        with self.assertRaises(asyncio.CancelledError):
+            asyncio.run(
+                self.service._apply_with_progress_polling(
+                    worker,
+                    {"manifest_digest": self.initial_manifest.digest},
+                    session=session,
+                    manifest=self.initial_manifest,
+                    transfer_job_id="bootstrap:session-1",
+                )
+            )
+
+        self.assertEqual(worker.transactions, 1)
+        self.assertEqual(
+            self.sessions.get(session.session_id).state,
+            SessionState.DESTROY_REQUESTED,
+        )
+
+    def _assert_snapshot_destroy_preempts_relay(self, remote_state):
+        job = self._save_remote_job(state=JobState.RUNNING)
+        relay_calls = []
+
+        async def snapshot(job_id, after_sequence):
+            self.sessions.transition(
+                job.session_id,
+                SessionState.DESTROY_REQUESTED,
+                now=101.0,
+                destroy_requested=True,
+            )
+            return {
+                "job_id": job_id,
+                "state": remote_state,
+                "prompt_id": job.remote_prompt_id,
+                "events": [],
+                "last_sequence": after_sequence,
+                "outputs": [],
+                "error": None,
+                "created_at": 100.0,
+                "updated_at": 100.0,
+            }
+
+        class Relay:
+            async def sync_snapshot(inner_self, job_id, _snapshot):
+                relay_calls.append(job_id)
+                raise AssertionError(
+                    "relay started after durable destroy intent"
+                )
+
+        self.worker.snapshot = snapshot
+        self.service.relay_factory = lambda _worker, _session: Relay()
+
+        with self.assertRaises(asyncio.CancelledError):
+            asyncio.run(
+                self.service.reconcile_session_once(job.session_id)
+            )
+
+        self.assertEqual(relay_calls, [])
+        self.assertEqual(
+            self.sessions.get(job.session_id).state,
+            SessionState.DESTROY_REQUESTED,
+        )
+
+    def test_running_snapshot_rechecks_destroy_before_relay(self):
+        self._assert_snapshot_destroy_preempts_relay("running")
+
+    def test_succeeded_snapshot_rechecks_destroy_before_relay(self):
+        self._assert_snapshot_destroy_preempts_relay("succeeded")
+
+    def test_failed_snapshot_rechecks_destroy_before_relay(self):
+        self._assert_snapshot_destroy_preempts_relay("failed")
+
+    def test_resume_rechecks_destroy_after_worker_start_before_scheduling(self):
+        job = self._save_remote_job(state=JobState.QUEUED)
+        reconciler_calls = []
+
+        class Reconciler:
+            def schedule(inner_self, session_id):
+                reconciler_calls.append(("schedule", session_id))
+
+            async def reconcile(inner_self, session_id):
+                reconciler_calls.append(("reconcile", session_id))
+
+        async def start_job(payload):
+            self.sessions.transition(
+                job.session_id,
+                SessionState.DESTROY_REQUESTED,
+                now=101.0,
+                destroy_requested=True,
+            )
+            return {
+                "job_id": payload["job_id"],
+                "state": "queued",
+                "prompt_id": (
+                    "11111111-1111-1111-1111-111111111111"
+                ),
+                "last_sequence": 0,
+                "outputs": [],
+                "error": None,
+            }
+
+        self.service.reconciler = Reconciler()
+        self.worker.start_job = start_job
+
+        with self.assertRaises(asyncio.CancelledError):
+            asyncio.run(self.service.resume_session(job.session_id))
+
+        self.assertEqual(reconciler_calls, [])
+        self.assertEqual(
+            self.jobs.get_job(job.job_id).state,
+            JobState.QUEUED,
+        )
+
+    def test_changed_safety_snapshot_requires_a_new_review(self):
+        provider_calls = []
+
+        class Lifecycle:
+            async def destroy_session(inner_self, session_id):
+                provider_calls.append(session_id)
+
+        self.service.lifecycle = Lifecycle()
+        review = asyncio.run(self.service.review_destroy("session-1"))
+        current = self.sessions.get("session-1")
+        self.sessions.transition(
+            current.session_id,
+            current.state,
+            now=101.0,
+            instance_id="changed-instance",
+        )
+
+        with self.assertRaises(DestroyConfirmationError):
+            asyncio.run(
+                self.service.destroy(
+                    "session-1",
+                    {
+                        "review_token": review.token,
+                        "acknowledge_data_loss": True,
+                    },
+                )
+            )
+
+        self.assertEqual(provider_calls, [])
+        self.assertFalse(self.sessions.get("session-1").destroy_requested)
+
+    def test_destroy_review_response_uses_the_atomic_repository_snapshot(self):
+        original = self.sessions.save_destroy_review
+
+        def move_instance_before_snapshot(*args, **kwargs):
+            current = self.sessions.get("session-1")
+            self.sessions.transition(
+                current.session_id,
+                current.state,
+                now=current.updated_at + 1,
+                instance_id="88",
+                residual_inventory=("88",),
+            )
+            return original(*args, **kwargs)
+
+        with mock.patch.object(
+            self.sessions,
+            "save_destroy_review",
+            side_effect=move_instance_before_snapshot,
+        ):
+            review = asyncio.run(
+                self.service.review_destroy("session-1")
+            )
+
+        self.assertEqual(review.instance_id, "88")
+        self.assertEqual(review.status, "ready")
+
+    def test_http_cancellation_after_intent_leaves_recoverable_teardown(self):
+        outer = self
+
+        async def scenario():
+            entered = asyncio.Event()
+            release = asyncio.Event()
+
+            class Reconciler:
+                async def preempt(inner_self, _session_id):
+                    return None
+
+            class Lifecycle:
+                async def preempt_session(inner_self, _session_id):
+                    return None
+
+                async def destroy_session(inner_self, session_id):
+                    entered.set()
+                    await release.wait()
+                    return outer._persist_destroyed(session_id)
+
+            outer.service.reconciler = Reconciler()
+            outer.service.lifecycle = Lifecycle()
+            review = await outer.service.review_destroy("session-1")
+            caller = asyncio.create_task(
+                outer.service.destroy(
+                    "session-1",
+                    {
+                        "review_token": review.token,
+                        "acknowledge_data_loss": True,
+                    },
+                )
+            )
+            await entered.wait()
+            caller.cancel()
+            with outer.assertRaises(asyncio.CancelledError):
+                await caller
+            persisted = outer.sessions.get("session-1")
+            outer.assertEqual(
+                persisted.state,
+                SessionState.DESTROY_REQUESTED,
+            )
+            teardown = outer.service._teardown_tasks["session-1"]
+            outer.assertFalse(teardown.cancelled())
+            release.set()
+            return await teardown
+
+        destroyed = asyncio.run(scenario())
+
+        self.assertEqual(destroyed.state, SessionState.DESTROYED)
+
+    def test_restart_resumes_persisted_destroy_intent_before_ordinary_recovery(self):
+        requested = self.sessions.transition(
+            "session-1",
+            SessionState.DESTROY_REQUESTED,
+            now=101.0,
+            destroy_requested=True,
+        )
+        self.sessions.transition(
+            requested.session_id,
+            SessionState.FAILED,
+            now=102.0,
+            destroy_requested=True,
+            sanitized_error="Destruction inventory remains unverified.",
+        )
+        events = []
+        outer = self
+
+        class Reconciler:
+            async def preempt(inner_self, session_id):
+                events.append(("reconciler", session_id))
+
+        class Lifecycle:
+            async def preempt_session(inner_self, session_id):
+                events.append(("lifecycle", session_id))
+
+            async def destroy_session(inner_self, session_id):
+                events.append(("provider", session_id))
+                return outer._persist_destroyed(session_id)
+
+        restarted = SessionService(
+            job_repository=self.jobs,
+            session_repository=self.sessions,
+            resolver=FakeResolver(self.first_resolution),
+            release=worker_release(),
+            worker_factory=lambda _session: self.fail(
+                "ordinary worker recovery ran before durable teardown"
+            ),
+            lifecycle=Lifecycle(),
+            reconciler=Reconciler(),
+            clock=lambda: 103.0,
+        )
+
+        destroyed = asyncio.run(restarted.recover_session("session-1"))
+
+        self.assertEqual(destroyed.state, SessionState.DESTROYED)
+        self.assertEqual(
+            events,
+            [
+                ("reconciler", "session-1"),
+                ("lifecycle", "session-1"),
+                ("provider", "session-1"),
+            ],
+        )
+
+    def test_submit_job_stops_before_worker_start_after_destroy_intent(self):
+        original_transition = self.service._transition_job
+
+        def transition(job, state, **changes):
+            result = original_transition(job, state, **changes)
+            if state == JobState.QUEUED:
+                self.sessions.transition(
+                    job.session_id,
+                    SessionState.DESTROY_REQUESTED,
+                    now=101.0,
+                    destroy_requested=True,
+                )
+            return result
+
+        async def forbidden_start(payload):
+            self.worker.job_calls.append(payload)
+            raise AssertionError("worker start ran after destroy intent")
+
+        self.service._transition_job = transition
+        self.worker.start_job = forbidden_start
+
+        with self.assertRaises(asyncio.CancelledError):
+            asyncio.run(
+                self.service.submit_job(
+                    "session-1",
+                    capture_id=self.first_capture.capture_id,
+                    idempotency_key="destroy-before-start",
+                )
+            )
+
+        self.assertEqual(self.worker.job_calls, [])
+
+    def test_submit_job_rechecks_destroy_intent_before_scheduling(self):
+        original_transition = self.service._transition_job
+
+        def transition(job, state, **changes):
+            result = original_transition(job, state, **changes)
+            if state == JobState.RUNNING:
+                self.sessions.transition(
+                    job.session_id,
+                    SessionState.DESTROY_REQUESTED,
+                    now=101.0,
+                    destroy_requested=True,
+                )
+            return result
+
+        class Reconciler:
+            def __init__(inner_self):
+                inner_self.calls = []
+
+            def schedule(inner_self, session_id):
+                inner_self.calls.append(("schedule", session_id))
+                raise AssertionError("scheduled after destroy intent")
+
+        reconciler = Reconciler()
+        self.service._transition_job = transition
+        self.service.reconciler = reconciler
+        self.worker.terminal_state = "queued"
+
+        with self.assertRaises(asyncio.CancelledError):
+            asyncio.run(
+                self.service.submit_job(
+                    "session-1",
+                    capture_id=self.first_capture.capture_id,
+                    idempotency_key="destroy-before-schedule",
+                )
+            )
+
+        self.assertEqual(reconciler.calls, [])
+
+    def test_submit_job_rechecks_destroy_intent_before_reconciling(self):
+        original_transition = self.service._transition_job
+
+        def transition(job, state, **changes):
+            result = original_transition(job, state, **changes)
+            if state == JobState.RUNNING:
+                self.sessions.transition(
+                    job.session_id,
+                    SessionState.DESTROY_REQUESTED,
+                    now=101.0,
+                    destroy_requested=True,
+                )
+            return result
+
+        class Reconciler:
+            def __init__(inner_self):
+                inner_self.calls = []
+
+            async def reconcile(inner_self, session_id):
+                inner_self.calls.append(("reconcile", session_id))
+                raise AssertionError("reconciled after destroy intent")
+
+        reconciler = Reconciler()
+        self.service._transition_job = transition
+        self.service.reconciler = reconciler
+        self.worker.terminal_state = "succeeded"
+
+        with self.assertRaises(asyncio.CancelledError):
+            asyncio.run(
+                self.service.submit_job(
+                    "session-1",
+                    capture_id=self.first_capture.capture_id,
+                    idempotency_key="destroy-before-reconcile",
+                )
+            )
+
+        self.assertEqual(reconciler.calls, [])
+
     def test_duplicate_key_is_idempotent_and_busy_session_rejects_new_job(self):
         first = asyncio.run(
             self.service.submit_job(
@@ -3633,6 +4599,90 @@ class NativeDesktopPromptTests(unittest.IsolatedAsyncioTestCase):
             forward.server_identity(),
         )
         self.assertEqual(worker.job_calls, [])
+
+    async def test_native_resume_rechecks_destroy_after_worker_response(self):
+        forward = await self.service.prepare_native_prompt(
+            "session-1",
+            request_id="request-destroy-race",
+            body=native_prompt_body(self.first_capture),
+        )
+        reconciler_calls = []
+
+        class Reconciler:
+            def schedule(inner_self, session_id):
+                reconciler_calls.append(session_id)
+
+        class NativeRecoveryWorker(SequentialWorker):
+            def __init__(inner_self):
+                super().__init__(terminal_state="running")
+                inner_self.transport = inner_self
+
+            async def start_job(inner_self, _payload):
+                raise AssertionError("native recovery used the headless route")
+
+            def native_envelope(
+                inner_self,
+                method,
+                path_qs,
+                body,
+                *,
+                identity=None,
+                headers=None,
+            ):
+                from cloud_run.worker_client import WorkerRequest
+
+                return WorkerRequest(
+                    method=method,
+                    url="http://worker.invalid" + path_qs,
+                    headers={},
+                    body=body,
+                )
+
+            async def request(inner_self, _request, *, max_bytes):
+                from cloud_run.worker_client import WorkerTransportResponse
+
+                self.sessions.transition(
+                    "session-1",
+                    SessionState.DESTROY_REQUESTED,
+                    now=101.0,
+                    destroy_requested=True,
+                )
+                return WorkerTransportResponse(
+                    status=200,
+                    headers={"Content-Type": "application/json"},
+                    body=json.dumps(
+                        {
+                            "prompt_id": (
+                                "22222222-2222-4222-8222-222222222222"
+                            ),
+                            "number": 1,
+                            "node_errors": {},
+                        },
+                        separators=(",", ":"),
+                    ).encode("utf-8"),
+                )
+
+        worker = NativeRecoveryWorker()
+        restarted = SessionService(
+            job_repository=self.jobs,
+            session_repository=self.sessions,
+            resolver=FakeResolver(self.first_resolution),
+            release=worker_release(),
+            worker_factory=lambda _session: worker,
+            relay_factory=lambda observed, _session: SequentialRelay(observed),
+            reconciler=Reconciler(),
+            clock=lambda: 103.0,
+            id_factory=lambda: "unused-recovery-id",
+        )
+
+        with self.assertRaises(asyncio.CancelledError):
+            await restarted.resume_session("session-1")
+
+        self.assertEqual(reconciler_calls, [])
+        self.assertEqual(
+            self.jobs.get_job(forward.job_id).state,
+            JobState.QUEUED,
+        )
 
     async def test_restart_revalidates_a_captured_native_intent_before_forwarding(self):
         body = native_prompt_body(self.first_capture)

@@ -142,6 +142,13 @@ _ABSENT_OR_PRE_PROVIDER_STATES = frozenset(
         SessionState.DESTROYED,
     }
 )
+_PRE_PROVIDER_STATES = frozenset(
+    {
+        SessionState.PREFLIGHT,
+        SessionState.OFFER_SELECTED,
+        SessionState.CONFIRMING,
+    }
+)
 _CONFIGURATION_REVISION = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
 )
@@ -203,6 +210,24 @@ def _stored_session_blocks_paid_claim(row):
         provider_token = row["provider_token"]
         session_secret_hex = row["session_secret_hex"]
         failure_code = row["failure_code"]
+        post_start_evidence = bool(
+            row["destroy_requested"]
+            or row["installed_manifest_digest"] is not None
+            or row["worker_base_url"] is not None
+            or row["pending_deadline_at"] is not None
+            or row["pending_deadline_mode"] is not None
+            or row["pending_deadline_action"] is not None
+        )
+        unverified_create_evidence = bool(
+            post_start_evidence
+            or row["create_settings_revision"] is not None
+            or row["create_configuration_revision"] is not None
+            or row["create_reconcile_started_at"] is not None
+            or row["create_empty_observations"]
+            or row["create_first_empty_at"] is not None
+            or row["create_last_empty_at"] is not None
+            or row["retry_count"]
+        )
     except (IndexError, KeyError, TypeError, ValueError):
         return True
     if not isinstance(residual_inventory, list):
@@ -213,6 +238,14 @@ def _stored_session_blocks_paid_claim(row):
         or session_secret_hex is not None
         or residual_inventory
         or state not in _ABSENT_OR_PRE_PROVIDER_STATES
+        or (
+            state in _PRE_PROVIDER_STATES
+            and unverified_create_evidence
+        )
+        or (
+            state == SessionState.FAILED
+            and post_start_evidence
+        )
         or (
             failure_code is not None
             and failure_code not in VAST_CREATE_FAILURE_CODES
@@ -1873,8 +1906,11 @@ class SessionRepository:
         now,
         provider_token,
         session_secret_hex,
+        settings_revision,
     ):
         """Atomically serialize the boundary immediately before Vast PUT."""
+        if not _is_canonical_uuid(settings_revision):
+            raise ValueError("The Vast credential revision is invalid.")
         identifier = str(session_id)
         with closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -1927,6 +1963,7 @@ class SessionRepository:
                 now=now,
                 provider_token=provider_token,
                 session_secret_hex=session_secret_hex,
+                create_settings_revision=settings_revision,
                 sanitized_error=None,
             )
             try:
@@ -2116,7 +2153,7 @@ class SessionRepository:
                 raise ConcurrentSessionUpdate(
                     "The session changed before destruction review."
                 )
-            snapshot, _session = reviewed
+            snapshot, reviewed_row = reviewed
             connection.execute(
                 """
                 INSERT INTO destroy_reviews(
@@ -2150,7 +2187,24 @@ class SessionRepository:
                     snapshot["profile_revision"],
                 ),
             )
+            review = DestroyReviewRecord(
+                session_id=identifier,
+                expires_at=expiry,
+                managed_label=snapshot["managed_label"],
+                instance_id=snapshot["instance_id"],
+                residual_instance_ids=snapshot[
+                    "residual_instance_ids"
+                ],
+                active_job_id=snapshot["active_job_id"],
+                unverified_artifact_ids=snapshot[
+                    "unverified_artifact_ids"
+                ],
+                profile_id=snapshot["profile_id"],
+                profile_revision=snapshot["profile_revision"],
+            )
+            reviewed_session = self._row_to_session(reviewed_row)
             connection.commit()
+        return review, reviewed_session
 
     def consume_destroy_review_and_request_destroy(
         self,

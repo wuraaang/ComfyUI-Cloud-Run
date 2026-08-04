@@ -1133,6 +1133,7 @@ class CloudRunService:
                 now=claim_now,
                 provider_token=provider_token,
                 session_secret_hex=session_secret_hex,
+                settings_revision=settings.get("api_key_revision"),
             )
         except ConcurrentSessionUpdate:
             return self.get_session(session.session_id)

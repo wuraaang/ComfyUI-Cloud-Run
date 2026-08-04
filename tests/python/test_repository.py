@@ -18,6 +18,9 @@ from cloud_run.models import (
 from cloud_run import repository
 
 
+CREATE_SETTINGS_REVISION = "33333333-3333-4333-8333-333333333333"
+
+
 def make_attempt(key="idem-1", attempt_id="attempt-1", now=100.0):
     return CloudAttempt.new(
         idempotency_key=key,
@@ -240,12 +243,56 @@ class SessionRepositoryTests(unittest.TestCase):
                 now=110.0,
                 provider_token="a" * 64,
                 session_secret_hex="b" * 64,
+                settings_revision=CREATE_SETTINGS_REVISION,
             )
 
         reopened = sessions.get(target.session_id)
         self.assertEqual(reopened.state, SessionState.OFFER_SELECTED)
         self.assertIsNone(reopened.provider_token)
         self.assertIsNone(reopened.session_secret_hex)
+
+    def test_atomic_create_claim_persists_settings_revision_with_secrets(self):
+        sessions = repository.SessionRepository(self.database_path)
+        target = make_confirming_session()
+        sessions.create_or_get(target)
+
+        claimed = sessions.claim_create_intent(
+            target.session_id,
+            now=110.0,
+            provider_token="a" * 64,
+            session_secret_hex="b" * 64,
+            settings_revision=CREATE_SETTINGS_REVISION,
+        )
+        reopened = repository.SessionRepository(self.database_path).get(
+            target.session_id
+        )
+
+        self.assertEqual(claimed.state, SessionState.CREATING)
+        self.assertEqual(
+            claimed.create_settings_revision,
+            CREATE_SETTINGS_REVISION,
+        )
+        self.assertEqual(reopened, claimed)
+
+    def test_atomic_create_claim_rejects_unbound_settings_revision(self):
+        sessions = repository.SessionRepository(self.database_path)
+        target = make_confirming_session()
+        sessions.create_or_get(target)
+
+        with self.assertRaises(ValueError):
+            sessions.claim_create_intent(
+                target.session_id,
+                now=110.0,
+                provider_token="a" * 64,
+                session_secret_hex="b" * 64,
+                settings_revision=None,
+            )
+
+        reopened = sessions.get(target.session_id)
+        self.assertEqual(reopened.state, SessionState.CONFIRMING)
+        self.assertIsNone(reopened.provider_token)
+        self.assertIsNone(reopened.session_secret_hex)
+        self.assertIsNone(reopened.create_settings_revision)
 
     def test_legacy_terminal_quote_does_not_block_paid_claim(self):
         sessions = repository.SessionRepository(self.database_path)
@@ -258,6 +305,7 @@ class SessionRepositoryTests(unittest.TestCase):
             now=110.0,
             provider_token="a" * 64,
             session_secret_hex="b" * 64,
+            settings_revision=CREATE_SETTINGS_REVISION,
         )
 
         self.assertEqual(claimed.state, SessionState.CREATING)
@@ -346,6 +394,7 @@ class SessionRepositoryTests(unittest.TestCase):
                             now=110.0,
                             provider_token="a" * 64,
                             session_secret_hex="b" * 64,
+                            settings_revision=CREATE_SETTINGS_REVISION,
                         )
 
                     reopened = sessions.get(target.session_id)
@@ -419,6 +468,101 @@ class SessionRepositoryTests(unittest.TestCase):
         )
 
         self._assert_create_claim_blocked(blocker)
+
+    def test_atomic_create_claim_blocks_every_unresolved_rental_evidence(self):
+        def blocker(name, state, **changes):
+            candidate = make_session(
+                key="unresolved-key-" + name,
+                session_id="unresolved-session-" + name,
+                now=90.0,
+            )
+            if state == SessionState.OFFER_SELECTED:
+                candidate = candidate.transition(
+                    SessionState.OFFER_SELECTED,
+                    now=91.0,
+                )
+            elif state == SessionState.CONFIRMING:
+                candidate = candidate.transition(
+                    SessionState.OFFER_SELECTED,
+                    now=91.0,
+                ).transition(
+                    SessionState.CONFIRMING,
+                    now=92.0,
+                )
+            elif state == SessionState.FAILED:
+                candidate = candidate.transition(
+                    SessionState.FAILED,
+                    now=91.0,
+                )
+            return candidate.transition(
+                state,
+                now=93.0,
+                **changes,
+            )
+
+        cases = (
+            blocker(
+                "destroy-requested",
+                SessionState.FAILED,
+                destroy_requested=True,
+            ),
+            blocker(
+                "installed-manifest",
+                SessionState.FAILED,
+                installed_manifest_digest="a" * 64,
+            ),
+            blocker(
+                "worker-url",
+                SessionState.FAILED,
+                worker_base_url="http://203.0.113.7:32100",
+            ),
+            blocker(
+                "pending-deadline",
+                SessionState.FAILED,
+                pending_deadline_at=9_090.0,
+                pending_deadline_mode="finite",
+                pending_deadline_action="add_30_minutes",
+            ),
+            blocker(
+                "settings-revision",
+                SessionState.PREFLIGHT,
+                create_settings_revision=CREATE_SETTINGS_REVISION,
+            ),
+            blocker(
+                "configuration-revision",
+                SessionState.OFFER_SELECTED,
+                create_configuration_revision="typed-env-object-v1",
+            ),
+            blocker(
+                "reconcile-start",
+                SessionState.CONFIRMING,
+                create_reconcile_started_at=92.0,
+            ),
+            blocker(
+                "empty-observation",
+                SessionState.PREFLIGHT,
+                create_reconcile_started_at=92.0,
+                create_empty_observations=1,
+                create_first_empty_at=92.0,
+                create_last_empty_at=92.0,
+            ),
+            blocker(
+                "retry-count",
+                SessionState.OFFER_SELECTED,
+                retry_count=1,
+            ),
+        )
+        original_path = self.database_path
+        try:
+            for candidate in cases:
+                with self.subTest(session_id=candidate.session_id):
+                    self.database_path = original_path.with_name(
+                        candidate.session_id + ".sqlite3"
+                    )
+                    self.assertEqual(candidate.rental_outcome, "unknown")
+                    self._assert_create_claim_blocked(candidate)
+        finally:
+            self.database_path = original_path
 
     def test_unremediated_400_401_403_block_direct_create_claim(self):
         cases = (
@@ -508,6 +652,7 @@ class SessionRepositoryTests(unittest.TestCase):
                 now=110.0,
                 provider_token="a" * 64,
                 session_secret_hex="b" * 64,
+                settings_revision=CREATE_SETTINGS_REVISION,
             )
 
         configuration_blocked = sessions.get(
@@ -531,6 +676,7 @@ class SessionRepositoryTests(unittest.TestCase):
             now=113.0,
             provider_token="c" * 64,
             session_secret_hex="d" * 64,
+            settings_revision=CREATE_SETTINGS_REVISION,
         )
 
         self.assertEqual(claimed.state, SessionState.CREATING)
@@ -565,6 +711,7 @@ class SessionRepositoryTests(unittest.TestCase):
                         if candidate is first
                         else "d" * 64
                     ),
+                    settings_revision=CREATE_SETTINGS_REVISION,
                 )
             except repository.PaidRentalConflict as error:
                 return error
@@ -769,12 +916,19 @@ class SessionRepositoryTests(unittest.TestCase):
         raw_token = "review-token-never-store-raw"
         digest = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
 
-        sessions.save_destroy_review(
+        review, reviewed_session = sessions.save_destroy_review(
             saved.session_id,
             token_digest=digest,
             expires_at=400.0,
             profile_id=None,
         )
+        self.assertEqual(review.session_id, saved.session_id)
+        self.assertEqual(review.expires_at, 400.0)
+        self.assertEqual(review.managed_label, saved.label)
+        self.assertEqual(review.instance_id, saved.instance_id)
+        self.assertEqual(review.residual_instance_ids, ())
+        self.assertEqual(review.unverified_artifact_ids, ())
+        self.assertEqual(reviewed_session, saved)
         sessions.update(
             saved.session_id,
             now=103.0,

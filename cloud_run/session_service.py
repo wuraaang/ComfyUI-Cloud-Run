@@ -82,6 +82,7 @@ _ARTIFACT_PROVISION_PHASES = {
 _SOURCE_KINDS = {
     "agent",
     "approved",
+    "certified_baseline",
     "civitai",
     "core",
     "huggingface",
@@ -92,12 +93,22 @@ _SOURCE_KINDS = {
     "registry",
 }
 _AGENT_PANEL_PACKAGE_ID = "comfyui-agent-panel"
+
+
+def _valid_class_type(value):
+    return bool(
+        isinstance(value, str)
+        and 1 <= len(value) <= 200
+        and value == value.strip()
+        and all(32 <= ord(character) <= 126 for character in value)
+    )
 _AGENT_PANEL_CAPABILITIES = frozenset({
     "graph_read",
     "graph_edit",
     "native_run",
     "native_batch",
 })
+_RUNTIME_PACKAGE_NAMES = frozenset({"aiohttp", "torch"})
 _MAPPING_CANDIDATE_FIELDS = {
     "approved",
     "archive_complete",
@@ -115,7 +126,14 @@ DEADLINE_ACTION_SECONDS = {
     "add_1_hour": 60 * 60,
 }
 DESTROY_REVIEW_TTL_SECONDS = 5 * 60
+READINESS_MAX_ATTEMPTS = 6
+READINESS_WINDOW_SECONDS = 60
+TEARDOWN_PROFILE_TIMEOUT_SECONDS = 5
 _MAX_PROFILE_ARCHIVE_BYTES = 128 * 1024 * 1024
+_EXTENSION_PATH = re.compile(
+    r"/extensions/[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}/"
+    r"[A-Za-z0-9._@+/-]+"
+)
 
 
 class SessionServiceError(RuntimeError):
@@ -160,6 +178,10 @@ class DeadlineSynchronizationError(SessionServiceError):
 
 class DestroyConfirmationError(SessionServiceError):
     pass
+
+
+class _DestroyRequested(asyncio.CancelledError):
+    """Internal cooperative cancellation after durable destroy intent."""
 
 
 @dataclass(frozen=True, repr=False)
@@ -568,7 +590,11 @@ class PreflightResult:
 
 
 def _candidate_for(repository, class_type, source_kind):
-    if repository is None or source_kind is None:
+    if (
+        repository is None
+        or source_kind is None
+        or source_kind in {"core", "certified_baseline"}
+    ):
         return None
     try:
         if source_kind == "approved":
@@ -583,6 +609,15 @@ def _candidate_for(repository, class_type, source_kind):
         )
     except Exception:
         return None
+
+
+def _node_dependency_id(class_type):
+    direct = "node:" + class_type
+    if _IDENTIFIER.fullmatch(direct):
+        return direct
+    return "node:" + hashlib.sha256(
+        class_type.encode("utf-8")
+    ).hexdigest()
 
 
 def _preflight_rows(resolution, mapping_repository):
@@ -618,7 +653,7 @@ def _preflight_rows(resolution, mapping_repository):
             destination = custom.archive.destination
         rows.append(
             PreflightRow(
-                dependency_id="node:" + node_row.class_type,
+                dependency_id=_node_dependency_id(node_row.class_type),
                 kind=(
                     "core_node"
                     if node_row.source_kind == "core"
@@ -1180,6 +1215,8 @@ def _worker_readiness_payload_valid(payload, manifest):
         "profile_digest",
         "bootstrap_digest",
         "ui_package_digests",
+        "served_extension_paths",
+        "runtime_package_versions",
         "comfy_process_healthy",
         "completed_at",
     }
@@ -1210,6 +1247,8 @@ def _worker_readiness_payload_valid(payload, manifest):
         )
     }
     profile = manifest.profile
+    extension_paths = payload.get("served_extension_paths")
+    runtime_versions = payload.get("runtime_package_versions")
     completed_at = payload.get("completed_at")
     return bool(
         payload.get("protocol_version") == manifest.protocol_version
@@ -1219,15 +1258,19 @@ def _worker_readiness_payload_valid(payload, manifest):
         == manifest.comfyui_frontend_version
         and payload.get("worker_version") == manifest.worker_version
         and isinstance(class_types, list)
+        and len(class_types) <= 100_000
+        and all(_valid_class_type(item) for item in class_types)
         and class_types == sorted(set(class_types))
-        and all(
-            isinstance(item, str) and _IDENTIFIER.fullmatch(item)
-            for item in class_types
-        )
         and all(
             class_type in class_types
             for node in manifest.custom_nodes
             for class_type in node.provided_class_types
+        )
+        and isinstance(artifacts, list)
+        and len(artifacts) <= 100_000
+        and all(
+            isinstance(item, str) and _IDENTIFIER.fullmatch(item)
+            for item in artifacts
         )
         and artifacts == expected_artifacts
         and payload.get("profile_revision")
@@ -1237,6 +1280,30 @@ def _worker_readiness_payload_valid(payload, manifest):
         and payload.get("bootstrap_digest")
         == (profile.bootstrap_digest if profile is not None else None)
         and payload.get("ui_package_digests") == expected_ui
+        and isinstance(extension_paths, list)
+        and len(extension_paths) <= 100_000
+        and all(isinstance(path, str) for path in extension_paths)
+        and extension_paths == sorted(set(extension_paths))
+        and all(
+            _EXTENSION_PATH.fullmatch(path) is not None
+            and "//" not in path
+            and "/./" not in path
+            and "/../" not in path
+            and all(
+                component not in {".", ".."}
+                for component in path.split("/")
+            )
+            for path in extension_paths
+        )
+        and isinstance(runtime_versions, dict)
+        and set(runtime_versions) == _RUNTIME_PACKAGE_NAMES
+        and all(
+            isinstance(version, str)
+            and 1 <= len(version) <= 200
+            and version == version.strip()
+            and all(ord(character) >= 32 for character in version)
+            for version in runtime_versions.values()
+        )
         and payload.get("comfy_process_healthy") is True
         and not isinstance(completed_at, bool)
         and isinstance(completed_at, (int, float))
@@ -1340,6 +1407,7 @@ class SessionService:
             clock=self.clock,
         )
         self._native_prompt_locks = {}
+        self._teardown_tasks = {}
 
     def _native_prompt_lock(self, session_id):
         loop = asyncio.get_running_loop()
@@ -1661,6 +1729,30 @@ class SessionService:
             )
         return session
 
+    def _raise_if_destroy_requested(self, session_id):
+        session = self._stored_session(session_id)
+        if session.destroy_requested or session.state in {
+            SessionState.DESTROY_REQUESTED,
+            SessionState.DESTROYING,
+            SessionState.DESTROYED,
+        }:
+            raise _DestroyRequested()
+        return session
+
+    @staticmethod
+    def _teardown_pending(session):
+        return bool(
+            session.state != SessionState.DESTROYED
+            and (
+                session.destroy_requested
+                or session.state
+                in {
+                    SessionState.DESTROY_REQUESTED,
+                    SessionState.DESTROYING,
+                }
+            )
+        )
+
     def session(self, session_id):
         session = self._stored_session(session_id)
         if session.state in {
@@ -1799,7 +1891,14 @@ class SessionService:
         report = self._current_readiness_report(session)
         return bool(report is not None and report.ready)
 
-    def _record_readiness_failure(self, session, report, *, relay=False):
+    def _record_readiness_failure(
+        self,
+        session,
+        report,
+        *,
+        relay=False,
+        retryable=True,
+    ):
         failed = tuple(
             item.name for item in report.checks if item.status == "failed"
         )
@@ -1832,9 +1931,9 @@ class SessionService:
             output_state=None,
             details={
                 "failed_checks": list(failed),
-                "retryable": True,
+                "retryable": bool(retryable),
             },
-            created_at=self._now(),
+            created_at=report.created_at,
         )
         return self.orchestrator.record(entry)
 
@@ -1842,6 +1941,40 @@ class SessionService:
         validator = self.readiness_validator
         if validator is None:
             return None
+        self._raise_if_destroy_requested(session.session_id)
+        try:
+            identity = validator.identity(session, manifest, manifest.profile)
+            success = self.job_repository.current_readiness_report(**identity)
+            if success is not None:
+                return success
+            attempts = self.job_repository.list_readiness_attempts(**identity)
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            raise
+        except Exception:
+            raise SessionExecutionError(
+                "ComfyUI Vast readiness validation failed."
+            ) from None
+        window_start = (
+            attempts[0].created_at if attempts else self._now()
+        )
+        latest = attempts[-1] if attempts else None
+        next_attempt = (
+            latest.attempt_number + 1 if latest is not None else 1
+        )
+        if (
+            next_attempt > READINESS_MAX_ATTEMPTS
+            or self._now() - window_start >= READINESS_WINDOW_SECONDS
+        ):
+            if latest is not None:
+                self._record_readiness_failure(
+                    session,
+                    latest,
+                    retryable=False,
+                )
+                return latest
+            raise SessionExecutionError(
+                "ComfyUI Vast readiness validation failed."
+            )
         relay = self.desktop_relay
         start = getattr(relay, "start", None)
         if not callable(start):
@@ -1849,25 +1982,54 @@ class SessionService:
                 "ComfyUI Vast Desktop readiness is unavailable."
             )
         try:
+            self._raise_if_destroy_requested(session.session_id)
             await start()
-            identity = validator.identity(session, manifest, manifest.profile)
-            report = self.job_repository.current_readiness_report(**identity)
-            if report is None:
+            while next_attempt <= READINESS_MAX_ATTEMPTS:
+                self._raise_if_destroy_requested(session.session_id)
+                if (
+                    next_attempt > 1
+                    and self._now() - window_start
+                    >= READINESS_WINDOW_SECONDS
+                ):
+                    break
                 report = await validator.validate(
                     session,
                     manifest,
                     manifest.profile,
+                    attempt_number=next_attempt,
                 )
                 report = self.job_repository.save_readiness_report(report)
+                if report.ready:
+                    return report
+                latest = report
+                next_attempt = report.attempt_number + 1
+                elapsed = self._now() - window_start
+                if (
+                    next_attempt > READINESS_MAX_ATTEMPTS
+                    or elapsed >= READINESS_WINDOW_SECONDS
+                ):
+                    break
+                delay = min(
+                    self.job_poll_interval_seconds,
+                    READINESS_WINDOW_SECONDS - elapsed,
+                )
+                await self.sleep(delay)
         except (asyncio.CancelledError, KeyboardInterrupt):
             raise
         except Exception:
             raise SessionExecutionError(
                 "ComfyUI Vast readiness validation failed."
             ) from None
-        if not report.ready:
-            self._record_readiness_failure(session, report)
-        return report
+        if latest is None:
+            raise SessionExecutionError(
+                "ComfyUI Vast readiness validation failed."
+            )
+        self._record_readiness_failure(
+            session,
+            latest,
+            retryable=False,
+        )
+        return latest
 
     async def _activate_committed_readiness(self, session, worker, report):
         if report is None:
@@ -1880,6 +2042,7 @@ class SessionService:
             self._record_readiness_failure(session, report, relay=True)
             return False
         try:
+            self._raise_if_destroy_requested(session.session_id)
             status = await activate(
                 session.session_id,
                 worker,
@@ -2445,32 +2608,41 @@ class SessionService:
                 "A destruction review could not be created."
             )
         expires_at = self._now() + DESTROY_REVIEW_TTL_SECONDS
-        unverified = self._unverified_outputs(session.session_id)
         digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
         try:
-            self._sessions().save_destroy_review(
+            _manifest, profile = self._profile_manifest(session)
+            review, reviewed_session = self._sessions().save_destroy_review(
                 session.session_id,
                 token_digest=digest,
                 expires_at=expires_at,
-                session_version=session.version,
-                instance_id=session.instance_id,
-                unverified_artifact_ids=unverified,
+                profile_id=(
+                    profile.profile_id if profile is not None else None
+                ),
             )
+            if (
+                review.session_id != reviewed_session.session_id
+                or review.managed_label != reviewed_session.label
+                or review.instance_id != reviewed_session.instance_id
+                or review.residual_instance_ids
+                != reviewed_session.residual_inventory
+                or reviewed_session.state == SessionState.DESTROYED
+            ):
+                raise ValueError("Destroy review snapshot changed.")
         except Exception:
             raise DestroyConfirmationError(
                 "A destruction review could not be created."
             ) from None
         return DestroyReview(
-            session_id=session.session_id,
-            instance_id=session.instance_id,
-            status=session.state.value,
-            unverified_artifact_ids=unverified,
+            session_id=reviewed_session.session_id,
+            instance_id=review.instance_id,
+            status=reviewed_session.state.value,
+            unverified_artifact_ids=review.unverified_artifact_ids,
             warning=(
                 "Destroying the GPU is irreversible. Unverified or "
                 "incomplete results will be irreversibly lost."
             ),
             token=token,
-            expires_at=expires_at,
+            expires_at=review.expires_at,
         )
 
     def _abandon_session_work(self, session_id):
@@ -2578,41 +2750,94 @@ class SessionService:
                 "The destruction review is invalid or expired."
             )
         digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
-        reviewed = self._sessions().consume_destroy_review(
+        consumed = self._sessions().consume_destroy_review_and_request_destroy(
             session.session_id,
             token_digest=digest,
             now=self._now(),
         )
-        if reviewed is None:
+        if consumed is None:
             raise DestroyConfirmationError(
                 "The destruction review is invalid or expired."
             )
-        if session.state in {
-            SessionState.RUNNING,
-            SessionState.HARVESTING,
-        }:
+        reviewed, requested = consumed
+        if (
+            reviewed.session_id != session.session_id
+            or requested.session_id != session.session_id
+            or requested.label != reviewed.managed_label
+            or requested.instance_id != reviewed.instance_id
+            or requested.residual_inventory
+            != reviewed.residual_instance_ids
+            or requested.state != SessionState.DESTROY_REQUESTED
+            or requested.destroy_requested is not True
+        ):
+            raise SessionExecutionError(
+                "Verified GPU destruction is unavailable."
+            )
+        task = self._ensure_teardown_task(requested.session_id)
+        return await asyncio.shield(task)
+
+    def _ensure_teardown_task(self, session_id):
+        identifier = _strict_identifier(session_id, "session ID")
+        existing = self._teardown_tasks.get(identifier)
+        if existing is not None and not existing.done():
+            return existing
+        task = asyncio.get_running_loop().create_task(
+            self._teardown_session(identifier),
+            name="cloud-vast-teardown-" + identifier,
+        )
+        self._teardown_tasks[identifier] = task
+
+        def finished(completed):
+            if self._teardown_tasks.get(identifier) is completed:
+                self._teardown_tasks.pop(identifier, None)
+            if not completed.cancelled():
+                try:
+                    completed.exception()
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+        task.add_done_callback(finished)
+        return task
+
+    async def _teardown_session(self, session_id):
+        preempt = getattr(self.reconciler, "preempt", None)
+        if callable(preempt):
             try:
-                await self.reconciler.before_teardown(
-                    session.session_id
-                )
+                await preempt(session_id)
             except (asyncio.CancelledError, KeyboardInterrupt):
                 raise
             except Exception:
                 pass
-        await self.sync_profile(session.session_id)
-        current_unverified = self._unverified_outputs(session.session_id)
-        if current_unverified != reviewed.unverified_artifact_ids:
-            raise DestroyConfirmationError(
-                "Session outputs changed; review destruction again."
+        preempt_lifecycle = getattr(self.lifecycle, "preempt_session", None)
+        if callable(preempt_lifecycle):
+            try:
+                await preempt_lifecycle(session_id)
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                raise
+            except Exception:
+                pass
+        try:
+            await self._revoke_agent_bridge(session_id)
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            raise
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(
+                self.sync_profile(session_id),
+                timeout=TEARDOWN_PROFILE_TIMEOUT_SECONDS,
             )
-        await self._revoke_agent_bridge(session.session_id)
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            raise
+        except Exception:
+            pass
         destroy = getattr(self.lifecycle, "destroy_session", None)
         if not callable(destroy):
             raise SessionExecutionError(
                 "Verified GPU destruction is unavailable."
             )
         try:
-            result = await destroy(session.session_id)
+            result = await destroy(session_id)
         except (asyncio.CancelledError, KeyboardInterrupt):
             raise
         except Exception:
@@ -2621,13 +2846,13 @@ class SessionService:
             ) from None
         if (
             not hasattr(result, "state")
-            or result.session_id != session.session_id
+            or result.session_id != session_id
         ):
             raise SessionExecutionError(
                 "Verified GPU destruction is unavailable."
             )
         if result.state == SessionState.DESTROYED:
-            self._abandon_session_work(session.session_id)
+            self._abandon_session_work(session_id)
         return result
 
     async def _request_terminal_destruction(self, session_id, diagnostic):
@@ -2790,6 +3015,7 @@ class SessionService:
         )
 
     async def _submit_native_worker_request(self, worker, job):
+        self._raise_if_destroy_requested(job.session_id)
         if job.native_body_json is None:
             raise SessionExecutionError(
                 "Native prompt identity is unavailable."
@@ -2818,10 +3044,12 @@ class SessionService:
                 raise SessionExecutionError(
                     "Native prompt recovery is unavailable."
                 )
+            self._raise_if_destroy_requested(job.session_id)
             response = await request_method(
                 request,
                 max_bytes=MAX_WORKER_NATIVE_RESPONSE_BYTES,
             )
+            self._raise_if_destroy_requested(job.session_id)
             if not isinstance(response, WorkerTransportResponse):
                 raise SessionExecutionError(
                     "Native prompt recovery is unavailable."
@@ -3217,7 +3445,8 @@ class SessionService:
         return tuple(
             session.session_id
             for session in self._sessions().list_recoverable()
-            if self._reconciliation_job(session.session_id) is not None
+            if self._teardown_pending(session)
+            or self._reconciliation_job(session.session_id) is not None
         )
 
     def _record_run_issue(self, job, *, phase, code, message, retryable):
@@ -3329,6 +3558,7 @@ class SessionService:
         ):
             if artifact.source.kind == "local-upload":
                 continue
+            self._raise_if_destroy_requested(session.session_id)
             result[artifact_id] = await self._source_url(
                 artifact,
                 session,
@@ -3377,7 +3607,14 @@ class SessionService:
             )
         return record
 
-    async def _upload_artifact(self, worker, job_id, artifact):
+    async def _upload_artifact(
+        self,
+        worker,
+        job_id,
+        artifact,
+        *,
+        session_id=None,
+    ):
         upload = getattr(worker, "upload_artifact", None)
         if not callable(upload):
             raise SessionExecutionError(
@@ -3402,6 +3639,8 @@ class SessionService:
         upload_status = getattr(worker, "upload_status", None)
         if callable(upload_status):
             try:
+                if session_id is not None:
+                    self._raise_if_destroy_requested(session_id)
                 remote_status = await upload_status(
                     artifact.artifact_id
                 )
@@ -3504,6 +3743,8 @@ class SessionService:
             )
 
         try:
+            if session_id is not None:
+                self._raise_if_destroy_requested(session_id)
             receipt = await upload(
                 artifact.artifact_id,
                 path=local.private_path,
@@ -3602,6 +3843,7 @@ class SessionService:
         manifest,
         transfer_job_id,
     ):
+        self._raise_if_destroy_requested(session.session_id)
         apply_task = asyncio.ensure_future(worker.apply_manifest(request))
         transaction = getattr(worker, "transaction", None)
         transaction_id = "provision-" + manifest.digest
@@ -3614,9 +3856,11 @@ class SessionService:
                 if apply_task in done:
                     response = apply_task.result()
                     break
+                self._raise_if_destroy_requested(session.session_id)
                 if not callable(transaction):
                     continue
                 try:
+                    self._raise_if_destroy_requested(session.session_id)
                     observed = await transaction(transaction_id)
                 except (asyncio.CancelledError, KeyboardInterrupt):
                     raise
@@ -3662,6 +3906,7 @@ class SessionService:
         transfer_job_id,
         capture,
     ):
+        self._raise_if_destroy_requested(session.session_id)
         transaction_id = "provision-" + manifest.digest
         local_transaction = self.job_repository.get_provision_transaction(
             _stored_provision_transaction_id(
@@ -3681,6 +3926,7 @@ class SessionService:
                 )
         if local_transaction is not None and callable(transaction):
             try:
+                self._raise_if_destroy_requested(session.session_id)
                 existing = await transaction(transaction_id)
             except (asyncio.CancelledError, KeyboardInterrupt):
                 raise
@@ -3701,6 +3947,7 @@ class SessionService:
                         transfer_job_id=transfer_job_id,
                     )
                     return existing
+        self._raise_if_destroy_requested(session.session_id)
         request = {
             "manifest": _manifest_payload(manifest),
             "manifest_digest": manifest.digest,
@@ -3736,6 +3983,7 @@ class SessionService:
             required_uploads = response.get("required_uploads", [])
             if required_uploads:
                 for artifact_id in required_uploads:
+                    self._raise_if_destroy_requested(session.session_id)
                     artifact = catalog.get(artifact_id)
                     if (
                         artifact is None
@@ -3748,6 +3996,7 @@ class SessionService:
                         worker,
                         transfer_job_id,
                         artifact,
+                        session_id=session.session_id,
                     )
                 continue
             if response["state"] == "ready":
@@ -3762,6 +4011,7 @@ class SessionService:
                     "Remote provisioning is incomplete."
                 )
             try:
+                self._raise_if_destroy_requested(session.session_id)
                 response = await transaction(response["transaction_id"])
             except WorkerBoundaryAuthenticationError:
                 raise
@@ -3797,6 +4047,10 @@ class SessionService:
 
     async def _bootstrap_session(self, session_id):
         session = self._stored_session(session_id)
+        if self._teardown_pending(session):
+            return await asyncio.shield(
+                self._ensure_teardown_task(session.session_id)
+            )
         if session.state not in {
             SessionState.BOOTSTRAPPING,
             SessionState.PROVISIONING,
@@ -3818,8 +4072,10 @@ class SessionService:
         if not all(callable(item) for item in (health, claim, deadline)):
             raise SessionExecutionError("Remote worker is unavailable.")
         try:
+            self._raise_if_destroy_requested(session.session_id)
             health_payload = await health()
             if health_payload.get("claimed") is not True:
+                self._raise_if_destroy_requested(session.session_id)
                 await claim()
         except (asyncio.CancelledError, KeyboardInterrupt):
             raise
@@ -3871,6 +4127,7 @@ class SessionService:
             else {"mode": "none", "acknowledged": True}
         )
         try:
+            self._raise_if_destroy_requested(session.session_id)
             deadline_result = await deadline(policy)
         except (asyncio.CancelledError, KeyboardInterrupt):
             raise
@@ -3911,6 +4168,11 @@ class SessionService:
 
     async def _recover_session(self, session_id):
         session = self._stored_session(session_id)
+        if self._teardown_pending(session):
+            return await asyncio.shield(
+                self._ensure_teardown_task(session.session_id)
+            )
+        self._raise_if_destroy_requested(session.session_id)
         if session.state not in {
             SessionState.READY,
             SessionState.RUNNING,
@@ -3934,8 +4196,10 @@ class SessionService:
         if not all(callable(item) for item in (health, claim, deadline)):
             raise SessionExecutionError("Remote worker is unavailable.")
         try:
+            self._raise_if_destroy_requested(session.session_id)
             health_payload = await health()
             if health_payload.get("claimed") is not True:
+                self._raise_if_destroy_requested(session.session_id)
                 await claim()
         except (asyncio.CancelledError, KeyboardInterrupt):
             raise
@@ -3975,6 +4239,7 @@ class SessionService:
             else {"mode": "none", "acknowledged": True}
         )
         try:
+            self._raise_if_destroy_requested(session.session_id)
             deadline_result = await deadline(policy)
         except (asyncio.CancelledError, KeyboardInterrupt):
             raise
@@ -3999,6 +4264,7 @@ class SessionService:
             installed_manifest_digest=manifest.digest,
             sanitized_error=None,
         )
+        self._raise_if_destroy_requested(session.session_id)
         await self.sync_profile(session.session_id, worker=worker)
         if session.state in {
             SessionState.RUNNING,
@@ -4017,6 +4283,11 @@ class SessionService:
 
     async def reconcile_session_once(self, session_id):
         session = self._stored_session(session_id)
+        if self._teardown_pending(session):
+            return await asyncio.shield(
+                self._ensure_teardown_task(session.session_id)
+            )
+        self._raise_if_destroy_requested(session.session_id)
         job = self._reconciliation_job(session.session_id)
         if job is None:
             return session
@@ -4035,7 +4306,9 @@ class SessionService:
                 )
             relay = self._relay(worker, session)
             cursor = self.job_repository.last_event_sequence(job.job_id)
+            self._raise_if_destroy_requested(session.session_id)
             snapshot = await snapshot_method(job.job_id, cursor)
+            self._raise_if_destroy_requested(session.session_id)
         except (asyncio.CancelledError, KeyboardInterrupt):
             raise
         except Exception:
@@ -4111,6 +4384,7 @@ class SessionService:
                 error_code=None,
             )
             try:
+                self._raise_if_destroy_requested(session.session_id)
                 result = await relay.sync_snapshot(job.job_id, snapshot)
                 if (
                     not isinstance(result, RelaySyncResult)
@@ -4170,6 +4444,7 @@ class SessionService:
                     now=self._now(),
                 )
             try:
+                self._raise_if_destroy_requested(session.session_id)
                 result = await relay.sync_snapshot(job.job_id, snapshot)
                 if (
                     not isinstance(result, RelaySyncResult)
@@ -4248,6 +4523,7 @@ class SessionService:
             error_code=None,
         )
         try:
+            self._raise_if_destroy_requested(session.session_id)
             result = await relay.sync_snapshot(job.job_id, snapshot)
             if (
                 not isinstance(result, RelaySyncResult)
@@ -4526,6 +4802,7 @@ class SessionService:
             "queue_options": payload["queue_options"],
         }
         try:
+            self._raise_if_destroy_requested(session.session_id)
             remote = await worker.start_job(request)
         except (asyncio.CancelledError, KeyboardInterrupt):
             raise
@@ -4566,6 +4843,7 @@ class SessionService:
                 raise SessionExecutionError(
                     "Remote job submission response was invalid."
                 ) from None
+        self._raise_if_destroy_requested(session.session_id)
         job = self._transition_job(
             job,
             JobState.RUNNING,
@@ -4580,6 +4858,7 @@ class SessionService:
                 )
             ),
         )
+        self._raise_if_destroy_requested(session.session_id)
         if remote["state"] in {"queued", "running"}:
             self.reconciler.schedule(session.session_id)
             return job
@@ -4590,6 +4869,11 @@ class SessionService:
 
     async def resume_session(self, session_id):
         session = self._stored_session(session_id)
+        if self._teardown_pending(session):
+            return await asyncio.shield(
+                self._ensure_teardown_task(session.session_id)
+            )
+        self._raise_if_destroy_requested(session.session_id)
         active = [
             job
             for job in self.job_repository.list_jobs(session.session_id)
@@ -4745,10 +5029,13 @@ class SessionService:
             )
         if job.state == JobState.QUEUED:
             if job.native_body_json is not None:
+                self._raise_if_destroy_requested(session.session_id)
                 job = await self._submit_native_worker_request(worker, job)
+                self._raise_if_destroy_requested(session.session_id)
                 self.reconciler.schedule(session.session_id)
                 return job
             payload = json.loads(job.capture_json)
+            self._raise_if_destroy_requested(session.session_id)
             remote = await worker.start_job(
                 {
                     "job_id": job.job_id,
@@ -4758,6 +5045,7 @@ class SessionService:
                     "queue_options": payload["queue_options"],
                 }
             )
+            self._raise_if_destroy_requested(session.session_id)
             if (
                 not isinstance(remote, dict)
                 or remote.get("job_id") != job.job_id
@@ -4787,6 +5075,7 @@ class SessionService:
                     )
                 ),
             )
+            self._raise_if_destroy_requested(session.session_id)
             if remote["state"] not in {"queued", "running"}:
                 await self.reconciler.reconcile(session.session_id)
                 return self.job_repository.get_job(job.job_id)

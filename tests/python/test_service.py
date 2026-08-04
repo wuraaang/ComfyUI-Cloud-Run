@@ -19,6 +19,7 @@ from cloud_run.worker_protocol import is_boundary_token
 
 
 _DEFAULT_RELEASE = object()
+SETTINGS_REVISION = "11111111-1111-4111-8111-111111111111"
 
 
 def offer(offer_id=42, *, price=0.42, gpu_name="RTX 4090"):
@@ -99,6 +100,7 @@ class FakeSettings:
     def load(self):
         return {
             "api_key": "synthetic-value",
+            "api_key_revision": SETTINGS_REVISION,
             "max_price_per_hour": 0.55,
             "min_vram_gb": 24,
         }
@@ -831,6 +833,10 @@ class CloudRunServiceTests(unittest.TestCase):
             self.assertTrue(
                 persisted.provider_token
                 != persisted.session_secret_hex
+            )
+            self.assertEqual(
+                persisted.create_settings_revision,
+                SETTINGS_REVISION,
             )
             self.assertTrue(
                 call["worker_boundary"].boundary_token

@@ -408,6 +408,75 @@ class ReadinessValidatorTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(check.status, "not_required")
 
+    def test_worker_readiness_rejects_non_string_extension_path(self):
+        from cloud_run.readiness import ControllerReadinessProbe
+
+        payload = {
+            "protocol_version": "2",
+            "comfyui_core_version": "0.29.0",
+            "comfyui_frontend_version": "1.47.10",
+            "worker_version": "c" * 40,
+            "validated_class_types": ["KSampler"],
+            "validated_artifacts": ["model-1"],
+            "profile_revision": 3,
+            "profile_digest": "e" * 64,
+            "bootstrap_digest": "f" * 64,
+            "ui_package_digests": {},
+            "served_extension_paths": [{}],
+            "runtime_package_versions": {
+                "aiohttp": "3.11.18",
+                "torch": "2.8.0",
+            },
+            "comfy_process_healthy": True,
+            "completed_at": 99.0,
+        }
+
+        self.assertIsNone(
+            ControllerReadinessProbe._worker_readiness(payload)
+        )
+
+        for field in ("validated_class_types", "validated_artifacts"):
+            with self.subTest(field=field):
+                malformed = {**payload, "served_extension_paths": []}
+                malformed[field] = [{}]
+                self.assertIsNone(
+                    ControllerReadinessProbe._worker_readiness(malformed)
+                )
+
+    def test_worker_readiness_accepts_locked_efficiency_class_types(self):
+        from cloud_run.certified_baseline import CertifiedBaselineResolver
+        from cloud_run.readiness import ControllerReadinessProbe
+
+        class_types = sorted(
+            CertifiedBaselineResolver()._lock["custom_nodes"][0][
+                "class_types"
+            ]
+        )
+        payload = {
+            "protocol_version": "2",
+            "comfyui_core_version": "0.29.0",
+            "comfyui_frontend_version": "1.47.10",
+            "worker_version": "c" * 40,
+            "validated_class_types": class_types,
+            "validated_artifacts": ["model-1"],
+            "profile_revision": 3,
+            "profile_digest": "e" * 64,
+            "bootstrap_digest": "f" * 64,
+            "ui_package_digests": {},
+            "served_extension_paths": [],
+            "runtime_package_versions": {
+                "aiohttp": "3.11.18",
+                "torch": "2.8.0",
+            },
+            "comfy_process_healthy": True,
+            "completed_at": 99.0,
+        }
+
+        self.assertEqual(
+            ControllerReadinessProbe._worker_readiness(payload),
+            payload,
+        )
+
     async def test_controller_probe_uses_only_read_only_worker_and_relay_checks(self):
         from cloud_run.readiness import (
             ControllerReadinessProbe,
@@ -474,6 +543,11 @@ class ReadinessValidatorTests(unittest.IsolatedAsyncioTestCase):
                         "profile_digest": "e" * 64,
                         "bootstrap_digest": "f" * 64,
                         "ui_package_digests": {},
+                        "served_extension_paths": [],
+                        "runtime_package_versions": {
+                            "aiohttp": "3.11.18",
+                            "torch": "2.8.0",
+                        },
                         "comfy_process_healthy": True,
                         "completed_at": 99.0,
                     },
@@ -523,6 +597,9 @@ class ReadinessValidatorTests(unittest.IsolatedAsyncioTestCase):
             release=release,
             required_class_types=lambda _manifest: ("KSampler",),
             local_execution_counter=lambda _session_id: 0,
+            continue_guard=lambda session_id: calls.append(
+                ("guard", session_id)
+            ),
         )
         validator = ReadinessValidator(
             probe=probe,
@@ -537,12 +614,119 @@ class ReadinessValidatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             calls,
             [
+                ("guard", "session-1"),
                 "inventory",
+                ("guard", "session-1"),
                 "health",
+                ("guard", "session-1"),
                 ("transaction", "provision-" + manifest.digest),
+                ("guard", "session-1"),
                 ("relay", "session-1", False),
             ],
         )
+
+    async def test_controller_probe_rechecks_destroy_before_each_remote_boundary(self):
+        from cloud_run.readiness import ControllerReadinessProbe
+
+        release = SimpleNamespace(
+            worker_archive_sha256="a" * 64,
+            worker_commit="c" * 40,
+            protocol_version="2",
+            comfyui_core_version="0.29.0",
+            comfyui_frontend_version="1.47.10",
+        )
+        session = SimpleNamespace(
+            session_id="session-1",
+            instance_id="instance-1",
+            label="comfy-cloud-run-session-1",
+        )
+        profile = SimpleNamespace(
+            revision=3,
+            archive=SimpleNamespace(sha256="e" * 64),
+            bootstrap_digest="f" * 64,
+        )
+        manifest = SimpleNamespace(
+            digest="b" * 64,
+            worker_version=release.worker_commit,
+            protocol_version=release.protocol_version,
+            comfyui_core_version=release.comfyui_core_version,
+            comfyui_frontend_version=release.comfyui_frontend_version,
+            custom_nodes=(),
+            artifacts=(),
+            ui_packages=(),
+            profile=profile,
+        )
+
+        for trigger, expected in (
+            ("inventory", ["guard", "inventory", "guard"]),
+            (
+                "health",
+                ["guard", "inventory", "guard", "health", "guard"],
+            ),
+            (
+                "transaction",
+                [
+                    "guard",
+                    "inventory",
+                    "guard",
+                    "health",
+                    "guard",
+                    "transaction",
+                    "guard",
+                ],
+            ),
+        ):
+            with self.subTest(trigger=trigger):
+                calls = []
+                destroy_requested = [False]
+
+                def observe(name):
+                    calls.append(name)
+                    if name == trigger:
+                        destroy_requested[0] = True
+
+                def continue_guard(observed_session_id):
+                    self.assertEqual(observed_session_id, session.session_id)
+                    calls.append("guard")
+                    if destroy_requested[0]:
+                        raise asyncio.CancelledError()
+
+                async def inventory(_session):
+                    observe("inventory")
+                    return {
+                        "instance_id": session.instance_id,
+                        "label": session.label,
+                        "actual_status": "running",
+                    }
+
+                class Worker:
+                    async def health(inner_self):
+                        observe("health")
+                        return {"claimed": True, "protocol_version": "2"}
+
+                    async def transaction(inner_self, _transaction_id):
+                        observe("transaction")
+                        return None
+
+                class Relay:
+                    async def probe_readiness(inner_self, *args, **kwargs):
+                        observe("relay")
+                        return ()
+
+                probe = ControllerReadinessProbe(
+                    worker_factory=lambda _session: Worker(),
+                    inventory_probe=inventory,
+                    desktop_relay=Relay(),
+                    release=release,
+                    required_class_types=lambda _manifest: ("KSampler",),
+                    local_execution_counter=lambda _session_id: 0,
+                    continue_guard=continue_guard,
+                )
+
+                with self.assertRaises(asyncio.CancelledError):
+                    await probe(session, manifest, profile)
+
+                self.assertEqual(calls, expected)
 
 
 class ReadinessRepositoryTests(unittest.TestCase):

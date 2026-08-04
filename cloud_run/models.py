@@ -1195,16 +1195,41 @@ class CloudSession:
     def rental_outcome(self):
         if self.instance_id is not None or self.residual_inventory:
             return "active"
+        post_start_evidence = bool(
+            self.destroy_requested
+            or self.installed_manifest_digest is not None
+            or self.worker_base_url is not None
+            or self.pending_deadline_at is not None
+            or self.pending_deadline_mode is not None
+            or self.pending_deadline_action is not None
+        )
+        unverified_create_evidence = bool(
+            post_start_evidence
+            or self.create_settings_revision is not None
+            or self.create_configuration_revision is not None
+            or self.create_reconcile_started_at is not None
+            or self.create_empty_observations
+            or self.create_first_empty_at is not None
+            or self.create_last_empty_at is not None
+            or self.retry_count
+        )
         if self.state in {
             SessionState.PREFLIGHT,
             SessionState.OFFER_SELECTED,
             SessionState.CONFIRMING,
-        } and self.provider_token is None and self.session_secret_hex is None:
-            return "not_started"
+        }:
+            if (
+                self.provider_token is None
+                and self.session_secret_hex is None
+                and not unverified_create_evidence
+            ):
+                return "not_started"
+            return "unknown"
         if self.state == SessionState.FAILED:
             if (
                 self.provider_token is not None
                 or self.session_secret_hex is not None
+                or post_start_evidence
             ):
                 return "unknown"
             return "absent"
