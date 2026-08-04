@@ -1024,16 +1024,138 @@ class SessionLifecycleTests(LifecycleTestCase):
             recovery = asyncio.create_task(lifecycle.recover_sessions())
             await started.wait()
             await lifecycle.preempt_session(session.session_id)
+            await asyncio.gather(recovery, return_exceptions=True)
             cancelled_by_preempt = recovery.cancelled()
-            if not recovery.done():
-                recovery.cancel()
-                await asyncio.gather(recovery, return_exceptions=True)
             return cancelled_by_preempt
 
         cancelled = asyncio.run(scenario())
 
         self.assertTrue(cancelled)
         self.assertEqual([call[0] for call in self.provider.calls], ["list"])
+
+    def test_preempting_one_session_does_not_cancel_another_recovery(self):
+        first = self.save_session(
+            state=SessionState.READY,
+            session_id="session-a",
+            instance_id="instance-a",
+        )
+        second = self.save_session(
+            state=SessionState.READY,
+            session_id="session-b",
+            instance_id="instance-b",
+        )
+        lifecycle = self.session_lifecycle()
+
+        async def scenario():
+            started = asyncio.Event()
+            release = asyncio.Event()
+
+            async def blocking_inventory(api_key):
+                self.provider.calls.append(("list", api_key))
+                started.set()
+                await release.wait()
+                return []
+
+            self.provider.list_instances = blocking_inventory
+            recovery = asyncio.create_task(lifecycle.recover_sessions())
+            await started.wait()
+            await lifecycle.preempt_session(first.session_id)
+            release.set()
+            return await recovery
+
+        recovered = asyncio.run(scenario())
+
+        self.assertEqual(
+            self.sessions.get(first.session_id).state,
+            SessionState.READY,
+        )
+        self.assertEqual(
+            self.sessions.get(second.session_id).state,
+            SessionState.DESTROYED,
+        )
+        self.assertEqual(
+            [session.session_id for session in recovered],
+            [second.session_id],
+        )
+
+    def test_preempt_session_cancels_all_concurrent_recovery_work(self):
+        session = self.save_session(state=SessionState.READY)
+        lifecycle = self.session_lifecycle()
+
+        async def scenario():
+            both_started = asyncio.Event()
+            release = asyncio.Event()
+            started = 0
+
+            async def blocking_inventory(api_key):
+                nonlocal started
+                self.provider.calls.append(("list", api_key))
+                started += 1
+                if started == 2:
+                    both_started.set()
+                await release.wait()
+                return []
+
+            self.provider.list_instances = blocking_inventory
+            recoveries = [
+                asyncio.create_task(lifecycle.recover_sessions())
+                for _attempt in range(2)
+            ]
+            await both_started.wait()
+            await lifecycle.preempt_session(session.session_id)
+            release.set()
+            return await asyncio.gather(
+                *recoveries,
+                return_exceptions=True,
+            )
+
+        recovered = asyncio.run(scenario())
+
+        self.assertTrue(
+            all(
+                isinstance(result, asyncio.CancelledError)
+                for result in recovered
+            )
+        )
+        current = self.sessions.get(session.session_id)
+        self.assertEqual(current.state, SessionState.READY)
+        self.assertEqual(current.instance_id, session.instance_id)
+
+    def test_stale_absence_observation_cannot_clear_new_residual_paid_identity(self):
+        session = self.save_session(state=SessionState.READY)
+        lifecycle = self.session_lifecycle()
+
+        async def scenario():
+            started = asyncio.Event()
+            release = asyncio.Event()
+
+            async def blocking_inventory(api_key):
+                self.provider.calls.append(("list", api_key))
+                started.set()
+                await release.wait()
+                return []
+
+            self.provider.list_instances = blocking_inventory
+            recovery = asyncio.create_task(lifecycle.recover_sessions())
+            await started.wait()
+            self.sessions.transition(
+                session.session_id,
+                SessionState.READY,
+                now=self.clock(),
+                residual_inventory=("new-paid-instance",),
+            )
+            release.set()
+            return await recovery
+
+        asyncio.run(scenario())
+
+        current = self.sessions.get(session.session_id)
+        self.assertNotEqual(current.state, SessionState.DESTROYED)
+        self.assertEqual(
+            current.residual_inventory,
+            ("new-paid-instance",),
+        )
+        self.assertTrue(current.public_payload()["billing_may_continue"])
 
     def test_recovery_finalizes_externally_destroyed_known_session_without_delete_or_create(self):
         session = self.save_session(state=SessionState.READY)

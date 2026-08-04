@@ -54,6 +54,8 @@ class SessionReconciler:
         self._retry_counts = {}
         self._retry_handles = {}
         self._preempted = set()
+        self._preempting = {}
+        self._preempted_tasks = set()
         self._closing = False
 
     @staticmethod
@@ -183,6 +185,8 @@ class SessionReconciler:
 
     def schedule(self, session_id):
         identifier = self._session_id(session_id)
+        if identifier in self._preempting:
+            raise RuntimeError("Cloud Vast reconciliation is being preempted.")
         existing = self._tasks.get(identifier)
         if existing is not None and not existing.done():
             return existing
@@ -209,16 +213,22 @@ class SessionReconciler:
             return
 
     def _observe(self, session_id, done):
+        intentionally_preempted = done in self._preempted_tasks
+        self._preempted_tasks.discard(done)
         if self._tasks.get(session_id) is done:
             self._tasks.pop(session_id, None)
         try:
             result = done.result()
         except asyncio.CancelledError:
-            if not self._closing and session_id not in self._preempted:
+            if (
+                not self._closing
+                and not intentionally_preempted
+                and session_id not in self._preempted
+            ):
                 self._record_failure(session_id, cancelled=True)
             return
         except Exception:
-            if session_id in self._preempted:
+            if intentionally_preempted or session_id in self._preempted:
                 return
             self._record_failure(session_id)
             retries = self._retry_counts.get(session_id, 0)
@@ -257,16 +267,31 @@ class SessionReconciler:
 
     async def preempt(self, session_id):
         identifier = self._session_id(session_id)
+        existing_preempt = self._preempting.get(identifier)
+        if existing_preempt is not None:
+            await asyncio.shield(existing_preempt)
+            return
+        completed = asyncio.get_running_loop().create_future()
+        self._preempting[identifier] = completed
         self._preempted.add(identifier)
-        handle = self._retry_handles.pop(identifier, None)
-        if handle is not None:
-            handle.cancel()
-        self._retry_counts.pop(identifier, None)
-        task = self._tasks.pop(identifier, None)
-        if task is not None:
-            if not task.done():
-                task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+        try:
+            handle = self._retry_handles.pop(identifier, None)
+            if handle is not None:
+                handle.cancel()
+            self._retry_counts.pop(identifier, None)
+            task = self._tasks.get(identifier)
+            if task is not None:
+                self._preempted_tasks.add(task)
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                if self._tasks.get(identifier) is task:
+                    self._tasks.pop(identifier, None)
+        finally:
+            if self._preempting.get(identifier) is completed:
+                self._preempting.pop(identifier, None)
+            if not completed.done():
+                completed.set_result(None)
 
     async def close(self):
         self._closing = True
@@ -281,3 +306,5 @@ class SessionReconciler:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._tasks.clear()
         self._preempted.clear()
+        self._preempting.clear()
+        self._preempted_tasks.clear()

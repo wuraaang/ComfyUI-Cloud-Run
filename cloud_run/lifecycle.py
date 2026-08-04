@@ -7,6 +7,7 @@ import time
 
 from .constants import COMFYUI_CONTAINER_PORT, DEFAULT_DISK_GB
 from .models import AttemptState, SessionState
+from .repository import ConcurrentSessionUpdate
 from .session_service import TerminalProvisioningError
 from .worker_protocol import is_boundary_token
 from .worker_release import WorkerRelease
@@ -486,11 +487,12 @@ class CloudRunLifecycle:
         key = str(session_id or "")
         if not key:
             raise ValueError("Cloud Run session identity is invalid.")
+        recovery_tasks = self._session_recovery_tasks.pop(key, set())
         tasks = {
             task
             for task in (
                 _SESSION_WATCHDOGS.pop(key, None),
-                self._session_recovery_tasks.pop(key, None),
+                *recovery_tasks,
             )
             if task is not None and task is not asyncio.current_task()
         }
@@ -753,7 +755,29 @@ class CloudRunLifecycle:
             return None
         return base_url
 
-    def _finalize_session_destroyed(self, session, *, terminal_error=None):
+    def _finalize_session_destroyed(
+        self,
+        session,
+        *,
+        terminal_error=None,
+        compare_and_set=False,
+    ):
+        def transition(current, state, **changes):
+            if compare_and_set:
+                return self.session_repository.save(
+                    current.transition(
+                        state,
+                        now=float(self.clock()),
+                        **changes,
+                    )
+                )
+            return self.session_repository.transition(
+                current.session_id,
+                state,
+                now=float(self.clock()),
+                **changes,
+            )
+
         if session.state == SessionState.DESTROYED:
             return session
         if session.state not in {
@@ -762,23 +786,20 @@ class CloudRunLifecycle:
             SessionState.DESTROY_REQUESTED,
             SessionState.DESTROYING,
         }:
-            session = self.session_repository.transition(
-                session.session_id,
+            session = transition(
+                session,
                 SessionState.DESTROY_REQUESTED,
-                now=float(self.clock()),
                 destroy_requested=True,
             )
         if session.state == SessionState.DESTROY_REQUESTED:
-            session = self.session_repository.transition(
-                session.session_id,
+            session = transition(
+                session,
                 SessionState.DESTROYING,
-                now=float(self.clock()),
                 destroy_requested=True,
             )
-        return self.session_repository.transition(
-            session.session_id,
+        return transition(
+            session,
             SessionState.DESTROYED,
-            now=float(self.clock()),
             destroy_requested=True,
             instance_id=None,
             worker_base_url=None,
@@ -823,14 +844,26 @@ class CloudRunLifecycle:
             for item in inventory
         ):
             return None
+        current = self.session_repository.get(session.session_id)
+        if (
+            current is None
+            or current.version != session.version
+            or current.label != session.label
+            or current.instance_id != session.instance_id
+            or current.residual_inventory != session.residual_inventory
+        ):
+            raise ConcurrentSessionUpdate(
+                "The session identity changed after inventory observation."
+            )
         error = (
-            session.sanitized_error
+            current.sanitized_error
             if terminal_error is _PRESERVE_ERROR
             else terminal_error
         )
         return self._finalize_session_destroyed(
-            session,
+            current,
             terminal_error=error,
+            compare_and_set=True,
         )
 
     async def _activate_session_instance(self, session, instance):
@@ -1065,11 +1098,14 @@ class CloudRunLifecycle:
                     "inventory is unavailable."
                 ),
             )
-        destroyed = self.finalize_verified_absence(
-            session,
-            inventory,
-            terminal_error=terminal_error,
-        )
+        try:
+            destroyed = self.finalize_verified_absence(
+                session,
+                inventory,
+                terminal_error=terminal_error,
+            )
+        except ConcurrentSessionUpdate:
+            return self._session(session.session_id)
         if destroyed is not None:
             return destroyed
         known_ids = self._known_session_instance_ids(session)
@@ -1131,32 +1167,14 @@ class CloudRunLifecycle:
                 confirmed(destroyed.session_id)
         return destroyed
 
-    async def recover_sessions(self):
+    async def _recover_session_from_inventory(self, original, inventory):
         repository = self.session_repository
-        if repository is None or not callable(
-            getattr(repository, "list_recoverable", None)
-        ):
-            return []
-        sessions = repository.list_recoverable()
-        recovery_task = asyncio.current_task()
-        recovery_ids = tuple(session.session_id for session in sessions)
-        if recovery_task is not None:
-            for session_id in recovery_ids:
-                self._session_recovery_tasks[session_id] = recovery_task
-
-            def recovery_finished(completed):
-                for session_id in recovery_ids:
-                    if self._session_recovery_tasks.get(session_id) is completed:
-                        self._session_recovery_tasks.pop(session_id, None)
-
-            recovery_task.add_done_callback(recovery_finished)
-        try:
-            _settings, api_key = self._api_key()
-            inventory = await self._inventory(api_key)
-        except Exception:
-            return sessions
         if inventory is None:
-            return sessions
+            return original
+        current = repository.get(original.session_id)
+        if current is None or current.version != original.version:
+            return current or original
+        session = current
         managed = [
             item
             for item in inventory
@@ -1164,153 +1182,207 @@ class CloudRunLifecycle:
                 "comfy-cloud-run-"
             )
         ]
-        recovered = []
-        for original in sessions:
-            session = original
-            matches = self._session_matches(managed, session.label)
-            known_ids = self._known_session_instance_ids(session)
-            known_id_matches = [
-                item
-                for item in inventory
-                if item.get("instance_id") is not None
-                and str(item.get("instance_id")) in known_ids
-            ]
-            if session.state in {
-                SessionState.DESTROY_REQUESTED,
-                SessionState.DESTROYING,
-            }:
-                session = await self.destroy_session(
-                    session.session_id
+        matches = self._session_matches(managed, session.label)
+        known_ids = self._known_session_instance_ids(session)
+        known_id_matches = [
+            item
+            for item in inventory
+            if item.get("instance_id") is not None
+            and str(item.get("instance_id")) in known_ids
+        ]
+        if session.state in {
+            SessionState.DESTROY_REQUESTED,
+            SessionState.DESTROYING,
+        }:
+            return await self.destroy_session(session.session_id)
+        if len(matches) > 1:
+            return repository.transition(
+                session.session_id,
+                SessionState.FAILED,
+                now=float(self.clock()),
+                instance_id=None,
+                residual_inventory=tuple(
+                    str(item.get("instance_id"))
+                    for item in matches
+                    if item.get("instance_id") is not None
+                ),
+                sanitized_error=(
+                    "Multiple managed Vast instances match this session."
+                ),
+            )
+        if not matches:
+            if known_id_matches:
+                return repository.transition(
+                    session.session_id,
+                    SessionState.FAILED,
+                    now=float(self.clock()),
+                    instance_id=str(session.instance_id),
+                    residual_inventory=tuple(
+                        str(item.get("instance_id"))
+                        for item in known_id_matches
+                        if item.get("instance_id") is not None
+                    ),
+                    sanitized_error=(
+                        "The managed Vast instance identity no longer "
+                        "matches its session label."
+                    ),
                 )
-                recovered.append(session)
-                continue
-            if len(matches) > 1:
+            deadline_expired = (
+                session.deadline_mode == "finite"
+                and isinstance(session.deadline_at, (int, float))
+                and not isinstance(session.deadline_at, bool)
+                and float(self.clock()) >= session.deadline_at
+                and session.instance_id is not None
+                and session.state
+                not in {
+                    SessionState.CONFIRMING,
+                    SessionState.CREATING,
+                }
+            )
+            absent = self.finalize_verified_absence(
+                session,
+                inventory,
+            )
+            if absent is not None:
+                if deadline_expired:
+                    confirmed = getattr(
+                        self.session_service,
+                        "confirmed_deadline_destroy",
+                        None,
+                    )
+                    if callable(confirmed):
+                        confirmed(absent.session_id)
+                return absent
+            if session.state in {
+                SessionState.CREATING,
+                SessionState.BOOTSTRAPPING,
+                SessionState.PROVISIONING,
+                SessionState.VALIDATING,
+                SessionState.READY,
+                SessionState.RUNNING,
+                SessionState.HARVESTING,
+                SessionState.REPAIRING,
+            }:
                 session = repository.transition(
                     session.session_id,
                     SessionState.FAILED,
                     now=float(self.clock()),
                     instance_id=None,
-                    residual_inventory=tuple(
-                        str(item.get("instance_id"))
-                        for item in matches
-                        if item.get("instance_id") is not None
-                    ),
+                    worker_base_url=None,
+                    residual_inventory=(),
                     sanitized_error=(
-                        "Multiple managed Vast instances match this session."
+                        "The managed Vast instance is absent."
                     ),
                 )
-                recovered.append(session)
+            return session
+        instance = matches[0]
+        if session.state == SessionState.CREATING:
+            session = repository.transition(
+                session.session_id,
+                SessionState.BOOTSTRAPPING,
+                now=float(self.clock()),
+                instance_id=str(instance["instance_id"]),
+                sanitized_error=None,
+            )
+        try:
+            session = await self._activate_session_instance(
+                session,
+                instance,
+            )
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            raise
+        except TerminalProvisioningError as error:
+            diagnostic = str(error)
+            session = repository.get(session.session_id)
+            session = repository.transition(
+                session.session_id,
+                SessionState.FAILED,
+                now=float(self.clock()),
+                sanitized_error=diagnostic,
+            )
+            session = await self.destroy_session(
+                session.session_id,
+                terminal_error=diagnostic,
+            )
+            if session.state == SessionState.DESTROYED:
+                confirmed = getattr(
+                    self.session_service,
+                    "confirmed_terminal_destroy",
+                    None,
+                )
+                if callable(confirmed):
+                    confirmed(session.session_id)
+        except Exception:
+            session = repository.get(session.session_id)
+        return session
+
+    async def recover_sessions(self):
+        repository = self.session_repository
+        if repository is None or not callable(
+            getattr(repository, "list_recoverable", None)
+        ):
+            return []
+        sessions = repository.list_recoverable()
+        if not sessions:
+            return []
+        try:
+            _settings, api_key = self._api_key()
+        except Exception:
+            return sessions
+        inventory_task = asyncio.create_task(self._inventory(api_key))
+        recovery_tasks = []
+
+        async def recover_one(original):
+            inventory = await asyncio.shield(inventory_task)
+            return await self._recover_session_from_inventory(
+                original,
+                inventory,
+            )
+
+        for session in sessions:
+            task = asyncio.create_task(recover_one(session))
+            recovery_tasks.append(task)
+            registered = self._session_recovery_tasks.setdefault(
+                session.session_id,
+                set(),
+            )
+            registered.add(task)
+
+            def recovery_finished(completed, session_id=session.session_id):
+                current = self._session_recovery_tasks.get(session_id)
+                if current is None:
+                    return
+                current.discard(completed)
+                if not current:
+                    self._session_recovery_tasks.pop(session_id, None)
+
+            task.add_done_callback(recovery_finished)
+        try:
+            results = await asyncio.gather(
+                *recovery_tasks,
+                return_exceptions=True,
+            )
+        finally:
+            if not inventory_task.done():
+                inventory_task.cancel()
+                await asyncio.gather(inventory_task, return_exceptions=True)
+        if results and all(
+            isinstance(result, asyncio.CancelledError)
+            for result in results
+        ):
+            raise asyncio.CancelledError
+        recovered = []
+        for original, result in zip(sessions, results):
+            if isinstance(result, asyncio.CancelledError):
                 continue
-            if not matches:
-                if known_id_matches:
-                    session = repository.transition(
-                        session.session_id,
-                        SessionState.FAILED,
-                        now=float(self.clock()),
-                        instance_id=str(session.instance_id),
-                        residual_inventory=tuple(
-                            str(item.get("instance_id"))
-                            for item in known_id_matches
-                            if item.get("instance_id") is not None
-                        ),
-                        sanitized_error=(
-                            "The managed Vast instance identity no longer "
-                            "matches its session label."
-                        ),
-                    )
-                    recovered.append(session)
-                    continue
-                deadline_expired = (
-                    session.deadline_mode == "finite"
-                    and isinstance(session.deadline_at, (int, float))
-                    and not isinstance(session.deadline_at, bool)
-                    and float(self.clock()) >= session.deadline_at
-                    and session.instance_id is not None
-                    and session.state
-                    not in {
-                        SessionState.CONFIRMING,
-                        SessionState.CREATING,
-                    }
+            if isinstance(result, (KeyboardInterrupt, SystemExit)):
+                raise result
+            if isinstance(result, BaseException):
+                recovered.append(
+                    repository.get(original.session_id) or original
                 )
-                absent = self.finalize_verified_absence(
-                    session,
-                    inventory,
-                )
-                if absent is not None:
-                    session = absent
-                    if deadline_expired:
-                        confirmed = getattr(
-                            self.session_service,
-                            "confirmed_deadline_destroy",
-                            None,
-                        )
-                        if callable(confirmed):
-                            confirmed(session.session_id)
-                    recovered.append(session)
-                    continue
-                if session.state in {
-                    SessionState.CREATING,
-                    SessionState.BOOTSTRAPPING,
-                    SessionState.PROVISIONING,
-                    SessionState.VALIDATING,
-                    SessionState.READY,
-                    SessionState.RUNNING,
-                    SessionState.HARVESTING,
-                    SessionState.REPAIRING,
-                }:
-                    session = repository.transition(
-                        session.session_id,
-                        SessionState.FAILED,
-                        now=float(self.clock()),
-                        instance_id=None,
-                        worker_base_url=None,
-                        residual_inventory=(),
-                        sanitized_error=(
-                            "The managed Vast instance is absent."
-                        ),
-                    )
-                recovered.append(session)
-                continue
-            instance = matches[0]
-            if session.state == SessionState.CREATING:
-                session = repository.transition(
-                    session.session_id,
-                    SessionState.BOOTSTRAPPING,
-                    now=float(self.clock()),
-                    instance_id=str(instance["instance_id"]),
-                    sanitized_error=None,
-                )
-            try:
-                session = await self._activate_session_instance(
-                    session,
-                    instance,
-                )
-            except (asyncio.CancelledError, KeyboardInterrupt):
-                raise
-            except TerminalProvisioningError as error:
-                diagnostic = str(error)
-                session = repository.get(session.session_id)
-                session = repository.transition(
-                    session.session_id,
-                    SessionState.FAILED,
-                    now=float(self.clock()),
-                    sanitized_error=diagnostic,
-                )
-                session = await self.destroy_session(
-                    session.session_id,
-                    terminal_error=diagnostic,
-                )
-                if session.state == SessionState.DESTROYED:
-                    confirmed = getattr(
-                        self.session_service,
-                        "confirmed_terminal_destroy",
-                        None,
-                    )
-                    if callable(confirmed):
-                        confirmed(session.session_id)
-            except Exception:
-                session = repository.get(session.session_id)
-            recovered.append(session)
+            else:
+                recovered.append(result)
         return recovered
 
     async def handle_session_boot_failure(

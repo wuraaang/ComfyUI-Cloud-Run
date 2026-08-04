@@ -37,6 +37,24 @@ class FailingReconciliationService(BlockingReconciliationService):
         raise RuntimeError("private transport failure")
 
 
+class SlowCancellationReconciliationService(BlockingReconciliationService):
+    def __init__(self):
+        super().__init__()
+        self.cancelling = asyncio.Event()
+        self.finish_cancellation = asyncio.Event()
+
+    async def reconcile_session_once(self, session_id):
+        self.calls += 1
+        self.started.set()
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.cancelling.set()
+            await self.finish_cancellation.wait()
+            raise
+        return session_id
+
+
 class BlockingHarvestService(BlockingReconciliationService):
     def __init__(self):
         super().__init__()
@@ -193,6 +211,37 @@ class SessionReconcilerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.orchestrator.entries("session-1"), ())
         self.assertEqual(reconciler._tasks, {})
         self.assertEqual(reconciler._retry_handles, {})
+
+    async def test_schedule_during_preempt_cannot_restart_or_journal_cancelled_work(self):
+        from cloud_run.reconciler import SessionReconciler
+
+        service = SlowCancellationReconciliationService()
+        reconciler = SessionReconciler(
+            service=service,
+            orchestrator=self.orchestrator,
+            max_retries=2,
+        )
+        self.addAsyncCleanup(reconciler.close)
+        reconciler.schedule("session-1")
+        await service.started.wait()
+
+        preempt = asyncio.create_task(reconciler.preempt("session-1"))
+        await service.cancelling.wait()
+        try:
+            with self.assertRaises(RuntimeError):
+                reconciler.schedule("session-1")
+        finally:
+            service.finish_cancellation.set()
+            await preempt
+
+        await asyncio.sleep(0)
+        self.assertEqual(service.calls, 1)
+        self.assertEqual(self.orchestrator.entries("session-1"), ())
+
+        restarted = reconciler.schedule("session-1")
+        service.release.set()
+        self.assertEqual(await restarted, "session-1")
+        self.assertEqual(service.calls, 2)
 
 
 class ReconcilerOutputTests(unittest.IsolatedAsyncioTestCase):
