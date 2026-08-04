@@ -239,7 +239,7 @@ class FullOfflineLifecycleTests(unittest.TestCase):
     def test_terminal_session_provisioning_destroys_fake_inventory_once(self):
         async def scenario(data_directory):
             settings = SettingsStore(data_directory)
-            settings.update(
+            stored_settings = settings.update(
                 {
                     "api_key": "synthetic-offline-only-value",
                     "max_price_per_hour": 0.55,
@@ -268,6 +268,9 @@ class FullOfflineLifecycleTests(unittest.TestCase):
                 instance_id="900",
                 provider_token="a" * 64,
                 session_secret_hex="d" * 64,
+                create_settings_revision=stored_settings[
+                    "api_key_revision"
+                ],
             )
             sessions.create_or_get(session)
             provider.instances = [
