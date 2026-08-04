@@ -305,6 +305,49 @@ class JobRepositoryTests(unittest.TestCase):
         self.assertEqual(installed[0].digest, "b" * 64)
         self.assertEqual(installed[0].destination, "models/a")
 
+    def test_installed_set_accepts_exact_content_addressed_ui_revision(self):
+        jobs = JobRepository(self.path)
+        revision = "sha256:" + "c" * 64
+
+        jobs.replace_installed_set(
+            "session-1",
+            [
+                {
+                    "dependency_id": "hermes-nous",
+                    "digest": "b" * 64,
+                    "revision": revision,
+                    "destination": "custom_nodes/hermes-nous",
+                }
+            ],
+        )
+
+        installed = JobRepository(self.path).installed_set("session-1")
+        self.assertEqual(len(installed), 1)
+        self.assertEqual(installed[0].revision, revision)
+
+        for invalid in (
+            "sha256:" + "C" * 64,
+            "sha256:" + "c" * 63,
+            "sha256:" + "c" * 65,
+            "sha512:" + "c" * 64,
+        ):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "Invalid installed revision",
+                ):
+                    jobs.replace_installed_set(
+                        "session-1",
+                        [
+                            {
+                                "dependency_id": "hermes-nous",
+                                "digest": "b" * 64,
+                                "revision": invalid,
+                                "destination": "custom_nodes/hermes-nous",
+                            }
+                        ],
+                    )
+
     def test_provision_progress_upserts_exact_bounds_and_selects_latest(self):
         jobs = JobRepository(self.path)
         base = {

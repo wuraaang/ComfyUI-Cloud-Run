@@ -29,6 +29,11 @@ from .repository import (
 from .run_errors import RunErrorCode, RunJournalEntry, RunPhase
 
 
+_INSTALLED_REVISION = re.compile(
+    r"(?:[0-9a-f]{40}|sha256:[0-9a-f]{64})"
+)
+
+
 class ConcurrentJobUpdate(RuntimeError):
     pass
 
@@ -2070,9 +2075,8 @@ class JobRepository:
                 raise ValueError("Installed dependency IDs must be unique.")
             seen.add(dependency_id)
             revision = dependency["revision"]
-            if revision is not None and not re.fullmatch(
-                r"[0-9a-f]{40}",
-                str(revision),
+            if revision is not None and not _INSTALLED_REVISION.fullmatch(
+                str(revision)
             ):
                 raise ValueError("Invalid installed revision.")
             records.append(
