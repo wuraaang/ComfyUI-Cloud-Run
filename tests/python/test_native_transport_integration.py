@@ -1,4 +1,5 @@
 import importlib.util
+from dataclasses import replace
 import tempfile
 import unittest
 from pathlib import Path
@@ -50,7 +51,7 @@ class NativeTransportIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(worker.close)
         return worker
 
-    def _client(self):
+    def _client(self, *, nonce=None):
         from cloud_run.worker_client import WorkerClient
 
         class EnvelopeTransport:
@@ -64,7 +65,7 @@ class NativeTransportIntegrationTests(unittest.IsolatedAsyncioTestCase):
             session_secret=bytes.fromhex("a" * 64),
             transport=EnvelopeTransport(),
             clock=lambda: 1000,
-            nonce=lambda: "native-transport",
+            nonce=nonce or (lambda: "native-transport"),
         )
 
     async def _native_response(self, worker, request):
@@ -143,6 +144,70 @@ class NativeTransportIntegrationTests(unittest.IsolatedAsyncioTestCase):
             "127.0.0.1:" + str(port),
         )
 
+    async def test_adjacent_backend_and_credential_routes_fail_before_upstream(self):
+        from cloud_run.worker_client import WorkerClientError
+
+        client = self._client(nonce=lambda: "controller-policy-refusal")
+        rejected = (
+            ("POST", "/system_stats", b""),
+            ("GET", "/system_stats?debug=1", b""),
+            ("GET", "/%2e%2e/system_stats", b""),
+            ("GET", "/comfyui_mcp_panel/civitai", b""),
+            ("GET", "/comfyui_mcp_panel/training", b""),
+            ("GET", "/comfyui_mcp_panel/apps", b""),
+            ("GET", "/manager/queue", b""),
+            ("POST", "/api/restart", b"{}"),
+            ("POST", "/reload", b"{}"),
+            ("GET", "/arbitrary-backend", b""),
+        )
+        for method, path, body in rejected:
+            with self.subTest(path=path), self.assertRaises(
+                WorkerClientError
+            ):
+                client.native_envelope(method, path, body)
+        for header in ("Authorization", "Cookie", "X-Api-Key"):
+            with self.subTest(header=header), self.assertRaises(
+                WorkerClientError
+            ):
+                client.native_envelope(
+                    "GET",
+                    "/system_stats",
+                    b"",
+                    headers={header: "must-not-cross"},
+                )
+
+        class NoUpstreamTransport:
+            def __init__(inner_self):
+                inner_self.calls = []
+
+            async def request(inner_self, **kwargs):
+                inner_self.calls.append(("http", kwargs))
+                raise AssertionError("rejected route reached upstream")
+
+            async def websocket(inner_self, path_qs):
+                inner_self.calls.append(("websocket", path_qs))
+                raise AssertionError("rejected route reached upstream")
+
+            async def close(inner_self):
+                return None
+
+        transport = NoUpstreamTransport()
+        worker = await self._worker(transport=transport)
+        valid = self._client(
+            nonce=lambda: "worker-policy-refusal"
+        ).native_envelope("GET", "/system_stats", b"")
+        for _method, path, _body in rejected:
+            mutated = replace(
+                valid,
+                method=_method,
+                url="http://8.8.8.8:30000" + path,
+                body=_body,
+            )
+            with self.subTest(worker_path=path):
+                response = await self._native_response(worker, mutated)
+                self.assertEqual(response.status, 404)
+        self.assertEqual(transport.calls, [])
+
     async def test_signed_websocket_crosses_worker_policy_and_redirect_cannot_escape(
         self,
     ):
@@ -186,3 +251,72 @@ class NativeTransportIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status, 502)
         self.assertEqual(target_hits, [])
+
+    async def test_signed_websocket_opens_and_closes_through_both_policies(self):
+        from aiohttp import ClientSession, web
+
+        from remote_worker.main import build_aiohttp_application
+        from remote_worker.native_proxy import AiohttpNativeTransport
+
+        upstream_hits = []
+
+        async def websocket(request):
+            upstream_hits.append(dict(request.headers))
+            socket = web.WebSocketResponse()
+            await socket.prepare(request)
+            return socket
+
+        application = web.Application()
+        application.router.add_get("/ws", websocket)
+        port = await self._loopback_server(application)
+        worker = await self._worker(transport=AiohttpNativeTransport())
+        worker_port = await self._loopback_server(
+            build_aiohttp_application(worker=worker)
+        )
+        worker_origin = "http://127.0.0.1:" + str(worker_port)
+        request = self._client(
+            nonce=lambda: "native-websocket-open",
+        ).native_envelope(
+            "GET",
+            "/ws?clientId=desktop-client-1",
+            b"",
+        )
+        request = replace(
+            request,
+            url=(
+                worker_origin
+                + request.url.removeprefix("http://8.8.8.8:30000")
+            ),
+        )
+        boundary_headers = {
+            key: value
+            for key, value in request.headers.items()
+            if key.casefold() != "authorization"
+        }
+        boundary_headers["X-Cloud-Run-Boundary"] = "authenticated"
+
+        with mock.patch(
+            "remote_worker.native_proxy.COMFY_LOOPBACK_ORIGIN",
+            "http://127.0.0.1:" + str(port),
+        ):
+            async with ClientSession(trust_env=False) as session:
+                async with session.ws_connect(
+                    request.url,
+                    headers=boundary_headers,
+                    autoclose=False,
+                ) as socket:
+                    self.assertFalse(socket.closed)
+                    await socket.close(code=1000)
+
+        self.assertEqual(len(upstream_hits), 1)
+        upstream_header_names = {
+            key.casefold() for key in upstream_hits[0]
+        }
+        for header in (
+            "authorization",
+            "cookie",
+            "x-cloud-run-boundary",
+            "x-cloud-run-signature",
+            "x-cloud-vast-job-id",
+        ):
+            self.assertNotIn(header, upstream_header_names)

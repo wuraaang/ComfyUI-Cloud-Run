@@ -1,29 +1,30 @@
 """Offline acceptance campaign for the local-to-Vast Desktop bridge."""
 
 import asyncio
-from contextlib import contextmanager, ExitStack
+from contextlib import closing, contextmanager, ExitStack
 from dataclasses import replace
-import hashlib
 import json
 from pathlib import Path
 import sqlite3
 import tarfile
+import types
 import unittest
 from unittest import mock
 
+from cloud_run.agent_bridge import AgentBridgeProbe
 from cloud_run.desktop_profile import DesktopProfileStore, ProfileConflict
 from cloud_run.desktop_relay import DesktopRelay, DesktopRelayResponse
 from cloud_run.job_repository import JobRepository
-from cloud_run.manifest import UiPackageSpec
 from cloud_run.models import JobState, SessionState, TransferState
 from cloud_run.readiness import (
-    REQUIRED_READINESS_CHECKS,
-    ReadinessCheck,
+    ControllerReadinessProbe,
+    LocalExecutionGuard,
     ReadinessValidator,
-    evidence_digest,
-    readiness_message,
 )
 from cloud_run.run_errors import RunErrorCode, RunJournalEntry, RunPhase
+from remote_worker.install import CustomNodeInstaller
+from remote_worker.native_proxy import NativeRoutePolicy
+from tests.python import test_certified_baseline as certified_baseline_fixture
 from tests.python.test_fake_session_integration import (
     FakeCloudRunSystem,
     confirmed,
@@ -50,6 +51,24 @@ def blocked_external_network():
         for target in targets:
             stack.enter_context(mock.patch(target, side_effect=failure))
         yield
+
+
+class _CertifiedBaselineFixture:
+    """Materialize the reviewed package shape through the production resolver."""
+
+    def __init__(self):
+        self._case = certified_baseline_fixture.CertifiedBaselineTests(
+            methodName="runTest"
+        )
+        self._case.setUp()
+        lock_path, fetcher, calls, _record = (
+            self._case._fixture_lock_and_fetcher()
+        )
+        self.resolution = self._case._resolve(lock_path, fetcher)
+        self.fetch_calls = tuple(calls)
+
+    def close(self):
+        self._case.doCleanups()
 
 
 LIVE_AUDIT_REGRESSION_MAP = {
@@ -209,6 +228,15 @@ class FakeAgentBridge:
     def allow(self, session_id):
         self.allowed.append(session_id)
 
+    async def probe(self, _session):
+        return AgentBridgeProbe(
+            orchestrator_identity="passed",
+            graph_read="passed",
+            graph_edit_restore="passed",
+            graph_run="passed",
+            ordered_batch="passed",
+        )
+
     async def open(self, request, session):
         self.opened.append((request.path_qs, session.session_id))
         return DesktopRelayResponse(200, b"agent-panel-connected")
@@ -268,7 +296,6 @@ def _campaign_canvas(*, seed=11):
         model="model-a.safetensors",
         input_name="input-a.png",
         seed=seed,
-        custom_revision="c" * 40,
     )
     payload["workflow"]["nodes"].extend(
         (
@@ -341,12 +368,17 @@ class OfflineDesktopBridgeCampaign:
             raise ValueError("invalid synthetic deadline mode")
         self.deadline_mode = deadline_mode
         self.system = FakeCloudRunSystem()
+        self.baseline_fixture = _CertifiedBaselineFixture()
+        self.baseline = self.baseline_fixture.resolution
         self.agent = FakeAgentBridge()
         self.listeners = []
         self.relays = []
         self.local_backend_starts = 0
         self.local_prompt_calls = []
         self.steps = []
+        self.readiness_probe_calls = 0
+        self.worker_readiness_proofs = []
+        self.local_execution_guard = LocalExecutionGuard()
         self._profile_setup()
         self._wire_desktop()
 
@@ -357,6 +389,65 @@ class OfflineDesktopBridgeCampaign:
             except RuntimeError:
                 pass
         self.system.close()
+        self.baseline_fixture.close()
+
+    def _measure_ui_baseline(self):
+        worker_root = self.system.root / "measured-worker"
+        custom_nodes = worker_root / "custom_nodes"
+        wheels = worker_root / "wheels"
+        artifacts = worker_root / "artifacts"
+        for path in (custom_nodes, wheels, artifacts):
+            path.mkdir(parents=True, mode=0o700)
+
+        local_by_id = {
+            item.artifact_id: Path(item.private_path)
+            for item in self.baseline.local_artifacts
+        }
+        for package in self.baseline.ui_packages:
+            source = local_by_id[package.archive.artifact_id]
+            (artifacts / (package.archive.artifact_id + ".tar")).write_bytes(
+                source.read_bytes()
+            )
+
+        class NoPipRunner:
+            async def run(_self, _argv):
+                raise AssertionError("UI-only baseline attempted pip")
+
+        installer = CustomNodeInstaller(
+            custom_nodes_root=custom_nodes,
+            wheel_root=wheels,
+            artifact_root=artifacts,
+            runner=NoPipRunner(),
+        )
+        return tuple(
+            asyncio.run(installer.install_ui_package(package))
+            for package in self.baseline.ui_packages
+        )
+
+    def _configure_resolver_baseline(self):
+        resolver = self.system.resolver
+        original = resolver.resolve_preflight
+        baseline_nodes = self.baseline.custom_nodes
+
+        async def resolve_preflight(
+            capture,
+            *,
+            explicit_output_allowance_bytes,
+        ):
+            result = await original(
+                capture,
+                explicit_output_allowance_bytes=(
+                    explicit_output_allowance_bytes
+                ),
+            )
+            values = vars(result).copy()
+            values["custom_nodes"] = (
+                *baseline_nodes,
+                *result.custom_nodes,
+            )
+            return types.SimpleNamespace(**values)
+
+        resolver.resolve_preflight = resolve_preflight
 
     def _profile_setup(self):
         root = self.system.root
@@ -388,26 +479,7 @@ class OfflineDesktopBridgeCampaign:
             ),
             encoding="utf-8",
         )
-        theme = root / "agent-panel.css"
-        theme.write_text(".agent-panel{color:#fff}", encoding="utf-8")
-        ui_archive, ui_local = self.system._asset(
-            "ui-agent-panel",
-            kind="ui_package_archive",
-            destination="custom_nodes/comfyui-agent-panel",
-        )
-        package = UiPackageSpec(
-            package_id="comfyui-agent-panel",
-            repository_url="https://github.com/acme/comfyui-agent-panel",
-            revision="a" * 40,
-            archive=ui_archive,
-            web_sha256=hashlib.sha256(theme.read_bytes()).hexdigest(),
-            required_capabilities=(
-                "graph_read",
-                "graph_edit",
-                "native_run",
-                "native_batch",
-            ),
-        )
+        self.ui_measurements = self._measure_ui_baseline()
         self.profile_store = DesktopProfileStore(
             repository=self.system.jobs,
             private_root=self.system.data_root / "desktop-profile",
@@ -419,29 +491,115 @@ class OfflineDesktopBridgeCampaign:
             profile_name="default",
             input_root=self.input_root,
             bootstrap_workflow=_campaign_canvas(),
-            ui_packages=(package,),
-            ui_assets=(("assets/approved/agent-panel.css", theme),),
+            ui_packages=self.baseline.ui_packages,
         )
         self.system.configure_desktop_profile(
             profile_store=self.profile_store,
             profile=self.initial_profile,
-            ui_packages=(package,),
-            ui_local_artifacts=(ui_local,),
+            ui_packages=self.baseline.ui_packages,
+            ui_local_artifacts=self.baseline.local_artifacts,
         )
+        self._configure_resolver_baseline()
 
-    @staticmethod
-    async def _readiness_probe(_session, _manifest, _profile):
-        return tuple(
-            ReadinessCheck(
-                name=name,
-                status="passed",
-                evidence_digest=evidence_digest(
-                    {"check": name, "fixture": "offline-desktop-campaign"}
-                ),
-                message=readiness_message(name, "passed"),
-            )
-            for name in REQUIRED_READINESS_CHECKS
+    def _served_extension_paths(self):
+        paths = {
+            path
+            for result in self.ui_measurements
+            for path in result.extension_paths
+        }
+        node = self.baseline.custom_nodes[0]
+        local = next(
+            item
+            for item in self.baseline.local_artifacts
+            if item.artifact_id == node.archive.artifact_id
         )
+        with tarfile.open(local.private_path, "r:") as archive:
+            for member in archive.getmembers():
+                if member.isfile() and member.name.startswith("js/"):
+                    paths.add(
+                        "/extensions/"
+                        + node.package_id
+                        + "/"
+                        + member.name.removeprefix("js/")
+                    )
+        return sorted(paths)
+
+    def _required_class_types(self, manifest):
+        capture = self.system.jobs.get_capture_by_prompt_digest(
+            manifest.prompt_digest
+        )
+        required = set(capture.executable_class_types)
+        for node in manifest.custom_nodes:
+            required.update(node.provided_class_types)
+        return tuple(sorted(required))
+
+    async def _worker_transaction(self, transaction_id):
+        self.readiness_probe_calls += 1
+        call = self.system.worker.manifest_calls[-1]
+        manifest = call["manifest"]
+        if transaction_id != "provision-" + call["manifest_digest"]:
+            return None
+        profile = manifest["profile"]
+        required_classes = {
+            "CheckpointLoaderSimple",
+            "KSampler",
+            "LoadImage",
+            "PreviewImage",
+            "SaveImage",
+        }
+        for node in manifest["custom_nodes"]:
+            required_classes.update(node["provided_class_types"])
+        expected_ui = {
+            package["package_id"]: package["web_sha256"]
+            for package in manifest["ui_packages"]
+        }
+        readiness = {
+            "protocol_version": manifest["protocol_version"],
+            "comfyui_core_version": manifest["comfyui_core_version"],
+            "comfyui_frontend_version": manifest[
+                "comfyui_frontend_version"
+            ],
+            "worker_version": manifest["worker_version"],
+            "validated_class_types": sorted(required_classes),
+            "validated_artifacts": sorted(
+                item["artifact_id"] for item in manifest["artifacts"]
+            ),
+            "profile_revision": profile["revision"],
+            "profile_digest": profile["archive"]["sha256"],
+            "bootstrap_digest": profile["bootstrap_digest"],
+            "ui_package_digests": expected_ui,
+            "served_extension_paths": self._served_extension_paths(),
+            "runtime_package_versions": {
+                "aiohttp": "offline-fixture",
+                "torch": "offline-fixture",
+            },
+            "comfy_process_healthy": True,
+            "completed_at": self.system.clock(),
+        }
+        if self.readiness_probe_calls == 1:
+            readiness["ui_package_digests"] = {}
+        self.worker_readiness_proofs.append(
+            json.loads(json.dumps(readiness))
+        )
+        return {
+            "transaction_id": transaction_id,
+            "manifest_digest": call["manifest_digest"],
+            "state": "ready",
+            "readiness": readiness,
+        }
+
+    async def _worker_native_websocket(self, request):
+        if not request.url.endswith(
+            "/ws?clientId=cloud-vast-readiness"
+        ):
+            raise AssertionError("unexpected readiness WebSocket")
+
+        class Socket:
+            async def close(_self, *, code):
+                if code != 1000:
+                    raise AssertionError("readiness WebSocket closed unsafely")
+
+        return Socket()
 
     def _wire_desktop(self):
         listener = FakeListener()
@@ -455,8 +613,26 @@ class OfflineDesktopBridgeCampaign:
             capability_factory=lambda: "campaign-capability-" + "c" * 32,
             clock=self.system.clock,
         )
+        self.system.worker.transaction = self._worker_transaction
+        self.system.worker.native_websocket = self._worker_native_websocket
+
+        async def inventory_probe(session):
+            return await self.system.vast.get_instance(
+                "synthetic-offline-key",
+                session.instance_id,
+            )
+
+        controller_probe = ControllerReadinessProbe(
+            worker_factory=lambda _session: self.system.worker,
+            inventory_probe=inventory_probe,
+            desktop_relay=relay,
+            release=self.system.release,
+            required_class_types=self._required_class_types,
+            local_execution_counter=self.local_execution_guard.count,
+            continue_guard=lambda _session_id: None,
+        )
         validator = ReadinessValidator(
-            probe=self._readiness_probe,
+            probe=controller_probe,
             worker_release_digest=self.system.release.worker_archive_sha256,
             relay_origin="http://127.0.0.1:32145",
             clock=self.system.clock,
@@ -569,6 +745,7 @@ class OfflineDesktopBridgeCampaign:
             ui_packages=self.initial_profile.ui_packages,
             ui_local_artifacts=self.system.ui_local_artifacts,
         )
+        self._configure_resolver_baseline()
         self._wire_desktop()
         asyncio.run(self.system.service.recover())
         asyncio.run(self.relay.start())
@@ -673,6 +850,13 @@ class OfflineDesktopBridgeCampaign:
         payload = _campaign_canvas()
         capture = self.system.capture(payload)
         assert len(self.local_prompt_calls) == local_count
+        assert "offlineCustomRevision" not in payload["workflow"]["extra"]
+        assert "FancyNode" not in capture.executable_class_types
+        assert set(self.baseline_fixture.fetch_calls) == {
+            certified_baseline_fixture.AGENT_URL,
+            certified_baseline_fixture.EFFICIENCY_URL,
+            certified_baseline_fixture.WHEEL_URL,
+        }
         self.steps.append(1)
 
         # 2. Search stays free and contains both explained outcomes.
@@ -702,19 +886,77 @@ class OfflineDesktopBridgeCampaign:
         assert self.system.vast.create_count == 1
         self.steps.append(3)
 
-        # 4. Profile, model, custom node and one immutable readiness report exist.
+        # 4. Baseline installation and both immutable readiness attempts exist.
         assert self.system.worker.installed_profile_members
-        assert "comfyui-agent-panel" in self.system.worker.installed_ui_packages
-        assert self.system.worker._installed_custom_nodes == {"acme.nodes": "c" * 40}
+        assert set(self.system.worker.installed_ui_packages) == {
+            "comfyui-agent-panel",
+            "hermes-nous",
+        }
+        assert self.system.worker._installed_custom_nodes == {
+            "efficiency-nodes-comfyui": (
+                "835bbe14627cccc871822e804c65c734960d3c6e"
+            )
+        }
+        manifest, profile = self.system.session_service._profile_manifest(
+            self.session
+        )
+        assert {
+            item.package_id for item in manifest.ui_packages
+        } == {"comfyui-agent-panel", "hermes-nous"}
+        assert tuple(
+            item.package_id for item in manifest.custom_nodes
+        ) == ("efficiency-nodes-comfyui",)
+        efficiency_classes = set(
+            self.baseline.custom_nodes[0].provided_class_types
+        )
+        assert len(efficiency_classes) == 40
         readiness = self.system.session_service.desktop_readiness(
             self.session.session_id
         )
         assert readiness["desktop_ready"] is True
-        with sqlite3.connect(self.system.database) as connection:
+        readiness_report = readiness["readiness_report"]
+        assert readiness_report["attempt_number"] == 2
+        assert self.readiness_probe_calls == 2
+        readiness_checks = {
+            item["name"]: item["status"]
+            for item in readiness_report["checks"]
+        }
+        assert readiness_checks["agent_panel_capabilities"] == "passed"
+        assert readiness_checks["native_http_probe"] == "passed"
+        assert readiness_checks["native_websocket_probe"] == "passed"
+        assert readiness_checks["local_execution_unused"] == "passed"
+        assert efficiency_classes.issubset(
+            self.worker_readiness_proofs[-1]["validated_class_types"]
+        )
+        served_paths = self.worker_readiness_proofs[-1][
+            "served_extension_paths"
+        ]
+        for package_id in (
+            "comfyui-agent-panel",
+            "hermes-nous",
+            "efficiency-nodes-comfyui",
+        ):
+            assert any(
+                path.startswith("/extensions/" + package_id + "/")
+                for path in served_paths
+            )
+        identity = self.system.session_service.readiness_validator.identity(
+            self.session,
+            manifest,
+            profile,
+        )
+        attempts = self.system.jobs.list_readiness_attempts(**identity)
+        assert [item.ready for item in attempts] == [False, True]
+        assert next(
+            item
+            for item in attempts[0].checks
+            if item.name == "approved_ui_asset_digests"
+        ).status == "failed"
+        with closing(sqlite3.connect(self.system.database)) as connection:
             readiness_count = connection.execute(
                 "SELECT COUNT(*) FROM readiness_reports"
             ).fetchone()[0]
-        assert readiness_count == 1
+        assert readiness_count == 2
         self.steps.append(4)
 
         # 5. The official-Remote-shaped local endpoint exposes native resources.
@@ -736,7 +978,13 @@ class OfflineDesktopBridgeCampaign:
             item.startswith("backgrounds/") and item.endswith(".jpg")
             for item in members
         )
-        assert "assets/approved/agent-panel.css" in members
+        assert {
+            item.package_id: item.web_sha256
+            for item in self.ui_measurements
+        } == {
+            item.package_id: item.web_sha256
+            for item in self.baseline.ui_packages
+        }
         with tarfile.open(self.initial_profile.archive_private_path, "r:gz") as archive:
             settings_stream = archive.extractfile("settings/comfy.settings.json")
             settings = json.loads(settings_stream.read())
@@ -744,11 +992,28 @@ class OfflineDesktopBridgeCampaign:
             "/cloud-run/api/agent/ws"
         )
         assert settings["comfyui-mcp.remoteComfyuiUrl"] == ""
+        assert settings["Comfy.Canvas.BackgroundImage"].startswith(
+            "/api/view?filename=cloud-vast/backgrounds/"
+        )
+        assert settings["Comfy.Canvas.BackgroundImage"].endswith(
+            "&type=input"
+        )
         agent_status = self._desktop_get("/comfyui_mcp_panel/status", self.cookie)
         agent_socket = self._desktop_get("/cloud-run/api/agent/ws", self.cookie)
         assert json.loads(agent_status.body)["running"] is True
         assert agent_socket.status == 200
         assert self.agent.opened[-1][1] == self.session.session_id
+        native_policy = NativeRoutePolicy()
+        for method, path in (
+            ("GET", "/comfyui_mcp_panel/civitai"),
+            ("GET", "/comfyui_mcp_panel/training"),
+            ("GET", "/comfyui_mcp_panel/apps"),
+            ("GET", "/manager/queue"),
+            ("POST", "/api/restart"),
+            ("POST", "/reload"),
+            ("GET", "/arbitrary-backend"),
+        ):
+            assert native_policy.classify(method, path) is None
         self.steps.append(6)
 
         # 7-9. Native frames, atomic terminal identity and persistent output.
@@ -841,7 +1106,32 @@ class OfflineDesktopBridgeCampaign:
         assert self.profile_store.conflicts(unresolved_only=True) == (conflict,)
         self.steps.append(13)
 
-        # 14. Persist bounded evidence only; never the seeded raw cause/secret.
+        # 14. A detail failure preserves the safety card. Progress after a
+        # manual review is append-only and cannot revoke that review.
+        from cloud_run.routes import _active_session_payloads
+
+        with mock.patch(
+            "cloud_run.routes._session_payload",
+            side_effect=RuntimeError("private-detail-marker"),
+        ):
+            cards, detail_error = _active_session_payloads(
+                self.system.service
+            )
+        assert detail_error == (
+            "Active session details are temporarily unavailable."
+        )
+        card = next(
+            item
+            for item in cards
+            if item["session_id"] == self.session.session_id
+        )
+        assert card["can_destroy"] is True
+        assert card["billing_may_continue"] is True
+        assert "private-detail-marker" not in repr(card)
+
+        manual_review = None
+        if self.deadline_mode == "none":
+            manual_review = self.system.review_destroy(self.session)
         self._record_safe_journal(first)
         journal = self.system.jobs.list_journal(self.session.session_id)
         rendered = repr(journal)
@@ -855,21 +1145,34 @@ class OfflineDesktopBridgeCampaign:
         asyncio.run(self.relay.close())
         assert len(self.system.vast.inventory) == 1
         assert self.system.vast.destroy_count == 0
+        destroy_intent_seen = []
+        original_destroy = self.system.vast.destroy_instance
+
+        async def destroy_after_intent(api_key, instance_id):
+            stored = self.system.sessions.get(self.session.session_id)
+            destroy_intent_seen.append(stored.destroy_requested)
+            return await original_destroy(api_key, instance_id)
+
+        self.system.vast.destroy_instance = destroy_after_intent
         if self.deadline_mode == "finite":
             destroyed = self.system.expire_deadline(self.session)
         else:
-            review = self.system.review_destroy(self.session)
-            destroyed = self.system.destroy(self.session, confirmed(review))
+            destroyed = self.system.destroy(
+                self.session,
+                confirmed(manual_review),
+            )
         assert destroyed.state == SessionState.DESTROYED
         assert self.system.vast.inventory == []
         assert destroyed.public_payload()["billing_may_continue"] is False
         assert self.system.vast.destroy_count == 1
+        assert destroy_intent_seen == [True]
         self.steps.append(15)
 
         # 16. The ordinary local Run still reaches only the existing local backend.
         self._local_run("after")
         assert self.system.local_prompt_posts == []
         assert self.local_prompt_calls == ["before", "after"]
+        assert self.local_execution_guard.count(self.session.session_id) == 0
         self.steps.append(16)
 
         return {
@@ -889,19 +1192,17 @@ class OfflineDesktopBridgeCampaign:
 
 class FakeDesktopBridgeCampaignTests(unittest.TestCase):
     def test_manual_campaign_survives_both_desktops_until_explicit_destroy(self):
-        campaign = OfflineDesktopBridgeCampaign(deadline_mode="none")
-        self.addCleanup(campaign.close)
-
         with blocked_external_network():
+            campaign = OfflineDesktopBridgeCampaign(deadline_mode="none")
+            self.addCleanup(campaign.close)
             evidence = campaign.run()
 
         self.assertEqual(evidence["steps"], tuple(range(1, 17)))
 
     def test_finite_campaign_uses_only_authorized_deadline_path(self):
-        campaign = OfflineDesktopBridgeCampaign(deadline_mode="finite")
-        self.addCleanup(campaign.close)
-
         with blocked_external_network():
+            campaign = OfflineDesktopBridgeCampaign(deadline_mode="finite")
+            self.addCleanup(campaign.close)
             evidence = campaign.run()
 
         self.assertTrue(evidence["deadline_destroyed_once"])
@@ -909,10 +1210,9 @@ class FakeDesktopBridgeCampaignTests(unittest.TestCase):
         self.assertFalse(evidence["billing_may_continue"])
 
     def test_bridge_uses_existing_prompt_server_lifecycle_only(self):
-        campaign = OfflineDesktopBridgeCampaign(deadline_mode="none")
-        self.addCleanup(campaign.close)
-
         with blocked_external_network():
+            campaign = OfflineDesktopBridgeCampaign(deadline_mode="none")
+            self.addCleanup(campaign.close)
             evidence = campaign.run()
 
         self.assertEqual(evidence["local_backend_starts"], 0)
