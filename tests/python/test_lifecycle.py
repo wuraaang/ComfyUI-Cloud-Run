@@ -1006,6 +1006,122 @@ class SessionLifecycleTests(LifecycleTestCase):
         self.assertTrue(task.cancelled())
         self.assertEqual(self.provider.calls, [])
 
+    def test_watchdog_schedule_during_preempt_cannot_restart_cancelled_work(self):
+        session = self.save_session()
+        lifecycle = self.session_lifecycle()
+
+        async def scenario():
+            started = asyncio.Event()
+            cancelling = asyncio.Event()
+            finish_cancellation = asyncio.Event()
+            calls = 0
+
+            async def cancellation_blocked_reconcile(_session_id):
+                nonlocal calls
+                calls += 1
+                if calls > 1:
+                    return session.transition(
+                        SessionState.FAILED,
+                        now=self.clock(),
+                    )
+                started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    cancelling.set()
+                    await finish_cancellation.wait()
+                    raise
+
+            lifecycle.reconcile_session_once = (
+                cancellation_blocked_reconcile
+            )
+            original = lifecycle.schedule_session_watchdog(
+                session.session_id
+            )
+            await started.wait()
+            preempt = asyncio.create_task(
+                lifecycle.preempt_session(session.session_id)
+            )
+            await cancelling.wait()
+            try:
+                blocked = lifecycle.schedule_session_watchdog(
+                    session.session_id
+                )
+                self.assertIsNone(blocked)
+            finally:
+                finish_cancellation.set()
+                await preempt
+
+            self.assertTrue(original.cancelled())
+            self.assertEqual(calls, 1)
+            restarted = lifecycle.schedule_session_watchdog(
+                session.session_id
+            )
+            self.assertIsNotNone(restarted)
+            self.assertEqual(
+                (await restarted).state,
+                SessionState.FAILED,
+            )
+            return calls
+
+        calls = asyncio.run(scenario())
+
+        self.assertEqual(calls, 2)
+        self.assertEqual(self.provider.calls, [])
+
+    def test_recovery_registration_during_preempt_cannot_start_remote_work(self):
+        session = self.save_session(state=SessionState.READY)
+        lifecycle = self.session_lifecycle()
+        self.provider.instances = []
+
+        async def scenario():
+            started = asyncio.Event()
+            cancelling = asyncio.Event()
+            finish_cancellation = asyncio.Event()
+
+            async def cancellation_blocked_reconcile(_session_id):
+                started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    cancelling.set()
+                    await finish_cancellation.wait()
+                    raise
+
+            lifecycle.reconcile_session_once = (
+                cancellation_blocked_reconcile
+            )
+            lifecycle.schedule_session_watchdog(session.session_id)
+            await started.wait()
+            preempt = asyncio.create_task(
+                lifecycle.preempt_session(session.session_id)
+            )
+            await cancelling.wait()
+            try:
+                blocked_recovery = await lifecycle.recover_sessions()
+                current_during_preempt = self.sessions.get(
+                    session.session_id
+                )
+            finally:
+                finish_cancellation.set()
+                await preempt
+
+            recovered_after_preempt = await lifecycle.recover_sessions()
+            return (
+                blocked_recovery,
+                current_during_preempt,
+                recovered_after_preempt,
+            )
+
+        blocked, current, recovered = asyncio.run(scenario())
+
+        self.assertEqual(blocked, [])
+        self.assertEqual(current.state, SessionState.READY)
+        self.assertEqual(current.instance_id, session.instance_id)
+        self.assertEqual(len(recovered), 1)
+        self.assertEqual(recovered[0].state, SessionState.DESTROYED)
+        self.assertEqual([call[0] for call in self.provider.calls], ["list"])
+
     def test_preempt_session_cancels_inflight_recovery_inventory(self):
         session = self.save_session(state=SessionState.READY)
         lifecycle = self.session_lifecycle()

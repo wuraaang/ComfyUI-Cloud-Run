@@ -71,6 +71,7 @@ class CloudRunLifecycle:
         self.session_repository = session_repository
         self.session_service = session_service
         self._session_recovery_tasks = {}
+        self._session_preemptions = {}
 
     def _attempt(self, attempt_id):
         attempt = self.repository.get(str(attempt_id))
@@ -461,6 +462,8 @@ class CloudRunLifecycle:
 
     def schedule_session_watchdog(self, session_id):
         key = str(session_id)
+        if key in self._session_preemptions:
+            return None
         existing = _SESSION_WATCHDOGS.get(key)
         if existing is not None and not existing.done():
             return existing
@@ -487,20 +490,32 @@ class CloudRunLifecycle:
         key = str(session_id or "")
         if not key:
             raise ValueError("Cloud Run session identity is invalid.")
-        recovery_tasks = self._session_recovery_tasks.pop(key, set())
-        tasks = {
-            task
-            for task in (
-                _SESSION_WATCHDOGS.pop(key, None),
-                *recovery_tasks,
-            )
-            if task is not None and task is not asyncio.current_task()
-        }
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        existing = self._session_preemptions.get(key)
+        if existing is not None:
+            await asyncio.shield(existing)
+            return
+        completed = asyncio.get_running_loop().create_future()
+        self._session_preemptions[key] = completed
+        try:
+            recovery_tasks = self._session_recovery_tasks.pop(key, set())
+            tasks = {
+                task
+                for task in (
+                    _SESSION_WATCHDOGS.pop(key, None),
+                    *recovery_tasks,
+                )
+                if task is not None and task is not asyncio.current_task()
+            }
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            if self._session_preemptions.get(key) is completed:
+                self._session_preemptions.pop(key, None)
+            if not completed.done():
+                completed.set_result(None)
 
     async def _destroy_failed_attempt(self, attempt):
         _settings, api_key = self._api_key()
@@ -1323,6 +1338,11 @@ class CloudRunLifecycle:
         ):
             return []
         sessions = repository.list_recoverable()
+        sessions = [
+            session
+            for session in sessions
+            if session.session_id not in self._session_preemptions
+        ]
         if not sessions:
             return []
         try:
