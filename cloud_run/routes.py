@@ -1,5 +1,6 @@
 """Allowlisted same-origin routes for the managed Cloud Run lifecycle."""
 
+import json
 import os
 from pathlib import Path
 import math
@@ -7,19 +8,31 @@ import re
 import stat
 
 from .artifacts import GIB
-from .capture import CaptureValidationError
+from .agent_bridge import AgentBridge
+from .capture import CaptureValidationError, certified_bootstrap_workflow
+from .certified_baseline import (
+    CertifiedBaselineResolution,
+    CertifiedBaselineResolver,
+    CertifiedBaselineUnavailable,
+)
 from .comfy_host import ComfyHost, FORBIDDEN_TREE, HostCompatibilityError
 from .dependency_repository import (
     DependencyRepository,
     MappingValidationError,
 )
+from .desktop_relay import DesktopRelay, DesktopRelayError
+from .desktop_profile import DesktopProfileStore
 from .job_repository import JobRepository
 from .huggingface import HuggingFaceClient
 from .lifecycle import CloudRunLifecycle
 from .model_sources import WorkflowModelSourceResolver
 from .models import SessionState
 from .offers import HostBlacklist
-from .repository import AttemptRepository, SessionRepository
+from .repository import (
+    AttemptRepository,
+    PaidRentalConflict,
+    SessionRepository,
+)
 from .registry import RegistryClient
 from .resolver import DependencyResolver
 from .r2 import R2TransferError, R2ValidationError
@@ -27,6 +40,11 @@ from .relay import (
     ArtifactVerificationError,
     LocalRelay,
     RelayError,
+)
+from .readiness import (
+    ControllerReadinessProbe,
+    LocalExecutionGuard,
+    ReadinessValidator,
 )
 from .service import (
     AttemptNotFound,
@@ -56,6 +74,7 @@ from .vast import (
     VastError,
 )
 from .worker_release import (
+    WorkerRelease,
     WorkerReleaseUnavailable,
     load_worker_release,
 )
@@ -77,6 +96,63 @@ _ARTIFACT_PROVISION_PHASES = {
     "model_transfer",
     "digest_verification",
 }
+_MAX_BASELINE_DOWNLOAD_BYTES = 192 * 1024 * 1024
+_BASELINE_DOWNLOAD_HOSTS = frozenset(
+    {"cdn.comfy.org", "files.pythonhosted.org"}
+)
+
+
+async def _fetch_certified_baseline(url):
+    """Fetch one locked baseline object without redirects or ambient auth."""
+    from urllib.parse import urlsplit
+
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port
+    except (TypeError, ValueError):
+        raise CertifiedBaselineUnavailable() from None
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname not in _BASELINE_DOWNLOAD_HOSTS
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in {None, 443}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise CertifiedBaselineUnavailable()
+    try:
+        import aiohttp
+    except ImportError:
+        raise CertifiedBaselineUnavailable() from None
+    timeout = aiohttp.ClientTimeout(total=180)
+    try:
+        async with aiohttp.ClientSession(
+            timeout=timeout,
+            trust_env=False,
+        ) as session:
+            async with session.get(
+                url,
+                allow_redirects=False,
+                headers={"Accept": "application/octet-stream"},
+            ) as response:
+                if response.status != 200:
+                    raise CertifiedBaselineUnavailable()
+                length = response.content_length
+                if length is not None and not 0 <= length <= (
+                    _MAX_BASELINE_DOWNLOAD_BYTES
+                ):
+                    raise CertifiedBaselineUnavailable()
+                body = bytearray()
+                async for chunk in response.content.iter_chunked(1024 * 1024):
+                    body.extend(chunk)
+                    if len(body) > _MAX_BASELINE_DOWNLOAD_BYTES:
+                        raise CertifiedBaselineUnavailable()
+                return bytes(body)
+    except CertifiedBaselineUnavailable:
+        raise
+    except Exception:
+        raise CertifiedBaselineUnavailable() from None
 
 
 def _lexical_path(value):
@@ -187,10 +263,18 @@ class _RuntimeResolver:
         dependency_repository,
         artifact_catalog=None,
         model_source_resolver=None,
+        profile_store=None,
+        baseline_resolver=None,
+        baseline_fetcher=None,
+        baseline_cache_root=None,
     ):
         self.dependency_repository = dependency_repository
         self.artifact_catalog = artifact_catalog
         self.model_source_resolver = model_source_resolver
+        self.profile_store = profile_store
+        self.baseline_resolver = baseline_resolver
+        self.baseline_fetcher = baseline_fetcher
+        self.baseline_cache_root = baseline_cache_root
 
     async def resolve_preflight(
         self,
@@ -204,13 +288,66 @@ class _RuntimeResolver:
             model_source_resolver = WorkflowModelSourceResolver(
                 HuggingFaceClient()
             )
+        context = _runtime_resolution_context(host)(capture)
+        try:
+            baseline_resolver = self.baseline_resolver
+            if baseline_resolver is None:
+                baseline_resolver = CertifiedBaselineResolver()
+            fetcher = self.baseline_fetcher or _fetch_certified_baseline
+            cache_root = self.baseline_cache_root
+            if cache_root is None and self.profile_store is not None:
+                cache_root = (
+                    Path(self.profile_store.private_root)
+                    / "certified-baseline"
+                )
+            if cache_root is None:
+                raise CertifiedBaselineUnavailable()
+            baseline = await baseline_resolver.resolve(
+                fetcher=fetcher,
+                cache_root=cache_root,
+            )
+            if not isinstance(baseline, CertifiedBaselineResolution):
+                raise CertifiedBaselineUnavailable()
+        except CertifiedBaselineUnavailable:
+            raise MappingValidationError(
+                "Certified Desktop baseline is unavailable."
+            ) from None
+
+        def profile_provider(observed_capture):
+            if self.profile_store is None:
+                return {
+                    "ui_packages": baseline.ui_packages,
+                    "custom_nodes": baseline.custom_nodes,
+                    "local_artifacts": baseline.local_artifacts,
+                    "profile": None,
+                    "minimum_vram_gb": 0.0,
+                }
+            profile = self.profile_store.capture(
+                user_root=host.comfy_root / "user",
+                profile_name="default",
+                input_root=context["input_root"],
+                bootstrap_workflow=certified_bootstrap_workflow(
+                    observed_capture
+                ),
+                ui_packages=baseline.ui_packages,
+                ui_assets=(),
+            )
+            return {
+                "ui_packages": baseline.ui_packages,
+                "custom_nodes": baseline.custom_nodes,
+                "local_artifacts": baseline.local_artifacts,
+                "profile": profile.manifest_spec(),
+                "minimum_vram_gb": 0.0,
+            }
+
         resolver = DependencyResolver(
             host=host,
             repository=self.dependency_repository,
             registry=RegistryClient(),
             cache_catalog=self.artifact_catalog,
-            resolution_context=_runtime_resolution_context(host),
+            resolution_context=context,
             model_source_resolver=model_source_resolver,
+            profile_provider=profile_provider,
         )
         return await resolver.resolve_preflight(
             capture,
@@ -238,6 +375,10 @@ def build_service():
     job_repository = JobRepository(data_directory / "attempts.sqlite3")
     dependency_repository = DependencyRepository(
         data_directory / "attempts.sqlite3"
+    )
+    profile_store = DesktopProfileStore(
+        repository=job_repository,
+        private_root=data_directory / "profiles",
     )
     blacklist = HostBlacklist(data_directory / "host-blacklist.json")
     provider = VastProvider()
@@ -268,6 +409,7 @@ def build_service():
     resolver = _RuntimeResolver(
         dependency_repository,
         artifact_catalog=job_repository,
+        profile_store=profile_store,
     )
     output_root = _runtime_output_root(data_directory)
 
@@ -287,6 +429,19 @@ def build_service():
             output_root=output_root,
         )
 
+    session_service_ref = {}
+
+    def agent_bridge_journal(session_id, code, diagnostic):
+        session_service = session_service_ref.get("service")
+        if session_service is None:
+            return False
+        return session_service.record_agent_bridge_issue(
+            session_id,
+            code,
+            diagnostic,
+        )
+
+    agent_bridge = AgentBridge(journal=agent_bridge_journal)
     service.session_service = SessionService(
         job_repository=job_repository,
         session_repository=session_repository,
@@ -297,7 +452,10 @@ def build_service():
         worker_factory=worker_factory,
         relay_factory=relay_factory,
         lifecycle=lifecycle,
+        profile_store=profile_store,
+        agent_bridge=agent_bridge,
     )
+    session_service_ref["service"] = service.session_service
     lifecycle.session_service = service.session_service
     service.relay = LocalRelay(
         worker=None,
@@ -305,6 +463,62 @@ def build_service():
         private_root=data_directory / "relay",
         output_root=output_root,
     )
+    service.desktop_worker_factory = worker_factory
+    service.desktop_profile_store = profile_store
+    service.agent_bridge = agent_bridge
+    service.desktop_relay = DesktopRelay(
+        repository=job_repository,
+        worker_factory=worker_factory,
+        native_prompt=service.session_service.prepare_native_prompt,
+        continue_guard=service.session_service._raise_if_destroy_requested,
+        agent_bridge=agent_bridge,
+        local_comfy_root=lambda: str(
+            ComfyHost.from_running_host().comfy_root
+        ),
+    )
+    service.session_service.desktop_relay = service.desktop_relay
+    if release is not None:
+        local_execution_guard = LocalExecutionGuard()
+
+        async def inventory_probe(session):
+            settings = settings_store.load()
+            api_key = (
+                settings.get("api_key")
+                if isinstance(settings, dict)
+                else None
+            )
+            if not api_key or session.instance_id is None:
+                return None
+            return await provider.get_instance(api_key, session.instance_id)
+
+        def required_class_types(manifest):
+            capture = job_repository.get_capture_by_prompt_digest(
+                manifest.prompt_digest
+            )
+            if capture is None:
+                return ()
+            required = set(capture.executable_class_types)
+            for node in manifest.custom_nodes:
+                required.update(node.provided_class_types)
+            return tuple(sorted(required))
+
+        readiness_probe = ControllerReadinessProbe(
+            worker_factory=worker_factory,
+            inventory_probe=inventory_probe,
+            desktop_relay=service.desktop_relay,
+            release=release,
+            required_class_types=required_class_types,
+            local_execution_counter=local_execution_guard.count,
+            continue_guard=(
+                service.session_service._raise_if_destroy_requested
+            ),
+        )
+        service.session_service.readiness_validator = ReadinessValidator(
+            probe=readiness_probe,
+            worker_release_digest=release.worker_archive_sha256,
+            relay_origin=lambda: service.desktop_relay.status().url,
+        )
+        service.local_execution_guard = local_execution_guard
     return service
 
 
@@ -325,6 +539,8 @@ def _public_filename(path, fallback):
 
 def _job_payload(service, job):
     payload = job.public_payload()
+    payload["execution_status"] = payload.get("execution_state")
+    payload["harvest_status"] = payload.get("harvest_state")
     repository = getattr(service, "job_repository", None)
     if not isinstance(repository, JobRepository):
         return payload
@@ -365,6 +581,8 @@ def _job_payload(service, job):
                 "size_bytes": transfer.expected_size,
                 "transferred_bytes": transfer.offset,
                 "sha256": transfer.sha256,
+                "node_id": transfer.source_node_id,
+                "local_verified": transfer.state.value == "verified",
             }
         )
     payload["previews"] = previews
@@ -379,9 +597,89 @@ def _job_payload(service, job):
         }
         for transfer in transfers
     ]
-    payload["current_node"] = None
-    payload["progress"] = None
-    payload["progress_text"] = None
+    node_titles = {}
+    try:
+        capture = json.loads(job.capture_json)
+        workflow = capture.get("workflow", {})
+        nodes = workflow.get("nodes", [])
+        if isinstance(nodes, list) and len(nodes) <= 100_000:
+            for node in nodes:
+                if not isinstance(node, dict):
+                    continue
+                node_id = node.get("id")
+                if not isinstance(node_id, (str, int)):
+                    continue
+                identifier = str(node_id)
+                if not _MODEL_CATEGORY.fullmatch(identifier):
+                    continue
+                title = node.get("title")
+                if (
+                    isinstance(title, str)
+                    and title
+                    and len(title.encode("utf-8")) <= 512
+                    and not any(ord(character) < 32 for character in title)
+                ):
+                    node_titles[identifier] = title
+    except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+        node_titles = {}
+    current_node_id = None
+    progress = None
+    progress_text = None
+    for event in repository.list_events(job.job_id, 0):
+        if event.event_type == "executing":
+            node_id = event.payload.get("node_id")
+            if isinstance(node_id, str) and _MODEL_CATEGORY.fullmatch(node_id):
+                current_node_id = node_id
+        elif event.event_type == "progress":
+            value = event.payload.get("value")
+            maximum = event.payload.get(
+                "max",
+                event.payload.get("total"),
+            )
+            progress = {
+                "value": (
+                    value
+                    if isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    and math.isfinite(value)
+                    else None
+                ),
+                "max": (
+                    maximum
+                    if isinstance(maximum, (int, float))
+                    and not isinstance(maximum, bool)
+                    and math.isfinite(maximum)
+                    else None
+                ),
+            }
+        elif event.event_type == "progress_text":
+            text = event.payload.get("text")
+            if isinstance(text, str):
+                progress_text = text
+        elif event.event_type in {
+            "execution_success",
+            "execution_error",
+            "execution_interrupted",
+        }:
+            current_node_id = None
+    payload["current_node"] = (
+        {
+            "id": current_node_id,
+            "title": node_titles.get(current_node_id),
+        }
+        if current_node_id is not None
+        else None
+    )
+    payload["progress"] = progress
+    payload["progress_text"] = (
+        progress_text
+        or (
+            "Execution succeeded — retrieving outputs."
+            if job.execution_state.value == "succeeded"
+            and job.harvest_state.value in {"running", "failed"}
+            else None
+        )
+    )
     payload["last_sequence"] = repository.last_event_sequence(
         job.job_id
     )
@@ -437,8 +735,36 @@ def _session_payload(session, service=None):
     except Exception:
         payload["deadline_alerts"] = []
 
+    readiness = getattr(
+        getattr(service, "session_service", None),
+        "desktop_readiness",
+        None,
+    )
+    try:
+        desktop = (
+            readiness(session.session_id)
+            if callable(readiness)
+            else {
+                "desktop_ready": False,
+                "readiness_report": None,
+            }
+        )
+        if not isinstance(desktop, dict) or set(desktop) != {
+            "desktop_ready",
+            "readiness_report",
+        }:
+            raise ValueError("Invalid readiness payload.")
+        payload.update(desktop)
+    except Exception:
+        payload["desktop_ready"] = False
+        payload["readiness_report"] = None
+
     repository = getattr(service, "job_repository", None)
     if not isinstance(repository, JobRepository):
+        seconds_without_progress = max(
+            0.0,
+            now - session.updated_at,
+        )
         payload["current_job"] = None
         payload["history"] = []
         payload["provisioning"] = {
@@ -448,11 +774,9 @@ def _session_payload(session, service=None):
             "total_bytes": 0,
             "installed_units": 0,
             "validated_units": 0,
-            "seconds_without_progress": max(
-                0.0,
-                now - session.updated_at,
-            ),
+            "seconds_without_progress": seconds_without_progress,
             "stall_budget_seconds": 600,
+            "stall_active": seconds_without_progress >= 600,
         }
         return payload
 
@@ -536,6 +860,7 @@ def _session_payload(session, service=None):
         )
     except Exception:
         transaction = None
+    progress_valid = False
     if transaction is not None and manifest is not None:
         current_artifact = catalog.get(
             transaction.current_dependency_id
@@ -569,7 +894,10 @@ def _session_payload(session, service=None):
             )
             and (
                 transaction.phase != "ready"
-                or transaction.transferred_bytes == exact_total
+                or (
+                    transaction.state == "ready"
+                    and transaction.transferred_bytes == exact_total
+                )
             )
             and isinstance(transaction.last_progress_at, (int, float))
             and not isinstance(transaction.last_progress_at, bool)
@@ -595,6 +923,17 @@ def _session_payload(session, service=None):
         transferred_bytes = sum(
             transfer.offset for transfer in transfer_records
         )
+    provision_ready = (
+        transaction is not None
+        and progress_valid
+        and phase == "ready"
+        and transaction.state == "ready"
+    )
+    seconds_without_progress = (
+        None
+        if provision_ready
+        else max(0.0, now - last_progress_at)
+    )
     payload["provisioning"] = {
         "phase": phase,
         "current_model": current_model,
@@ -603,7 +942,8 @@ def _session_payload(session, service=None):
         "installed_units": len(installed),
         "validated_units": (
             len(installed)
-            if session.state
+            if provision_ready
+            or session.state
             in {
                 SessionState.READY,
                 SessionState.RUNNING,
@@ -611,27 +951,71 @@ def _session_payload(session, service=None):
             }
             else 0
         ),
-        "seconds_without_progress": max(
-            0.0,
-            now - last_progress_at,
-        ),
+        "seconds_without_progress": seconds_without_progress,
         "stall_budget_seconds": 600,
+        "stall_active": (
+            seconds_without_progress is not None
+            and seconds_without_progress >= 600
+        ),
     }
     return payload
+
+
+_ACTIVE_SESSION_DETAILS_ERROR = (
+    "Active session details are temporarily unavailable."
+)
+
+
+def _minimal_session_safety_card(session):
+    error = session.sanitized_error
+    if (
+        error is not None
+        and (
+            not isinstance(error, str)
+            or len(error.encode("utf-8")) > 500
+            or any(ord(character) < 32 for character in error)
+        )
+    ):
+        error = None
+    rate = session.quote.dph_total if session.quote is not None else None
+    if (
+        isinstance(rate, bool)
+        or not isinstance(rate, (int, float))
+        or not math.isfinite(rate)
+        or rate < 0
+    ):
+        rate = None
+    return {
+        "session_id": session.session_id,
+        "instance_id": session.instance_id,
+        "status": session.state.value,
+        "billing_may_continue": session.billing_may_continue,
+        "can_destroy": session.can_destroy,
+        "rate": rate,
+        "error": error,
+    }
 
 
 def _active_session_payloads(service):
     repository = getattr(service, "session_repository", None)
     if not isinstance(repository, SessionRepository):
-        return []
+        return [], None
     try:
         sessions = repository.list_recoverable()[-20:]
-        return [
-            _session_payload(session, service)
-            for session in sessions
-        ]
     except Exception:
-        return []
+        return [], _ACTIVE_SESSION_DETAILS_ERROR
+    payloads = []
+    detail_error = None
+    for session in sessions:
+        try:
+            payload = _session_payload(session, service)
+            if not isinstance(payload, dict):
+                raise ValueError("Invalid active session payload.")
+        except Exception:
+            payload = _minimal_session_safety_card(session)
+            detail_error = _ACTIVE_SESSION_DETAILS_ERROR
+        payloads.append(payload)
+    return payloads, detail_error
 
 
 async def _request_payload(request, *, allowed, required):
@@ -658,10 +1042,22 @@ def register_routes(service_factory=None):
 
     prompt_server = PromptServer.instance
     routes = prompt_server.routes
-    make_service = service_factory or build_service
+    if service_factory is not None:
+        make_service = service_factory
+    else:
+        shared_service = None
+
+        def make_service():
+            nonlocal shared_service
+            if shared_service is None:
+                shared_service = build_service()
+            return shared_service
 
     def service_error(error):
-        if isinstance(error, (SessionBusy, IncompatibleSession)):
+        if isinstance(
+            error,
+            (PaidRentalConflict, SessionBusy, IncompatibleSession),
+        ):
             return web.json_response({"error": str(error)}, status=409)
         if isinstance(
             error,
@@ -679,6 +1075,11 @@ def register_routes(service_factory=None):
             return web.json_response(
                 {"error": "R2 cache transfer is unavailable."},
                 status=502,
+            )
+        if isinstance(error, DesktopRelayError):
+            return web.json_response(
+                {"error": "ComfyUI Vast Desktop relay is unavailable."},
+                status=503,
             )
         if isinstance(error, AttemptNotFound):
             return web.json_response({"error": str(error)}, status=404)
@@ -748,11 +1149,19 @@ def register_routes(service_factory=None):
             service = make_service()
         except Exception:
             service = None
-        payload["active_sessions"] = (
+        release = getattr(service, "release", None)
+        payload["worker_release"] = (
+            release.to_record()
+            if isinstance(release, WorkerRelease)
+            else None
+        )
+        active_sessions, active_sessions_error = (
             _active_session_payloads(service)
             if service is not None
-            else []
+            else ([], _ACTIVE_SESSION_DETAILS_ERROR)
         )
+        payload["active_sessions"] = active_sessions
+        payload["active_sessions_error"] = active_sessions_error
         return payload
 
     @routes.get("/cloud-run/api/settings")
@@ -760,6 +1169,18 @@ def register_routes(service_factory=None):
         return web.json_response(
             browser_settings(SettingsStore().load())
         )
+
+    @routes.get("/cloud-run/api/desktop-context")
+    async def get_local_desktop_context(_request):
+        return web.json_response({"role": "local"})
+
+    @routes.get("/cloud-run/api/desktop-setup")
+    async def get_desktop_setup(_request):
+        try:
+            payload = make_service().desktop_setup()
+        except Exception as error:
+            return service_error(error)
+        return web.json_response(payload)
 
     @routes.put("/cloud-run/api/settings")
     async def put_settings(request):
@@ -900,6 +1321,7 @@ def register_routes(service_factory=None):
                     "idempotency_key",
                     "deadline",
                     "max_instance_creates",
+                    "estimate_digest",
                 },
                 required={
                     "preflight_id",
@@ -907,14 +1329,26 @@ def register_routes(service_factory=None):
                     "idempotency_key",
                     "deadline",
                     "max_instance_creates",
+                    "estimate_digest",
                 },
             )
+            if (
+                not isinstance(payload["estimate_digest"], str)
+                or re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    payload["estimate_digest"],
+                ) is None
+            ):
+                raise CloudRunValidationError(
+                    "A valid readiness estimate is required."
+                )
             session = await service.preview_session(
                 preflight_id=payload["preflight_id"],
                 offer_id=payload["offer_id"],
                 idempotency_key=payload["idempotency_key"],
                 deadline=payload["deadline"],
                 max_instance_creates=payload["max_instance_creates"],
+                estimate_digest=payload["estimate_digest"],
             )
         except Exception as error:
             return service_error(error)
@@ -926,12 +1360,38 @@ def register_routes(service_factory=None):
         try:
             payload = await _request_payload(
                 request,
-                allowed={"idempotency_key"},
-                required={"idempotency_key"},
+                allowed={
+                    "idempotency_key",
+                    "estimate_digest",
+                    "accepted_longer_estimate",
+                    "preflight_id",
+                },
+                required={
+                    "idempotency_key",
+                    "estimate_digest",
+                    "accepted_longer_estimate",
+                    "preflight_id",
+                },
             )
+            if (
+                not isinstance(payload["estimate_digest"], str)
+                or re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    payload["estimate_digest"],
+                ) is None
+                or type(payload["accepted_longer_estimate"]) is not bool
+            ):
+                raise CloudRunValidationError(
+                    "A valid readiness confirmation is required."
+                )
             session = await service.confirm_session(
                 request.match_info.get("session_id", ""),
                 idempotency_key=payload["idempotency_key"],
+                estimate_digest=payload["estimate_digest"],
+                accepted_longer_estimate=(
+                    payload["accepted_longer_estimate"]
+                ),
+                current_preflight_id=payload["preflight_id"],
             )
         except Exception as error:
             return service_error(error)
@@ -947,6 +1407,70 @@ def register_routes(service_factory=None):
         except Exception as error:
             return service_error(error)
         return web.json_response(_session_payload(session, service))
+
+    @routes.get("/cloud-run/api/sessions/{session_id}/profile")
+    async def get_session_profile(request):
+        try:
+            payload = await make_service().session_profile(
+                request.match_info.get("session_id", "")
+            )
+        except Exception as error:
+            return service_error(error)
+        return web.json_response(payload)
+
+    @routes.post(
+        "/cloud-run/api/sessions/{session_id}/profile/conflicts/{conflict_id}"
+    )
+    async def post_session_profile_conflict(request):
+        try:
+            payload = await _request_payload(
+                request,
+                allowed={"winner"},
+                required={"winner"},
+            )
+            if payload["winner"] not in {"local", "cloud_vast"}:
+                raise CloudRunValidationError(
+                    "Invalid Desktop profile conflict choice."
+                )
+            result = await make_service().resolve_session_profile_conflict(
+                request.match_info.get("session_id", ""),
+                request.match_info.get("conflict_id", ""),
+                winner=payload["winner"],
+            )
+        except Exception as error:
+            return service_error(error)
+        return web.json_response(result)
+
+    @routes.post(
+        "/cloud-run/api/sessions/{session_id}/desktop-relay"
+    )
+    async def post_session_desktop_relay(request):
+        service = make_service()
+        try:
+            await _request_payload(
+                request,
+                allowed=set(),
+                required=set(),
+            )
+            status = await service.activate_desktop_relay(
+                request.match_info.get("session_id", "")
+            )
+        except Exception as error:
+            return service_error(error)
+        return web.json_response(status.public_payload())
+
+    @routes.delete(
+        "/cloud-run/api/sessions/{session_id}/desktop-relay"
+    )
+    async def delete_session_desktop_relay(request):
+        service = make_service()
+        try:
+            status = await service.deactivate_desktop_relay(
+                request.match_info.get("session_id", "")
+            )
+        except Exception as error:
+            return service_error(error)
+        return web.json_response(status.public_payload())
 
     @routes.post("/cloud-run/api/sessions/{session_id}/jobs")
     async def post_session_job(request):
@@ -973,6 +1497,28 @@ def register_routes(service_factory=None):
         service = make_service()
         try:
             job = service.get_job(
+                request.match_info.get("session_id", ""),
+                request.match_info.get("job_id", ""),
+            )
+        except Exception as error:
+            return service_error(error)
+        return web.json_response(_job_payload(service, job))
+
+    @routes.post(
+        (
+            "/cloud-run/api/sessions/{session_id}/jobs/{job_id}/"
+            "harvest"
+        )
+    )
+    async def post_session_job_harvest(request):
+        service = make_service()
+        try:
+            await _request_payload(
+                request,
+                allowed=set(),
+                required=set(),
+            )
+            job = await service.retry_harvest(
                 request.match_info.get("session_id", ""),
                 request.match_info.get("job_id", ""),
             )
@@ -1177,3 +1723,20 @@ def register_routes(service_factory=None):
 
         startup.append(recover_managed_attempts)
         setattr(prompt_server, marker, True)
+    cleanup = getattr(app, "on_cleanup", None)
+    cleanup_marker = "_comfyui_cloud_run_cleanup_registered"
+    if (
+        cleanup is not None
+        and hasattr(cleanup, "append")
+        and not getattr(prompt_server, cleanup_marker, False)
+    ):
+        async def close_managed_service(_app):
+            try:
+                close = getattr(make_service(), "close", None)
+                if callable(close):
+                    await close()
+            except Exception:
+                return
+
+        cleanup.append(close_managed_service)
+        setattr(prompt_server, cleanup_marker, True)

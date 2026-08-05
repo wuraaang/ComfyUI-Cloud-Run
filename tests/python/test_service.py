@@ -1,16 +1,25 @@
 import asyncio
+from dataclasses import replace
+import json
 import tempfile
 import types
 import unittest
+from unittest import mock
 from pathlib import Path
 
-from cloud_run.models import AttemptState, SessionState
-from cloud_run.repository import AttemptRepository, SessionRepository
+from cloud_run.models import AttemptState, CloudSession, SessionState
+from cloud_run.repository import (
+    AttemptRepository,
+    PaidRentalConflict,
+    SessionRepository,
+)
 from cloud_run.vast import VastError
 from cloud_run.worker_release import WorkerRelease
+from cloud_run.worker_protocol import is_boundary_token
 
 
 _DEFAULT_RELEASE = object()
+SETTINGS_REVISION = "11111111-1111-4111-8111-111111111111"
 
 
 def offer(offer_id=42, *, price=0.42, gpu_name="RTX 4090"):
@@ -37,10 +46,10 @@ def worker_release():
             "template_hash_id": "1" * 32,
             "worker_commit": "a" * 40,
             "worker_archive_sha256": "b" * 64,
-            "protocol_version": "1",
+            "protocol_version": "2",
             "comfyui_core_version": "0.29.0",
             "comfyui_frontend_version": "1.47.10",
-            "python_version": "3.13.12",
+            "python_version": "3.12",
             "worker_port": 8765,
         }
     )
@@ -49,6 +58,7 @@ def worker_release():
 class FakePreflightService:
     def __init__(self):
         self.calls = []
+        self.free_calls = []
         self.result = types.SimpleNamespace(
             preflight_id="preflight-1",
             rentable=True,
@@ -56,20 +66,55 @@ class FakePreflightService:
             transfer_bytes=12_000,
             output_allowance_bytes=4_000,
             disk_gb=96,
+            execution_baseline_digest="e" * 64,
+            randomized_seed_node_ids=("3",),
+            minimum_vram_gb=24.0,
+            cached_bytes=0,
         )
 
     def require_rentable_preflight(self, preflight_id):
         self.calls.append(preflight_id)
         return self.result
 
+    async def preflight(
+        self,
+        capture_id,
+        *,
+        explicit_output_allowance_bytes=None,
+    ):
+        self.free_calls.append(
+            (
+                "preflight",
+                capture_id,
+                explicit_output_allowance_bytes,
+            )
+        )
+        return self.result
+
+    async def search_offers(self, preflight_id):
+        self.free_calls.append(("search", preflight_id))
+        return [offer()]
+
 
 class FakeSettings:
     def load(self):
         return {
             "api_key": "synthetic-value",
+            "api_key_revision": SETTINGS_REVISION,
             "max_price_per_hour": 0.55,
             "min_vram_gb": 24,
         }
+
+
+class PrivateBoundaryContext:
+    __slots__ = ("boundary_token", "session_id")
+
+    def __init__(self, boundary_token, session_id):
+        self.boundary_token = boundary_token
+        self.session_id = session_id
+
+    def __repr__(self):
+        return "PrivateBoundaryContext(<redacted>)"
 
 
 class FakeProvider:
@@ -132,18 +177,21 @@ class FakeProvider:
         disk_gb,
         label,
         release,
+        boundary_token,
+        session_id,
     ):
-        self.create_calls.append(
-            {
-                "api_key": api_key,
-                "offer_id": offer_id,
-                "disk_gb": disk_gb,
-                "label": label,
-                "release": release,
-            }
-        )
+        boundary = PrivateBoundaryContext(boundary_token, session_id)
+        call = {
+            "api_key": api_key,
+            "offer_id": offer_id,
+            "disk_gb": disk_gb,
+            "label": label,
+            "release": release,
+            "worker_boundary": boundary,
+        }
+        self.create_calls.append(call)
         if self.on_create is not None:
-            self.on_create(label)
+            self.on_create(call)
         if self.create_error is not None:
             raise self.create_error
         return self.create_result
@@ -190,6 +238,22 @@ class CloudRunServiceTests(unittest.TestCase):
             lifecycle=lifecycle,
         )
 
+    def save_api_key_blocker(self):
+        blocker = CloudSession.new(
+            "api-blocker-key",
+            session_id="api-blocker-session",
+            now=50.0,
+            state=SessionState.FAILED,
+        ).transition(
+            SessionState.FAILED,
+            now=60.0,
+            failure_code="api_key_rejected",
+            create_settings_revision=(
+                "11111111-1111-4111-8111-111111111111"
+            ),
+        )
+        return self.session_repository.create_or_get(blocker)[0]
+
     def test_paid_session_quote_is_complete_read_only_and_durable(self):
         provider = FakeProvider(lookups=[offer(price=0.50)])
         preflights = FakePreflightService()
@@ -221,8 +285,23 @@ class CloudRunServiceTests(unittest.TestCase):
         self.assertIn("inet_down_mbps", reopened.quote.to_record())
         self.assertEqual(reopened.quote.inet_down_mbps, 500.0)
         self.assertEqual(reopened.quote.disk_bw_mbps, 600.0)
+        self.assertIsNotNone(reopened.quote.readiness_estimate)
+        self.assertEqual(
+            reopened.quote.readiness_estimate.remaining_bytes,
+            12_000,
+        )
         self.assertEqual(reopened.quote.duration_seconds, 7_200)
         self.assertEqual(reopened.quote.max_instance_creates, 1)
+        self.assertEqual(
+            reopened.quote.execution_baseline_digest,
+            "e" * 64,
+        )
+        self.assertEqual(
+            reopened.quote.randomized_seed_node_ids,
+            ("3",),
+        )
+        self.assertEqual(reopened.execution_baseline_digest, "e" * 64)
+        self.assertEqual(reopened.randomized_seed_node_ids, ("3",))
         self.assertEqual(
             reopened.quote.approximate_max_active_charge,
             1.0,
@@ -241,6 +320,90 @@ class CloudRunServiceTests(unittest.TestCase):
             repr(quoted.public_payload()),
         )
 
+    def test_long_estimate_requires_exact_digest_acceptance_before_create(self):
+        from cloud_run.service import CloudRunValidationError, QuoteUnavailable
+
+        for case in ("not-accepted", "wrong-digest"):
+            with self.subTest(case=case):
+                self.setUp()
+                provider = FakeProvider(lookups=[offer(), offer()])
+                preflights = FakePreflightService()
+                preflights.result.transfer_bytes = 29_347_469_703
+                service = self.service(provider, session_service=preflights)
+                quoted = asyncio.run(
+                    service.preview_session(
+                        preflight_id="preflight-1",
+                        offer_id="42",
+                        idempotency_key="long-estimate-" + case,
+                        deadline={"mode": "none", "duration_seconds": None},
+                        max_instance_creates=1,
+                    )
+                )
+                estimate = quoted.quote.readiness_estimate
+                self.assertGreater(estimate.estimated_seconds, 600)
+                if case == "not-accepted":
+                    with self.assertRaises(CloudRunValidationError):
+                        asyncio.run(
+                            service.confirm_session(
+                                quoted.session_id,
+                                idempotency_key="long-estimate-" + case,
+                                estimate_digest=estimate.digest,
+                                accepted_longer_estimate=False,
+                            )
+                        )
+                    self.assertEqual(
+                        service.get_session(quoted.session_id).state,
+                        SessionState.OFFER_SELECTED,
+                    )
+                else:
+                    with self.assertRaises(QuoteUnavailable):
+                        asyncio.run(
+                            service.confirm_session(
+                                quoted.session_id,
+                                idempotency_key="long-estimate-" + case,
+                                estimate_digest="f" * 64,
+                                accepted_longer_estimate=True,
+                            )
+                        )
+                    saved = service.get_session(quoted.session_id)
+                    self.assertEqual(saved.state, SessionState.FAILED)
+                    self.assertEqual(saved.failure_code, "quote_expired")
+                self.assertEqual(provider.create_calls, [])
+
+    def test_changed_current_canvas_expires_quote_before_provider_create(self):
+        from cloud_run.service import QuoteUnavailable
+
+        provider = FakeProvider(lookups=[offer(), offer()])
+        preflights = FakePreflightService()
+        preflights.matches_paid_preflight = lambda *_args, **_kwargs: False
+        service = self.service(provider, session_service=preflights)
+        quoted = asyncio.run(
+            service.preview_session(
+                preflight_id="preflight-1",
+                offer_id="42",
+                idempotency_key="changed-current-canvas",
+                deadline={"mode": "none", "duration_seconds": None},
+                max_instance_creates=1,
+            )
+        )
+
+        with self.assertRaises(QuoteUnavailable):
+            asyncio.run(
+                service.confirm_session(
+                    quoted.session_id,
+                    idempotency_key="changed-current-canvas",
+                    estimate_digest=(
+                        quoted.quote.readiness_estimate.digest
+                    ),
+                    accepted_longer_estimate=False,
+                    current_preflight_id="preflight-current",
+                )
+            )
+
+        saved = service.get_session(quoted.session_id)
+        self.assertEqual(saved.failure_code, "quote_expired")
+        self.assertEqual(provider.create_calls, [])
+
     def test_paid_session_create_limit_is_validated_before_offer_lookup(self):
         from cloud_run.service import CloudRunValidationError
 
@@ -251,12 +414,12 @@ class CloudRunServiceTests(unittest.TestCase):
         )
 
         for index, max_instance_creates in enumerate(
-            (None, True, 0, 3, 1.0, "1")
+            (None, True, 0, 2, 3, 1.0, "1")
         ):
             with self.subTest(max_instance_creates=max_instance_creates):
                 with self.assertRaisesRegex(
                     CloudRunValidationError,
-                    "Maximum total instance creates must be 1 or 2.",
+                    "Maximum total instance creates must be 1.",
                 ):
                     asyncio.run(
                         service.preview_session(
@@ -272,6 +435,71 @@ class CloudRunServiceTests(unittest.TestCase):
                     )
 
         self.assertEqual(provider.lookup_calls, [])
+        self.assertEqual(provider.create_calls, [])
+
+    def test_historical_create_limit_two_remains_readable_but_new_preview_rejects_two(self):
+        from cloud_run.service import CloudRunValidationError
+
+        provider = FakeProvider(lookups=[offer(price=0.50)])
+        service = self.service(
+            provider,
+            session_service=FakePreflightService(),
+        )
+        quoted = asyncio.run(
+            service.preview_session(
+                preflight_id="preflight-1",
+                offer_id="42",
+                idempotency_key="historical-two-key",
+                deadline={
+                    "mode": "finite",
+                    "duration_seconds": 7_200,
+                },
+                max_instance_creates=1,
+            )
+        )
+        historical_quote = replace(
+            quoted.quote,
+            max_instance_creates=2,
+        )
+        self.session_repository.save(
+            quoted.transition(
+                SessionState.OFFER_SELECTED,
+                now=101.0,
+                quote=historical_quote,
+                retry_count=1,
+            )
+        )
+
+        reopened = SessionRepository(self.database_path).get(
+            quoted.session_id
+        )
+        result = asyncio.run(
+            service.confirm_session(
+                quoted.session_id,
+                idempotency_key="historical-two-key",
+            )
+        )
+        with self.assertRaises(CloudRunValidationError):
+            asyncio.run(
+                service.preview_session(
+                    preflight_id="preflight-1",
+                    offer_id="42",
+                    idempotency_key="new-preview-two-key",
+                    deadline={
+                        "mode": "finite",
+                        "duration_seconds": 7_200,
+                    },
+                    max_instance_creates=2,
+                )
+            )
+
+        self.assertEqual(reopened.quote.max_instance_creates, 2)
+        self.assertEqual(result.state, SessionState.FAILED)
+        self.assertEqual(
+            result.sanitized_error,
+            "The authorized total instance-create limit was reached.",
+        )
+        self.assertEqual(len(provider.lookup_calls), 1)
         self.assertEqual(provider.create_calls, [])
 
     def test_duplicate_paid_preview_keeps_its_original_create_limit(self):
@@ -349,6 +577,224 @@ class CloudRunServiceTests(unittest.TestCase):
         self.assertEqual(len(provider.lookup_calls), 1)
         self.assertEqual(provider.create_calls, [])
 
+    def test_blocked_confirmation_returns_to_pre_mutation_state(self):
+        provider = FakeProvider(
+            lookups=[offer(price=0.50), offer(price=0.50)]
+        )
+        service = self.service(
+            provider,
+            session_service=FakePreflightService(),
+        )
+        self.save_api_key_blocker()
+        quoted = asyncio.run(
+            service.preview_session(
+                preflight_id="preflight-1",
+                offer_id="42",
+                idempotency_key="blocked-confirm-key",
+                deadline={
+                    "mode": "finite",
+                    "duration_seconds": 7_200,
+                },
+                max_instance_creates=1,
+            )
+        )
+
+        with self.assertRaises(PaidRentalConflict):
+            asyncio.run(
+                service.confirm_session(
+                    quoted.session_id,
+                    idempotency_key="blocked-confirm-key",
+                )
+            )
+
+        reopened = self.session_repository.get(quoted.session_id)
+        self.assertEqual(reopened.state, SessionState.OFFER_SELECTED)
+        self.assertIsNone(reopened.provider_token)
+        self.assertIsNone(reopened.session_secret_hex)
+        self.assertEqual(provider.create_calls, [])
+
+    def test_pre_provider_claim_failure_returns_offer_for_review(self):
+        provider = FakeProvider(
+            lookups=[offer(price=0.50), offer(price=0.50)]
+        )
+        service = self.service(
+            provider,
+            session_service=FakePreflightService(),
+        )
+        quoted = asyncio.run(
+            service.preview_session(
+                preflight_id="preflight-1",
+                offer_id="42",
+                idempotency_key="pre-provider-claim-failure",
+                deadline={
+                    "mode": "finite",
+                    "duration_seconds": 7_200,
+                },
+                max_instance_creates=1,
+            )
+        )
+
+        with mock.patch.object(
+            self.session_repository,
+            "claim_create_intent",
+            side_effect=ValueError("synthetic pre-provider failure"),
+        ):
+            with self.assertRaisesRegex(
+                ValueError,
+                "synthetic pre-provider failure",
+            ):
+                asyncio.run(
+                    service.confirm_session(
+                        quoted.session_id,
+                        idempotency_key="pre-provider-claim-failure",
+                    )
+                )
+
+        reopened = self.session_repository.get(quoted.session_id)
+        self.assertEqual(reopened.state, SessionState.OFFER_SELECTED)
+        self.assertIsNone(reopened.provider_token)
+        self.assertIsNone(reopened.session_secret_hex)
+        self.assertIsNone(reopened.instance_id)
+        self.assertEqual(provider.create_calls, [])
+        self.assertEqual(provider.inventory_calls, [])
+
+    def test_refresh_recovers_only_quiet_tokenless_confirmation(self):
+        provider = FakeProvider(
+            lookups=[offer(price=0.50), offer(price=0.50)]
+        )
+        preflights = FakePreflightService()
+        quoting_service = self.service(
+            provider,
+            now=100.0,
+            session_service=preflights,
+        )
+        quiet = asyncio.run(
+            quoting_service.preview_session(
+                preflight_id="preflight-1",
+                offer_id="42",
+                idempotency_key="quiet-confirmation",
+                deadline={
+                    "mode": "finite",
+                    "duration_seconds": 7_200,
+                },
+                max_instance_creates=1,
+            )
+        )
+        fresh = asyncio.run(
+            quoting_service.preview_session(
+                preflight_id="preflight-1",
+                offer_id="42",
+                idempotency_key="fresh-confirmation",
+                deadline={
+                    "mode": "finite",
+                    "duration_seconds": 7_200,
+                },
+                max_instance_creates=1,
+            )
+        )
+        self.session_repository.save(
+            quiet.transition(SessionState.CONFIRMING, now=102.0)
+        )
+        self.session_repository.save(
+            fresh.transition(SessionState.CONFIRMING, now=105.0)
+        )
+        provider_calls_before_refresh = (
+            len(provider.lookup_calls),
+            len(provider.create_calls),
+            len(provider.inventory_calls),
+        )
+        refresh_service = self.service(
+            provider,
+            now=108.0,
+            session_service=preflights,
+        )
+
+        recovered = asyncio.run(
+            refresh_service.refresh_session(quiet.session_id)
+        )
+        unchanged = asyncio.run(
+            refresh_service.refresh_session(fresh.session_id)
+        )
+
+        self.assertEqual(recovered.state, SessionState.OFFER_SELECTED)
+        self.assertFalse(recovered.public_payload()["billing_may_continue"])
+        self.assertIsNone(recovered.provider_token)
+        self.assertIsNone(recovered.session_secret_hex)
+        self.assertIsNone(recovered.instance_id)
+        self.assertEqual(unchanged.state, SessionState.CONFIRMING)
+        self.assertEqual(
+            (
+                len(provider.lookup_calls),
+                len(provider.create_calls),
+                len(provider.inventory_calls),
+            ),
+            provider_calls_before_refresh,
+        )
+
+    def test_preflight_search_and_reload_never_lift_remediation_block(self):
+        provider = FakeProvider(
+            lookups=[offer(price=0.50), offer(price=0.50)]
+        )
+        preflights = FakePreflightService()
+        service = self.service(
+            provider,
+            session_service=preflights,
+        )
+        blocker = self.save_api_key_blocker()
+
+        asyncio.run(
+            service.preflight(
+                "capture-1",
+                explicit_output_allowance_bytes=4_000,
+            )
+        )
+        asyncio.run(service.search("preflight-1"))
+        quoted = asyncio.run(
+            service.preview_session(
+                preflight_id="preflight-1",
+                offer_id="42",
+                idempotency_key="reload-blocked-key",
+                deadline={
+                    "mode": "finite",
+                    "duration_seconds": 7_200,
+                },
+                max_instance_creates=1,
+            )
+        )
+        reloaded_repository = SessionRepository(self.database_path)
+        from cloud_run.service import CloudRunService
+
+        reloaded = CloudRunService(
+            FakeSettings(),
+            self.repository,
+            provider=provider,
+            clock=lambda: 100.0,
+            quote_ttl_seconds=60,
+            session_repository=reloaded_repository,
+            release=worker_release(),
+            session_service=preflights,
+        )
+
+        with self.assertRaises(PaidRentalConflict):
+            asyncio.run(
+                reloaded.confirm_session(
+                    quoted.session_id,
+                    idempotency_key="reload-blocked-key",
+                )
+            )
+
+        persisted_blocker = reloaded_repository.get(blocker.session_id)
+        self.assertTrue(persisted_blocker.blocks_new_rental)
+        self.assertIsNone(persisted_blocker.remediation_verified_at)
+        self.assertEqual(
+            preflights.free_calls,
+            [
+                ("preflight", "capture-1", 4_000),
+                ("search", "preflight-1"),
+            ],
+        )
+        self.assertEqual(provider.create_calls, [])
+
     def test_paid_confirmation_persists_secret_and_intent_before_one_put(self):
         provider = FakeProvider(
             lookups=[offer(price=0.50), offer(price=0.50)]
@@ -370,16 +816,36 @@ class CloudRunServiceTests(unittest.TestCase):
             )
         )
 
-        def assert_persisted_before_create(label):
+        def assert_persisted_before_create(call):
             persisted = self.session_repository.get(quoted.session_id)
-            self.assertEqual(persisted.label, label)
+            self.assertEqual(persisted.label, call["label"])
             self.assertEqual(persisted.state.value, "creating")
             self.assertEqual(
                 persisted.idempotency_key,
                 "session-idem-create",
             )
             self.assertEqual(persisted.manifest_digest, "c" * 64)
+            self.assertTrue(is_boundary_token(persisted.provider_token))
             self.assertEqual(len(persisted.session_secret_hex), 64)
+            self.assertTrue(
+                is_boundary_token(persisted.session_secret_hex)
+            )
+            self.assertTrue(
+                persisted.provider_token
+                != persisted.session_secret_hex
+            )
+            self.assertEqual(
+                persisted.create_settings_revision,
+                SETTINGS_REVISION,
+            )
+            self.assertTrue(
+                call["worker_boundary"].boundary_token
+                == persisted.provider_token
+            )
+            self.assertTrue(
+                call["worker_boundary"].session_id
+                == persisted.session_id
+            )
 
         provider.on_create = assert_persisted_before_create
         started = asyncio.run(
@@ -399,6 +865,20 @@ class CloudRunServiceTests(unittest.TestCase):
         self.assertEqual(started.instance_id, "instance-9")
         self.assertEqual(duplicate.session_id, started.session_id)
         self.assertEqual(len(provider.create_calls), 1)
+        boundary_token = provider.create_calls[0][
+            "worker_boundary"
+        ].boundary_token
+        session_secret_hex = started.session_secret_hex
+        self.assertTrue(duplicate.provider_token == boundary_token)
+        for public_value in (
+            started.public_payload(),
+            duplicate.public_payload(),
+            repr(started),
+            repr(provider),
+        ):
+            rendered = repr(public_value)
+            self.assertFalse(boundary_token in rendered)
+            self.assertFalse(session_secret_hex in rendered)
         self.assertIs(
             provider.create_calls[0]["release"],
             service.release,
@@ -495,6 +975,90 @@ class CloudRunServiceTests(unittest.TestCase):
         self.assertEqual(reconciled.quote.max_instance_creates, 1)
         self.assertEqual(duplicate, reconciled)
         self.assertEqual(len(provider.create_calls), 1)
+        boundary_token = provider.create_calls[0][
+            "worker_boundary"
+        ].boundary_token
+        session_secret_hex = reconciled.session_secret_hex
+        self.assertTrue(reconciled.provider_token == boundary_token)
+        self.assertTrue(duplicate.provider_token == boundary_token)
+        for public_value in (
+            reconciled.public_payload(),
+            duplicate.public_payload(),
+            reconciled.sanitized_error,
+            repr(provider),
+        ):
+            rendered = repr(public_value)
+            self.assertFalse(boundary_token in rendered)
+            self.assertFalse(session_secret_hex in rendered)
+
+    def test_ambiguous_initial_session_create_fails_closed_on_multiple_matches(self):
+        provider = FakeProvider(
+            lookups=[offer(price=0.50), offer(price=0.50)]
+        )
+        provider.create_error = VastError(
+            "sensitive lost create response",
+            retryable=True,
+        )
+        service = self.service(
+            provider,
+            session_service=FakePreflightService(),
+        )
+        quoted = asyncio.run(
+            service.preview_session(
+                preflight_id="preflight-1",
+                offer_id=42,
+                idempotency_key="ambiguous-multiple-session",
+                deadline={
+                    "mode": "finite",
+                    "duration_seconds": 7_200,
+                },
+                max_instance_creates=1,
+            )
+        )
+        provider.instances = [
+            {
+                "instance_id": instance_id,
+                "label": quoted.label,
+                "actual_status": "loading",
+            }
+            for instance_id in ("instance-77", "instance-78")
+        ]
+
+        failed = asyncio.run(
+            service.confirm_session(
+                quoted.session_id,
+                idempotency_key="ambiguous-multiple-session",
+            )
+        )
+        duplicate = asyncio.run(
+            service.confirm_session(
+                quoted.session_id,
+                idempotency_key="ambiguous-multiple-session",
+            )
+        )
+
+        self.assertEqual(failed.state, SessionState.FAILED)
+        self.assertIsNone(failed.instance_id)
+        self.assertEqual(
+            failed.residual_inventory,
+            ("instance-77", "instance-78"),
+        )
+        self.assertTrue(failed.public_payload()["billing_may_continue"])
+        self.assertEqual(duplicate, failed)
+        self.assertEqual(len(provider.create_calls), 1)
+        self.assertEqual(len(provider.inventory_calls), 1)
+        boundary_token = provider.create_calls[0][
+            "worker_boundary"
+        ].boundary_token
+        for public_value in (
+            failed.public_payload(),
+            failed.sanitized_error,
+            repr(provider),
+        ):
+            rendered = repr(public_value)
+            self.assertNotIn("sensitive", rendered)
+            self.assertNotIn(boundary_token, rendered)
+            self.assertNotIn(failed.session_secret_hex, rendered)
 
     def test_concurrent_paid_confirmations_issue_exactly_one_create(self):
         async def scenario():
@@ -549,6 +1113,91 @@ class CloudRunServiceTests(unittest.TestCase):
         self.assertEqual(first.state.value, "bootstrapping")
         self.assertEqual(second.state.value, "bootstrapping")
         self.assertEqual(len(provider.create_calls), 1)
+        call = provider.create_calls[0]
+        self.assertTrue(
+            call["worker_boundary"].boundary_token
+            == first.provider_token
+        )
+        self.assertTrue(
+            call["worker_boundary"].boundary_token
+            == second.provider_token
+        )
+        self.assertTrue(
+            call["worker_boundary"].session_id == first.session_id
+        )
+        self.assertTrue(first.provider_token != first.session_secret_hex)
+
+    def test_concurrent_sessions_issue_only_one_provider_create(self):
+        async def scenario():
+            provider = FakeProvider(
+                lookups=[offer(price=0.50) for _index in range(4)]
+            )
+            service = self.service(
+                provider,
+                session_service=FakePreflightService(),
+            )
+            first = await service.preview_session(
+                preflight_id="preflight-1",
+                offer_id=42,
+                idempotency_key="first-session-key",
+                deadline={
+                    "mode": "finite",
+                    "duration_seconds": 7_200,
+                },
+                max_instance_creates=1,
+            )
+            second = await service.preview_session(
+                preflight_id="preflight-1",
+                offer_id=42,
+                idempotency_key="second-session-key",
+                deadline={
+                    "mode": "finite",
+                    "duration_seconds": 7_200,
+                },
+                max_instance_creates=1,
+            )
+            original_lookup = provider.get_offer
+            both_revalidating = asyncio.Event()
+            revalidation_count = 0
+
+            async def synchronized_lookup(*args, **kwargs):
+                nonlocal revalidation_count
+                revalidation_count += 1
+                if revalidation_count == 2:
+                    both_revalidating.set()
+                await both_revalidating.wait()
+                return await original_lookup(*args, **kwargs)
+
+            provider.get_offer = synchronized_lookup
+            results = await asyncio.gather(
+                service.confirm_session(
+                    first.session_id,
+                    idempotency_key="first-session-key",
+                ),
+                service.confirm_session(
+                    second.session_id,
+                    idempotency_key="second-session-key",
+                ),
+                return_exceptions=True,
+            )
+            return results, provider
+
+        results, provider = asyncio.run(scenario())
+
+        self.assertEqual(
+            sum(isinstance(item, PaidRentalConflict) for item in results),
+            1,
+        )
+        successful = [
+            item for item in results if isinstance(item, CloudSession)
+        ]
+        self.assertEqual(len(successful), 1)
+        self.assertEqual(successful[0].state, SessionState.BOOTSTRAPPING)
+        self.assertEqual(len(provider.create_calls), 1)
+        self.assertEqual(
+            {session.state for session in self.session_repository.list_all()},
+            {SessionState.OFFER_SELECTED, SessionState.BOOTSTRAPPING},
+        )
 
     def test_destroy_requested_during_create_is_finished_by_the_creator(self):
         async def scenario():
@@ -746,12 +1395,35 @@ class CloudRunServiceTests(unittest.TestCase):
                         )
                         confirm = service.confirm
                         identifier = preview.attempt_id
-                    if accepted:
+                    exact_session_terms = (
+                        not session_path or current_speed == quoted_speed
+                    )
+                    if accepted and exact_session_terms:
                         result = asyncio.run(
                             confirm(identifier, idempotency_key=key)
                         )
                         self.assertEqual(result.instance_id, "instance-9")
                         self.assertEqual(len(provider.create_calls), 1)
+                        if session_path:
+                            destroying = self.session_repository.transition(
+                                result.session_id,
+                                SessionState.DESTROY_REQUESTED,
+                                now=101.0,
+                                destroy_requested=True,
+                            )
+                            destroying = self.session_repository.transition(
+                                destroying.session_id,
+                                SessionState.DESTROYING,
+                                now=102.0,
+                            )
+                            self.session_repository.transition(
+                                destroying.session_id,
+                                SessionState.DESTROYED,
+                                now=103.0,
+                                instance_id=None,
+                                provider_token=None,
+                                session_secret_hex=None,
+                            )
                     else:
                         with self.assertRaises(QuoteUnavailable):
                             asyncio.run(
@@ -926,11 +1598,20 @@ class CloudRunServiceTests(unittest.TestCase):
             )
         )
 
-        def assert_persisted_before_create(label):
+        def assert_persisted_before_create(call):
             persisted = self.repository.get(preview.attempt_id)
-            self.assertEqual(persisted.label, label)
+            self.assertEqual(persisted.label, call["label"])
             self.assertEqual(persisted.state, AttemptState.CREATING)
             self.assertEqual(persisted.idempotency_key, "idem-create")
+            self.assertTrue(is_boundary_token(persisted.provider_token))
+            self.assertTrue(
+                call["worker_boundary"].boundary_token
+                == persisted.provider_token
+            )
+            self.assertTrue(
+                call["worker_boundary"].session_id
+                == persisted.attempt_id
+            )
 
         provider.on_create = assert_persisted_before_create
         started = asyncio.run(
@@ -950,7 +1631,14 @@ class CloudRunServiceTests(unittest.TestCase):
         self.assertEqual(started.instance_id, "instance-9")
         self.assertEqual(duplicate.attempt_id, started.attempt_id)
         self.assertEqual(len(provider.create_calls), 1)
+        boundary_token = provider.create_calls[0][
+            "worker_boundary"
+        ].boundary_token
+        self.assertTrue(duplicate.provider_token == boundary_token)
         self.assertNotIn("synthetic-value", repr(started.public_payload()))
+        self.assertFalse(boundary_token in repr(started.public_payload()))
+        self.assertFalse(boundary_token in repr(started))
+        self.assertFalse(boundary_token in repr(provider))
 
     def test_ambiguous_create_is_reconciled_by_unique_label_without_retry(self):
         provider = FakeProvider(lookups=[offer(), offer()])
@@ -992,6 +1680,60 @@ class CloudRunServiceTests(unittest.TestCase):
         self.assertEqual(len(provider.create_calls), 1)
         self.assertEqual(len(provider.inventory_calls), 1)
         self.assertNotIn("sensitive", repr(reconciled.public_payload()))
+
+    def test_ambiguous_initial_attempt_create_fails_closed_on_multiple_matches(self):
+        provider = FakeProvider(lookups=[offer(), offer()])
+        provider.create_error = VastError(
+            "sensitive provider timeout",
+            retryable=True,
+        )
+        service = self.service(provider)
+        preview = asyncio.run(
+            service.preview_offer(
+                offer_id=42,
+                idempotency_key="idem-ambiguous-multiple",
+            )
+        )
+        provider.instances = [
+            {
+                "instance_id": instance_id,
+                "label": preview.label,
+                "actual_status": "loading",
+            }
+            for instance_id in ("instance-77", "instance-78")
+        ]
+
+        failed = asyncio.run(
+            service.confirm(
+                preview.attempt_id,
+                idempotency_key="idem-ambiguous-multiple",
+            )
+        )
+        duplicate = asyncio.run(
+            service.confirm(
+                preview.attempt_id,
+                idempotency_key="idem-ambiguous-multiple",
+            )
+        )
+
+        self.assertEqual(failed.state, AttemptState.FAILED)
+        self.assertIsNone(failed.instance_id)
+        self.assertEqual(
+            failed.residual_inventory,
+            ("instance-77", "instance-78"),
+        )
+        payload = failed.public_payload()
+        self.assertEqual(
+            payload["residual_inventory"],
+            ["instance-77", "instance-78"],
+        )
+        self.assertTrue(payload["billing_may_continue"])
+        self.assertIn("instance-77", payload["emergency_action"])
+        self.assertIn("instance-78", payload["emergency_action"])
+        self.assertNotIn("sensitive", repr(payload))
+        self.assertEqual(duplicate, failed)
+        self.assertEqual(len(provider.create_calls), 1)
+        self.assertEqual(len(provider.inventory_calls), 1)
 
     def test_unknown_create_outcome_stays_recoverable_and_is_never_reissued(self):
         provider = FakeProvider(lookups=[offer(), offer()])
@@ -1081,6 +1823,213 @@ class CloudRunServiceTests(unittest.TestCase):
                 )
             )
         self.assertEqual(provider.create_calls, [])
+
+
+class DesktopRelayServiceTests(unittest.TestCase):
+    def setUp(self):
+        from cloud_run.job_repository import JobRepository
+
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.database = Path(self.temporary_directory.name) / "attempts.sqlite3"
+        self.attempts = AttemptRepository(self.database)
+        self.sessions = SessionRepository(self.database)
+        self.jobs = JobRepository(self.database)
+
+    def ready_session(self, session_id="session-1"):
+        session = CloudSession.new(
+            "ready-session-key-" + session_id,
+            session_id=session_id,
+            manifest_digest="b" * 64,
+            deadline_at=7_300.0,
+            deadline_mode="finite",
+            now=100.0,
+            state=SessionState.READY,
+        ).transition(
+            SessionState.READY,
+            now=101.0,
+            installed_manifest_digest="b" * 64,
+            instance_id="instance-1",
+            worker_base_url="http://8.8.8.8:30000",
+            provider_token="a" * 64,
+            session_secret_hex="c" * 64,
+        )
+        return self.sessions.create_or_get(session)[0]
+
+    def service(self, relay, worker_factory):
+        from cloud_run.service import CloudRunService
+
+        return CloudRunService(
+            FakeSettings(),
+            self.attempts,
+            job_repository=self.jobs,
+            session_repository=self.sessions,
+            desktop_relay=relay,
+            desktop_worker_factory=worker_factory,
+            clock=lambda: 200.0,
+        )
+
+    def test_activation_requires_ready_and_uses_only_backend_worker(self):
+        class Relay:
+            def __init__(inner_self):
+                inner_self.calls = []
+
+            async def start(inner_self):
+                inner_self.calls.append(("start",))
+
+            async def activate(
+                inner_self,
+                session_id,
+                worker,
+                profile_revision,
+            ):
+                inner_self.calls.append(
+                    ("activate", session_id, worker, profile_revision)
+                )
+                return types.SimpleNamespace(ready=True)
+
+            async def deactivate(inner_self, session_id):
+                inner_self.calls.append(("deactivate", session_id))
+
+            def status(inner_self):
+                return types.SimpleNamespace(ready=False)
+
+        relay = Relay()
+        worker = object()
+        service = self.service(relay, lambda _session: worker)
+        ready = self.ready_session()
+
+        result = asyncio.run(service.activate_desktop_relay(ready.session_id))
+
+        self.assertTrue(result.ready)
+        self.assertEqual(
+            relay.calls,
+            [("start",), ("activate", "session-1", worker, 0)],
+        )
+        failed = CloudSession.new(
+            "failed-session-key",
+            session_id="session-failed",
+            now=100.0,
+            state=SessionState.FAILED,
+        )
+        self.sessions.create_or_get(failed)
+        with self.assertRaisesRegex(Exception, "ready"):
+            asyncio.run(service.activate_desktop_relay("session-failed"))
+
+    def test_native_prompt_intent_is_persisted_before_forwarding(self):
+        service = self.service(types.SimpleNamespace(), lambda _session: object())
+        self.ready_session()
+        body = json.dumps(
+            {
+                "client_id": "desktop-client-1",
+                "prompt": {
+                    "9": {
+                        "class_type": "SaveImage",
+                        "inputs": {"filename_prefix": "ComfyUI"},
+                    }
+                },
+                "extra_data": {
+                    "extra_pnginfo": {
+                        "workflow": {
+                            "version": 0.4,
+                            "nodes": [{"id": 9, "type": "SaveImage"}],
+                            "extra": {"frontendVersion": "1.47.10"},
+                        }
+                    }
+                },
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+        identity = service.prepare_native_prompt("session-1", body)
+        saved = self.jobs.get_job(identity["job_id"])
+
+        self.assertEqual(saved.state.value, "queued")
+        self.assertEqual(saved.execution_state.value, "queued")
+        self.assertEqual(saved.session_id, "session-1")
+        self.assertEqual(saved.manifest_digest, "b" * 64)
+        self.assertEqual(identity["request_id"], saved.idempotency_key)
+        self.assertIsNotNone(
+            self.jobs.get_capture_by_prompt_digest(saved.prompt_digest)
+        )
+
+    def test_native_prompt_rejects_duplicate_json_keys_before_persistence(self):
+        service = self.service(types.SimpleNamespace(), lambda _session: object())
+        self.ready_session()
+        body = (
+            b'{"client_id":"desktop-client-1",'
+            b'"client_id":"desktop-client-2",'
+            b'"prompt":{"9":{"class_type":"SaveImage",'
+            b'"inputs":{"filename_prefix":"ComfyUI"}}},'
+            b'"extra_data":{"extra_pnginfo":{"workflow":'
+            b'{"version":0.4,"nodes":[{"id":9,'
+            b'"type":"SaveImage"}],"extra":'
+            b'{"frontendVersion":"1.47.10"}}}}}'
+        )
+
+        with self.assertRaisesRegex(Exception, "Invalid native prompt"):
+            service.prepare_native_prompt("session-1", body)
+
+        self.assertEqual(self.jobs.list_jobs("session-1"), [])
+
+    def test_recover_reactivates_persisted_ready_session_and_closes(self):
+        from cloud_run.desktop_relay import DesktopRelayConfig
+
+        ready = self.ready_session()
+        self.jobs.save_desktop_relay(
+            DesktopRelayConfig(
+                bind_host="127.0.0.1",
+                port=32145,
+                active_session_id=ready.session_id,
+                profile_revision=4,
+                updated_at=150.0,
+            )
+        )
+
+        class Relay:
+            def __init__(inner_self):
+                inner_self.calls = []
+
+            async def start(inner_self):
+                inner_self.calls.append(("start",))
+
+            async def activate(
+                inner_self,
+                session_id,
+                worker,
+                profile_revision,
+            ):
+                inner_self.calls.append(
+                    ("activate", session_id, worker, profile_revision)
+                )
+
+            async def close(inner_self):
+                inner_self.calls.append(("close",))
+
+        relay = Relay()
+        worker = object()
+        service = self.service(relay, lambda _session: worker)
+        surface_close_calls = []
+
+        async def close_surface_tasks():
+            surface_close_calls.append("surface")
+
+        service.session_service = types.SimpleNamespace(
+            close_surface_tasks=close_surface_tasks,
+        )
+
+        asyncio.run(service.recover())
+        asyncio.run(service.close())
+
+        self.assertEqual(surface_close_calls, ["surface"])
+        self.assertEqual(
+            relay.calls,
+            [
+                ("start",),
+                ("activate", "session-1", worker, 4),
+                ("close",),
+            ],
+        )
 
 
 if __name__ == "__main__":

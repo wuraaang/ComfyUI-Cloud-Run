@@ -5,28 +5,31 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
-import re
 import stat
 import subprocess
 import sys
 import time
 from typing import Mapping
 
+from cloud_run.worker_protocol import (
+    BOUNDARY_TOKEN_ENVIRONMENT,
+    SESSION_ID_ENVIRONMENT,
+    is_boundary_token,
+)
+
 
 CADDY_CANDIDATES = (
     Path("/opt/portal-aio/caddy_manager/caddy"),
 )
 STATE_DIRECTORY = Path("/var/lib/comfyui-cloud-run")
-MAX_TOKEN_BYTES = 4096
 SHUTDOWN_TIMEOUT_SECONDS = 10
 
 _CADDY_CONFIG_DIRECTORY = STATE_DIRECTORY / "caddy-config"
 _CADDY_DATA_DIRECTORY = STATE_DIRECTORY / "caddy-data"
 _GATEWAY_ERROR_TEXT = "Remote Worker gateway configuration is unavailable."
-_TOKEN = re.compile(rb"[A-Za-z0-9._~+/=-]{1,4096}")
 _GATEWAY_REJECTED = object()
 _WORKER_ENVIRONMENT_ALLOWLIST = (
-    "CLOUD_RUN_SESSION_ID",
+    SESSION_ID_ENVIRONMENT,
     "CLOUD_RUN_COMFY_ROOT",
     "CLOUD_RUN_WORKER_VERSION",
     "CONTAINER_ID",
@@ -38,6 +41,9 @@ _WORKER_ENVIRONMENT_ALLOWLIST = (
     "PYTHONPATH",
     "PYTHONUNBUFFERED",
     "TMPDIR",
+)
+_NETWORK_PROXY_ENVIRONMENT = frozenset(
+    {"ALL_PROXY", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"}
 )
 
 
@@ -51,11 +57,10 @@ def _gateway_error():
 
 def _validated_gateway_token_result(environ):
     try:
-        token = environ.get("JUPYTER_TOKEN")
-        encoded = token.encode("utf-8")
+        token = environ.get(BOUNDARY_TOKEN_ENVIRONMENT)
     except Exception:
         return _GATEWAY_REJECTED
-    if len(encoded) > MAX_TOKEN_BYTES or _TOKEN.fullmatch(encoded) is None:
+    if not is_boundary_token(token):
         return _GATEWAY_REJECTED
     return token
 
@@ -171,7 +176,7 @@ def _run_gateway_unsafe(*, environ, popen_factory, wait_timeout_seconds):
         config_directory, data_directory = _prepare_caddy_directories()
         installed_root = caddyfile.parent.parent
         caddy_environment = {
-            "JUPYTER_TOKEN": token,
+            BOUNDARY_TOKEN_ENVIRONMENT: token,
             "HOME": str(STATE_DIRECTORY),
             "XDG_CONFIG_HOME": str(config_directory),
             "XDG_DATA_HOME": str(data_directory),
@@ -181,6 +186,8 @@ def _run_gateway_unsafe(*, environ, popen_factory, wait_timeout_seconds):
             for name in _WORKER_ENVIRONMENT_ALLOWLIST
             if name in environ and isinstance(environ[name], str)
         }
+        if set(worker_environment).intersection(_NETWORK_PROXY_ENVIRONMENT):
+            raise _gateway_error()
         caddy_argv = [
             caddy,
             "run",

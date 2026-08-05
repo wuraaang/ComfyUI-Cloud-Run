@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import math
 import secrets
 import time
+import uuid
 
 from .capture import CompiledCapture
 from .constants import (
@@ -15,20 +18,54 @@ from .constants import (
 from .models import (
     AttemptState,
     CloudAttempt,
+    CloudJob,
     CloudSession,
+    ExecutionState,
+    HarvestState,
+    JobState,
     OfferQuote,
     SessionState,
 )
 from .offers import (
     apply_offer_policy,
+    decide_offers,
     offer_meets_connection_quality_policy,
 )
-from .repository import ConcurrentAttemptUpdate, ConcurrentSessionUpdate
+from .repository import (
+    ConcurrentAttemptUpdate,
+    ConcurrentSessionUpdate,
+    PaidRentalConflict,
+)
 from .worker_release import WorkerRelease, WorkerReleaseUnavailable
 from . import vast
 
 
 DEFAULT_QUOTE_TTL_SECONDS = 120
+_CONFIRMING_RECOVERY_GRACE_SECONDS = 5.0
+_PRE_PROVIDER_CONFIRMATION_ERROR = (
+    "Paid confirmation stopped before Vast create; review the offer again."
+)
+
+
+def _strict_json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if not isinstance(key, str) or key in result:
+            raise ValueError("Invalid JSON object.")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(_value):
+    raise ValueError("Invalid JSON constant.")
+
+
+def _native_prompt_intent_class():
+    if "." in (__package__ or ""):
+        from ..remote_worker.native_jobs import NativePromptIntent
+    else:
+        from remote_worker.native_jobs import NativePromptIntent
+    return NativePromptIntent
 
 
 class CloudRunError(RuntimeError):
@@ -94,6 +131,8 @@ class VastProvider:
         disk_gb,
         label,
         release,
+        boundary_token,
+        session_id,
     ):
         return await vast.create_instance(
             api_key,
@@ -101,6 +140,8 @@ class VastProvider:
             disk_gb=disk_gb,
             label=label,
             release=release,
+            boundary_token=boundary_token,
+            session_id=session_id,
         )
 
     async def list_instances(self, api_key):
@@ -132,9 +173,9 @@ def _offer_id(value):
 
 
 def _max_instance_creates(value):
-    if type(value) is not int or value not in {1, 2}:
+    if type(value) is not int or value != 1:
         raise CloudRunValidationError(
-            "Maximum total instance creates must be 1 or 2."
+            "Maximum total instance creates must be 1."
         )
     return value
 
@@ -156,6 +197,8 @@ class CloudRunService:
         session_service=None,
         session_repository=None,
         release=None,
+        desktop_relay=None,
+        desktop_worker_factory=None,
     ):
         self.settings_store = settings_store
         self.repository = repository
@@ -170,6 +213,159 @@ class CloudRunService:
         self.session_service = session_service
         self.session_repository = session_repository
         self.release = release if isinstance(release, WorkerRelease) else None
+        self.desktop_relay = desktop_relay
+        self.desktop_worker_factory = desktop_worker_factory
+
+    def _desktop_components(self):
+        relay = self.desktop_relay
+        if relay is None or not all(
+            callable(getattr(relay, method, None))
+            for method in ("start", "activate", "deactivate", "status")
+        ):
+            raise CloudRunValidationError(
+                "ComfyUI Vast Desktop relay is unavailable."
+            )
+        if not callable(self.desktop_worker_factory):
+            raise CloudRunValidationError(
+                "ComfyUI Vast Desktop worker is unavailable."
+            )
+        return relay
+
+    def desktop_setup(self):
+        relay = self._desktop_components()
+        status = relay.status().public_payload()
+        return {
+            **status,
+            "manual_setup_required": True,
+            "instructions": [
+                "Open Remote Connections in ComfyUI Desktop.",
+                "Add the loopback URL with the name ComfyUI Vast.",
+                "Open ComfyUI Vast only after this status is ready.",
+            ],
+        }
+
+    async def activate_desktop_relay(self, session_id):
+        relay = self._desktop_components()
+        session = self.get_session(session_id)
+        if session.state != SessionState.READY:
+            raise CloudRunValidationError(
+                "The ComfyUI Vast session is not ready."
+            )
+        certified = getattr(
+            self.session_service,
+            "readiness_certified",
+            None,
+        )
+        if callable(certified) and certified(session.session_id) is not True:
+            raise CloudRunValidationError(
+                "The ComfyUI Vast readiness report is incomplete."
+            )
+        await relay.start()
+        try:
+            worker = self.desktop_worker_factory(session)
+        except Exception:
+            raise CloudRunValidationError(
+                "ComfyUI Vast Desktop worker is unavailable."
+            ) from None
+        profile_revision = 0
+        if self.job_repository is not None and callable(
+            getattr(self.job_repository, "get_desktop_relay", None)
+        ):
+            config = self.job_repository.get_desktop_relay()
+            if (
+                config is not None
+                and config.active_session_id == session.session_id
+                and config.profile_revision is not None
+            ):
+                profile_revision = config.profile_revision
+        return await relay.activate(
+            session.session_id,
+            worker,
+            profile_revision,
+        )
+
+    async def deactivate_desktop_relay(self, session_id):
+        relay = self._desktop_components()
+        self.get_session(session_id)
+        return await relay.deactivate(str(session_id))
+
+    def prepare_native_prompt(self, session_id, body):
+        if self.job_repository is None:
+            raise CloudRunValidationError(
+                "Native prompt storage is unavailable."
+            )
+        session = self.get_session(session_id)
+        if session.state not in {
+            SessionState.READY,
+            SessionState.RUNNING,
+            SessionState.HARVESTING,
+        }:
+            raise CloudRunValidationError(
+                "The ComfyUI Vast session is not ready."
+            )
+        manifest_digest = session.installed_manifest_digest
+        if manifest_digest != session.manifest_digest:
+            raise CloudRunValidationError(
+                "The ComfyUI Vast environment is not validated."
+            )
+        if not isinstance(body, bytes):
+            raise CloudRunValidationError("Invalid native prompt.")
+        try:
+            NativePromptIntent = _native_prompt_intent_class()
+
+            parsed = json.loads(
+                body.decode("utf-8"),
+                object_pairs_hook=_strict_json_object,
+                parse_constant=_reject_json_constant,
+            )
+            job_id = uuid.uuid4().hex
+            request_id = uuid.uuid4().hex
+            intent = NativePromptIntent.from_http(
+                job_id=job_id,
+                request_id=request_id,
+                manifest_digest=manifest_digest,
+                body=parsed,
+            )
+        except Exception:
+            raise CloudRunValidationError("Invalid native prompt.") from None
+        now = self.clock()
+        if (
+            isinstance(now, bool)
+            or not isinstance(now, (int, float))
+            or not math.isfinite(now)
+            or now < 0
+        ):
+            raise CloudRunValidationError(
+                "Native prompt storage clock is unavailable."
+            )
+        now = float(now)
+        self.job_repository.save_capture(intent.capture, created_at=now)
+        job = CloudJob(
+            job_id=job_id,
+            session_id=session.session_id,
+            idempotency_key=request_id,
+            state=JobState.QUEUED,
+            prompt_digest=intent.capture.prompt_digest,
+            capture_json=intent.capture.canonical_payload(),
+            manifest_digest=manifest_digest,
+            remote_prompt_id=None,
+            sanitized_error=None,
+            created_at=now,
+            updated_at=now,
+            version=1,
+            execution_state=ExecutionState.QUEUED,
+            harvest_state=HarvestState.PENDING,
+        )
+        saved, created = self.job_repository.create_job(job)
+        if not created or saved.job_id != job.job_id:
+            raise CloudRunValidationError(
+                "Native prompt identity could not be persisted."
+            )
+        return {
+            "job_id": job_id,
+            "request_id": request_id,
+            "manifest_digest": manifest_digest,
+        }
 
     async def capture(self, payload):
         if self.job_repository is None:
@@ -282,6 +478,28 @@ class CloudRunService:
 
     async def refresh_session(self, session_id):
         session = self.get_session(session_id)
+        now = float(self.clock())
+        if (
+            math.isfinite(now)
+            and math.isfinite(session.updated_at)
+            and session.state == SessionState.CONFIRMING
+            and session.provider_token is None
+            and session.session_secret_hex is None
+            and session.instance_id is None
+            and not session.residual_inventory
+            and now - session.updated_at
+            >= _CONFIRMING_RECOVERY_GRACE_SECONDS
+        ):
+            try:
+                session = self._session_repository().transition_if_state(
+                    session.session_id,
+                    SessionState.CONFIRMING,
+                    SessionState.OFFER_SELECTED,
+                    now=now,
+                    sanitized_error=_PRE_PROVIDER_CONFIRMATION_ERROR,
+                )
+            except ConcurrentSessionUpdate:
+                session = self.get_session(session.session_id)
         enforce = getattr(
             self.lifecycle,
             "enforce_session_deadline",
@@ -292,10 +510,11 @@ class CloudRunService:
             and session.deadline_mode == "finite"
             and isinstance(session.deadline_at, (int, float))
             and not isinstance(session.deadline_at, bool)
-            and float(self.clock()) >= session.deadline_at
+            and now >= session.deadline_at
             and session.state != SessionState.DESTROYED
         ):
-            return await enforce(session.session_id)
+            session = await enforce(session.session_id)
+            return session
         refresh = getattr(self.lifecycle, "reconcile_session_once", None)
         if callable(refresh) and session.state in {
             SessionState.CREATING,
@@ -305,8 +524,61 @@ class CloudRunService:
             SessionState.DESTROY_REQUESTED,
             SessionState.DESTROYING,
         }:
-            return await refresh(session.session_id)
+            session = await refresh(session.session_id)
+        reconciler = getattr(
+            self.session_service,
+            "reconciler",
+            None,
+        )
+        schedule = getattr(reconciler, "schedule", None)
+        if callable(schedule) and session.state in {
+            SessionState.RUNNING,
+            SessionState.HARVESTING,
+        }:
+            try:
+                schedule(session.session_id)
+                await asyncio.sleep(0)
+            except (RuntimeError, ValueError):
+                pass
+            session = self.get_session(session.session_id)
+        sync_profile = getattr(self.session_service, "sync_profile", None)
+        if callable(sync_profile) and session.state in {
+            SessionState.READY,
+            SessionState.RUNNING,
+            SessionState.HARVESTING,
+        }:
+            await sync_profile(session.session_id)
         return session
+
+    async def session_profile(self, session_id):
+        sync = getattr(self.session_service, "sync_profile", None)
+        if not callable(sync):
+            raise CloudRunValidationError(
+                "Desktop profile synchronization is unavailable."
+            )
+        return await sync(session_id)
+
+    async def resolve_session_profile_conflict(
+        self,
+        session_id,
+        conflict_id,
+        *,
+        winner,
+    ):
+        resolve = getattr(
+            self.session_service,
+            "resolve_profile_conflict",
+            None,
+        )
+        if not callable(resolve):
+            raise CloudRunValidationError(
+                "Desktop profile synchronization is unavailable."
+            )
+        return await resolve(
+            session_id,
+            conflict_id,
+            winner=winner,
+        )
 
     async def submit_job(
         self,
@@ -335,6 +607,18 @@ class CloudRunService:
                 "Cloud Run job storage is unavailable."
             )
         return self.session_service.get_job(session_id, job_id)
+
+    async def retry_harvest(self, session_id, job_id):
+        if self.session_service is None or not callable(
+            getattr(self.session_service, "retry_harvest", None)
+        ):
+            raise CloudRunValidationError(
+                "Cloud Vast output retrieval is unavailable."
+            )
+        return await self.session_service.retry_harvest(
+            session_id,
+            job_id,
+        )
 
     async def update_session_deadline(self, session_id, payload):
         update = getattr(self.session_service, "update_deadline", None)
@@ -377,6 +661,7 @@ class CloudRunService:
         idempotency_key,
         deadline,
         max_instance_creates,
+        estimate_digest=None,
     ):
         release = self._reviewed_release()
         repository = self._session_repository()
@@ -408,10 +693,51 @@ class CloudRunService:
             identifier,
             settings,
             disk_gb=preflight.disk_gb,
+            min_vram_gb=max(
+                1,
+                math.ceil(
+                    float(getattr(preflight, "minimum_vram_gb", 0.0))
+                ),
+            ),
         )
         if selected is None:
             raise QuoteUnavailable(
                 "The selected Vast offer is no longer available."
+            )
+        decisions = decide_offers(
+            [selected],
+            workflow_min_vram_gb=float(
+                getattr(preflight, "minimum_vram_gb", 0.0)
+            ),
+            workflow_disk_gb=preflight.disk_gb,
+            preferred_vram_gb=(
+                None
+                if settings["min_vram_gb"] <= 1
+                else settings["min_vram_gb"]
+            ),
+            max_price_per_hour=(
+                None
+                if settings["max_price_per_hour"] >= 100
+                else settings["max_price_per_hour"]
+            ),
+            transfer_bytes=preflight.transfer_bytes,
+            cached_bytes=int(getattr(preflight, "cached_bytes", 0)),
+            source_ready=True,
+        )
+        decision = next(
+            (item for item in decisions if item.included),
+            None,
+        )
+        if decision is None or decision.estimate is None:
+            raise QuoteUnavailable(
+                "The selected Vast offer is no longer available."
+            )
+        if estimate_digest is not None and (
+            not isinstance(estimate_digest, str)
+            or estimate_digest != decision.estimate.digest
+        ):
+            raise QuoteUnavailable(
+                "The readiness estimate changed before review."
             )
         now = float(self.clock())
         quote = OfferQuote(
@@ -426,6 +752,7 @@ class CloudRunService:
             ),
             inet_down_mbps=selected.get("inet_down_mbps"),
             disk_bw_mbps=selected.get("disk_bw_mbps"),
+            dlperf=selected.get("dlperf"),
             max_price_per_hour=float(settings["max_price_per_hour"]),
             expires_at=now + self.quote_ttl_seconds,
             disk_gb=int(preflight.disk_gb),
@@ -447,15 +774,28 @@ class CloudRunService:
             worker_archive_sha256=release.worker_archive_sha256,
             protocol_version=release.protocol_version,
             manifest_digest=preflight.manifest_digest,
+            execution_baseline_digest=(
+                preflight.execution_baseline_digest
+            ),
+            randomized_seed_node_ids=(
+                preflight.randomized_seed_node_ids
+            ),
             machine_id=selected.get("machine_id"),
             host_id=selected.get("host_id"),
             public_ipaddr=selected.get("public_ipaddr"),
             max_instance_creates=create_limit,
+            readiness_estimate=decision.estimate,
         )
         candidate = CloudSession.new(
             key,
             quote=quote,
             manifest_digest=preflight.manifest_digest,
+            execution_baseline_digest=(
+                preflight.execution_baseline_digest
+            ),
+            randomized_seed_node_ids=(
+                preflight.randomized_seed_node_ids
+            ),
             deadline_at=(now + duration if duration is not None else None),
             deadline_mode=mode,
             disk_gb=preflight.disk_gb,
@@ -480,6 +820,18 @@ class CloudRunService:
         if quoted is None:
             return current is None
         return current is not None and float(current) <= float(quoted)
+
+    @classmethod
+    def _same_optional_number(cls, current, quoted):
+        if current is None or quoted is None:
+            return current is None and quoted is None
+        current_value = cls._finite_metric(current)
+        quoted_value = cls._finite_metric(quoted)
+        return (
+            current_value is not None
+            and quoted_value is not None
+            and current_value == quoted_value
+        )
 
     @staticmethod
     def _finite_metric(value):
@@ -509,29 +861,51 @@ class CloudRunService:
         )
 
     async def _revalidated_session_offer(self, session, settings):
+        if float(settings["max_price_per_hour"]) != float(
+            session.quote.max_price_per_hour
+        ):
+            return None
         selected = await self._eligible_offer(
             session.quote.offer_id,
             settings,
             disk_gb=session.quote.disk_gb,
+            min_vram_gb=1,
         )
         if selected is None:
             return None
         if (
             self._connection_quality_is_eligible(selected)
-            and self._connection_speed_matches_quote(
+            and str(selected.get("offer_id")) == session.quote.offer_id
+            and str(selected.get("gpu_name")) == session.quote.gpu_name
+            and self._same_optional_number(
+                selected.get("gpu_ram_gb"),
+                session.quote.gpu_ram_gb,
+            )
+            and self._same_optional_number(
+                selected.get("dph_total"),
+                session.quote.dph_total,
+            )
+            and self._same_optional_number(
+                selected.get("reliability"),
+                session.quote.reliability,
+            )
+            and self._same_optional_number(
                 selected.get("inet_down_mbps"),
                 session.quote.inet_down_mbps,
             )
-            and str(selected.get("gpu_name")) == session.quote.gpu_name
-            and float(selected.get("gpu_ram_gb", 0))
-            >= session.quote.gpu_ram_gb
-            and float(selected.get("dph_total", float("inf")))
-            <= session.quote.dph_total
-            and self._bandwidth_cost_not_increased(
+            and self._same_optional_number(
+                selected.get("disk_bw_mbps"),
+                session.quote.disk_bw_mbps,
+            )
+            and self._same_optional_number(
+                selected.get("dlperf"),
+                session.quote.dlperf,
+            )
+            and self._same_optional_number(
                 selected.get("inet_down_cost"),
                 session.quote.inet_down_cost,
             )
-            and self._bandwidth_cost_not_increased(
+            and self._same_optional_number(
                 selected.get("inet_up_cost"),
                 session.quote.inet_up_cost,
             )
@@ -545,7 +919,26 @@ class CloudRunService:
                 or selected.get("host_id") == session.quote.host_id
             )
         ):
-            return selected
+            estimate = session.quote.readiness_estimate
+            if estimate is None:
+                return None
+            decisions = decide_offers(
+                [selected],
+                workflow_min_vram_gb=1,
+                workflow_disk_gb=session.quote.disk_gb,
+                preferred_vram_gb=None,
+                max_price_per_hour=session.quote.max_price_per_hour,
+                transfer_bytes=session.quote.transfer_bytes,
+                cached_bytes=estimate.cached_bytes,
+                source_ready=estimate.source_ready,
+            )
+            if (
+                len(decisions) == 1
+                and decisions[0].included
+                and decisions[0].estimate is not None
+                and decisions[0].estimate.digest == estimate.digest
+            ):
+                return selected
         return None
 
     async def _finish_created_session(self, session_id, instance_id):
@@ -587,7 +980,15 @@ class CloudRunService:
             schedule(session.session_id)
         return session
 
-    async def confirm_session(self, session_id, *, idempotency_key):
+    async def confirm_session(
+        self,
+        session_id,
+        *,
+        idempotency_key,
+        estimate_digest=None,
+        accepted_longer_estimate=False,
+        current_preflight_id=None,
+    ):
         session = self._validated_session(session_id, idempotency_key)
         if session.state not in {
             SessionState.OFFER_SELECTED,
@@ -596,7 +997,77 @@ class CloudRunService:
             return session
         repository = self._session_repository()
         now = float(self.clock())
-        if 1 + session.retry_count > session.quote.max_instance_creates:
+        estimate = session.quote.readiness_estimate
+        expected_digest = estimate.digest if estimate is not None else None
+        supplied_digest = (
+            expected_digest if estimate_digest is None else estimate_digest
+        )
+        if (
+            estimate is None
+            or not isinstance(supplied_digest, str)
+            or supplied_digest != expected_digest
+        ):
+            repository.transition(
+                session.session_id,
+                SessionState.FAILED,
+                now=now,
+                sanitized_error=(
+                    "The readiness estimate changed before confirmation."
+                ),
+                failure_code="quote_expired",
+            )
+            raise QuoteUnavailable(
+                "The readiness estimate changed before confirmation."
+            )
+        if current_preflight_id is not None:
+            matches = getattr(
+                self.session_service,
+                "matches_paid_preflight",
+                None,
+            )
+            if not callable(matches) or not matches(
+                current_preflight_id,
+                reviewed_manifest_digest=session.quote.manifest_digest,
+                reviewed_execution_baseline_digest=(
+                    session.quote.execution_baseline_digest
+                ),
+                reviewed_randomized_seed_node_ids=(
+                    session.quote.randomized_seed_node_ids
+                ),
+                reviewed_transfer_bytes=session.quote.transfer_bytes,
+                reviewed_cached_bytes=estimate.cached_bytes,
+                reviewed_output_allowance_bytes=(
+                    session.quote.output_allowance_bytes
+                ),
+                reviewed_disk_gb=session.quote.disk_gb,
+            ):
+                repository.transition(
+                    session.session_id,
+                    SessionState.FAILED,
+                    now=now,
+                    sanitized_error=(
+                        "The canvas or profile changed before confirmation."
+                    ),
+                    failure_code="quote_expired",
+                )
+                raise QuoteUnavailable(
+                    "The canvas or profile changed before confirmation."
+                )
+        if (
+            not estimate.source_ready
+            or (
+                not estimate.ten_minute_eligible
+                and accepted_longer_estimate is not True
+            )
+        ):
+            raise CloudRunValidationError(
+                "Accept the reviewed longer readiness estimate before rental."
+            )
+        if (
+            session.retry_count != 0
+            or 1 + session.retry_count
+            > session.quote.max_instance_creates
+        ):
             return repository.transition(
                 session.session_id,
                 SessionState.FAILED,
@@ -612,6 +1083,7 @@ class CloudRunService:
                 SessionState.FAILED,
                 now=now,
                 sanitized_error="The quote expired before confirmation.",
+                failure_code="quote_expired",
             )
             raise QuoteUnavailable("The quote expired before confirmation.")
         if not self._release_matches_quote(release, session.quote):
@@ -622,6 +1094,7 @@ class CloudRunService:
                 sanitized_error=(
                     "The reviewed worker release changed before confirmation."
                 ),
+                failure_code="quote_expired",
             )
             raise QuoteUnavailable(
                 "The reviewed worker release changed before confirmation."
@@ -636,28 +1109,46 @@ class CloudRunService:
                 sanitized_error=(
                     "The selected offer changed or is no longer eligible."
                 ),
+                failure_code="quote_expired",
             )
             raise QuoteUnavailable(
                 "The selected offer changed or is no longer eligible."
             )
-        try:
-            if session.state == SessionState.OFFER_SELECTED:
+        if session.state == SessionState.OFFER_SELECTED:
+            try:
                 session = repository.save(
                     session.transition(
                         SessionState.CONFIRMING,
                         now=float(self.clock()),
                     )
                 )
-            session = repository.save(
-                session.transition(
-                    SessionState.CREATING,
-                    now=float(self.clock()),
-                    session_secret_hex=secrets.token_hex(32),
-                    sanitized_error=None,
-                )
+            except ConcurrentSessionUpdate:
+                return self.get_session(session.session_id)
+        claim_now = float(self.clock())
+        provider_token = secrets.token_hex(32)
+        session_secret_hex = secrets.token_hex(32)
+        try:
+            session = repository.claim_create_intent(
+                session.session_id,
+                now=claim_now,
+                provider_token=provider_token,
+                session_secret_hex=session_secret_hex,
+                settings_revision=settings.get("api_key_revision"),
             )
         except ConcurrentSessionUpdate:
             return self.get_session(session.session_id)
+        except Exception:
+            try:
+                repository.transition_if_state(
+                    session.session_id,
+                    SessionState.CONFIRMING,
+                    SessionState.OFFER_SELECTED,
+                    now=float(self.clock()),
+                    sanitized_error=_PRE_PROVIDER_CONFIRMATION_ERROR,
+                )
+            except ConcurrentSessionUpdate:
+                pass
+            raise
         try:
             instance_id = await self.provider.create_instance(
                 settings["api_key"],
@@ -665,16 +1156,37 @@ class CloudRunService:
                 disk_gb=session.quote.disk_gb,
                 label=session.label,
                 release=release,
+                boundary_token=session.provider_token,
+                session_id=session.session_id,
             )
         except Exception as error:
-            reconciled = await self._instance_for_label(
+            matches = await self._instance_for_label(
                 settings["api_key"],
                 session.label,
             )
-            if reconciled is not None and reconciled.get("instance_id"):
+            if (
+                matches is not None
+                and len(matches) == 1
+                and matches[0].get("instance_id")
+            ):
                 return await self._finish_created_session(
                     session.session_id,
-                    str(reconciled["instance_id"]),
+                    str(matches[0]["instance_id"]),
+                )
+            if matches is not None and len(matches) > 1:
+                return repository.transition(
+                    session.session_id,
+                    SessionState.FAILED,
+                    now=float(self.clock()),
+                    instance_id=None,
+                    residual_inventory=tuple(
+                        str(item.get("instance_id"))
+                        for item in matches
+                        if item.get("instance_id") is not None
+                    ),
+                    sanitized_error=(
+                        "Multiple managed Vast instances match this session."
+                    ),
                 )
             retryable = isinstance(error, vast.VastError) and error.retryable
             if retryable:
@@ -715,19 +1227,48 @@ class CloudRunService:
             return await self.session_service.search_offers(preflight_id)
         return await self._search_without_preflight()
 
-    async def _search_without_preflight(self, *, disk_gb=DEFAULT_DISK_GB):
+    async def _search_without_preflight(
+        self,
+        *,
+        disk_gb=DEFAULT_DISK_GB,
+        workflow_min_vram_gb=None,
+        transfer_bytes=0,
+        cached_bytes=0,
+        source_ready=True,
+    ):
         settings = self._settings()
+        hard_vram = (
+            settings["min_vram_gb"]
+            if workflow_min_vram_gb is None
+            else max(1, math.ceil(float(workflow_min_vram_gb)))
+        )
         offers = await self.provider.search_offers(
             settings["api_key"],
             max_price_per_hour=settings["max_price_per_hour"],
-            min_vram_gb=settings["min_vram_gb"],
+            min_vram_gb=hard_vram,
             disk_gb=disk_gb,
         )
-        return apply_offer_policy(
+        decisions = decide_offers(
             offers,
+            workflow_min_vram_gb=hard_vram,
+            workflow_disk_gb=disk_gb,
+            preferred_vram_gb=(
+                None
+                if settings["min_vram_gb"] <= 1
+                else settings["min_vram_gb"]
+            ),
+            max_price_per_hour=(
+                None
+                if settings["max_price_per_hour"] >= 100
+                else settings["max_price_per_hour"]
+            ),
+            transfer_bytes=transfer_bytes,
+            cached_bytes=cached_bytes,
+            source_ready=source_ready,
             blacklist=self.blacklist,
             now=float(self.clock()),
         )
+        return [decision.public_payload() for decision in decisions]
 
     async def _eligible_offer(
         self,
@@ -735,12 +1276,17 @@ class CloudRunService:
         settings,
         *,
         disk_gb=DEFAULT_DISK_GB,
+        min_vram_gb=None,
     ):
         selected = await self.provider.get_offer(
             settings["api_key"],
             identifier,
             max_price_per_hour=settings["max_price_per_hour"],
-            min_vram_gb=settings["min_vram_gb"],
+            min_vram_gb=(
+                settings["min_vram_gb"]
+                if min_vram_gb is None
+                else min_vram_gb
+            ),
             disk_gb=disk_gb,
         )
         if selected is None:
@@ -792,6 +1338,7 @@ class CloudRunService:
             ),
             inet_down_mbps=selected.get("inet_down_mbps"),
             disk_bw_mbps=selected.get("disk_bw_mbps"),
+            dlperf=selected.get("dlperf"),
             max_price_per_hour=float(settings["max_price_per_hour"]),
             expires_at=now + self.quote_ttl_seconds,
             disk_gb=self.disk_gb,
@@ -862,15 +1409,15 @@ class CloudRunService:
             instances = await self.provider.list_instances(api_key)
         except Exception:
             return None
+        if not isinstance(instances, list):
+            return None
         matches = [
             instance
             for instance in instances
             if isinstance(instance, dict) and instance.get("label") == label
         ]
-        if not matches:
-            return None
         matches.sort(key=lambda item: str(item.get("instance_id") or ""))
-        return matches[0]
+        return tuple(matches)
 
     async def _finish_created_instance(self, attempt_id, instance_id):
         current = self.get_attempt(attempt_id)
@@ -891,6 +1438,7 @@ class CloudRunService:
             AttemptState.STARTING,
             now=float(self.clock()),
             instance_id=str(instance_id),
+            residual_inventory=(),
             sanitized_error=None,
         )
         if self.lifecycle is not None:
@@ -955,6 +1503,7 @@ class CloudRunService:
                 attempt.transition(
                     AttemptState.CREATING,
                     now=float(self.clock()),
+                    provider_token=secrets.token_hex(32),
                 )
             )
         except ConcurrentAttemptUpdate:
@@ -967,16 +1516,37 @@ class CloudRunService:
                 disk_gb=self.disk_gb,
                 label=attempt.label,
                 release=release,
+                boundary_token=attempt.provider_token,
+                session_id=attempt.attempt_id,
             )
         except Exception as error:
-            reconciled = await self._instance_for_label(
+            matches = await self._instance_for_label(
                 settings["api_key"],
                 attempt.label,
             )
-            if reconciled is not None and reconciled.get("instance_id"):
+            if (
+                matches is not None
+                and len(matches) == 1
+                and matches[0].get("instance_id")
+            ):
                 return await self._finish_created_instance(
                     attempt.attempt_id,
-                    str(reconciled["instance_id"]),
+                    str(matches[0]["instance_id"]),
+                )
+            if matches is not None and len(matches) > 1:
+                return self.repository.transition(
+                    attempt.attempt_id,
+                    AttemptState.FAILED,
+                    now=float(self.clock()),
+                    instance_id=None,
+                    residual_inventory=tuple(
+                        str(item.get("instance_id"))
+                        for item in matches
+                        if item.get("instance_id") is not None
+                    ),
+                    sanitized_error=(
+                        "Multiple managed Vast instances match this attempt."
+                    ),
                 )
             retryable = isinstance(error, vast.VastError) and error.retryable
             if retryable:
@@ -1021,21 +1591,89 @@ class CloudRunService:
         return await self.lifecycle.destroy(attempt_id)
 
     async def recover(self):
-        if self.lifecycle is None:
-            return []
-        recover_sessions = getattr(
-            self.lifecycle,
-            "recover_sessions",
+        recovered = []
+        if self.lifecycle is not None:
+            recover_sessions = getattr(
+                self.lifecycle,
+                "recover_sessions",
+                None,
+            )
+            if (
+                getattr(self.lifecycle, "session_repository", None)
+                is not None
+                and callable(recover_sessions)
+            ):
+                recovered = await recover_sessions()
+            else:
+                recovered = await self.lifecycle.recover()
+                for attempt in recovered:
+                    if attempt.state == AttemptState.STARTING:
+                        self.lifecycle.schedule_watchdog(
+                            attempt.attempt_id
+                        )
+        reconciler = getattr(
+            self.session_service,
+            "reconciler",
             None,
         )
-        if (
-            getattr(self.lifecycle, "session_repository", None)
-            is not None
-            and callable(recover_sessions)
-        ):
-            return await recover_sessions()
-        attempts = await self.lifecycle.recover()
-        for attempt in attempts:
-            if attempt.state == AttemptState.STARTING:
-                self.lifecycle.schedule_watchdog(attempt.attempt_id)
-        return attempts
+        recover_jobs = getattr(reconciler, "recover", None)
+        if callable(recover_jobs):
+            await recover_jobs()
+        relay = self.desktop_relay
+        start = getattr(relay, "start", None)
+        if callable(start):
+            await start()
+            config = (
+                self.job_repository.get_desktop_relay()
+                if self.job_repository is not None
+                and callable(
+                    getattr(
+                        self.job_repository,
+                        "get_desktop_relay",
+                        None,
+                    )
+                )
+                else None
+            )
+            if config is not None and config.active_session_id is not None:
+                session = (
+                    self.session_repository.get(config.active_session_id)
+                    if self.session_repository is not None
+                    else None
+                )
+                if (
+                    session is not None
+                    and session.state == SessionState.READY
+                    and callable(self.desktop_worker_factory)
+                    and callable(getattr(relay, "activate", None))
+                ):
+                    try:
+                        worker = self.desktop_worker_factory(session)
+                        await relay.activate(
+                            session.session_id,
+                            worker,
+                            config.profile_revision,
+                        )
+                    except Exception:
+                        pass
+        return recovered
+
+    async def close(self):
+        reconciler = getattr(
+            self.session_service,
+            "reconciler",
+            None,
+        )
+        close = getattr(reconciler, "close", None)
+        if callable(close):
+            await close()
+        close_surface_tasks = getattr(
+            self.session_service,
+            "close_surface_tasks",
+            None,
+        )
+        if callable(close_surface_tasks):
+            await close_surface_tasks()
+        relay_close = getattr(self.desktop_relay, "close", None)
+        if callable(relay_close):
+            await relay_close()

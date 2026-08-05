@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import importlib.util
 import json
 from pathlib import Path
 import tempfile
@@ -13,12 +14,12 @@ class RecordingTransport:
         self.requests = []
         self.responses = [
             {
-                "protocol_version": "1",
+                "protocol_version": "2",
                 "session_id": "session-1",
                 "claimed": True,
             },
             {
-                "protocol_version": "1",
+                "protocol_version": "2",
                 "claimed": True,
             },
         ]
@@ -39,14 +40,542 @@ class RecordingTransport:
         )
 
 
+@unittest.skipUnless(importlib.util.find_spec("aiohttp"), "aiohttp unavailable")
+class AiohttpWorkerTransportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_websocket_opens_with_the_comfyui_aiohttp_api(self):
+        from aiohttp import web
+
+        from cloud_run.worker_client import (
+            AiohttpWorkerTransport,
+            WorkerRequest,
+        )
+
+        async def websocket_handler(request):
+            socket = web.WebSocketResponse()
+            await socket.prepare(request)
+            await socket.send_bytes(b"native-preview")
+            await socket.close()
+            return socket
+
+        application = web.Application()
+        application.router.add_get("/ws", websocket_handler)
+        runner = web.AppRunner(application, access_log=None)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        self.addAsyncCleanup(runner.cleanup)
+        port = runner.addresses[0][1]
+        request = WorkerRequest(
+            method="GET",
+            url="http://127.0.0.1:" + str(port) + "/ws?clientId=test",
+            headers={"Authorization": "private"},
+            body=b"",
+        )
+
+        socket = await AiohttpWorkerTransport().websocket(
+            request,
+            max_bytes=1024,
+        )
+        self.addAsyncCleanup(socket.close)
+        message = await socket.__aiter__().__anext__()
+
+        self.assertEqual(bytes(message.data), b"native-preview")
+
+    async def test_websocket_redirect_is_rejected_before_credentials_move(self):
+        from aiohttp import web
+
+        from cloud_run.worker_client import (
+            AiohttpWorkerTransport,
+            WorkerClientError,
+            WorkerRequest,
+        )
+
+        target_hits = []
+
+        async def target_handler(request):
+            target_hits.append(dict(request.headers))
+            socket = web.WebSocketResponse()
+            await socket.prepare(request)
+            return socket
+
+        target_application = web.Application()
+        target_application.router.add_get("/target", target_handler)
+        target_runner = web.AppRunner(target_application, access_log=None)
+        await target_runner.setup()
+        target_site = web.TCPSite(target_runner, "127.0.0.1", 0)
+        await target_site.start()
+        self.addAsyncCleanup(target_runner.cleanup)
+        target_port = target_runner.addresses[0][1]
+
+        async def redirect_handler(_request):
+            raise web.HTTPFound(
+                "http://127.0.0.1:"
+                + str(target_port)
+                + "/target"
+            )
+
+        redirect_application = web.Application()
+        redirect_application.router.add_get("/ws", redirect_handler)
+        redirect_runner = web.AppRunner(redirect_application, access_log=None)
+        await redirect_runner.setup()
+        redirect_site = web.TCPSite(redirect_runner, "127.0.0.1", 0)
+        await redirect_site.start()
+        self.addAsyncCleanup(redirect_runner.cleanup)
+        redirect_port = redirect_runner.addresses[0][1]
+        request = WorkerRequest(
+            method="GET",
+            url="http://127.0.0.1:" + str(redirect_port) + "/ws",
+            headers={"Authorization": "private"},
+            body=b"",
+        )
+
+        with self.assertRaises(WorkerClientError):
+            await AiohttpWorkerTransport().websocket(
+                request,
+                max_bytes=1024,
+            )
+
+        self.assertEqual(target_hits, [])
+
+
 class WorkerClientTests(unittest.TestCase):
+    def test_native_system_stats_envelope_rejects_bodies_and_identity_headers(self):
+        from cloud_run.worker_client import WorkerClient, WorkerClientError
+
+        client = WorkerClient(
+            base_url="http://8.8.8.8:30000",
+            provider_token="a" * 64,
+            session_id="session-1",
+            session_secret=b"s" * 32,
+            transport=RecordingTransport(),
+            clock=lambda: 1000,
+            nonce=lambda: "system-stats",
+        )
+
+        request = client.native_envelope("GET", "/system_stats", b"")
+
+        self.assertEqual(request.method, "GET")
+        self.assertTrue(request.url.endswith("/system_stats"))
+        for method, path_qs, body, options in (
+            ("GET", "/system_stats", b"body", {}),
+            ("POST", "/system_stats", b"", {}),
+            ("GET", "/system_stats?detail=1", b"", {}),
+            ("GET", "/system_stats", b"", {"identity": {"job_id": "job-1"}}),
+            ("GET", "/system_stats", b"", {"headers": {"Authorization": "x"}}),
+            ("GET", "/system_stats", b"", {"headers": {"Cookie": "x"}}),
+            ("GET", "/system_stats", b"", {"headers": {"Host": "x"}}),
+            ("GET", "/system_stats", b"", {"headers": {"X-Forwarded-For": "x"}}),
+        ):
+            with self.subTest(method=method, path_qs=path_qs, options=options):
+                with self.assertRaises(WorkerClientError):
+                    client.native_envelope(method, path_qs, body, **options)
+
+    def test_profile_snapshot_is_exact_cursor_bound_and_supports_unchanged(self):
+        from cloud_run.worker_client import (
+            WorkerClient,
+            WorkerTransportResponse,
+        )
+
+        payload = {
+            "profile_id": "desktop-profile",
+            "revision": 2,
+            "base_revision": 1,
+            "bootstrap_digest": "b" * 64,
+            "archive_size_bytes": 123,
+            "archive_sha256": "a" * 64,
+            "archive_artifact_id": "profile-" + "a" * 64,
+            "artifacts": [
+                {
+                    "path": "bootstrap/current.json",
+                    "kind": "bootstrap_workflow",
+                    "size_bytes": 2,
+                    "sha256": "c" * 64,
+                }
+            ],
+        }
+
+        class Transport:
+            def __init__(self):
+                self.requests = []
+
+            async def request(self, request, *, max_bytes):
+                self.requests.append(request)
+                if len(self.requests) == 1:
+                    return WorkerTransportResponse(
+                        status=200,
+                        headers={"Content-Type": "application/json"},
+                        body=json.dumps(payload).encode("utf-8"),
+                    )
+                return WorkerTransportResponse(
+                    status=204,
+                    headers={},
+                    body=b"",
+                )
+
+        transport = Transport()
+        client = WorkerClient(
+            base_url="http://8.8.8.8:30000",
+            provider_token="a" * 64,
+            session_id="session-1",
+            session_secret=b"s" * 32,
+            transport=transport,
+            clock=lambda: 1000,
+            nonce=lambda: "profile-snapshot",
+        )
+
+        changed = asyncio.run(client.profile_snapshot(1))
+        unchanged = asyncio.run(client.profile_snapshot(2))
+
+        self.assertEqual(changed, payload)
+        self.assertIsNone(unchanged)
+        self.assertTrue(
+            transport.requests[0].url.endswith(
+                "/worker/v1/profile?after_revision=1"
+            )
+        )
+
+    def test_profile_archive_download_uses_the_scoped_signed_route(self):
+        from cloud_run.worker_client import (
+            WorkerClient,
+            WorkerTransportResponse,
+        )
+
+        content = b"profile-archive"
+
+        class Transport:
+            def __init__(self):
+                self.request_seen = None
+
+            async def request(self, request, *, max_bytes):
+                return WorkerTransportResponse(500, {}, b"")
+
+            async def stream(
+                self,
+                request,
+                *,
+                on_headers,
+                on_chunk,
+                max_bytes,
+            ):
+                self.request_seen = request
+                on_headers(
+                    206,
+                    {
+                        "Content-Range": "bytes 0-14/15",
+                        "Content-Length": "15",
+                        "Content-Type": "application/gzip",
+                        "ETag": '"' + hashlib.sha256(content).hexdigest() + '"',
+                    },
+                )
+                on_chunk(content)
+                return len(content)
+
+        transport = Transport()
+        client = WorkerClient(
+            base_url="http://8.8.8.8:30000",
+            provider_token="a" * 64,
+            session_id="session-1",
+            session_secret=b"s" * 32,
+            transport=transport,
+            clock=lambda: 1000,
+            nonce=lambda: "profile-download",
+        )
+        chunks = []
+        artifact_id = "profile-" + hashlib.sha256(content).hexdigest()
+
+        result = asyncio.run(
+            client.download_profile_artifact(
+                artifact_id,
+                start=0,
+                on_chunk=chunks.append,
+            )
+        )
+
+        self.assertEqual(b"".join(chunks), content)
+        self.assertEqual(result.artifact_id, artifact_id)
+        self.assertIn(
+            "/worker/v1/profile/artifacts/" + artifact_id,
+            transport.request_seen.url,
+        )
+
+    def test_native_websocket_uses_only_the_private_signed_request(self):
+        from cloud_run.worker_client import WorkerClient
+
+        sentinel = object()
+
+        class Transport:
+            def __init__(self):
+                self.calls = []
+
+            async def request(self, request, *, max_bytes):
+                raise AssertionError("HTTP transport was not expected")
+
+            async def websocket(self, request, *, max_bytes):
+                self.calls.append((request, max_bytes))
+                return sentinel
+
+        transport = Transport()
+        client = WorkerClient(
+            base_url="http://8.8.8.8:30000",
+            provider_token="a" * 64,
+            session_id="session-1",
+            session_secret=b"s" * 32,
+            transport=transport,
+            clock=lambda: 1000,
+            nonce=lambda: "native-ws-1",
+        )
+        request = client.native_envelope(
+            "GET",
+            "/ws?clientId=desktop-client-1",
+            b"",
+        )
+
+        result = asyncio.run(client.native_websocket(request))
+
+        self.assertIs(result, sentinel)
+        self.assertEqual(transport.calls[0][0], request)
+        self.assertGreater(transport.calls[0][1], 0)
+
+    def test_snapshot_accepts_migrated_schema_one_job_timestamps(self):
+        from cloud_run.worker_client import (
+            WorkerClient,
+            WorkerTransportResponse,
+        )
+
+        payload = {
+            "job_id": "job-1",
+            "state": "succeeded",
+            "prompt_id": "11111111-1111-4111-8111-111111111111",
+            "events": [
+                {
+                    "sequence": 1,
+                    "type": "execution_success",
+                    "data": {"timestamp": 10.0},
+                    "created_at": 10.0,
+                }
+            ],
+            "last_sequence": 1,
+            "outputs": [],
+            "error": None,
+            "created_at": 20.0,
+            "updated_at": 20.0,
+        }
+
+        class Transport:
+            async def request(self, request, *, max_bytes):
+                return WorkerTransportResponse(
+                    status=200,
+                    headers={"Content-Type": "application/json"},
+                    body=json.dumps(payload).encode("utf-8"),
+                )
+
+        client = WorkerClient(
+            base_url="http://8.8.8.8:30000",
+            provider_token="a" * 64,
+            session_id="session-1",
+            session_secret=b"s" * 32,
+            transport=Transport(),
+            clock=lambda: 1000,
+            nonce=lambda: "snapshot-legacy-1",
+        )
+
+        snapshot = asyncio.run(client.snapshot("job-1", 0))
+
+        self.assertEqual(snapshot["last_sequence"], 1)
+        self.assertEqual(snapshot["events"][0]["created_at"], 10.0)
+
+    def test_snapshot_is_exact_validated_and_bound_to_its_cursor(self):
+        from cloud_run.worker_client import (
+            WorkerClient,
+            WorkerClientError,
+            WorkerTransportResponse,
+        )
+
+        valid = {
+            "job_id": "job-1",
+            "state": "succeeded",
+            "prompt_id": "11111111-1111-4111-8111-111111111111",
+            "events": [
+                {
+                    "sequence": 94,
+                    "type": "execution_success",
+                    "data": {"timestamp": 158.0},
+                    "created_at": 158.0,
+                }
+            ],
+            "last_sequence": 94,
+            "outputs": [],
+            "error": None,
+            "created_at": 1.0,
+            "updated_at": 158.0,
+        }
+
+        class SnapshotTransport:
+            def __init__(self, payload):
+                self.payload = payload
+                self.requests = []
+
+            async def request(self, request, *, max_bytes):
+                self.requests.append(request)
+                return WorkerTransportResponse(
+                    status=200,
+                    headers={"Content-Type": "application/json"},
+                    body=json.dumps(
+                        self.payload,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ).encode("utf-8"),
+                )
+
+        def client(payload):
+            transport = SnapshotTransport(payload)
+            return (
+                WorkerClient(
+                    base_url="http://8.8.8.8:30000",
+                    provider_token="a" * 64,
+                    session_id="session-1",
+                    session_secret=b"s" * 32,
+                    transport=transport,
+                    clock=lambda: 1000,
+                    nonce=lambda: "snapshot-1",
+                ),
+                transport,
+            )
+
+        worker, transport = client(valid)
+        snapshot = asyncio.run(worker.snapshot("job-1", 93))
+
+        self.assertEqual(snapshot, valid)
+        self.assertIsNot(snapshot, valid)
+        self.assertEqual(
+            transport.requests[0].url,
+            (
+                "http://8.8.8.8:30000/worker/v1/jobs/job-1/"
+                "snapshot?after_sequence=93"
+            ),
+        )
+
+        invalid_payloads = []
+        invalid_payloads.append({**valid, "extra": True})
+        invalid_payloads.append(
+            {key: value for key, value in valid.items() if key != "error"}
+        )
+        invalid_payloads.append({**valid, "job_id": "job-2"})
+        invalid_payloads.append({**valid, "state": "complete"})
+        invalid_payloads.append(
+            {
+                **valid,
+                "events": [{**valid["events"][0], "sequence": 95}],
+            }
+        )
+        invalid_payloads.append({**valid, "last_sequence": 93})
+        invalid_payloads.append(
+            {
+                **valid,
+                "outputs": [{"artifact_id": "output-1"}],
+            }
+        )
+        invalid_payloads.append({**valid, "error": "private error"})
+        invalid_payloads.append({**valid, "created_at": 200.0})
+        invalid_payloads.append({**valid, "updated_at": float("inf")})
+
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload):
+                invalid, _transport = client(payload)
+                with self.assertRaises(WorkerClientError):
+                    asyncio.run(invalid.snapshot("job-1", 93))
+
+    def test_boundary_401_is_typed_and_never_echoes_response(self):
+        from cloud_run.worker_client import (
+            WorkerBoundaryAuthenticationError,
+            WorkerClient,
+            WorkerTransportResponse,
+        )
+
+        private_marker = "private-boundary-response-marker"
+
+        class RejectingTransport:
+            requests = []
+
+            async def request(self, request, *, max_bytes):
+                self.requests.append(request)
+                return WorkerTransportResponse(
+                    status=401,
+                    headers={
+                        "Content-Type": "text/html",
+                        "Content-Encoding": "gzip",
+                        "X-Private-Marker": private_marker,
+                    },
+                    body=private_marker.encode("utf-8") + b"\xffnot-json",
+                )
+
+        transport = RejectingTransport()
+        client = WorkerClient(
+            base_url="http://8.8.8.8:30000",
+            provider_token="a" * 64,
+            session_id="session-1",
+            session_secret=b"s" * 32,
+            transport=transport,
+            clock=lambda: 1000,
+            nonce=lambda: "n-1",
+        )
+
+        with self.assertRaises(
+            WorkerBoundaryAuthenticationError
+        ) as raised:
+            asyncio.run(client.health())
+
+        self.assertIs(
+            type(raised.exception),
+            WorkerBoundaryAuthenticationError,
+        )
+        self.assertEqual(
+            str(raised.exception),
+            "Remote worker boundary authentication failed.",
+        )
+        self.assertNotIn(private_marker, str(raised.exception))
+        self.assertNotIn(private_marker, repr(raised.exception))
+        self.assertNotIn("a" * 64, str(raised.exception))
+        self.assertNotIn("a" * 64, repr(raised.exception))
+        self.assertEqual(len(transport.requests), 1)
+
+    def test_client_rejects_invalid_boundary_tokens_before_transport(self):
+        from cloud_run.worker_client import WorkerClient, WorkerClientError
+
+        class Transport:
+            requests = []
+
+            async def request(self, request, *, max_bytes):
+                self.requests.append(request)
+
+        for value in (
+            "a" * 63,
+            "a" * 65,
+            "A" * 64,
+            " " + "a" * 63,
+            "a" * 63 + "!",
+            b"a" * 64,
+            None,
+        ):
+            with self.subTest(provider_token=value):
+                transport = Transport()
+                with self.assertRaises(WorkerClientError):
+                    WorkerClient(
+                        base_url="http://8.8.8.8:30000",
+                        provider_token=value,
+                        session_id="session-1",
+                        session_secret=b"s" * 32,
+                        transport=transport,
+                    )
+                self.assertEqual(transport.requests, [])
+
     def test_client_claims_through_vast_bearer_then_uses_hmac(self):
         from cloud_run.worker_client import WorkerClient
 
         transport = RecordingTransport()
         client = WorkerClient(
             base_url="http://8.8.8.8:30000",
-            provider_token="vast-boundary-token",
+            provider_token="a" * 64,
             session_id="session-1",
             session_secret=b"s" * 32,
             transport=transport,
@@ -61,7 +590,7 @@ class WorkerClientTests(unittest.TestCase):
         self.assertTrue(health["claimed"])
         self.assertEqual(
             transport.requests[0].headers["Authorization"],
-            "Bearer vast-boundary-token",
+            "Bearer " + "a" * 64,
         )
         self.assertNotIn(
             "X-Cloud-Run-Signature",
@@ -69,7 +598,7 @@ class WorkerClientTests(unittest.TestCase):
         )
         self.assertEqual(
             transport.requests[1].headers["Authorization"],
-            "Bearer vast-boundary-token",
+            "Bearer " + "a" * 64,
         )
         self.assertIn(
             "X-Cloud-Run-Signature",
@@ -101,7 +630,7 @@ class WorkerClientTests(unittest.TestCase):
         )
         self.assertEqual(
             client.public_payload(),
-            {"session_id": "session-1", "protocol_version": "1"},
+            {"session_id": "session-1", "protocol_version": "2"},
         )
         exposed = repr(
             [
@@ -109,7 +638,7 @@ class WorkerClientTests(unittest.TestCase):
                 transport.requests,
             ]
         )
-        self.assertNotIn("vast-boundary-token", exposed)
+        self.assertNotIn("a" * 64, exposed)
         self.assertNotIn((b"s" * 32).hex(), exposed)
         self.assertNotIn("8.8.8.8", repr(client.public_payload()))
 
@@ -129,7 +658,7 @@ class WorkerClientTests(unittest.TestCase):
                 with self.assertRaises(WorkerClientError):
                     WorkerClient(
                         base_url=url,
-                        provider_token="provider-token",
+                        provider_token="a" * 64,
                         session_id="session-1",
                         session_secret=b"s" * 32,
                         transport=RecordingTransport(),
@@ -166,7 +695,7 @@ class WorkerClientTests(unittest.TestCase):
             transport = RefusingTransport(response)
             client = WorkerClient(
                 base_url="http://8.8.8.8:30000",
-                provider_token="provider-token",
+                provider_token="a" * 64,
                 session_id="session-1",
                 session_secret=b"s" * 32,
                 transport=transport,
@@ -177,7 +706,7 @@ class WorkerClientTests(unittest.TestCase):
                 asyncio.run(client.health())
             self.assertEqual(len(transport.requests), 1)
             self.assertNotIn("127.0.0.1", str(raised.exception))
-            self.assertNotIn("provider-token", str(raised.exception))
+            self.assertNotIn("a" * 64, str(raised.exception))
 
     def test_download_binds_resume_offset_into_the_signed_request(self):
         from cloud_run.worker_client import (
@@ -226,7 +755,7 @@ class WorkerClientTests(unittest.TestCase):
         transport = StreamingTransport()
         client = WorkerClient(
             base_url="http://8.8.8.8:30000",
-            provider_token="provider-token",
+            provider_token="a" * 64,
             session_id="session-1",
             session_secret=b"s" * 32,
             transport=transport,
@@ -276,7 +805,7 @@ class WorkerClientTests(unittest.TestCase):
 
         client = WorkerClient(
             base_url="http://8.8.8.8:30000",
-            provider_token="provider-token",
+            provider_token="a" * 64,
             session_id="session-1",
             session_secret=b"s" * 32,
             transport=RecordingTransport(),
@@ -334,7 +863,7 @@ class WorkerClientTests(unittest.TestCase):
             transport = UploadTransport()
             client = WorkerClient(
                 base_url="http://8.8.8.8:30000",
-                provider_token="provider-token",
+                provider_token="a" * 64,
                 session_id="session-1",
                 session_secret=b"s" * 32,
                 transport=transport,
@@ -436,7 +965,7 @@ class WorkerClientTests(unittest.TestCase):
         transport = StatusTransport()
         client = WorkerClient(
             base_url="http://8.8.8.8:30000",
-            provider_token="provider-token",
+            provider_token="a" * 64,
             session_id="session-1",
             session_secret=b"s" * 32,
             transport=transport,

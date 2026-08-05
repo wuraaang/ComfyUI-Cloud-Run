@@ -2,14 +2,26 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
+import hashlib
+import json
 import math
 import re
 import time
 import uuid
 
-from .constants import MAX_SESSION_DISK_GB, MIN_SESSION_DISK_GB
+from .constants import (
+    MAX_SESSION_DISK_GB,
+    MIN_SESSION_DISK_GB,
+    VAST_CREATE_FAILURE_CODES,
+)
+from .run_errors import RunErrorCode
+from .worker_protocol import (
+    PROTOCOL_VERSION,
+    canonical_native_prompt_body,
+    is_boundary_token,
+)
 
 
 class SessionState(str, Enum):
@@ -17,6 +29,7 @@ class SessionState(str, Enum):
     OFFER_SELECTED = "offer_selected"
     CONFIRMING = "confirming"
     CREATING = "creating"
+    RECONCILING_CREATE = "reconciling_create"
     BOOTSTRAPPING = "bootstrapping"
     PROVISIONING = "provisioning"
     VALIDATING = "validating"
@@ -36,6 +49,22 @@ class JobState(str, Enum):
     QUEUED = "queued"
     RUNNING = "running"
     HARVESTING = "harvesting"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
+class ExecutionState(str, Enum):
+    PENDING = "pending"
+    QUEUED = "queued"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    INTERRUPTED = "interrupted"
+
+
+class HarvestState(str, Enum):
+    PENDING = "pending"
+    RUNNING = "running"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
 
@@ -76,7 +105,7 @@ LEGACY_SESSION_STATES = {
     "starting": SessionState.BOOTSTRAPPING,
     "cancel_requested": SessionState.DESTROY_REQUESTED,
     "destroying": SessionState.DESTROYING,
-    "retrying": SessionState.CREATING,
+    "retrying": SessionState.FAILED,
     "ready": SessionState.READY,
     "cancelled": SessionState.DESTROYED,
     "failed": SessionState.FAILED,
@@ -96,13 +125,21 @@ SESSION_TRANSITIONS = {
         SessionState.FAILED,
     },
     SessionState.CONFIRMING: {
+        SessionState.OFFER_SELECTED,
         SessionState.CREATING,
         SessionState.DESTROY_REQUESTED,
         SessionState.FAILED,
     },
     SessionState.CREATING: {
+        SessionState.RECONCILING_CREATE,
         SessionState.BOOTSTRAPPING,
         SessionState.DESTROY_REQUESTED,
+        SessionState.FAILED,
+    },
+    SessionState.RECONCILING_CREATE: {
+        SessionState.BOOTSTRAPPING,
+        SessionState.DESTROY_REQUESTED,
+        SessionState.DESTROYING,
         SessionState.FAILED,
     },
     SessionState.BOOTSTRAPPING: {
@@ -152,14 +189,12 @@ SESSION_TRANSITIONS = {
     },
     SessionState.DESTROYING: {
         SessionState.DESTROYED,
-        SessionState.CREATING,
         SessionState.FAILED,
     },
     SessionState.FAILED: {
         SessionState.REPAIRING,
         SessionState.DESTROY_REQUESTED,
         SessionState.DESTROYING,
-        SessionState.CREATING,
     },
     SessionState.DESTROYED: set(),
 }
@@ -213,10 +248,8 @@ _TRANSITIONS = {
     AttemptState.DESTROYING: {
         AttemptState.CANCELLED,
         AttemptState.FAILED,
-        AttemptState.RETRYING,
     },
     AttemptState.RETRYING: {
-        AttemptState.CREATING,
         AttemptState.CANCEL_REQUESTED,
         AttemptState.FAILED,
     },
@@ -225,7 +258,6 @@ _TRANSITIONS = {
         AttemptState.FAILED,
     },
     AttemptState.FAILED: {
-        AttemptState.RETRYING,
         AttemptState.DESTROYING,
         AttemptState.CANCELLED,
     },
@@ -248,6 +280,191 @@ _LEGACY_QUOTE_KEYS = {
 _UNBOUND_TEMPLATE_HASH = "0" * 32
 _UNBOUND_WORKER_COMMIT = "0" * 40
 _UNBOUND_SHA256 = "0" * 64
+_NODE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}")
+_CONFIGURATION_REVISION = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
+)
+_READINESS_LABELS = frozenset({"cold", "prepositioned", "warm"})
+_OFFER_REASON_CODES = frozenset({
+    "workflow_requirements",
+    "price_cap",
+    "source_ready",
+    "quality_metrics",
+    "vram",
+    "disk",
+    "price",
+    "reliability",
+    "source_readiness",
+    "missing_metrics",
+    "blacklisted",
+    "suspicious_price",
+})
+
+
+def _valid_node_id_tuple(value):
+    return (
+        isinstance(value, tuple)
+        and all(
+            isinstance(node_id, str)
+            and _NODE_ID.fullmatch(node_id) is not None
+            for node_id in value
+        )
+        and tuple(sorted(value)) == value
+        and len(set(value)) == len(value)
+    )
+
+
+def _canonical_uuid(value):
+    if not isinstance(value, str):
+        return False
+    try:
+        return str(uuid.UUID(value)) == value
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
+@dataclass(frozen=True)
+class ReadinessEstimate:
+    label: str
+    cached_bytes: int
+    remaining_bytes: int
+    assumed_mbps: float
+    estimated_seconds: int
+    source_ready: bool
+    ten_minute_eligible: bool
+    digest: str
+
+    def __post_init__(self):
+        if (
+            self.label not in _READINESS_LABELS
+            or type(self.cached_bytes) is not int
+            or self.cached_bytes < 0
+            or type(self.remaining_bytes) is not int
+            or self.remaining_bytes < 0
+            or isinstance(self.assumed_mbps, bool)
+            or not isinstance(self.assumed_mbps, (int, float))
+            or not math.isfinite(self.assumed_mbps)
+            or self.assumed_mbps <= 0
+            or type(self.estimated_seconds) is not int
+            or self.estimated_seconds < 0
+            or type(self.source_ready) is not bool
+            or type(self.ten_minute_eligible) is not bool
+            or not isinstance(self.digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", self.digest) is None
+        ):
+            raise ValueError("Invalid readiness estimate.")
+        if (
+            (self.label == "warm") != (self.remaining_bytes == 0)
+            or (
+                self.label == "prepositioned"
+                and (self.cached_bytes == 0 or self.remaining_bytes == 0)
+            )
+            or (
+                self.label == "cold"
+                and (self.cached_bytes != 0 or self.remaining_bytes == 0)
+            )
+            or self.ten_minute_eligible
+            != (self.source_ready and self.estimated_seconds <= 600)
+        ):
+            raise ValueError("Invalid readiness estimate.")
+        payload = {
+            "assumed_mbps": float(self.assumed_mbps),
+            "cached_bytes": self.cached_bytes,
+            "estimated_seconds": self.estimated_seconds,
+            "label": self.label,
+            "remaining_bytes": self.remaining_bytes,
+            "source_ready": self.source_ready,
+            "ten_minute_eligible": self.ten_minute_eligible,
+        }
+        calculated = hashlib.sha256(
+            json.dumps(
+                payload,
+                ensure_ascii=True,
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        if calculated != self.digest:
+            raise ValueError("Invalid readiness estimate.")
+
+    def public_payload(self):
+        return {
+            "label": self.label,
+            "cached_bytes": self.cached_bytes,
+            "remaining_bytes": self.remaining_bytes,
+            "assumed_mbps": float(self.assumed_mbps),
+            "estimated_seconds": self.estimated_seconds,
+            "source_ready": self.source_ready,
+            "ten_minute_eligible": self.ten_minute_eligible,
+            "digest": self.digest,
+        }
+
+    @classmethod
+    def from_payload(cls, payload):
+        if not isinstance(payload, dict) or set(payload) != {
+            "label",
+            "cached_bytes",
+            "remaining_bytes",
+            "assumed_mbps",
+            "estimated_seconds",
+            "source_ready",
+            "ten_minute_eligible",
+            "digest",
+        }:
+            raise ValueError("Invalid readiness estimate.")
+        try:
+            return cls(**payload)
+        except (TypeError, ValueError):
+            raise ValueError("Invalid readiness estimate.") from None
+
+
+@dataclass(frozen=True)
+class OfferDecision:
+    offer: dict | None
+    included: bool
+    score: tuple
+    reasons: tuple[str, ...]
+    estimate: ReadinessEstimate | None
+
+    def __post_init__(self):
+        if (
+            (self.offer is not None and not isinstance(self.offer, dict))
+            or type(self.included) is not bool
+            or not isinstance(self.score, tuple)
+            or not isinstance(self.reasons, tuple)
+            or not self.reasons
+            or any(reason not in _OFFER_REASON_CODES for reason in self.reasons)
+            or (
+                self.estimate is not None
+                and not isinstance(self.estimate, ReadinessEstimate)
+            )
+        ):
+            raise ValueError("Invalid offer decision.")
+        if self.offer is not None:
+            object.__setattr__(self, "offer", dict(self.offer))
+
+    @property
+    def included_reasons(self):
+        return self.reasons if self.included else ()
+
+    @property
+    def excluded_reasons(self):
+        return () if self.included else self.reasons
+
+    def public_payload(self):
+        payload = dict(self.offer or {})
+        payload.update({
+            "included": self.included,
+            "included_reasons": list(self.included_reasons),
+            "excluded_reasons": list(self.excluded_reasons),
+            "readiness": (
+                self.estimate.public_payload()
+                if self.estimate is not None
+                else None
+            ),
+        })
+        return payload
 
 
 @dataclass(frozen=True)
@@ -272,12 +489,16 @@ class OfferQuote:
     worker_archive_sha256: str
     protocol_version: str
     manifest_digest: str
-    machine_id: str | None = None
-    host_id: str | None = None
-    public_ipaddr: str | None = None
+    execution_baseline_digest: str = _UNBOUND_SHA256
+    randomized_seed_node_ids: tuple[str, ...] = ()
+    machine_id: str | None = field(default=None, repr=False)
+    host_id: str | None = field(default=None, repr=False)
+    public_ipaddr: str | None = field(default=None, repr=False)
     max_instance_creates: int = 1
     inet_down_mbps: float | None = None
     disk_bw_mbps: float | None = None
+    dlperf: float | None = None
+    readiness_estimate: ReadinessEstimate | None = None
 
     def __post_init__(self):
         finite_numbers = (
@@ -319,8 +540,15 @@ class OfferQuote:
                 r"[0-9a-f]{64}",
                 self.worker_archive_sha256,
             )
-            or self.protocol_version != "1"
+            or self.protocol_version != PROTOCOL_VERSION
             or not re.fullmatch(r"[0-9a-f]{64}", self.manifest_digest)
+            or not isinstance(self.execution_baseline_digest, str)
+            or re.fullmatch(
+                r"[0-9a-f]{64}",
+                self.execution_baseline_digest,
+            )
+            is None
+            or not _valid_node_id_tuple(self.randomized_seed_node_ids)
             or type(self.max_instance_creates) is not int
             or self.max_instance_creates not in {1, 2}
         ):
@@ -340,7 +568,7 @@ class OfferQuote:
                 or cost < 0
             ):
                 raise ValueError("Invalid paid offer quote.")
-        for metric in (self.inet_down_mbps, self.disk_bw_mbps):
+        for metric in (self.inet_down_mbps, self.disk_bw_mbps, self.dlperf):
             if metric is not None and (
                 isinstance(metric, bool)
                 or not isinstance(metric, (int, float))
@@ -348,6 +576,18 @@ class OfferQuote:
                 or metric < 0
             ):
                 raise ValueError("Invalid paid offer quote.")
+        if (
+            self.readiness_estimate is not None
+            and not isinstance(self.readiness_estimate, ReadinessEstimate)
+        ):
+            raise ValueError("Invalid paid offer quote.")
+        if (
+            self.readiness_estimate is not None
+            and self.readiness_estimate.cached_bytes
+            + self.readiness_estimate.remaining_bytes
+            != self.transfer_bytes
+        ):
+            raise ValueError("Invalid paid offer quote.")
         if self.deadline_mode == "finite":
             if (
                 isinstance(self.duration_seconds, bool)
@@ -409,14 +649,37 @@ class OfferQuote:
                 "template_hash_id": _UNBOUND_TEMPLATE_HASH,
                 "worker_commit": _UNBOUND_WORKER_COMMIT,
                 "worker_archive_sha256": _UNBOUND_SHA256,
-                "protocol_version": "1",
+                "protocol_version": PROTOCOL_VERSION,
                 "manifest_digest": _UNBOUND_SHA256,
+                "execution_baseline_digest": _UNBOUND_SHA256,
+                "randomized_seed_node_ids": (),
                 "max_instance_creates": 1,
                 "inet_down_mbps": None,
                 "disk_bw_mbps": None,
+                "dlperf": None,
+                "readiness_estimate": None,
             }
+        values = dict(payload)
+        values.setdefault(
+            "execution_baseline_digest",
+            _UNBOUND_SHA256,
+        )
+        node_ids = values.get("randomized_seed_node_ids", ())
+        if not isinstance(node_ids, (list, tuple)):
+            raise ValueError("Invalid paid offer quote.")
+        values["randomized_seed_node_ids"] = tuple(node_ids)
+        estimate = values.get("readiness_estimate")
+        if estimate is not None and not isinstance(
+            estimate,
+            ReadinessEstimate,
+        ):
+            values["readiness_estimate"] = ReadinessEstimate.from_payload(
+                estimate
+            )
+        else:
+            values.setdefault("readiness_estimate", None)
         try:
-            return cls(**payload)
+            return cls(**values)
         except (TypeError, ValueError):
             raise ValueError("Invalid paid offer quote.") from None
 
@@ -441,6 +704,7 @@ class OfferQuote:
                 self.inet_down_mbps if reviewed else None
             ),
             "disk_bw_mbps": self.disk_bw_mbps if reviewed else None,
+            "dlperf": self.dlperf if reviewed else None,
             "max_price_per_hour": self.max_price_per_hour,
             "expires_at": self.expires_at,
             "disk_gb": self.disk_gb if reviewed else None,
@@ -467,6 +731,16 @@ class OfferQuote:
             "max_instance_creates": (
                 self.max_instance_creates if reviewed else None
             ),
+            "readiness": (
+                self.readiness_estimate.public_payload()
+                if reviewed and self.readiness_estimate is not None
+                else None
+            ),
+            "estimate_digest": (
+                self.readiness_estimate.digest
+                if reviewed and self.readiness_estimate is not None
+                else None
+            ),
         }
 
 
@@ -481,8 +755,8 @@ class CloudSession:
     installed_manifest_digest: str | None
     instance_id: str | None
     worker_base_url: str | None
-    provider_token: str | None
-    session_secret_hex: str | None
+    provider_token: str | None = field(repr=False)
+    session_secret_hex: str | None = field(repr=False)
     deadline_at: float | None
     deadline_mode: str
     disk_gb: int
@@ -496,6 +770,23 @@ class CloudSession:
     pending_deadline_at: float | None = None
     pending_deadline_mode: str | None = None
     pending_deadline_action: str | None = None
+    failure_code: str | None = None
+    create_reconcile_started_at: float | None = field(
+        default=None,
+        repr=False,
+    )
+    create_empty_observations: int = field(default=0, repr=False)
+    create_first_empty_at: float | None = field(default=None, repr=False)
+    create_last_empty_at: float | None = field(default=None, repr=False)
+    create_settings_revision: str | None = field(default=None, repr=False)
+    create_configuration_revision: str | None = field(
+        default=None,
+        repr=False,
+    )
+    remediation_verified_at: float | None = field(default=None, repr=False)
+    remediation_revision: str | None = field(default=None, repr=False)
+    execution_baseline_digest: str = _UNBOUND_SHA256
+    randomized_seed_node_ids: tuple[str, ...] = ()
 
     @classmethod
     def new(
@@ -510,6 +801,8 @@ class CloudSession:
         disk_gb=80,
         now=None,
         state=SessionState.PREFLIGHT,
+        execution_baseline_digest=None,
+        randomized_seed_node_ids=None,
     ):
         key = str(idempotency_key or "").strip()
         if not key or len(key) > 200:
@@ -517,6 +810,26 @@ class CloudSession:
         identifier = str(session_id or uuid.uuid4())
         safe_identifier = re.sub(r"[^A-Za-z0-9-]", "-", identifier)[:48]
         timestamp = float(time.time() if now is None else now)
+        baseline_digest = (
+            quote.execution_baseline_digest
+            if execution_baseline_digest is None
+            and isinstance(quote, OfferQuote)
+            else (
+                _UNBOUND_SHA256
+                if execution_baseline_digest is None
+                else execution_baseline_digest
+            )
+        )
+        seed_node_ids = (
+            quote.randomized_seed_node_ids
+            if randomized_seed_node_ids is None
+            and isinstance(quote, OfferQuote)
+            else (
+                ()
+                if randomized_seed_node_ids is None
+                else tuple(randomized_seed_node_ids)
+            )
+        )
         if quote is not None:
             expected_deadline = (
                 timestamp + quote.duration_seconds
@@ -529,6 +842,8 @@ class CloudSession:
                 or quote.manifest_digest != manifest_digest
                 or quote.disk_gb != disk_gb
                 or quote.deadline_mode != deadline_mode
+                or quote.execution_baseline_digest != baseline_digest
+                or quote.randomized_seed_node_ids != seed_node_ids
                 or (
                     expected_deadline is None
                     and deadline_at is not None
@@ -572,6 +887,8 @@ class CloudSession:
             created_at=timestamp,
             updated_at=timestamp,
             version=1,
+            execution_baseline_digest=baseline_digest,
+            randomized_seed_node_ids=seed_node_ids,
         )
         session._validate()
         return session
@@ -638,11 +955,129 @@ class CloudSession:
         ):
             if digest is not None and not re.fullmatch(r"[0-9a-f]{64}", digest):
                 raise ValueError(f"Invalid {name}.")
+        if (
+            self.provider_token is not None
+            and not is_boundary_token(self.provider_token)
+        ):
+            raise ValueError("Invalid provider token.")
         if self.session_secret_hex is not None and not re.fullmatch(
             r"[0-9a-f]{64}",
             self.session_secret_hex,
         ):
             raise ValueError("Invalid session secret.")
+        if (
+            self.failure_code is not None
+            and self.failure_code not in VAST_CREATE_FAILURE_CODES
+        ):
+            raise ValueError("Invalid Vast create failure code.")
+        if self.create_settings_revision is not None and not _canonical_uuid(
+            self.create_settings_revision
+        ):
+            raise ValueError("Invalid API-key settings revision.")
+        if (
+            self.create_configuration_revision is not None
+            and (
+                not isinstance(self.create_configuration_revision, str)
+                or _CONFIGURATION_REVISION.fullmatch(
+                    self.create_configuration_revision
+                )
+                is None
+            )
+        ):
+            raise ValueError("Invalid create-configuration revision.")
+        if (
+            not isinstance(self.execution_baseline_digest, str)
+            or re.fullmatch(
+                r"[0-9a-f]{64}",
+                self.execution_baseline_digest,
+            )
+            is None
+            or not _valid_node_id_tuple(self.randomized_seed_node_ids)
+        ):
+            raise ValueError("Invalid certified execution baseline.")
+        if self.quote is not None and (
+            self.quote.execution_baseline_digest
+            != self.execution_baseline_digest
+            or self.quote.randomized_seed_node_ids
+            != self.randomized_seed_node_ids
+        ):
+            raise ValueError(
+                "Session quote does not match its durable contract."
+            )
+
+        def valid_time(value):
+            return (
+                not isinstance(value, bool)
+                and isinstance(value, (int, float))
+                and math.isfinite(value)
+                and value >= 0
+            )
+
+        if (
+            self.create_reconcile_started_at is not None
+            and not valid_time(self.create_reconcile_started_at)
+        ):
+            raise ValueError("Invalid create-reconciliation start time.")
+        if (
+            self.state == SessionState.RECONCILING_CREATE
+            and self.create_reconcile_started_at is None
+        ):
+            raise ValueError("Create reconciliation requires a start time.")
+        if (
+            type(self.create_empty_observations) is not int
+            or not 0 <= self.create_empty_observations <= 3
+        ):
+            raise ValueError("Invalid empty-inventory observation count.")
+        if self.create_empty_observations == 0:
+            if (
+                self.create_first_empty_at is not None
+                or self.create_last_empty_at is not None
+            ):
+                raise ValueError("Invalid empty-inventory evidence.")
+        elif (
+            not valid_time(self.create_first_empty_at)
+            or not valid_time(self.create_last_empty_at)
+            or self.create_first_empty_at > self.create_last_empty_at
+            or self.create_reconcile_started_at is None
+            or self.create_first_empty_at
+            < self.create_reconcile_started_at
+        ):
+            raise ValueError("Invalid empty-inventory evidence.")
+
+        remediation_values = (
+            self.remediation_verified_at,
+            self.remediation_revision,
+        )
+        if all(value is None for value in remediation_values):
+            pass
+        elif (
+            self.state != SessionState.FAILED
+            or not valid_time(self.remediation_verified_at)
+            or self.remediation_verified_at < self.created_at
+        ):
+            raise ValueError("Invalid remediation evidence.")
+        elif self.failure_code == "api_key_rejected":
+            if (
+                self.create_settings_revision is None
+                or not _canonical_uuid(self.remediation_revision)
+                or self.remediation_revision
+                == self.create_settings_revision
+            ):
+                raise ValueError("Invalid remediation evidence.")
+        elif self.failure_code == "configuration_rejected":
+            if (
+                self.create_configuration_revision is None
+                or not isinstance(self.remediation_revision, str)
+                or _CONFIGURATION_REVISION.fullmatch(
+                    self.remediation_revision
+                )
+                is None
+                or self.remediation_revision
+                == self.create_configuration_revision
+            ):
+                raise ValueError("Invalid remediation evidence.")
+        else:
+            raise ValueError("Invalid remediation evidence.")
 
     def transition(self, state, *, now=None, **changes):
         target = SessionState(state)
@@ -654,10 +1089,18 @@ class CloudSession:
                 f"Cannot transition from {self.state.value} to {target.value}."
             )
         allowed_changes = {
+            "create_configuration_revision",
+            "create_empty_observations",
+            "create_first_empty_at",
+            "create_last_empty_at",
+            "create_reconcile_started_at",
+            "create_settings_revision",
             "deadline_at",
             "deadline_mode",
             "destroy_requested",
             "disk_gb",
+            "execution_baseline_digest",
+            "failure_code",
             "installed_manifest_digest",
             "instance_id",
             "manifest_digest",
@@ -666,6 +1109,9 @@ class CloudSession:
             "pending_deadline_mode",
             "provider_token",
             "quote",
+            "randomized_seed_node_ids",
+            "remediation_revision",
+            "remediation_verified_at",
             "residual_inventory",
             "retry_count",
             "sanitized_error",
@@ -679,6 +1125,10 @@ class CloudSession:
             changes["residual_inventory"] = tuple(
                 str(item) for item in changes["residual_inventory"]
             )
+        if "randomized_seed_node_ids" in changes:
+            changes["randomized_seed_node_ids"] = tuple(
+                changes["randomized_seed_node_ids"]
+            )
         timestamp = float(time.time() if now is None else now)
         changed = replace(
             self,
@@ -688,6 +1138,163 @@ class CloudSession:
         )
         changed._validate()
         return changed
+
+    def record_create_empty_observation(self, *, now):
+        if self.state not in {
+            SessionState.RECONCILING_CREATE,
+            SessionState.DESTROY_REQUESTED,
+            SessionState.DESTROYING,
+        }:
+            raise InvalidStateTransition(
+                "Empty create evidence requires reconciliation."
+            )
+        if (
+            isinstance(now, bool)
+            or not isinstance(now, (int, float))
+            or not math.isfinite(now)
+            or now < 0
+            or self.create_reconcile_started_at is None
+            or now < self.create_reconcile_started_at
+            or (
+                self.create_last_empty_at is not None
+                and now < self.create_last_empty_at
+            )
+        ):
+            raise ValueError("Invalid empty-inventory observation time.")
+        timestamp = float(now)
+        return self.transition(
+            self.state,
+            now=timestamp,
+            create_empty_observations=min(
+                3,
+                self.create_empty_observations + 1,
+            ),
+            create_first_empty_at=(
+                timestamp
+                if self.create_first_empty_at is None
+                else self.create_first_empty_at
+            ),
+            create_last_empty_at=timestamp,
+        )
+
+    @property
+    def create_absence_verified(self):
+        return bool(
+            self.create_empty_observations >= 3
+            and self.create_reconcile_started_at is not None
+            and self.create_first_empty_at is not None
+            and self.create_last_empty_at is not None
+            and self.create_last_empty_at
+            >= self.create_reconcile_started_at
+            and self.create_last_empty_at
+            - self.create_first_empty_at
+            >= 120
+        )
+
+    @property
+    def rental_outcome(self):
+        if self.instance_id is not None or self.residual_inventory:
+            return "active"
+        post_start_evidence = bool(
+            self.destroy_requested
+            or self.installed_manifest_digest is not None
+            or self.worker_base_url is not None
+            or self.pending_deadline_at is not None
+            or self.pending_deadline_mode is not None
+            or self.pending_deadline_action is not None
+        )
+        unverified_create_evidence = bool(
+            post_start_evidence
+            or self.create_settings_revision is not None
+            or self.create_configuration_revision is not None
+            or self.create_reconcile_started_at is not None
+            or self.create_empty_observations
+            or self.create_first_empty_at is not None
+            or self.create_last_empty_at is not None
+            or self.retry_count
+        )
+        if self.state in {
+            SessionState.PREFLIGHT,
+            SessionState.OFFER_SELECTED,
+            SessionState.CONFIRMING,
+        }:
+            if (
+                self.provider_token is None
+                and self.session_secret_hex is None
+                and not unverified_create_evidence
+            ):
+                return "not_started"
+            return "unknown"
+        if self.state == SessionState.FAILED:
+            if (
+                self.provider_token is not None
+                or self.session_secret_hex is not None
+                or post_start_evidence
+            ):
+                return "unknown"
+            return "absent"
+        if self.state == SessionState.DESTROYED:
+            if (
+                self.provider_token is not None
+                or self.session_secret_hex is not None
+            ):
+                return "unknown"
+            return "absent"
+        if self.state in {
+            SessionState.BOOTSTRAPPING,
+            SessionState.PROVISIONING,
+            SessionState.VALIDATING,
+            SessionState.REPAIRING,
+            SessionState.READY,
+            SessionState.RUNNING,
+            SessionState.HARVESTING,
+        }:
+            return "unknown"
+        return "unknown"
+
+    @property
+    def billing_may_continue(self):
+        return self.rental_outcome in {"unknown", "active"}
+
+    @property
+    def blocks_new_rental(self):
+        return bool(
+            self.failure_code
+            in {"configuration_rejected", "api_key_rejected"}
+            and self.remediation_verified_at is None
+        )
+
+    @property
+    def can_search_offers(self):
+        if self.blocks_new_rental:
+            return False
+        if self.state in {
+            SessionState.PREFLIGHT,
+            SessionState.OFFER_SELECTED,
+        }:
+            return self.rental_outcome == "not_started"
+        return self.rental_outcome == "absent"
+
+    @property
+    def can_destroy(self):
+        return bool(
+            self.state
+            not in {
+                SessionState.DESTROY_REQUESTED,
+                SessionState.DESTROYING,
+                SessionState.DESTROYED,
+            }
+            and self.rental_outcome in {"unknown", "active"}
+        )
+
+    @property
+    def can_verify_vast_access(self):
+        return bool(
+            self.state == SessionState.FAILED
+            and self.rental_outcome == "absent"
+            and self.failure_code == "api_key_rejected"
+            and self.blocks_new_rental
+        )
 
     def public_payload(self):
         payload = {
@@ -707,28 +1314,22 @@ class CloudSession:
             "destroy_requested": self.destroy_requested,
             "residual_inventory": list(self.residual_inventory),
             "error": self.sanitized_error,
+            "failure_code": self.failure_code,
+            "rental_outcome": self.rental_outcome,
+            "can_search_offers": self.can_search_offers,
+            "can_destroy": self.can_destroy,
+            "can_verify_vast_access": self.can_verify_vast_access,
+            "billing_may_continue": self.billing_may_continue,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
-        residual = (
-            self.state
-            in {
-                SessionState.DESTROY_REQUESTED,
-                SessionState.DESTROYING,
-            }
-            or (
-                self.state == SessionState.FAILED
-                and bool(
-                    self.destroy_requested
-                    or self.instance_id
-                    or self.residual_inventory
-                )
-            )
+        emergency = (
+            self.state == SessionState.FAILED
+            and bool(self.instance_id or self.residual_inventory)
         )
-        payload["billing_may_continue"] = residual
         payload["emergency_action"] = (
             "Destroy the residual Vast instance in the Vast.ai console immediately."
-            if residual
+            if emergency
             else None
         )
         return payload
@@ -748,6 +1349,63 @@ class CloudJob:
     created_at: float
     updated_at: float
     version: int
+    execution_state: ExecutionState = ExecutionState.PENDING
+    harvest_state: HarvestState = HarvestState.PENDING
+    error_code: RunErrorCode | None = None
+    queue_position: int = 0
+    native_request_digest: str | None = None
+    native_body_json: str | None = field(default=None, repr=False)
+
+    def __post_init__(self):
+        object.__setattr__(
+            self,
+            "execution_state",
+            ExecutionState(self.execution_state),
+        )
+        object.__setattr__(
+            self,
+            "harvest_state",
+            HarvestState(self.harvest_state),
+        )
+        object.__setattr__(
+            self,
+            "error_code",
+            None if self.error_code is None else RunErrorCode(self.error_code),
+        )
+        if (
+            isinstance(self.queue_position, bool)
+            or not isinstance(self.queue_position, int)
+            or self.queue_position < 0
+        ):
+            raise ValueError("Invalid job queue position.")
+        native_values = (
+            self.native_request_digest,
+            self.native_body_json,
+        )
+        if (native_values[0] is None) != (native_values[1] is None):
+            raise ValueError("Invalid native prompt identity.")
+        if self.native_request_digest is not None:
+            if (
+                not isinstance(self.native_request_digest, str)
+                or re.fullmatch(r"[0-9a-f]{64}", self.native_request_digest)
+                is None
+                or not isinstance(self.native_body_json, str)
+            ):
+                raise ValueError("Invalid native prompt identity.")
+            try:
+                canonical = canonical_native_prompt_body(
+                    self.native_body_json.encode("utf-8")
+                ).decode("utf-8")
+                parsed = json.loads(canonical)
+            except (UnicodeError, ValueError):
+                raise ValueError("Invalid native prompt identity.") from None
+            if (
+                canonical != self.native_body_json
+                or not isinstance(parsed, dict)
+                or hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+                != self.native_request_digest
+            ):
+                raise ValueError("Invalid native prompt identity.")
 
     def transition(self, state, *, now=None, **changes):
         target = JobState(state)
@@ -755,9 +1413,24 @@ class CloudJob:
             raise InvalidStateTransition(
                 f"Cannot transition from {self.state.value} to {target.value}."
             )
-        unknown = set(changes) - {"remote_prompt_id", "sanitized_error"}
+        unknown = set(changes) - {
+            "manifest_digest",
+            "remote_prompt_id",
+            "sanitized_error",
+            "execution_state",
+            "harvest_state",
+            "error_code",
+        }
         if unknown:
             raise TypeError("Unsupported job fields: " + ", ".join(sorted(unknown)))
+        if "execution_state" in changes:
+            changes["execution_state"] = ExecutionState(
+                changes["execution_state"]
+            )
+        if "harvest_state" in changes:
+            changes["harvest_state"] = HarvestState(changes["harvest_state"])
+        if "error_code" in changes and changes["error_code"] is not None:
+            changes["error_code"] = RunErrorCode(changes["error_code"])
         timestamp = float(time.time() if now is None else now)
         return replace(self, state=target, updated_at=timestamp, **changes)
 
@@ -766,9 +1439,15 @@ class CloudJob:
             "job_id": self.job_id,
             "session_id": self.session_id,
             "status": self.state.value,
+            "execution_state": self.execution_state.value,
+            "harvest_state": self.harvest_state.value,
+            "error_code": (
+                self.error_code.value if self.error_code is not None else None
+            ),
             "error": self.sanitized_error,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            "queue_position": self.queue_position,
         }
 
 
@@ -780,8 +1459,9 @@ class CloudAttempt:
     state: AttemptState
     quote: OfferQuote
     instance_id: str | None = None
+    residual_inventory: tuple[str, ...] = ()
     ready_url: str | None = None
-    provider_token: str | None = None
+    provider_token: str | None = field(default=None, repr=False)
     retry_count: int = 0
     cancel_requested: bool = False
     sanitized_error: str | None = None
@@ -826,15 +1506,26 @@ class CloudAttempt:
             "provider_token",
             "quote",
             "ready_url",
+            "residual_inventory",
             "retry_count",
             "sanitized_error",
         }
         unknown = set(changes) - allowed_changes
         if unknown:
             raise TypeError("Unsupported attempt fields: " + ", ".join(sorted(unknown)))
+        provider_token = changes.get("provider_token", self.provider_token)
+        if (
+            provider_token is not None
+            and not is_boundary_token(provider_token)
+        ):
+            raise ValueError("Invalid provider token.")
         retry_count = int(changes.get("retry_count", self.retry_count))
         if retry_count not in (0, 1):
             raise ValueError("At most one automatic retry is allowed.")
+        if "residual_inventory" in changes:
+            changes["residual_inventory"] = tuple(
+                str(item) for item in changes["residual_inventory"]
+            )
         changes["retry_count"] = retry_count
         timestamp = float(time.time() if now is None else now)
         return replace(self, state=target, updated_at=timestamp, **changes)
@@ -845,6 +1536,7 @@ class CloudAttempt:
             "status": self.state.value,
             "offer": self.quote.public_payload(),
             "instance_id": self.instance_id,
+            "residual_inventory": list(self.residual_inventory),
             "ready_url": self.ready_url,
             "retry_count": self.retry_count,
             "cancel_requested": self.cancel_requested,
@@ -852,11 +1544,15 @@ class CloudAttempt:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
-        residual = self.state == AttemptState.FAILED and bool(self.instance_id)
+        residual_ids = self.residual_inventory or (
+            (str(self.instance_id),) if self.instance_id else ()
+        )
+        residual = self.state == AttemptState.FAILED and bool(residual_ids)
         payload["billing_may_continue"] = residual
         payload["emergency_action"] = (
-            "Destroy Vast instance "
-            + str(self.instance_id)
+            "Destroy residual Vast instance"
+            + ("s " if len(residual_ids) != 1 else " ")
+            + ", ".join(residual_ids)
             + " in the Vast.ai console immediately."
             if residual
             else None

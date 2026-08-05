@@ -16,6 +16,10 @@ from .manifest import PINNED_COMFYUI_FRONTEND_VERSION, PROTOCOL_VERSION
 
 MAX_CAPTURE_BYTES = 16 * 1024 * 1024
 PINNED_FRONTEND_VERSION = PINNED_COMFYUI_FRONTEND_VERSION
+BOUNDARY_TOKEN_ENVIRONMENT = "CLOUD_RUN_BOUNDARY_TOKEN"
+SESSION_ID_ENVIRONMENT = "CLOUD_RUN_SESSION_ID"
+_BOUNDARY_TOKEN = re.compile(r"[0-9a-f]{64}")
+_WORKER_SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}")
 ALLOWED_QUEUE_OPTIONS = {
     "front",
     "number",
@@ -23,14 +27,48 @@ ALLOWED_QUEUE_OPTIONS = {
     "preview_method",
 }
 FORBIDDEN_KEYS = {
+    "access_token",
     "auth_token_comfy_org",
     "api_key_comfy_org",
     "api_key",
     "authorization",
     "bearer",
+    "cookie",
+    "password",
+    "private_key",
+    "secret",
     "signed_url",
+    "token",
 }
 MAX_NESTING_DEPTH = 64
+_NATIVE_CLIENT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}")
+_NATIVE_PROMPT_FIELDS = {
+    "client_id",
+    "prompt",
+    "extra_data",
+    "front",
+    "number",
+    "partial_execution_targets",
+}
+_NATIVE_EXTRA_DATA_FIELDS = {
+    "comfy_usage_source",
+    "extra_pnginfo",
+    "preview_method",
+}
+
+
+def is_boundary_token(value):
+    return (
+        isinstance(value, str)
+        and _BOUNDARY_TOKEN.fullmatch(value) is not None
+    )
+
+
+def is_worker_session_id(value):
+    return (
+        isinstance(value, str)
+        and _WORKER_SESSION_ID.fullmatch(value) is not None
+    )
 
 
 class CaptureValidationError(ValueError):
@@ -158,6 +196,67 @@ def _validate_queue_options(queue_options, output_ids):
         )
 
 
+def _strict_json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if not isinstance(key, str) or key in result:
+            raise CaptureValidationError("Invalid native prompt JSON.")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(_value):
+    raise CaptureValidationError("Invalid native prompt JSON.")
+
+
+def _native_prompt_payload(body):
+    if not isinstance(body, bytes) or not 0 < len(body) <= MAX_CAPTURE_BYTES:
+        raise CaptureValidationError("Invalid native prompt body.")
+    try:
+        parsed = json.loads(
+            body.decode("utf-8"),
+            object_pairs_hook=_strict_json_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (CaptureValidationError, UnicodeError, ValueError, json.JSONDecodeError):
+        raise CaptureValidationError("Invalid native prompt body.") from None
+    if (
+        not isinstance(parsed, dict)
+        or not {"client_id", "prompt", "extra_data"}.issubset(parsed)
+        or set(parsed) - _NATIVE_PROMPT_FIELDS
+        or not isinstance(parsed.get("client_id"), str)
+        or _NATIVE_CLIENT_ID.fullmatch(parsed["client_id"]) is None
+        or not isinstance(parsed.get("extra_data"), dict)
+        or set(parsed["extra_data"]) - _NATIVE_EXTRA_DATA_FIELDS
+    ):
+        raise CaptureValidationError("Invalid native prompt body.")
+    extra_data = parsed["extra_data"]
+    extra_pnginfo = extra_data.get("extra_pnginfo")
+    if (
+        not isinstance(extra_pnginfo, dict)
+        or set(extra_pnginfo) != {"workflow"}
+    ):
+        raise CaptureValidationError("Invalid native prompt body.")
+    if "comfy_usage_source" in extra_data:
+        _validate_identifier(
+            extra_data["comfy_usage_source"],
+            "Comfy usage source",
+            maximum=200,
+        )
+    _validate_tree(parsed)
+    encoded = canonical_json(parsed)
+    if not 0 < len(encoded.encode("utf-8")) <= MAX_CAPTURE_BYTES:
+        raise CaptureValidationError("Invalid native prompt body.")
+    return json.loads(encoded), encoded.encode("utf-8")
+
+
+def canonical_native_prompt_body(body):
+    """Validate and canonicalize one pinned native ComfyUI prompt request."""
+
+    _parsed, encoded = _native_prompt_payload(body)
+    return encoded
+
+
 @dataclass(frozen=True)
 class CompiledCapture:
     capture_id: str
@@ -166,6 +265,26 @@ class CompiledCapture:
     queue_options: dict
     prompt_digest: str
     executable_class_types: tuple[str, ...]
+
+    @classmethod
+    def from_native_prompt(cls, body, *, capture_id=None):
+        parsed, _encoded = _native_prompt_payload(body)
+        extra_data = parsed["extra_data"]
+        queue_options = {
+            key: parsed[key]
+            for key in ("front", "number", "partial_execution_targets")
+            if key in parsed
+        }
+        if "preview_method" in extra_data:
+            queue_options["preview_method"] = extra_data["preview_method"]
+        return cls.from_payload(
+            {
+                "workflow": extra_data["extra_pnginfo"]["workflow"],
+                "output": parsed["prompt"],
+                "queue_options": queue_options,
+            },
+            capture_id=capture_id,
+        )
 
     @classmethod
     def from_payload(cls, payload, *, capture_id=None):
@@ -282,6 +401,12 @@ _ENVELOPE_FIELDS = {
     "nonce",
     "signature",
 }
+_NATIVE_IDENTITY_FIELDS = {
+    "job_id",
+    "request_id",
+    "manifest_digest",
+}
+_NATIVE_DIGEST = re.compile(r"[0-9a-f]{64}")
 
 
 class ProtocolAuthenticationError(ValueError):
@@ -292,6 +417,34 @@ def _authentication_error():
     return ProtocolAuthenticationError(
         "Worker request authentication failed."
     )
+
+
+def native_request_material(body, identity):
+    """Bind server-only native prompt identity to one HTTP body digest."""
+
+    if not isinstance(body, bytes) or not isinstance(identity, dict):
+        raise _authentication_error()
+    if identity:
+        if set(identity) != _NATIVE_IDENTITY_FIELDS:
+            raise _authentication_error()
+        if (
+            not is_worker_session_id(identity.get("job_id"))
+            or not is_worker_session_id(identity.get("request_id"))
+            or not isinstance(identity.get("manifest_digest"), str)
+            or _NATIVE_DIGEST.fullmatch(identity["manifest_digest"])
+            is None
+        ):
+            raise _authentication_error()
+    try:
+        metadata = canonical_json(
+            {
+                "body_sha256": hashlib.sha256(body).hexdigest(),
+                "identity": dict(identity),
+            }
+        ).encode("utf-8")
+    except CaptureValidationError:
+        raise _authentication_error() from None
+    return b"cloud-vast-native-v2\n" + metadata
 
 
 def _secret(value):

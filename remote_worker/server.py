@@ -14,6 +14,7 @@ from cloud_run.worker_protocol import (
     NonceCache,
     PROTOCOL_VERSION,
     ProtocolAuthenticationError,
+    native_request_material,
     verify_request,
 )
 from .state import (
@@ -40,8 +41,20 @@ from .jobs import (
     JobBusyError,
     JobError,
     JobResult,
+    JobSnapshot,
     JobValidationError,
     parse_job_request,
+)
+from .native_proxy import (
+    MAX_NATIVE_BODY_BYTES,
+    NativeProxyResponse,
+    NativeRoutePolicy,
+)
+from .profile import (
+    ProfileError,
+    WorkerProfileArtifact,
+    WorkerProfileSnapshot,
+    parse_profile_request,
 )
 
 
@@ -64,10 +77,14 @@ _ROUTES = (
     ("POST", "/worker/v1/jobs"),
     ("GET", "/worker/v1/jobs/{job_id}"),
     ("GET", "/worker/v1/jobs/{job_id}/events"),
+    ("GET", "/worker/v1/jobs/{job_id}/snapshot"),
     (
         "GET",
         "/worker/v1/jobs/{job_id}/previews/{preview_id}",
     ),
+    ("PUT", "/worker/v1/profile"),
+    ("GET", "/worker/v1/profile"),
+    ("GET", "/worker/v1/profile/artifacts/{artifact_id}"),
     ("PUT", "/worker/v1/deadline"),
 )
 
@@ -134,6 +151,11 @@ def _provision_result_payload(result):
             if result.progress is not None
             else None
         ),
+        readiness=(
+            dict(result.readiness)
+            if result.readiness is not None
+            else None
+        ),
     )
     return validated.payload()
 
@@ -151,6 +173,28 @@ def _headers(request):
         }
     except (AttributeError, TypeError, ValueError):
         return {}
+
+
+def _header_values(request, name):
+    raw = getattr(request, "headers", {})
+    getter = getattr(raw, "getall", None)
+    if callable(getter):
+        try:
+            values = getter(name)
+        except (KeyError, TypeError, ValueError):
+            values = []
+        try:
+            return tuple(str(value) for value in values)
+        except (TypeError, ValueError):
+            return ()
+    try:
+        return tuple(
+            str(value)
+            for key, value in raw.items()
+            if str(key).casefold() == name.casefold()
+        )
+    except (AttributeError, TypeError, ValueError):
+        return ()
 
 
 def _has_boundary(request):
@@ -249,7 +293,9 @@ class WorkerApplication:
         upload_artifacts=(),
         provisioner=None,
         job_manager=None,
+        native_proxy=None,
         deadline_watchdog=None,
+        profile_store=None,
     ):
         self.state = WorkerStateStore(
             state_path,
@@ -262,7 +308,10 @@ class WorkerApplication:
         self.transfer_manager = transfer_manager
         self.provisioner = provisioner
         self.job_manager = job_manager
+        self.native_proxy = native_proxy
+        self.native_route_policy = NativeRoutePolicy()
         self.deadline_watchdog = deadline_watchdog
+        self.profile_store = profile_store
         self.upload_artifacts = {}
         self._manifest_lock = None
         self._manifest_lock_loop = None
@@ -448,6 +497,29 @@ class WorkerApplication:
             )
         return 206, start, end
 
+    @staticmethod
+    def _profile_cursor(request):
+        query = getattr(request, "query", {})
+        try:
+            keys = set(query)
+        except (TypeError, ValueError):
+            raise ProfileError("Worker profile cursor is invalid.") from None
+        if not keys:
+            return 0
+        if keys != {"after_revision"}:
+            raise ProfileError("Worker profile cursor is invalid.")
+        try:
+            values = query.getall("after_revision")
+        except AttributeError:
+            values = [query.get("after_revision")]
+        if (
+            len(values) != 1
+            or not isinstance(values[0], str)
+            or not re.fullmatch(r"0|[1-9][0-9]{0,19}", values[0])
+        ):
+            raise ProfileError("Worker profile cursor is invalid.")
+        return int(values[0])
+
     async def _upload_artifact(self, request, artifact_id, body):
         artifact = self.upload_artifacts.get(artifact_id)
         if artifact is None:
@@ -566,7 +638,18 @@ class WorkerApplication:
         if self.provisioner is None:
             return _error(501, "Worker route is not implemented.")
         try:
-            result = self.provisioner.transaction(transaction_id)
+            transaction_live = getattr(
+                self.provisioner,
+                "transaction_live",
+                None,
+            )
+            if not callable(transaction_live):
+                raise ProvisionError(
+                    "Worker transaction is unavailable."
+                )
+            result = await transaction_live(transaction_id)
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            raise
         except ProvisionError:
             return _error(503, "Worker transaction is unavailable.")
         except Exception:
@@ -640,6 +723,22 @@ class WorkerApplication:
             },
         )
 
+    async def _job_snapshot(self, request, job_id):
+        if self.job_manager is None:
+            return _error(501, "Worker route is not implemented.")
+        try:
+            cursor = self._event_cursor(request)
+            snapshot = self.job_manager.snapshot(job_id, cursor)
+        except JobValidationError:
+            return _error(400, "Worker event cursor was rejected.")
+        except JobError:
+            return _error(503, "Worker job snapshot is unavailable.")
+        if snapshot is None:
+            return _error(404, "Worker job was not found.")
+        if not isinstance(snapshot, JobSnapshot):
+            return _error(503, "Worker job snapshot is unavailable.")
+        return _response(200, snapshot.public_payload())
+
     async def _job_preview(self, job_id, preview_id):
         if self.job_manager is None:
             return _error(501, "Worker route is not implemented.")
@@ -696,6 +795,86 @@ class WorkerApplication:
                 size_bytes=output.size_bytes,
                 sha256=output.sha256,
                 mime_type=output.mime_type,
+            ),
+            headers=headers,
+        )
+
+    async def _apply_profile(self, body):
+        if self.profile_store is None:
+            return _error(501, "Worker route is not implemented.")
+        try:
+            profile = parse_profile_request(body)
+            payload = self.profile_store.apply(profile)
+        except ProfileError:
+            return _error(400, "Worker profile was rejected.")
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            raise
+        except Exception:
+            return _error(503, "Worker profile is unavailable.")
+        if not isinstance(payload, dict):
+            return _error(503, "Worker profile is unavailable.")
+        return _response(200, dict(payload))
+
+    async def _profile_snapshot(self, request):
+        if self.profile_store is None:
+            return _error(501, "Worker route is not implemented.")
+        try:
+            cursor = self._profile_cursor(request)
+            snapshot = self.profile_store.snapshot(cursor)
+        except ProfileError:
+            return _error(400, "Worker profile cursor was rejected.")
+        except Exception:
+            return _error(503, "Worker profile is unavailable.")
+        if snapshot is None:
+            return _response(204, None)
+        if not isinstance(snapshot, WorkerProfileSnapshot):
+            return _error(503, "Worker profile is unavailable.")
+        return _response(200, snapshot.public_payload())
+
+    async def _profile_artifact(self, request, artifact_id):
+        if self.profile_store is None:
+            return _error(501, "Worker route is not implemented.")
+        try:
+            snapshot = self.profile_store.snapshot(0)
+            if snapshot is None:
+                return _error(404, "Worker profile was not found.")
+            artifact = self.profile_store.artifact(
+                snapshot.profile_id,
+                artifact_id,
+            )
+            if artifact is None:
+                return _error(404, "Worker profile artifact was not found.")
+            if not isinstance(artifact, WorkerProfileArtifact):
+                raise ProfileError("Worker profile artifact is invalid.")
+            status, start, end = self._file_range(
+                request,
+                artifact.size_bytes,
+            )
+        except (ProfileError, JobValidationError):
+            return _error(416, "Worker profile artifact range was rejected.")
+        except Exception:
+            return _error(503, "Worker profile artifact is unavailable.")
+        headers = {
+            "Content-Type": artifact.mime_type,
+            "Content-Length": str(end - start + 1),
+            "Accept-Ranges": "bytes",
+            "ETag": '"' + artifact.sha256 + '"',
+            "X-Content-Type-Options": "nosniff",
+            "Cache-Control": "no-store",
+        }
+        if status == 206:
+            headers["Content-Range"] = (
+                f"bytes {start}-{end}/{artifact.size_bytes}"
+            )
+        return _response(
+            status,
+            WorkerFile(
+                path=artifact.path,
+                start=start,
+                end=end,
+                size_bytes=artifact.size_bytes,
+                sha256=artifact.sha256,
+                mime_type=artifact.mime_type,
             ),
             headers=headers,
         )
@@ -762,6 +941,11 @@ class WorkerApplication:
                 request,
                 parameters["job_id"],
             )
+        if route == "/worker/v1/jobs/{job_id}/snapshot":
+            return await self._job_snapshot(
+                request,
+                parameters["job_id"],
+            )
         if route == (
             "/worker/v1/jobs/{job_id}/previews/{preview_id}"
         ):
@@ -769,11 +953,123 @@ class WorkerApplication:
                 parameters["job_id"],
                 parameters["preview_id"],
             )
+        if route == "/worker/v1/profile" and str(method).upper() == "PUT":
+            return await self._apply_profile(body)
+        if route == "/worker/v1/profile":
+            return await self._profile_snapshot(request)
+        if route == "/worker/v1/profile/artifacts/{artifact_id}":
+            return await self._profile_artifact(
+                request,
+                parameters["artifact_id"],
+            )
         if route == "/worker/v1/deadline":
             return await self._deadline(body)
         return _error(501, "Worker route is not implemented.")
 
+    @staticmethod
+    def _native_identity(request):
+        headers = _headers(request)
+        mapping = {
+            "x-cloud-vast-job-id": "job_id",
+            "x-cloud-vast-request-id": "request_id",
+            "x-cloud-vast-manifest": "manifest_digest",
+        }
+        if {
+            name for name in headers if name.startswith("x-cloud-vast-")
+        } - set(mapping):
+            raise ProtocolAuthenticationError(
+                "Worker request authentication failed."
+            )
+        identity = {}
+        for header, field in mapping.items():
+            values = _header_values(request, header)
+            if len(values) > 1:
+                raise ProtocolAuthenticationError(
+                    "Worker request authentication failed."
+                )
+            if values:
+                identity[field] = values[0]
+        return identity
+
+    @staticmethod
+    def _native_error(status):
+        return NativeProxyResponse(
+            status=status,
+            body=b'{"error":"Native ComfyUI request was rejected."}',
+            headers={"Content-Type": "application/json"},
+        )
+
+    async def handle_native(self, request):
+        method = getattr(request, "method", None)
+        path = _authentication_path(request)
+        if (
+            self.native_proxy is None
+            or self.native_route_policy.classify(method, path) is None
+        ):
+            return self._native_error(404)
+        duplicate_authentication = any(
+            len(_header_values(request, name)) > 1
+            for name in (
+                "x-cloud-run-protocol-version",
+                "x-cloud-run-timestamp",
+                "x-cloud-run-nonce",
+                "x-cloud-run-signature",
+            )
+        )
+        if (
+            not _has_boundary(request)
+            or _header_values(request, "authorization")
+            or duplicate_authentication
+        ):
+            return self._native_error(401)
+        try:
+            body = await _body(request)
+            if len(body) > MAX_NATIVE_BODY_BYTES:
+                raise ProtocolAuthenticationError(
+                    "Worker request authentication failed."
+                )
+            identity = self._native_identity(request)
+            signed_body = native_request_material(body, identity)
+            secret = self.state.secret_bytes()
+            verify_request(
+                secret,
+                method,
+                path,
+                signed_body,
+                _auth_envelope(request),
+                now=self.clock(),
+                seen_nonces=self.nonce_cache,
+            )
+        except (
+            ValueError,
+            WorkerStateError,
+            ProtocolAuthenticationError,
+        ):
+            return self._native_error(401)
+        try:
+            setattr(request, "_cloud_vast_authenticated_body", body)
+        except (AttributeError, TypeError):
+            pass
+        try:
+            response = await self.native_proxy.handle(request)
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            raise
+        except Exception:
+            return self._native_error(502)
+        if not isinstance(response, NativeProxyResponse):
+            try:
+                from aiohttp.web_ws import WebSocketResponse
+            except ImportError:
+                WebSocketResponse = ()
+            if not isinstance(response, WebSocketResponse):
+                return self._native_error(502)
+        return response
+
     async def close(self):
+        if self.native_proxy is not None:
+            close = getattr(self.native_proxy, "close", None)
+            if callable(close):
+                await close()
         if self.job_manager is not None:
             close = getattr(self.job_manager, "close", None)
             if callable(close):

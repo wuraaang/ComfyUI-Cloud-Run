@@ -1,0 +1,361 @@
+html[data-hermes-nous="light"] {
+    --hn-background: #F8FAFF;
+    --hn-foreground: #17171A;
+    --hn-card: #FFFFFF;
+    --hn-card-foreground: #17171A;
+    --hn-muted: color-mix(in srgb, #0053FD 5%, #FFFFFF);
+    --hn-muted-foreground: #666678;
+    --hn-popover: #FFFFFF;
+    --hn-popover-foreground: #17171A;
+    --hn-primary: #0053FD;
+    --hn-primary-foreground: #FCFCFC;
+    --hn-secondary: color-mix(in srgb, #0053FD 7%, #FFFFFF);
+    --hn-secondary-foreground: #242432;
+    --hn-accent-surface: color-mix(in srgb, #0053FD 10%, #FFFFFF);
+    --hn-accent-foreground: #202030;
+    --hn-border: color-mix(in srgb, #0053FD 22%, transparent);
+    --hn-input: color-mix(in srgb, #0053FD 30%, transparent);
+    --hn-ring: #0053FD;
+    --hn-accent: #0053FD;
+    --hn-destructive: #C72E4D;
+    --hn-destructive-foreground: #FFFFFF;
+    --hn-sidebar: #F3F7FF;
+    --hn-sidebar-border: color-mix(in srgb, #0053FD 18%, transparent);
+    --hn-user-bubble: color-mix(in srgb, #0053FD 6%, #FFFFFF);
+    --hn-user-bubble-border: color-mix(in srgb, #0053FD 24%, transparent);
+    --hn-base: #17171A;
+    --hn-blue: #0053FD;
+    --hn-warm: #CF806D;
+    --hn-red: #CF2D56;
+    --hn-orange: #DB704B;
+    --hn-yellow: #C08532;
+    --hn-green: #1F8A65;
+    --hn-cyan: #4C7F8C;
+    --hn-purple: #9E94D5;
+    --hn-text-primary: color-mix(in srgb, var(--hn-base) 94%, transparent);
+    --hn-text-secondary: color-mix(in srgb, var(--hn-base) 74%, transparent);
+    --hn-text-tertiary: color-mix(in srgb, var(--hn-base) 54%, transparent);
+    --hn-text-quaternary: color-mix(in srgb, var(--hn-base) 36%, transparent);
+    --hn-fill-primary: color-mix(in srgb, var(--hn-accent) 16%, color-mix(in srgb, var(--hn-base) 10%, transparent));
+    --hn-fill-secondary: color-mix(in srgb, var(--hn-accent) 11%, color-mix(in srgb, var(--hn-base) 7%, transparent));
+    --hn-fill-tertiary: color-mix(in srgb, var(--hn-accent) 8%, color-mix(in srgb, var(--hn-base) 5%, transparent));
+    --hn-fill-quaternary: color-mix(in srgb, var(--hn-accent) 5%, color-mix(in srgb, var(--hn-base) 4%, transparent));
+    --hn-fill-quinary: color-mix(in srgb, var(--hn-accent) 3%, color-mix(in srgb, var(--hn-base) 3%, transparent));
+    --hn-stroke-primary: color-mix(in srgb, var(--hn-accent) 24%, color-mix(in srgb, var(--hn-base) 10%, transparent));
+    --hn-stroke-secondary: color-mix(in srgb, var(--hn-accent) 16%, color-mix(in srgb, var(--hn-base) 7%, transparent));
+    --hn-stroke-tertiary: color-mix(in srgb, var(--hn-accent) 10%, color-mix(in srgb, var(--hn-base) 5%, transparent));
+    --hn-stroke-quaternary: color-mix(in srgb, var(--hn-accent) 6%, color-mix(in srgb, var(--hn-base) 3%, transparent));
+    --hn-row-hover: color-mix(in srgb, var(--hn-accent) 4%, color-mix(in srgb, var(--hn-base) 3%, transparent));
+    --hn-row-active: color-mix(in srgb, var(--hn-accent) 8%, color-mix(in srgb, var(--hn-base) 5%, transparent));
+    --hn-control-hover: color-mix(in srgb, var(--hn-accent) 6%, color-mix(in srgb, var(--hn-base) 4%, transparent));
+    --hn-control-active: color-mix(in srgb, var(--hn-accent) 8%, color-mix(in srgb, var(--hn-base) 5%, transparent));
+    --hn-input-inset: 0 1px 1px rgba(0, 0, 0, 0.10);
+    --p-primary-color: var(--hn-primary);
+    --p-primary-contrast-color: var(--hn-primary-foreground);
+    --p-content-background: var(--hn-card);
+    --p-content-color: var(--hn-card-foreground);
+    --p-content-border-color: var(--hn-border);
+    --p-content-hover-background: var(--hn-row-hover);
+    --p-text-color: var(--hn-text-primary);
+    --p-text-muted-color: var(--hn-muted-foreground);
+    --p-form-field-background: #FCFCFC;
+    --p-form-field-border-color: var(--hn-input);
+    --p-form-field-color: var(--hn-foreground);
+    --p-focus-ring-color: color-mix(in srgb, var(--hn-ring) 50%, transparent);
+    --p-highlight-background: var(--hn-row-active);
+    --p-highlight-color: var(--hn-accent-foreground);
+    --p-button-primary-background: var(--hn-primary);
+    --p-button-primary-color: var(--hn-primary-foreground);
+    --p-inputtext-background: #FCFCFC;
+    --p-popover-background: var(--hn-popover);
+    --p-popover-border-color: var(--hn-stroke-secondary);
+    --p-panel-border-color: var(--hn-stroke-tertiary);
+    --p-divider-color: var(--hn-stroke-tertiary);
+    --p-border-radius-sm: 2.5px;
+    --p-border-radius-md: 4px;
+    --p-border-radius-lg: 5px;
+    --p-border-radius-xl: 5px;
+    --p-surface-500: #666678;
+    --p-surface-600: #52617E;
+    --p-surface-700: #E4ECFF;
+    --p-surface-800: #F3F7FF;
+    --p-surface-900: #F8FAFF;
+    --p-surface-950: #FFFFFF;
+}
+
+html[data-hermes-nous="dark"] {
+    --hn-background: #0D2F86;
+    --hn-foreground: #FFE6CB;
+    --hn-card: #12378F;
+    --hn-card-foreground: #FFE6CB;
+    --hn-muted: #183F9A;
+    --hn-muted-foreground: #B5C7F3;
+    --hn-popover: #123A96;
+    --hn-popover-foreground: #FFE6CB;
+    --hn-primary: #FFE6CB;
+    --hn-primary-foreground: #0D2F86;
+    --hn-secondary: #1B45A4;
+    --hn-secondary-foreground: #E0E8FF;
+    --hn-accent-surface: #1540B1;
+    --hn-accent-foreground: #F0F4FF;
+    --hn-border: #3158AD;
+    --hn-input: #0B2566;
+    --hn-ring: #FFE6CB;
+    --hn-accent: #0053FD;
+    --hn-destructive: #C0473A;
+    --hn-destructive-foreground: #FEF2F2;
+    --hn-sidebar: #09286F;
+    --hn-sidebar-border: #234A9C;
+    --hn-user-bubble: #143B91;
+    --hn-user-bubble-border: #3A63BD;
+    --hn-base: #FFE6CB;
+    --hn-blue: #0053FD;
+    --hn-warm: #CF806D;
+    --hn-red: #E75E78;
+    --hn-orange: #DB704B;
+    --hn-yellow: #C08532;
+    --hn-green: #55A583;
+    --hn-cyan: #6F9BA6;
+    --hn-purple: #9E94D5;
+    --hn-text-primary: color-mix(in srgb, var(--hn-base) 94%, transparent);
+    --hn-text-secondary: color-mix(in srgb, var(--hn-base) 74%, transparent);
+    --hn-text-tertiary: color-mix(in srgb, var(--hn-base) 54%, transparent);
+    --hn-text-quaternary: color-mix(in srgb, var(--hn-base) 36%, transparent);
+    --hn-fill-primary: color-mix(in srgb, var(--hn-accent) 16%, color-mix(in srgb, var(--hn-base) 10%, transparent));
+    --hn-fill-secondary: color-mix(in srgb, var(--hn-accent) 11%, color-mix(in srgb, var(--hn-base) 7%, transparent));
+    --hn-fill-tertiary: color-mix(in srgb, var(--hn-accent) 8%, color-mix(in srgb, var(--hn-base) 5%, transparent));
+    --hn-fill-quaternary: color-mix(in srgb, var(--hn-accent) 5%, color-mix(in srgb, var(--hn-base) 4%, transparent));
+    --hn-fill-quinary: color-mix(in srgb, var(--hn-accent) 3%, color-mix(in srgb, var(--hn-base) 3%, transparent));
+    --hn-stroke-primary: color-mix(in srgb, var(--hn-accent) 24%, color-mix(in srgb, var(--hn-base) 10%, transparent));
+    --hn-stroke-secondary: color-mix(in srgb, var(--hn-accent) 16%, color-mix(in srgb, var(--hn-base) 7%, transparent));
+    --hn-stroke-tertiary: color-mix(in srgb, var(--hn-accent) 10%, color-mix(in srgb, var(--hn-base) 5%, transparent));
+    --hn-stroke-quaternary: color-mix(in srgb, var(--hn-accent) 6%, color-mix(in srgb, var(--hn-base) 3%, transparent));
+    --hn-row-hover: color-mix(in srgb, var(--hn-accent) 4%, color-mix(in srgb, var(--hn-base) 3%, transparent));
+    --hn-row-active: color-mix(in srgb, var(--hn-accent) 8%, color-mix(in srgb, var(--hn-base) 5%, transparent));
+    --hn-control-hover: color-mix(in srgb, var(--hn-accent) 6%, color-mix(in srgb, var(--hn-base) 4%, transparent));
+    --hn-control-active: color-mix(in srgb, var(--hn-accent) 8%, color-mix(in srgb, var(--hn-base) 5%, transparent));
+    --hn-input-inset: 0 1px 1px rgba(0, 0, 0, 0.38);
+    --p-primary-color: var(--hn-primary);
+    --p-primary-contrast-color: var(--hn-primary-foreground);
+    --p-content-background: var(--hn-card);
+    --p-content-color: var(--hn-card-foreground);
+    --p-content-border-color: var(--hn-border);
+    --p-content-hover-background: var(--hn-row-hover);
+    --p-text-color: var(--hn-text-primary);
+    --p-text-muted-color: var(--hn-muted-foreground);
+    --p-form-field-background: var(--hn-input);
+    --p-form-field-border-color: var(--hn-border);
+    --p-form-field-color: var(--hn-foreground);
+    --p-focus-ring-color: color-mix(in srgb, var(--hn-ring) 50%, transparent);
+    --p-highlight-background: var(--hn-row-active);
+    --p-highlight-color: var(--hn-accent-foreground);
+    --p-button-primary-background: var(--hn-primary);
+    --p-button-primary-color: var(--hn-primary-foreground);
+    --p-inputtext-background: var(--hn-input);
+    --p-popover-background: var(--hn-popover);
+    --p-popover-border-color: var(--hn-stroke-secondary);
+    --p-panel-border-color: var(--hn-stroke-tertiary);
+    --p-divider-color: var(--hn-stroke-tertiary);
+    --p-border-radius-sm: 2.5px;
+    --p-border-radius-md: 4px;
+    --p-border-radius-lg: 5px;
+    --p-border-radius-xl: 5px;
+    --p-surface-500: #6F82B8;
+    --p-surface-600: #506AA9;
+    --p-surface-700: #3158AD;
+    --p-surface-800: #183F9A;
+    --p-surface-900: #12378F;
+    --p-surface-950: #09286F;
+}
+
+html[data-hermes-nous="light"] body,
+html[data-hermes-nous="dark"] body {
+    background-color: var(--hn-background);
+    color: var(--hn-text-primary);
+    font-family: "Segoe WPC", "Segoe UI", -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", system-ui, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji", emoji;
+}
+
+html[data-hermes-nous="light"] :is(.p-component, .cmcp-root),
+html[data-hermes-nous="dark"] :is(.p-component, .cmcp-root) {
+    color: var(--hn-text-primary);
+    font-family: inherit;
+}
+
+html[data-hermes-nous="light"] :is(code, pre, kbd, samp),
+html[data-hermes-nous="dark"] :is(code, pre, kbd, samp) {
+    font-family: Menlo, Monaco, "SF Mono", "Courier Prime", monospace, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji", emoji;
+}
+
+html[data-hermes-nous="light"] :is(.comfyui-body-left, .comfyui-body-right, .side-bar-panel),
+html[data-hermes-nous="dark"] :is(.comfyui-body-left, .comfyui-body-right, .side-bar-panel) {
+    background: var(--hn-sidebar);
+    border-color: var(--hn-sidebar-border);
+    box-shadow: none;
+}
+
+html[data-hermes-nous="light"] :is(.p-panel, .p-card),
+html[data-hermes-nous="dark"] :is(.p-panel, .p-card) {
+    background: var(--hn-card);
+    border-color: var(--hn-stroke-tertiary);
+    box-shadow: none;
+    color: var(--hn-card-foreground);
+}
+
+html[data-hermes-nous="light"] :is(.p-dialog, .p-drawer),
+html[data-hermes-nous="dark"] :is(.p-dialog, .p-drawer) {
+    background: var(--hn-popover);
+    border: 1px solid color-mix(in srgb, currentColor 3%, transparent);
+    border-radius: 4px;
+    box-shadow: 0 0.125rem 0.25rem -0.125rem color-mix(in srgb, #000 7%, transparent), 0 0.5rem 0.75rem -0.375rem color-mix(in srgb, #000 6%, transparent), 0 1.25rem 1.75rem -0.875rem color-mix(in srgb, #000 6%, transparent), 0 2.25rem 3rem -1.75rem color-mix(in srgb, #000 0%, transparent);
+    color: var(--hn-popover-foreground);
+}
+
+html[data-hermes-nous="light"] :is(.p-popover, .p-menu, .p-tieredmenu, .p-contextmenu, .p-select-overlay, .p-tooltip-text),
+html[data-hermes-nous="dark"] :is(.p-popover, .p-menu, .p-tieredmenu, .p-contextmenu, .p-select-overlay, .p-tooltip-text) {
+    background: var(--hn-popover);
+    border: 1px solid var(--hn-stroke-secondary);
+    border-radius: 4px;
+    box-shadow: 0 0 0 0.0625rem color-mix(in srgb, var(--hn-base) 8%, transparent), 0 0.25rem 1rem color-mix(in srgb, #000 8%, transparent), 0 1rem 2rem -1.5rem color-mix(in srgb, #000 18%, transparent);
+    color: var(--hn-popover-foreground);
+}
+
+html[data-hermes-nous="light"] :is(.p-menu-item-content, .p-listbox-option, .p-tree-node-content),
+html[data-hermes-nous="dark"] :is(.p-menu-item-content, .p-listbox-option, .p-tree-node-content) {
+    border-radius: 2.5px;
+    transition: background-color 100ms, color 100ms;
+}
+
+html[data-hermes-nous="light"] :is(.p-menu-item-content, .p-listbox-option, .p-tree-node-content):hover,
+html[data-hermes-nous="dark"] :is(.p-menu-item-content, .p-listbox-option, .p-tree-node-content):hover {
+    background: var(--hn-row-hover);
+}
+
+html[data-hermes-nous="light"] :is(.p-listbox-option-selected, .p-tree-node-selected),
+html[data-hermes-nous="dark"] :is(.p-listbox-option-selected, .p-tree-node-selected) {
+    background: var(--hn-row-active);
+    color: var(--hn-accent-foreground);
+}
+
+html[data-hermes-nous="light"] .p-button,
+html[data-hermes-nous="dark"] .p-button {
+    border-radius: 2.5px;
+    transition: background-color 100ms, border-color 100ms, color 100ms, box-shadow 100ms;
+}
+
+html[data-hermes-nous="light"] .p-button-icon-only,
+html[data-hermes-nous="dark"] .p-button-icon-only {
+    border-radius: 4px;
+}
+
+html[data-hermes-nous="light"] :is(.p-button-secondary, .p-button-outlined),
+html[data-hermes-nous="dark"] :is(.p-button-secondary, .p-button-outlined) {
+    background: var(--hn-fill-quaternary);
+    border-color: var(--hn-stroke-secondary);
+    color: var(--hn-text-primary);
+}
+
+html[data-hermes-nous="light"] :is(.p-button-text, .p-button-link),
+html[data-hermes-nous="dark"] :is(.p-button-text, .p-button-link) {
+    background: transparent;
+    box-shadow: none;
+    color: var(--hn-text-secondary);
+}
+
+html[data-hermes-nous="light"] :is(.p-button-text, .p-button-link):hover,
+html[data-hermes-nous="dark"] :is(.p-button-text, .p-button-link):hover {
+    background: var(--hn-control-hover);
+    color: var(--hn-text-primary);
+}
+
+html[data-hermes-nous="light"] :is(.p-button-danger, .p-message-error, .p-toast-message-error),
+html[data-hermes-nous="dark"] :is(.p-button-danger, .p-message-error, .p-toast-message-error) {
+    --p-button-primary-background: var(--hn-destructive);
+    --p-button-primary-color: var(--hn-destructive-foreground);
+    color: var(--hn-destructive-foreground);
+}
+
+html[data-hermes-nous="light"] :is(.p-inputtext, .p-textarea, .p-select),
+html[data-hermes-nous="dark"] :is(.p-inputtext, .p-textarea, .p-select) {
+    background: var(--p-form-field-background);
+    border-color: var(--p-form-field-border-color);
+    border-radius: 2.5px;
+    box-shadow: inset var(--hn-input-inset);
+    color: var(--p-form-field-color);
+    transition: background-color 100ms, border-color 200ms ease-out, box-shadow 100ms;
+}
+
+html[data-hermes-nous="light"] :is(.p-inputtext, .p-textarea, .p-select):hover,
+html[data-hermes-nous="dark"] :is(.p-inputtext, .p-textarea, .p-select):hover {
+    border-color: var(--hn-stroke-primary);
+}
+
+html[data-hermes-nous="light"] :is(.p-inputtext, .p-textarea, .p-select):focus-within,
+html[data-hermes-nous="dark"] :is(.p-inputtext, .p-textarea, .p-select):focus-within {
+    border-color: var(--hn-ring);
+    box-shadow: inset var(--hn-input-inset), 0 0 0 3px color-mix(in srgb, var(--hn-ring) 50%, transparent);
+}
+
+html[data-hermes-nous="light"] :is(.p-invalid, [aria-invalid="true"]),
+html[data-hermes-nous="dark"] :is(.p-invalid, [aria-invalid="true"]) {
+    border-color: var(--hn-destructive);
+}
+
+html[data-hermes-nous="light"] input[type="search"],
+html[data-hermes-nous="dark"] input[type="search"] {
+    background: transparent;
+    border-color: transparent;
+    border-radius: 0;
+    box-shadow: none;
+}
+
+html[data-hermes-nous="light"] input[type="search"]:focus,
+html[data-hermes-nous="dark"] input[type="search"]:focus {
+    border-bottom-color: var(--hn-ring);
+}
+
+html[data-hermes-nous="light"] .p-selectbutton,
+html[data-hermes-nous="dark"] .p-selectbutton {
+    background: var(--hn-fill-tertiary);
+    border-radius: 5px;
+    padding: 2px;
+}
+
+html[data-hermes-nous="light"] .p-selectbutton .p-togglebutton,
+html[data-hermes-nous="dark"] .p-selectbutton .p-togglebutton {
+    background: transparent;
+    border: 0;
+    border-radius: 3px;
+    box-shadow: none;
+}
+
+html[data-hermes-nous="light"] .p-selectbutton .p-togglebutton-checked,
+html[data-hermes-nous="dark"] .p-selectbutton .p-togglebutton-checked {
+    background: var(--hn-background);
+    box-shadow: 0 0 0 0.0625rem color-mix(in srgb, var(--hn-base) 6%, transparent), 0 0.125rem 0.5rem color-mix(in srgb, #000 4%, transparent);
+}
+
+html[data-hermes-nous="light"] .p-toggleswitch-checked .p-toggleswitch-slider,
+html[data-hermes-nous="dark"] .p-toggleswitch-checked .p-toggleswitch-slider {
+    background: var(--hn-primary);
+}
+
+html[data-hermes-nous="light"] :is(button, input, textarea, select, [tabindex]):focus-visible,
+html[data-hermes-nous="dark"] :is(button, input, textarea, select, [tabindex]):focus-visible {
+    outline: 3px solid color-mix(in srgb, var(--hn-ring) 50%, transparent);
+    outline-offset: 2px;
+}
+
+html[data-hermes-nous="light"] :is(button, input, textarea, select):disabled,
+html[data-hermes-nous="dark"] :is(button, input, textarea, select):disabled {
+    cursor: not-allowed;
+    opacity: 0.48;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    html[data-hermes-nous="light"] :is(.p-button, .p-inputtext, .p-textarea, .p-select, .p-dialog, .p-drawer, .p-popover, .p-menu, .p-tooltip),
+    html[data-hermes-nous="dark"] :is(.p-button, .p-inputtext, .p-textarea, .p-select, .p-dialog, .p-drawer, .p-popover, .p-menu, .p-tooltip) {
+        animation-duration: 0.01ms;
+        animation-iteration-count: 1;
+        transition-duration: 0.01ms;
+    }
+}

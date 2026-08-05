@@ -1,0 +1,1552 @@
+"""Stable loopback-only data plane for an official ComfyUI Vast environment."""
+
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass, field
+import hashlib
+import hmac
+import json
+import math
+import re
+import secrets
+
+from .agent_bridge import AgentBridgeSession
+from .readiness import ReadinessCheck, evidence_digest, readiness_message
+from .repository import DesktopRelayConfig
+from .worker_client import (
+    MAX_WORKER_JSON_BYTES,
+    MAX_WORKER_NATIVE_RESPONSE_BYTES,
+    WorkerRequest,
+    WorkerTransportResponse,
+)
+
+
+COOKIE_NAME = "comfy_vast_session"
+COOKIE_TTL_SECONDS = 300
+MAX_RELAY_RESPONSE_BYTES = MAX_WORKER_NATIVE_RESPONSE_BYTES
+WEBSOCKET_CLOSE_TIMEOUT_SECONDS = 1
+_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}")
+_CAPABILITY = re.compile(r"[A-Za-z0-9_-]{32,128}")
+_RESPONSE_HEADERS = {
+    "accept-ranges": "Accept-Ranges",
+    "cache-control": "Cache-Control",
+    "content-range": "Content-Range",
+    "content-type": "Content-Type",
+    "etag": "ETag",
+    "last-modified": "Last-Modified",
+    "x-content-type-options": "X-Content-Type-Options",
+}
+_REQUEST_HEADERS = {
+    "accept": "Accept",
+    "content-type": "Content-Type",
+    "if-modified-since": "If-Modified-Since",
+    "if-none-match": "If-None-Match",
+    "range": "Range",
+}
+_AGENT_COMPATIBILITY_PATHS = frozenset({
+    "/comfyui_mcp_panel/status",
+    "/comfyui_mcp_panel/bridge_url",
+    "/comfyui_mcp_panel/backends",
+})
+
+
+class DesktopRelayError(RuntimeError):
+    """A sanitized local Desktop relay lifecycle failure."""
+
+
+@dataclass(frozen=True)
+class DesktopRelayStatus:
+    bound: bool
+    url: str | None
+    active_session_id: str | None
+    profile_revision: int | None
+    ready: bool
+    error: str | None
+
+    def public_payload(self):
+        return {
+            "bound": self.bound,
+            "url": self.url,
+            "connection_name": "ComfyUI Vast",
+            "active_session_id": self.active_session_id,
+            "profile_revision": self.profile_revision,
+            "ready": self.ready,
+            "error": self.error,
+        }
+
+
+@dataclass(frozen=True)
+class DesktopRelayResponse:
+    status: int
+    body: bytes
+    headers: dict = field(default_factory=dict)
+
+
+@dataclass(eq=False)
+class _TrackedWebSocket:
+    session_id: str
+    generation: int
+    upstream: object
+    desktop: object
+
+
+def _headers(request):
+    raw = getattr(request, "headers", {})
+    try:
+        return {str(key).casefold(): str(value) for key, value in raw.items()}
+    except (AttributeError, TypeError, ValueError):
+        return {}
+
+
+def _header_values(request, name):
+    raw = getattr(request, "headers", {})
+    getter = getattr(raw, "getall", None)
+    if callable(getter):
+        try:
+            values = getter(name)
+        except (KeyError, TypeError, ValueError):
+            values = []
+        try:
+            return tuple(str(value) for value in values)
+        except (TypeError, ValueError):
+            return ()
+    try:
+        return tuple(
+            str(value)
+            for key, value in raw.items()
+            if str(key).casefold() == name.casefold()
+        )
+    except (AttributeError, TypeError, ValueError):
+        return ()
+
+
+async def _body(request):
+    value = getattr(request, "body", None)
+    if not isinstance(value, bytes):
+        reader = getattr(request, "read", None)
+        if not callable(reader):
+            raise DesktopRelayError("Desktop relay request was rejected.")
+        value = await reader()
+    if not isinstance(value, bytes) or len(value) > MAX_WORKER_JSON_BYTES:
+        raise DesktopRelayError("Desktop relay request was rejected.")
+    return value
+
+
+def _message_type(message):
+    value = getattr(message, "type", None)
+    name = getattr(value, "name", None)
+    if isinstance(name, str):
+        return name.upper()
+    return str(value).rsplit(".", 1)[-1].upper()
+
+
+def _native_route_policy():
+    if "." in (__package__ or ""):
+        from ..remote_worker.native_proxy import NativeRoutePolicy
+    else:
+        from remote_worker.native_proxy import NativeRoutePolicy
+    return NativeRoutePolicy
+
+
+class _AiohttpRelayListener:
+    def __init__(self, handler):
+        self.handler = handler
+        self.runner = None
+        self.site = None
+
+    async def start(self, host, port, handler):
+        try:
+            from aiohttp import web
+        except ImportError:
+            raise OSError("aiohttp unavailable") from None
+        application = web.Application(
+            client_max_size=MAX_WORKER_JSON_BYTES + 1
+        )
+
+        async def dispatch(request):
+            response = await handler(request)
+            if isinstance(response, web.StreamResponse):
+                return response
+            return web.Response(
+                status=response.status,
+                body=response.body,
+                headers=response.headers,
+            )
+
+        application.router.add_route("*", "/{path:.*}", dispatch)
+        runner = web.AppRunner(application, access_log=None)
+        try:
+            await runner.setup()
+            site = web.TCPSite(
+                runner,
+                host,
+                port,
+                shutdown_timeout=5,
+            )
+            await site.start()
+            addresses = list(getattr(runner, "addresses", ()))
+            if len(addresses) != 1:
+                server = getattr(site, "_server", None)
+                sockets = list(getattr(server, "sockets", ()) or ())
+                addresses = [socket.getsockname() for socket in sockets]
+            if len(addresses) != 1:
+                raise OSError("ambiguous relay binding")
+            bound_port = int(addresses[0][1])
+        except Exception:
+            await runner.cleanup()
+            raise
+        self.runner = runner
+        self.site = site
+        return bound_port
+
+    async def close(self):
+        if self.runner is not None:
+            await self.runner.cleanup()
+            self.runner = None
+            self.site = None
+
+
+class DesktopRelay:
+    def __init__(
+        self,
+        *,
+        repository,
+        bind_host="127.0.0.1",
+        port_selector=None,
+        listener_factory=None,
+        worker_factory=None,
+        native_prompt=None,
+        continue_guard=None,
+        agent_bridge=None,
+        local_comfy_root=None,
+        capability_factory=None,
+        clock=None,
+    ):
+        if bind_host != "127.0.0.1":
+            raise DesktopRelayError(
+                "Desktop relay requires the fixed loopback host."
+            )
+        for method in ("get_desktop_relay", "save_desktop_relay"):
+            if not callable(getattr(repository, method, None)):
+                raise DesktopRelayError(
+                    "Desktop relay storage is unavailable."
+                )
+        if worker_factory is not None and not callable(worker_factory):
+            raise DesktopRelayError("Desktop worker factory is unavailable.")
+        if not callable(native_prompt):
+            raise DesktopRelayError("Native prompt preparation is unavailable.")
+        if continue_guard is not None and not callable(continue_guard):
+            raise DesktopRelayError("Desktop continuation guard is unavailable.")
+        if agent_bridge is not None and not all(
+            callable(getattr(agent_bridge, method, None))
+            for method in (
+                "allow",
+                "open",
+                "compatibility",
+                "revoke",
+                "close",
+            )
+        ):
+            raise DesktopRelayError("Agent Panel bridge is unavailable.")
+        if local_comfy_root is not None and not (
+            isinstance(local_comfy_root, str) or callable(local_comfy_root)
+        ):
+            raise DesktopRelayError("Approved ComfyUI root is unavailable.")
+        self.repository = repository
+        self.bind_host = bind_host
+        self.port_selector = port_selector or (lambda: 0)
+        self.listener_factory = listener_factory or (
+            lambda handler: _AiohttpRelayListener(handler)
+        )
+        self.worker_factory = worker_factory
+        self.native_prompt = native_prompt
+        self.continue_guard = continue_guard
+        self.agent_bridge = agent_bridge
+        self.local_comfy_root = local_comfy_root
+        self.capability_factory = capability_factory or (
+            lambda: secrets.token_urlsafe(48)
+        )
+        self.clock = clock or __import__("time").time
+        self._config = None
+        self._listener = None
+        self._worker = None
+        self._bound = False
+        self._error = None
+        self._capability = None
+        self._capability_expires_at = None
+        self._lifecycle_lock = None
+        self._lifecycle_lock_loop = None
+        self._activation_generation = 0
+        self._active_websockets = set()
+        self._cleanup_tasks = set()
+        self._preempted_sessions = set()
+
+    def _lock(self):
+        loop = asyncio.get_running_loop()
+        if (
+            self._lifecycle_lock is None
+            or self._lifecycle_lock_loop is not loop
+        ):
+            self._lifecycle_lock = asyncio.Lock()
+            self._lifecycle_lock_loop = loop
+        return self._lifecycle_lock
+
+    def _now(self):
+        value = self.clock()
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < 0
+        ):
+            raise DesktopRelayError("Desktop relay clock is unavailable.")
+        return float(value)
+
+    def _next_updated_at(self, previous):
+        value = max(self._now(), math.nextafter(previous, math.inf))
+        if not math.isfinite(value):
+            raise DesktopRelayError("Desktop relay clock is unavailable.")
+        return value
+
+    def _session_may_continue(self, session_id):
+        if session_id in self._preempted_sessions:
+            return False
+        guard = self.continue_guard
+        if guard is None:
+            return True
+        try:
+            result = guard(session_id)
+            if asyncio.iscoroutine(result):
+                result.close()
+                return False
+            return True
+        except (asyncio.CancelledError, Exception):
+            return False
+
+    def _target_is_active(self, session_id, worker, generation):
+        config = self._config
+        return bool(
+            self._bound
+            and config is not None
+            and config.active_session_id == session_id
+            and self._worker is worker
+            and worker is not None
+            and self._activation_generation == generation
+            and self._session_may_continue(session_id)
+        )
+
+    def _invalidate_session(self, session_id, *, terminal):
+        if terminal:
+            self._preempted_sessions.add(session_id)
+        config = self._config
+        if config is not None and config.active_session_id == session_id:
+            self._activation_generation += 1
+            self._worker = None
+            self._capability = None
+            self._capability_expires_at = None
+        return tuple(
+            connection
+            for connection in self._active_websockets
+            if connection.session_id == session_id
+        )
+
+    @staticmethod
+    async def _close_socket(socket, code):
+        close = getattr(socket, "close", None)
+        if not callable(close):
+            return
+        result = close(code=code)
+        if asyncio.iscoroutine(result):
+            await result
+
+    async def _close_websockets(self, connections, *, code):
+        sockets = {
+            socket
+            for connection in connections
+            for socket in (connection.upstream, connection.desktop)
+            if socket is not None
+        }
+        if not sockets:
+            return
+        tasks = {
+            asyncio.create_task(self._close_socket(socket, code))
+            for socket in sockets
+        }
+        done, pending = await asyncio.wait(
+            tasks,
+            timeout=WEBSOCKET_CLOSE_TIMEOUT_SECONDS,
+        )
+        for task in done:
+            try:
+                task.result()
+            except (asyncio.CancelledError, Exception):
+                self._error = "local_relay_unavailable"
+        for task in pending:
+            task.cancel()
+        if pending:
+            self._error = "local_relay_unavailable"
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    async def _cleanup_session(self, session_id, connections, *, code):
+        await self._close_websockets(connections, code=code)
+        bridge = self.agent_bridge
+        revoke = getattr(bridge, "revoke", None)
+        if not callable(revoke):
+            return
+        try:
+            result = revoke(session_id)
+            if asyncio.iscoroutine(result):
+                await asyncio.wait_for(
+                    result,
+                    timeout=WEBSOCKET_CLOSE_TIMEOUT_SECONDS,
+                )
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            raise
+        except Exception:
+            self._error = "agent_bridge_unavailable"
+
+    def _schedule_session_cleanup(self, session_id, connections, *, code):
+        task = asyncio.create_task(
+            self._cleanup_session(session_id, connections, code=code),
+            name="cloud-vast-relay-cleanup-" + session_id,
+        )
+        self._cleanup_tasks.add(task)
+
+        def finished(completed):
+            self._cleanup_tasks.discard(completed)
+            if not completed.cancelled():
+                try:
+                    completed.exception()
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+        task.add_done_callback(finished)
+        return task
+
+    async def start(self):
+        async with self._lock():
+            if self._bound:
+                return self.status()
+            listener = None
+            try:
+                config = self.repository.get_desktop_relay()
+                self._config = config
+                if config is not None and config.bind_host != self.bind_host:
+                    raise DesktopRelayError(
+                        "Stored Desktop relay configuration is invalid."
+                    )
+                selected = config.port if config is not None else self.port_selector()
+                if (
+                    isinstance(selected, bool)
+                    or not isinstance(selected, int)
+                    or not 0 <= selected <= 65535
+                ):
+                    raise DesktopRelayError(
+                        "Desktop relay port selection failed."
+                    )
+                listener = self.listener_factory(self.handle)
+                bound_port = await listener.start(
+                    self.bind_host,
+                    selected,
+                    self.handle,
+                )
+                if (
+                    isinstance(bound_port, bool)
+                    or not isinstance(bound_port, int)
+                    or not 1 <= bound_port <= 65535
+                    or (config is not None and bound_port != config.port)
+                ):
+                    raise OSError("invalid relay binding")
+                if config is None:
+                    config = self.repository.save_desktop_relay(
+                        DesktopRelayConfig(
+                            bind_host=self.bind_host,
+                            port=bound_port,
+                            active_session_id=None,
+                            profile_revision=None,
+                            updated_at=self._now(),
+                        )
+                    )
+                self._config = config
+                self._listener = listener
+                self._bound = True
+                self._error = None
+            except OSError:
+                self._bound = False
+                self._error = "local_port_unavailable"
+            except DesktopRelayError:
+                self._bound = False
+                self._error = "local_relay_unavailable"
+            except Exception:
+                self._bound = False
+                self._error = "local_relay_unavailable"
+            if not self._bound and listener is not None:
+                try:
+                    await listener.close()
+                except Exception:
+                    pass
+            return self.status()
+
+    async def activate(self, session_id, worker, profile_revision):
+        if (
+            not isinstance(session_id, str)
+            or _IDENTIFIER.fullmatch(session_id) is None
+            or isinstance(profile_revision, bool)
+            or not isinstance(profile_revision, int)
+            or profile_revision < 0
+            or not callable(getattr(worker, "native_envelope", None))
+            or not callable(
+                getattr(getattr(worker, "transport", None), "request", None)
+            )
+        ):
+            raise DesktopRelayError("Desktop relay activation was rejected.")
+        if not self._session_may_continue(session_id):
+            raise DesktopRelayError("Desktop relay activation was rejected.")
+        async with self._lock():
+            if not self._bound or self._config is None:
+                raise DesktopRelayError("Desktop relay is not bound.")
+            if (
+                self._config.active_session_id
+                not in {None, session_id}
+                or not self._session_may_continue(session_id)
+            ):
+                raise DesktopRelayError(
+                    "Desktop relay session identity does not match."
+                )
+            if self.agent_bridge is not None:
+                try:
+                    allowed = self.agent_bridge.allow(session_id)
+                    if asyncio.iscoroutine(allowed):
+                        await allowed
+                except (asyncio.CancelledError, KeyboardInterrupt):
+                    raise
+                except Exception:
+                    raise DesktopRelayError(
+                        "Agent Panel bridge activation failed."
+                    ) from None
+            if not self._session_may_continue(session_id):
+                raise DesktopRelayError("Desktop relay activation was rejected.")
+            previous = self._config
+            updated = DesktopRelayConfig(
+                bind_host=previous.bind_host,
+                port=previous.port,
+                active_session_id=session_id,
+                profile_revision=profile_revision,
+                updated_at=self._next_updated_at(previous.updated_at),
+            )
+            self._config = self.repository.save_desktop_relay(
+                updated,
+                expected_updated_at=previous.updated_at,
+            )
+            self._activation_generation += 1
+            self._worker = worker
+            self._capability = None
+            self._capability_expires_at = None
+            self._error = None
+            return self.status()
+
+    async def probe_readiness(
+        self,
+        session_id,
+        worker,
+        profile_revision,
+        *,
+        agent_required,
+    ):
+        """Probe the exact relay data plane without exposing an active Desktop."""
+        if (
+            not isinstance(session_id, str)
+            or _IDENTIFIER.fullmatch(session_id) is None
+            or isinstance(profile_revision, bool)
+            or not isinstance(profile_revision, int)
+            or profile_revision < 0
+            or not isinstance(agent_required, bool)
+            or not callable(getattr(worker, "native_envelope", None))
+            or not callable(
+                getattr(getattr(worker, "transport", None), "request", None)
+            )
+        ):
+            raise DesktopRelayError("Desktop readiness probe was rejected.")
+        if not self._session_may_continue(session_id):
+            raise DesktopRelayError("Desktop readiness probe was rejected.")
+
+        def check(name, status, proof, diagnostic_code=None):
+            return ReadinessCheck(
+                name=name,
+                status=status,
+                evidence_digest=evidence_digest(proof),
+                message=readiness_message(name, status),
+                diagnostic_code=(
+                    diagnostic_code if status == "failed" else None
+                ),
+            )
+
+        async with self._lock():
+            config = self._config
+            binding_ok = bool(
+                self._bound
+                and config is not None
+                and config.bind_host == "127.0.0.1"
+                and 1 <= config.port <= 65535
+                and (
+                    (
+                        config.active_session_id is None
+                        and config.profile_revision is None
+                    )
+                    or (
+                        config.active_session_id == session_id
+                        and config.profile_revision == profile_revision
+                    )
+                )
+                and (
+                    getattr(worker, "session_id", session_id)
+                    == session_id
+                )
+                and self._session_may_continue(session_id)
+            )
+            binding = check(
+                "loopback_session_binding",
+                "passed" if binding_ok else "failed",
+                {
+                    "bound": binding_ok,
+                    "session_id": session_id,
+                    "profile_revision": profile_revision,
+                },
+                "profile_package_mismatch",
+            )
+
+            http_ok = False
+            http_proof = {"status": "unavailable"}
+            http_diagnostic = "native_route_rejected"
+            if binding_ok:
+                try:
+                    if not self._session_may_continue(session_id):
+                        raise DesktopRelayError(
+                            "Native HTTP readiness probe failed."
+                        )
+                    request = worker.native_envelope(
+                        "GET",
+                        "/system_stats",
+                        b"",
+                        headers={"Accept": "application/json"},
+                    )
+                    if not isinstance(request, WorkerRequest):
+                        raise DesktopRelayError(
+                            "Native HTTP readiness probe failed."
+                        )
+                except (asyncio.CancelledError, KeyboardInterrupt):
+                    raise
+                except Exception:
+                    request = None
+                if request is not None:
+                    http_diagnostic = "native_http_status"
+                    try:
+                        response = await worker.transport.request(
+                            request,
+                            max_bytes=MAX_RELAY_RESPONSE_BYTES,
+                        )
+                        if not self._session_may_continue(session_id):
+                            raise DesktopRelayError(
+                                "Native HTTP readiness probe failed."
+                            )
+                        http_ok = bool(
+                            isinstance(response, WorkerTransportResponse)
+                            and response.status == 200
+                            and isinstance(response.body, bytes)
+                            and len(response.body) <= MAX_RELAY_RESPONSE_BYTES
+                        )
+                        http_proof = {
+                            "status": response.status,
+                            "body_sha256": (
+                                hashlib.sha256(response.body).hexdigest()
+                                if http_ok
+                                else None
+                            ),
+                        }
+                    except (asyncio.CancelledError, KeyboardInterrupt):
+                        raise
+                    except Exception:
+                        http_ok = False
+            http = check(
+                "native_http_probe",
+                "passed" if http_ok else "failed",
+                http_proof,
+                http_diagnostic,
+            )
+
+            websocket_ok = False
+            websocket_proof = {"status": "unavailable"}
+            open_socket = getattr(worker, "native_websocket", None)
+            if binding_ok and callable(open_socket):
+                upstream = None
+                try:
+                    if not self._session_may_continue(session_id):
+                        raise DesktopRelayError(
+                            "Native WebSocket readiness probe failed."
+                        )
+                    request = worker.native_envelope(
+                        "GET",
+                        "/ws?clientId=cloud-vast-readiness",
+                        b"",
+                    )
+                    if not isinstance(request, WorkerRequest):
+                        raise DesktopRelayError(
+                            "Native WebSocket readiness probe failed."
+                        )
+                    upstream = await open_socket(request)
+                    if not self._session_may_continue(session_id):
+                        raise DesktopRelayError(
+                            "Native WebSocket readiness probe failed."
+                        )
+                    close = getattr(upstream, "close", None)
+                    if not callable(close):
+                        raise DesktopRelayError(
+                            "Native WebSocket readiness probe failed."
+                        )
+                    closed = close(code=1000)
+                    if asyncio.iscoroutine(closed):
+                        await closed
+                    websocket_ok = True
+                    websocket_proof = {
+                        "status": "opened_and_closed",
+                        "session_id": session_id,
+                    }
+                except (asyncio.CancelledError, KeyboardInterrupt):
+                    raise
+                except Exception:
+                    websocket_ok = False
+                    if upstream is not None:
+                        try:
+                            closed = upstream.close(code=1011)
+                            if asyncio.iscoroutine(closed):
+                                await closed
+                        except Exception:
+                            pass
+            websocket = check(
+                "native_websocket_probe",
+                "passed" if websocket_ok else "failed",
+                websocket_proof,
+                "native_websocket_handshake",
+            )
+
+            agent_status = "not_required"
+            agent_ok = not agent_required
+            agent_proof = {"required": agent_required}
+            if agent_required:
+                bridge = self.agent_bridge
+                probe = getattr(bridge, "probe", None)
+                allow = getattr(bridge, "allow", None)
+                revoke = getattr(bridge, "revoke", None)
+                if all(callable(item) for item in (probe, allow, revoke)):
+                    try:
+                        if not self._session_may_continue(session_id):
+                            raise DesktopRelayError(
+                                "Agent Panel readiness probe failed."
+                            )
+                        capability = self.capability_factory()
+                        now = self._now()
+                        root = self.local_comfy_root
+                        if callable(root):
+                            root = root()
+                        bridge_session = AgentBridgeSession(
+                            session_id=session_id,
+                            relay_origin=(
+                                "http://127.0.0.1:" + str(config.port)
+                            ),
+                            capability=capability,
+                            capability_expires_at=now + COOKIE_TTL_SECONDS,
+                            local_comfy_root=(
+                                str(root) if root is not None else None
+                            ),
+                        )
+                        allowed = allow(session_id)
+                        if asyncio.iscoroutine(allowed):
+                            await allowed
+                        if not self._session_may_continue(session_id):
+                            raise DesktopRelayError(
+                                "Agent Panel readiness probe failed."
+                            )
+                        result = probe(bridge_session)
+                        if asyncio.iscoroutine(result):
+                            result = await result
+                        if not self._session_may_continue(session_id):
+                            raise DesktopRelayError(
+                                "Agent Panel readiness probe failed."
+                            )
+                        agent_ok = bool(getattr(result, "ready", None) is True)
+                        agent_proof = (
+                            result.public_payload()
+                            if agent_ok
+                            and callable(getattr(result, "public_payload", None))
+                            else {"required": True, "ready": False}
+                        )
+                    except (asyncio.CancelledError, KeyboardInterrupt):
+                        raise
+                    except Exception:
+                        agent_ok = False
+                    finally:
+                        try:
+                            revoked = revoke(session_id)
+                            if asyncio.iscoroutine(revoked):
+                                await revoked
+                        except Exception:
+                            agent_ok = False
+                agent_status = "passed" if agent_ok else "failed"
+            agent = check(
+                "agent_panel_capabilities",
+                agent_status,
+                agent_proof,
+                "agent_bridge_unavailable",
+            )
+            return (binding, http, websocket, agent)
+
+    async def deactivate(self, session_id):
+        if not isinstance(session_id, str) or _IDENTIFIER.fullmatch(session_id) is None:
+            raise DesktopRelayError("Desktop relay deactivation was rejected.")
+        connections = self._invalidate_session(session_id, terminal=False)
+        failure = None
+        async with self._lock():
+            if self._config is None:
+                self._config = self.repository.get_desktop_relay()
+            if (
+                self._config is not None
+                and self._config.active_session_id not in {None, session_id}
+            ):
+                raise DesktopRelayError(
+                    "Desktop relay session identity does not match."
+                )
+            previous = self._config
+            if previous is not None and previous.active_session_id == session_id:
+                inactive = DesktopRelayConfig(
+                    bind_host=previous.bind_host,
+                    port=previous.port,
+                    active_session_id=None,
+                    profile_revision=None,
+                    updated_at=self._next_updated_at(previous.updated_at),
+                )
+                self._config = inactive
+                try:
+                    self.repository.save_desktop_relay(
+                        inactive,
+                        expected_updated_at=previous.updated_at,
+                    )
+                except Exception:
+                    failure = DesktopRelayError(
+                        "Desktop relay deactivation was rejected."
+                    )
+            self._worker = None
+            self._capability = None
+            self._capability_expires_at = None
+        self._schedule_session_cleanup(
+            session_id,
+            connections,
+            code=1001,
+        )
+        await asyncio.sleep(0)
+        if failure is not None:
+            self._error = "local_relay_unavailable"
+            raise failure
+        return self.status()
+
+    async def preempt(self, session_id):
+        if not isinstance(session_id, str) or _IDENTIFIER.fullmatch(session_id) is None:
+            raise DesktopRelayError("Desktop relay deactivation was rejected.")
+        connections = self._invalidate_session(session_id, terminal=True)
+        previous = self._config
+        if previous is None:
+            try:
+                previous = self.repository.get_desktop_relay()
+            except Exception:
+                previous = None
+        if previous is not None and previous.active_session_id == session_id:
+            inactive = DesktopRelayConfig(
+                bind_host=previous.bind_host,
+                port=previous.port,
+                active_session_id=None,
+                profile_revision=None,
+                updated_at=self._next_updated_at(previous.updated_at),
+            )
+            self._config = inactive
+            try:
+                self.repository.save_desktop_relay(
+                    inactive,
+                    expected_updated_at=previous.updated_at,
+                )
+            except Exception:
+                self._error = "local_relay_unavailable"
+        self._worker = None
+        self._capability = None
+        self._capability_expires_at = None
+        self._schedule_session_cleanup(
+            session_id,
+            connections,
+            code=1001,
+        )
+        await asyncio.sleep(0)
+        return self.status()
+
+    def status(self):
+        config = self._config
+        active = config.active_session_id if config is not None else None
+        revision = config.profile_revision if config is not None else None
+        ready = bool(self._bound and self._worker is not None and active)
+        return DesktopRelayStatus(
+            bound=self._bound,
+            url=(
+                "http://127.0.0.1:" + str(config.port)
+                if config is not None
+                else None
+            ),
+            active_session_id=active,
+            profile_revision=revision,
+            ready=ready,
+            error=self._error,
+        )
+
+    def _request_origin_is_valid(self, request):
+        if self._config is None:
+            return False
+        expected_host = "127.0.0.1:" + str(self._config.port)
+        hosts = _header_values(request, "host")
+        origins = _header_values(request, "origin")
+        return (
+            len(hosts) == 1
+            and hosts[0] == expected_host
+            and len(origins) <= 1
+            and (
+                not origins
+                or origins[0] == "http://" + expected_host
+            )
+        )
+
+    def _cookie_capability(self, request):
+        values = _header_values(request, "cookie")
+        if len(values) != 1:
+            return None
+        found = []
+        for component in values[0].split(";"):
+            name, separator, value = component.strip().partition("=")
+            if separator and name == COOKIE_NAME:
+                found.append(value)
+        return found[0] if len(found) == 1 else None
+
+    def _capability_is_valid(self, request):
+        supplied = self._cookie_capability(request)
+        if (
+            supplied is None
+            or self._capability is None
+            or self._capability_expires_at is None
+            or self._now() >= self._capability_expires_at
+        ):
+            return False
+        return hmac.compare_digest(supplied, self._capability)
+
+    def _cookie_header(self):
+        now = self._now()
+        if (
+            self._capability is None
+            or self._capability_expires_at is None
+            or now >= self._capability_expires_at
+        ):
+            try:
+                capability = self.capability_factory()
+            except Exception:
+                raise DesktopRelayError(
+                    "Desktop relay capability is unavailable."
+                ) from None
+            if (
+                not isinstance(capability, str)
+                or _CAPABILITY.fullmatch(capability) is None
+            ):
+                raise DesktopRelayError(
+                    "Desktop relay capability is unavailable."
+                )
+            self._capability = capability
+            self._capability_expires_at = now + COOKIE_TTL_SECONDS
+        remaining = max(
+            1,
+            min(
+                COOKIE_TTL_SECONDS,
+                int(self._capability_expires_at - now),
+            ),
+        )
+        return (
+            COOKIE_NAME
+            + "="
+            + self._capability
+            + "; Path=/; HttpOnly; SameSite=Strict; Max-Age="
+            + str(remaining)
+        )
+
+    @staticmethod
+    def _response(status, body=b"", *, headers=None):
+        return DesktopRelayResponse(
+            status=status,
+            body=body,
+            headers=dict(headers or {}),
+        )
+
+    def _context_response(self, *, set_cookie):
+        status = self.status()
+        payload = {
+            "role": "vast",
+            "session_id": status.active_session_id,
+            "profile_revision": status.profile_revision,
+            "agent_bridge_url": (
+                "ws://127.0.0.1:"
+                + str(self._config.port)
+                + "/cloud-run/api/agent/ws"
+            ),
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+        }
+        if set_cookie:
+            headers["Set-Cookie"] = self._cookie_header()
+        return self._response(
+            200,
+            json.dumps(
+                payload,
+                ensure_ascii=True,
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8"),
+            headers=headers,
+        )
+
+    def _agent_session(self):
+        if (
+            self._config is None
+            or self._config.active_session_id is None
+            or self._capability is None
+            or self._capability_expires_at is None
+        ):
+            raise DesktopRelayError("Agent Panel bridge is unavailable.")
+        root = self.local_comfy_root
+        if callable(root):
+            try:
+                root = root()
+            except Exception:
+                raise DesktopRelayError(
+                    "Approved ComfyUI root is unavailable."
+                ) from None
+        if root is not None:
+            root = str(root)
+        return AgentBridgeSession(
+            session_id=self._config.active_session_id,
+            relay_origin="http://127.0.0.1:" + str(self._config.port),
+            capability=self._capability,
+            capability_expires_at=self._capability_expires_at,
+            local_comfy_root=root,
+        )
+
+    def _agent_compatibility_response(self, path):
+        if self.agent_bridge is None:
+            return self._response(404)
+        try:
+            payload = self.agent_bridge.compatibility(
+                path,
+                self._agent_session(),
+            )
+            body = json.dumps(
+                payload,
+                ensure_ascii=True,
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+            if len(body) > MAX_WORKER_JSON_BYTES:
+                raise DesktopRelayError(
+                    "Agent Panel compatibility response was rejected."
+                )
+        except Exception:
+            return self._response(502)
+        return self._response(
+            200,
+            body,
+            headers={
+                "Content-Type": "application/json",
+                "Cache-Control": "no-store",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+
+    @staticmethod
+    def _forward_headers(request):
+        source = _headers(request)
+        return {
+            canonical: source[name]
+            for name, canonical in _REQUEST_HEADERS.items()
+            if name in source
+            and source[name]
+            and len(source[name]) <= 8192
+            and not any(character in source[name] for character in "\r\n")
+        }
+
+    @staticmethod
+    def _upstream_headers(response):
+        try:
+            source = {
+                str(key).casefold(): str(value)
+                for key, value in response.headers.items()
+            }
+        except (AttributeError, TypeError, ValueError):
+            raise DesktopRelayError("Desktop upstream response was rejected.")
+        if source.get("content-encoding", "identity").casefold() != "identity":
+            raise DesktopRelayError("Desktop upstream response was rejected.")
+        headers = {}
+        for name, canonical in _RESPONSE_HEADERS.items():
+            if name not in source:
+                continue
+            value = source[name]
+            if len(value) > 8192 or any(character in value for character in "\r\n"):
+                raise DesktopRelayError(
+                    "Desktop upstream response was rejected."
+                )
+            headers[canonical] = value
+        return headers
+
+    async def _native_http(
+        self,
+        request,
+        route,
+        *,
+        set_cookie,
+        session_id,
+        worker,
+        generation,
+    ):
+        if not self._target_is_active(session_id, worker, generation):
+            return self._response(503)
+        try:
+            body = await _body(request)
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            raise
+        except Exception:
+            return self._response(400)
+        if not self._target_is_active(session_id, worker, generation):
+            return self._response(503)
+        identity = None
+        response_callback = None
+        if route.kind == "prompt":
+            request_ids = _header_values(
+                request,
+                "x-cloud-vast-request-id",
+            )
+            if (
+                len(request_ids) != 1
+                or _IDENTIFIER.fullmatch(request_ids[0]) is None
+            ):
+                return self._response(409)
+            try:
+                prepared = self.native_prompt(
+                    session_id,
+                    request_id=request_ids[0],
+                    body=body,
+                )
+                if asyncio.iscoroutine(prepared):
+                    prepared = await prepared
+                if not self._target_is_active(
+                    session_id,
+                    worker,
+                    generation,
+                ):
+                    return self._response(503)
+                server_identity = getattr(
+                    prepared,
+                    "server_identity",
+                    None,
+                )
+                if callable(server_identity):
+                    identity = server_identity()
+                    body = getattr(prepared, "body", None)
+                    response_callback = getattr(
+                        prepared,
+                        "bind_response",
+                        None,
+                    )
+                elif isinstance(prepared, dict):
+                    prepared = dict(prepared)
+                    body = prepared.pop("body", body)
+                    identity = prepared
+                if (
+                    not isinstance(identity, dict)
+                    or set(identity)
+                    != {"job_id", "request_id", "manifest_digest"}
+                    or identity.get("request_id") != request_ids[0]
+                    or any(
+                        not isinstance(identity.get(name), str)
+                        for name in identity
+                    )
+                    or not isinstance(body, bytes)
+                    or not body
+                    or len(body) > MAX_WORKER_JSON_BYTES
+                    or (
+                        response_callback is not None
+                        and not callable(response_callback)
+                    )
+                ):
+                    raise DesktopRelayError(
+                        "Native prompt preparation was rejected."
+                    )
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                raise
+            except Exception:
+                return self._response(409)
+        try:
+            if not self._target_is_active(session_id, worker, generation):
+                return self._response(503)
+            envelope = worker.native_envelope(
+                str(request.method).upper(),
+                route.path_qs,
+                body,
+                identity=identity,
+                headers=self._forward_headers(request),
+            )
+            if not isinstance(envelope, WorkerRequest):
+                raise DesktopRelayError("Desktop upstream request was rejected.")
+            if not self._target_is_active(session_id, worker, generation):
+                return self._response(503)
+            response = await worker.transport.request(
+                envelope,
+                max_bytes=MAX_RELAY_RESPONSE_BYTES,
+            )
+            if not self._target_is_active(session_id, worker, generation):
+                return self._response(503)
+            if (
+                not isinstance(response, WorkerTransportResponse)
+                or isinstance(response.status, bool)
+                or not isinstance(response.status, int)
+                or not 100 <= response.status <= 599
+                or not isinstance(response.body, bytes)
+                or len(response.body) > MAX_RELAY_RESPONSE_BYTES
+                or 300 <= response.status < 400
+            ):
+                raise DesktopRelayError(
+                    "Desktop upstream response was rejected."
+                )
+            headers = self._upstream_headers(response)
+            if response_callback is not None and response.status == 200:
+                bound = response_callback(response.status, response.body)
+                if asyncio.iscoroutine(bound):
+                    await bound
+                if not self._target_is_active(
+                    session_id,
+                    worker,
+                    generation,
+                ):
+                    return self._response(503)
+            if set_cookie:
+                headers["Set-Cookie"] = self._cookie_header()
+            return self._response(
+                response.status,
+                response.body,
+                headers=headers,
+            )
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            raise
+        except Exception:
+            return self._response(502)
+
+    async def _bridge_websocket(
+        self,
+        request,
+        route,
+        *,
+        session_id,
+        worker,
+        generation,
+    ):
+        if not self._target_is_active(session_id, worker, generation):
+            return self._response(503)
+        open_socket = getattr(worker, "native_websocket", None)
+        if not callable(open_socket):
+            return self._response(502)
+        try:
+            from aiohttp import web
+        except ImportError:
+            return self._response(502)
+        upstream = None
+        desktop = None
+        connection = None
+        tasks = set()
+        failed = False
+        prepared = False
+        try:
+            if not self._target_is_active(session_id, worker, generation):
+                return self._response(503)
+            envelope = worker.native_envelope(
+                "GET",
+                route.path_qs,
+                b"",
+                headers=self._forward_headers(request),
+            )
+            if not self._target_is_active(session_id, worker, generation):
+                return self._response(503)
+            upstream = await open_socket(envelope)
+            if not self._target_is_active(session_id, worker, generation):
+                return self._response(503)
+            desktop = web.WebSocketResponse(
+                heartbeat=30,
+                max_msg_size=MAX_WORKER_JSON_BYTES,
+                autoclose=False,
+            )
+            connection = _TrackedWebSocket(
+                session_id=session_id,
+                generation=generation,
+                upstream=upstream,
+                desktop=desktop,
+            )
+            self._active_websockets.add(connection)
+            if not self._target_is_active(session_id, worker, generation):
+                return self._response(503)
+            await desktop.prepare(request)
+            prepared = True
+            if not self._target_is_active(session_id, worker, generation):
+                return desktop
+
+            async def upstream_to_desktop():
+                async for message in upstream:
+                    if not self._target_is_active(
+                        session_id,
+                        worker,
+                        generation,
+                    ):
+                        break
+                    kind = _message_type(message)
+                    if kind == "TEXT":
+                        if not self._target_is_active(
+                            session_id,
+                            worker,
+                            generation,
+                        ):
+                            break
+                        await desktop.send_str(message.data)
+                    elif kind == "BINARY":
+                        if not self._target_is_active(
+                            session_id,
+                            worker,
+                            generation,
+                        ):
+                            break
+                        await desktop.send_bytes(bytes(message.data))
+                    elif kind in {"CLOSE", "CLOSED", "CLOSING"}:
+                        break
+                    elif kind == "ERROR":
+                        raise DesktopRelayError("Desktop WebSocket failed.")
+
+            async def desktop_to_upstream():
+                async for message in desktop:
+                    if not self._target_is_active(
+                        session_id,
+                        worker,
+                        generation,
+                    ):
+                        break
+                    kind = _message_type(message)
+                    if kind == "TEXT":
+                        if not self._target_is_active(
+                            session_id,
+                            worker,
+                            generation,
+                        ):
+                            break
+                        await upstream.send_str(message.data)
+                    elif kind == "BINARY":
+                        if not self._target_is_active(
+                            session_id,
+                            worker,
+                            generation,
+                        ):
+                            break
+                        await upstream.send_bytes(bytes(message.data))
+                    elif kind in {"CLOSE", "CLOSED", "CLOSING"}:
+                        break
+                    elif kind == "ERROR":
+                        raise DesktopRelayError("Desktop WebSocket failed.")
+
+            tasks = {
+                asyncio.create_task(upstream_to_desktop()),
+                asyncio.create_task(desktop_to_upstream()),
+            }
+            done, pending = await asyncio.wait(
+                tasks,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in done:
+                try:
+                    task.result()
+                except (asyncio.CancelledError, KeyboardInterrupt):
+                    raise
+                except Exception:
+                    failed = True
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            return desktop
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            failed = True
+            raise
+        except Exception:
+            failed = True
+            return desktop if prepared else self._response(502)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            if connection is not None:
+                self._active_websockets.discard(connection)
+                code = (
+                    1011
+                    if failed
+                    else (
+                        1000
+                        if self._target_is_active(
+                            session_id,
+                            worker,
+                            generation,
+                        )
+                        else 1001
+                    )
+                )
+                await self._close_websockets((connection,), code=code)
+            elif upstream is not None:
+                try:
+                    await asyncio.wait_for(
+                        self._close_socket(upstream, 1001),
+                        timeout=WEBSOCKET_CLOSE_TIMEOUT_SECONDS,
+                    )
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+    async def handle(self, request):
+        try:
+            NativeRoutePolicy = _native_route_policy()
+        except ImportError:
+            return self._response(503)
+        method = getattr(request, "method", None)
+        path_qs = getattr(request, "path_qs", getattr(request, "path", None))
+        path = getattr(request, "path", None)
+        normalized_method = str(method).upper()
+        context = (
+            normalized_method == "GET"
+            and path_qs == "/cloud-run/api/desktop-context"
+        )
+        agent = (
+            normalized_method == "GET"
+            and path_qs == "/cloud-run/api/agent/ws"
+        )
+        agent_compatibility = (
+            normalized_method == "GET"
+            and path_qs in _AGENT_COMPATIBILITY_PATHS
+        )
+        route = NativeRoutePolicy().classify(method, path_qs)
+        if not context and not agent and not agent_compatibility and route is None:
+            return self._response(404)
+        config = self._config
+        session_id = (
+            config.active_session_id if config is not None else None
+        )
+        worker = self._worker
+        generation = self._activation_generation
+        if (
+            not isinstance(session_id, str)
+            or not self._target_is_active(session_id, worker, generation)
+        ):
+            return self._response(503)
+        if not self._request_origin_is_valid(request):
+            return self._response(403)
+        bootstrap = context or (
+            route is not None
+            and route.kind == "http"
+            and normalized_method == "GET"
+            and path == "/"
+        )
+        valid_cookie = self._capability_is_valid(request)
+        if not bootstrap and not valid_cookie:
+            return self._response(403)
+        set_cookie = bootstrap and not valid_cookie
+        if not self._target_is_active(session_id, worker, generation):
+            return self._response(503)
+        if context:
+            return self._context_response(set_cookie=set_cookie)
+        if agent_compatibility:
+            return self._agent_compatibility_response(path_qs)
+        if agent:
+            if self.agent_bridge is None:
+                return self._response(404)
+            try:
+                result = self.agent_bridge.open(
+                    request,
+                    self._agent_session(),
+                )
+                if asyncio.iscoroutine(result):
+                    result = await result
+                if not self._target_is_active(
+                    session_id,
+                    worker,
+                    generation,
+                ):
+                    return self._response(503)
+                return result
+            except Exception:
+                return self._response(502)
+        if route.kind == "websocket":
+            return await self._bridge_websocket(
+                request,
+                route,
+                session_id=session_id,
+                worker=worker,
+                generation=generation,
+            )
+        return await self._native_http(
+            request,
+            route,
+            set_cookie=set_cookie,
+            session_id=session_id,
+            worker=worker,
+            generation=generation,
+        )
+
+    async def close(self):
+        self._activation_generation += 1
+        self._bound = False
+        self._worker = None
+        self._capability = None
+        self._capability_expires_at = None
+        await self._close_websockets(
+            tuple(self._active_websockets),
+            code=1001,
+        )
+        async with self._lock():
+            listener = self._listener
+            self._listener = None
+            if listener is not None:
+                try:
+                    await listener.close()
+                except Exception:
+                    self._error = "local_relay_unavailable"
+            if self.agent_bridge is not None:
+                try:
+                    closed = self.agent_bridge.close()
+                    if asyncio.iscoroutine(closed):
+                        await closed
+                except Exception:
+                    self._error = "agent_bridge_unavailable"
+        cleanup = set(self._cleanup_tasks)
+        if cleanup:
+            done, pending = await asyncio.wait(
+                cleanup,
+                timeout=WEBSOCKET_CLOSE_TIMEOUT_SECONDS,
+            )
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)

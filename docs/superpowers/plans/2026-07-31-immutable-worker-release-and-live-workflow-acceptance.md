@@ -513,12 +513,12 @@ Use one synthetic, secret-free base-template audit record with this exact privat
 base = {
     "schema_version": 1,
     "hash_id": "027fba7753c024be019030fb42aed900",
-    "image": "reviewed-image.example/comfyui@sha256:" + "d" * 64,
+    "image": "docker.io/vastai/base-image@sha256:" + "d" * 64,
     "tag": "reviewed-pinned-tag",
-    "runtype": "ssh",
+    "runtype": "jupyter_direc ssh_direc",
     "use_ssh": True,
     "ssh_direct": True,
-    "jupyter_dir": "/workspace",
+    "jupyter_dir": None,
 }
 ```
 
@@ -580,8 +580,10 @@ Use no downloaded script, interpolated shell path, caller command, `eval`, pipe-
 Set request `name` to `cloud-run-worker-` plus the full 40-hex commit,
 `recommended_disk_space` to the fixed minimum `80`, `private` to `true`, and
 `env` to the single fixed port mapping `-p 8765:8765`. Copy the validated
-immutable `image`, pinned `tag`, and Jupyter directory from the exact audited
-base record. Require and emit the documented fixed connection contract
+immutable `image` and pinned `tag` from the exact audited base record. Preserve
+the base's documented `jupyter_dir == null` in the audit, but emit the fixed
+worker value `jupyter_dir == "/workspace"`. Require and emit the documented
+fixed connection contract
 `runtype == "ssh"`, `use_ssh is True`, and `ssh_direct is True`; reject legacy
 combined runtype strings. Emit false Jupyter-direct flags and explicit empty
 Docker-registry credential fields as required by Vast's documented complete
@@ -1531,7 +1533,7 @@ mutation during tests, instance creation, or any paid action.
   `cloud-run-worker-[0-9a-f]{40}`, and the exact strict request emitted by
   `render_worker_template.py`.
 - Uses only: `GET https://console.vast.ai/api/v0/template/` with exact encoded
-  `select_filters`, `select_cols`, and `order_by`, plus at most one
+  `select_filters`, `select_cols=["*"]`, and no `order_by`, plus at most one
   `POST https://console.vast.ai/api/v0/template/`.
 - Produces: a sanitized base-template audit or a sanitized publication record
   containing only the validated public template ID/hash and comparison result.
@@ -1554,13 +1556,15 @@ template endpoint. Base audit uses the exact filter:
 ```
 
 Project lookup uses one exact validated generated name. Both send compact,
-sorted JSON in `select_filters`, set `select_cols` to exactly
-`["id","name","hash_id","image","tag","env","onstart","runtype","ssh_direct","use_ssh","jup_direct","jupyter_dir","use_jupyter_lab","docker_login_repo","docker_login_user","docker_login_pass","recommended_disk_space","private"]`,
-and set deterministic `order_by=id`. Require an exact HTTP `200`, JSON object, documented success
+sorted JSON in `select_filters`, set `select_cols` to exactly `["*"]`, and omit
+`order_by`. This is the current official Vast client shape; the former explicit
+column list plus `order_by=id` returned HTTP 400 during the Task 8 live audit.
+Require an exact HTTP `200`, JSON object, documented success
 shape, bounded response body, and either zero or exactly one normalized match
-as appropriate. Missing, duplicate, malformed, additional security-relevant,
-wrong-type, secret-bearing, mutable-image, uppercase hash, or conflicting rows
-fail with one static sanitized exception.
+as appropriate. Project the wildcard row immediately to the fixed local field
+allowlist. Missing, duplicate, malformed, wrong-type, secret-bearing required,
+mutable-image, uppercase hash, or conflicting rows fail with one static
+sanitized exception; additional provider fields are discarded before use.
 
 Prove the transport:
 

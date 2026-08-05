@@ -11,10 +11,10 @@ def release_payload():
         "template_hash_id": "1" * 32,
         "worker_commit": "a" * 40,
         "worker_archive_sha256": "b" * 64,
-        "protocol_version": "1",
+        "protocol_version": "2",
         "comfyui_core_version": "0.29.0",
         "comfyui_frontend_version": "1.47.10",
-        "python_version": "3.13.12",
+        "python_version": "3.12",
         "worker_port": 8765,
     }
 
@@ -37,7 +37,7 @@ class WorkerReleaseTests(unittest.TestCase):
             ("comfyui_frontend_version", "1.47.11"),
             ("comfyui_core_version", "latest"),
             ("python_version", "3.13"),
-            ("protocol_version", "2"),
+            ("protocol_version", "1"),
             ("worker_port", 8188),
             ("schema_version", True),
         ):

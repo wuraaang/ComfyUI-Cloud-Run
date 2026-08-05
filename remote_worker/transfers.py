@@ -13,11 +13,18 @@ import stat
 from collections.abc import Mapping
 from urllib.parse import urljoin, urlsplit
 
-from cloud_run.manifest import (
-    ArtifactSpec,
-    PythonWheelSpec,
-    validate_dependency,
-)
+try:
+    from ..cloud_run.manifest import (
+        ArtifactSpec,
+        PythonWheelSpec,
+        validate_dependency,
+    )
+except ImportError:
+    from cloud_run.manifest import (
+        ArtifactSpec,
+        PythonWheelSpec,
+        validate_dependency,
+    )
 
 
 TRANSFER_CHUNK_BYTES = 8 * 1024 * 1024
@@ -386,8 +393,12 @@ class TransferManager:
 
     def _destination(self, artifact):
         artifact = self._artifact(artifact)
-        if artifact.kind == "custom_node_archive":
-            suffix = ".tar"
+        if artifact.kind in {"custom_node_archive", "profile_archive"}:
+            suffix = (
+                ".tar"
+                if artifact.kind == "custom_node_archive"
+                else ".profile.tar.gz"
+            )
             destination = self.artifact_root / (
                 artifact.artifact_id + suffix
             )

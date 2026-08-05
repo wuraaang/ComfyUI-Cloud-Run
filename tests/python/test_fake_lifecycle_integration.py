@@ -21,18 +21,30 @@ def worker_release():
             "template_hash_id": "1" * 32,
             "worker_commit": "a" * 40,
             "worker_archive_sha256": "b" * 64,
-            "protocol_version": "1",
+            "protocol_version": "2",
             "comfyui_core_version": "0.29.0",
             "comfyui_frontend_version": "1.47.10",
-            "python_version": "3.13.12",
+            "python_version": "3.12",
             "worker_port": 8765,
         }
     )
 
 
+class PrivateBoundaryContext:
+    __slots__ = ("boundary_token", "session_id")
+
+    def __init__(self, boundary_token, session_id):
+        self.boundary_token = boundary_token
+        self.session_id = session_id
+
+    def __repr__(self):
+        return "PrivateBoundaryContext(<redacted>)"
+
+
 class OfflineVast:
     def __init__(self):
         self.create_count = 0
+        self.create_boundaries = []
         self.destroy_count = 0
         self.instances = []
         self.offer = {
@@ -90,9 +102,14 @@ class OfflineVast:
         disk_gb,
         label,
         release,
+        boundary_token,
+        session_id,
     ):
         self.create_count += 1
         self.asserted_create = (str(offer_id), disk_gb, label)
+        self.create_boundaries.append(
+            PrivateBoundaryContext(boundary_token, session_id)
+        )
         self.instances = [
             {
                 "instance_id": "900",
@@ -222,7 +239,7 @@ class FullOfflineLifecycleTests(unittest.TestCase):
     def test_terminal_session_provisioning_destroys_fake_inventory_once(self):
         async def scenario(data_directory):
             settings = SettingsStore(data_directory)
-            settings.update(
+            stored_settings = settings.update(
                 {
                     "api_key": "synthetic-offline-only-value",
                     "max_price_per_hour": 0.55,
@@ -249,7 +266,11 @@ class FullOfflineLifecycleTests(unittest.TestCase):
                 SessionState.BOOTSTRAPPING,
                 now=100.0,
                 instance_id="900",
+                provider_token="a" * 64,
                 session_secret_hex="d" * 64,
+                create_settings_revision=stored_settings[
+                    "api_key_revision"
+                ],
             )
             sessions.create_or_get(session)
             provider.instances = [
@@ -259,7 +280,7 @@ class FullOfflineLifecycleTests(unittest.TestCase):
                     "actual_status": "running",
                     "public_ipaddr": "8.8.8.8",
                     "ports": {"8765/tcp": [{"HostPort": "32100"}]},
-                    "jupyter_token": "offline-boundary-token",
+                    "jupyter_token": "f" * 64,
                 }
             ]
             sleeps = []

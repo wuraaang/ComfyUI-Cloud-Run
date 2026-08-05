@@ -1,5 +1,6 @@
 import dataclasses
 import base64
+import gzip
 import json
 import os
 import stat
@@ -11,7 +12,7 @@ from pathlib import Path
 from unittest import mock
 
 from remote_worker.bootstrap import MAX_ARCHIVE_BYTES
-from scripts.build_worker_artifact import WorkerArtifact
+from scripts.build_worker_artifact import WorkerArtifact, build_worker_artifact
 from scripts.build_worker_release_bundle import (
     ReleaseBuildError,
     ReleaseMetadata,
@@ -29,6 +30,18 @@ from scripts.write_worker_release_lock import (
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 WORKER_COMMIT = "a" * 40
+OFFICIAL_IMAGE = (
+    "docker.io/vastai/comfy@sha256:"
+    "9852fae86527d0be097ffcb90dc18368ff808bcbb7c41fbabd538bff3eb6ab9c"
+)
+OFFICIAL_TAG = "v0.29.0-cuda-12.9-py312"
+EXTRA_FILTERS = {
+    "gpu_arch": {"eq": "nvidia"},
+    "cpu_arch": {"eq": "amd64"},
+    "cuda_max_good": {"gte": 12.9},
+    "compute_cap": {"gte": 750},
+    "num_gpus": {"eq": 1},
+}
 
 
 def release_metadata():
@@ -56,10 +69,10 @@ def release_metadata():
         ),
         worker_archive_size_bytes=12345,
         worker_archive_sha256=digest,
-        protocol_version="1",
+        protocol_version="2",
         comfyui_core_version="0.29.0",
         comfyui_frontend_version="1.47.10",
-        python_version="3.13.12",
+        python_version="3.12",
         destination="/opt/comfyui-cloud-run",
     )
 
@@ -68,13 +81,63 @@ def base_template_audit():
     return {
         "schema_version": 1,
         "hash_id": "027fba7753c024be019030fb42aed900",
-        "image": "docker.io/vastai/base-image@sha256:" + "d" * 64,
-        "tag": "reviewed-pinned-tag",
-        "runtype": "jupyter_direc ssh_direc",
         "use_ssh": True,
         "ssh_direct": True,
-        "jupyter_dir": "/workspace",
     }
+
+
+class WorkerReleaseToolTests(unittest.TestCase):
+    def test_rendered_onstart_reuses_only_exact_verified_install(self):
+        with tempfile.TemporaryDirectory() as root:
+            output = Path(root) / "render"
+            output.mkdir(mode=0o700)
+            rendered = render_worker_template(
+                REPOSITORY_ROOT,
+                output,
+                release_metadata(),
+                base_template_audit(),
+            )
+
+        self.assertIn(
+            "mkdir -p -m 0700 /opt/comfyui-cloud-run-bootstrap",
+            rendered.onstart,
+        )
+        self.assertNotIn(
+            "mkdir -m 0700 /opt/comfyui-cloud-run-bootstrap",
+            rendered.onstart,
+        )
+        self.assertIn(
+            "exec /venv/main/bin/python "
+            "/opt/comfyui-cloud-run-bootstrap/bootstrap.py "
+            "/opt/comfyui-cloud-run-bootstrap/release-lock.json",
+            rendered.onstart,
+        )
+
+    def test_worker_artifact_ignores_generated_bytecode_cache(self):
+        cache = REPOSITORY_ROOT / "remote_worker" / "__pycache__"
+        cache_preexisted = cache.exists()
+        cache.mkdir(exist_ok=True)
+        bytecode = cache / "jobs.cpython-313.pyc"
+        previous = bytecode.read_bytes() if bytecode.exists() else None
+        bytecode.write_bytes(b"generated")
+        try:
+            with tempfile.TemporaryDirectory() as temporary_root:
+                result = build_worker_artifact(
+                    REPOSITORY_ROOT,
+                    Path(temporary_root) / "worker.tar.gz",
+                )
+            self.assertNotIn(
+                "remote_worker/__pycache__/jobs.cpython-313.pyc",
+                result.members,
+            )
+            self.assertIn("remote_worker/native_proxy.py", result.members)
+        finally:
+            if previous is None:
+                bytecode.unlink(missing_ok=True)
+            else:
+                bytecode.write_bytes(previous)
+            if not cache_preexisted:
+                cache.rmdir()
 
 
 class ReleaseBundleTests(unittest.TestCase):
@@ -356,15 +419,20 @@ class TemplateRendererTests(unittest.TestCase):
                 "docker_login_pass",
                 "onstart",
                 "env",
+                "extra_filters",
                 "recommended_disk_space",
                 "private",
             },
         )
+        self.assertEqual(rendered.request["image"], OFFICIAL_IMAGE)
+        self.assertEqual(rendered.request["tag"], OFFICIAL_TAG)
+        self.assertEqual(rendered.request["extra_filters"], EXTRA_FILTERS)
         self.assertEqual(rendered.request["runtype"], "ssh")
         self.assertIs(rendered.request["use_ssh"], True)
         self.assertIs(rendered.request["ssh_direct"], True)
         self.assertIs(rendered.request["jup_direct"], False)
         self.assertIs(rendered.request["use_jupyter_lab"], False)
+        self.assertEqual(rendered.request["jupyter_dir"], "/workspace")
         self.assertEqual(rendered.request["docker_login_repo"], "")
         self.assertEqual(rendered.request["docker_login_user"], "")
         self.assertEqual(rendered.request["docker_login_pass"], "")
@@ -414,15 +482,23 @@ class TemplateRendererTests(unittest.TestCase):
                 base_template_audit(),
             )
 
-            encoded = []
-            for line in rendered.onstart.splitlines():
-                prefix = "printf '%s' '"
-                suffix = "' | base64 -d > "
-                if line.startswith(prefix) and suffix in line:
-                    encoded.append(line[len(prefix):].split(suffix, 1)[0])
-            self.assertEqual(len(encoded), 2)
+            prefix = "printf '%s' '"
+            bootstrap_suffix = "' | base64 -d | gzip -d > "
+            lock_suffix = "' | base64 -d > "
+            bootstrap_encoded = next(
+                line[len(prefix):].split(bootstrap_suffix, 1)[0]
+                for line in rendered.onstart.splitlines()
+                if line.startswith(prefix) and bootstrap_suffix in line
+            )
+            lock_encoded = next(
+                line[len(prefix):].split(lock_suffix, 1)[0]
+                for line in rendered.onstart.splitlines()
+                if line.startswith(prefix) and lock_suffix in line
+            )
             self.assertEqual(
-                base64.b64decode(encoded[0], validate=True),
+                gzip.decompress(
+                    base64.b64decode(bootstrap_encoded, validate=True)
+                ),
                 (REPOSITORY_ROOT / "remote_worker" / "bootstrap.py").read_bytes(),
             )
             compact_lock = (
@@ -434,14 +510,15 @@ class TemplateRendererTests(unittest.TestCase):
                 + b"\n"
             )
             self.assertEqual(
-                base64.b64decode(encoded[1], validate=True),
+                base64.b64decode(lock_encoded, validate=True),
                 compact_lock,
             )
+            self.assertLessEqual(len(rendered.onstart), 16384)
             self.assertEqual(rendered.remote_lock_path.read_bytes(), compact_lock)
             self.assertEqual(rendered.onstart_path.read_text(), rendered.onstart)
 
         self.assertIn("umask 077", rendered.onstart)
-        self.assertIn("mkdir -m 0700 /opt/comfyui-cloud-run-bootstrap", rendered.onstart)
+        self.assertIn("mkdir -p -m 0700 /opt/comfyui-cloud-run-bootstrap", rendered.onstart)
         self.assertIn("chmod 0600 /opt/comfyui-cloud-run-bootstrap/bootstrap.py", rendered.onstart)
         self.assertIn(
             "chmod 0600 /opt/comfyui-cloud-run-bootstrap/release-lock.json",
@@ -452,33 +529,54 @@ class TemplateRendererTests(unittest.TestCase):
             rendered.onstart,
         )
         self.assertIn(
-            "exec python3 /opt/comfyui-cloud-run-bootstrap/bootstrap.py "
+            "CLOUD_RUN_COMFY_ROOT=/opt/workspace-internal/ComfyUI",
+            rendered.onstart,
+        )
+        self.assertIn("export CLOUD_RUN_COMFY_ROOT", rendered.onstart)
+        self.assertIn(
+            "exec /venv/main/bin/python /opt/comfyui-cloud-run-bootstrap/bootstrap.py "
             "/opt/comfyui-cloud-run-bootstrap/release-lock.json",
             rendered.onstart,
         )
-        for forbidden in ("curl", "wget", "eval", "sh -c", "bash -c"):
-            self.assertNotIn(forbidden, rendered.onstart)
+        exec_line = next(
+            line for line in rendered.onstart.splitlines()
+            if line.startswith("exec ")
+        )
+        self.assertEqual(
+            exec_line,
+            "exec /venv/main/bin/python "
+            "/opt/comfyui-cloud-run-bootstrap/bootstrap.py "
+            "/opt/comfyui-cloud-run-bootstrap/release-lock.json",
+        )
+        for forbidden in (
+            "curl",
+            "wget",
+            "eval",
+            "sh -c",
+            "bash -c",
+            "entrypoint",
+            "boot_default",
+            "supervisor",
+            "comfyui-wrapper",
+            "portal_config",
+            "serverless",
+            "$(",
+            "${",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, rendered.onstart.casefold())
 
     def test_renderer_rejects_non_exact_base_template_audits(self):
         invalid = []
         missing = base_template_audit()
-        missing.pop("tag")
+        missing.pop("ssh_direct")
         invalid.append(missing)
         invalid.append({**base_template_audit(), "env": "SECRET=value"})
-        invalid.append({**base_template_audit(), "tag": "latest"})
-        invalid.append({**base_template_audit(), "tag": "reviewed\ntag"})
-        invalid.append({**base_template_audit(), "tag": "reviewed;shutdown"})
-        invalid.append({**base_template_audit(), "image": "image.example/latest"})
-        invalid.append(
-            {
-                **base_template_audit(),
-                "image": "registry.example/vastai/base-image@sha256:"
-                + "d" * 64,
-            }
-        )
+        invalid.append({**base_template_audit(), "image": OFFICIAL_IMAGE})
+        invalid.append({**base_template_audit(), "tag": OFFICIAL_TAG})
         invalid.append({**base_template_audit(), "hash_id": "e" * 32})
         invalid.append({**base_template_audit(), "schema_version": 1.0})
-        invalid.append({**base_template_audit(), "runtype": "ssh_direc"})
+        invalid.append({**base_template_audit(), "runtype": "jupyter"})
         invalid.append({**base_template_audit(), "use_ssh": False})
         invalid.append({**base_template_audit(), "jupyter_dir": "/tmp"})
 
@@ -497,7 +595,7 @@ class TemplateRendererTests(unittest.TestCase):
 
     def test_renderer_rejects_altered_metadata_and_output_permissions(self):
         metadata = release_metadata()
-        object.__setattr__(metadata, "protocol_version", "2")
+        object.__setattr__(metadata, "protocol_version", "1")
         with tempfile.TemporaryDirectory() as root:
             private = self._private_directory(root, "private")
             symlink = Path(root) / "symlink"

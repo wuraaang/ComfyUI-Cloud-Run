@@ -53,10 +53,15 @@ export async function postCapture(fetchImpl, capture) {
 
 
 export const SETTINGS_ENDPOINT = "/cloud-run/api/settings";
+export const VERIFY_VAST_ACCESS_ENDPOINT =
+  "/cloud-run/api/settings/verify-vast-access";
 export const CAPTURES_ENDPOINT = "/cloud-run/api/captures";
 export const PREFLIGHTS_ENDPOINT = "/cloud-run/api/preflights";
 export const OFFERS_ENDPOINT = "/cloud-run/api/offers";
 export const SESSIONS_ENDPOINT = "/cloud-run/api/sessions";
+export const DESKTOP_CONTEXT_ENDPOINT = "/cloud-run/api/desktop-context";
+export const DESKTOP_SETUP_ENDPOINT = "/cloud-run/api/desktop-setup";
+export const DESKTOP_BOOTSTRAP_ENDPOINT = "/cloud-run/api/desktop-bootstrap";
 
 
 function identifier(value) {
@@ -92,6 +97,45 @@ function jobEndpoint(sessionId, jobId) {
 export function createCloudRunApi(fetchImpl) {
   if (typeof fetchImpl !== "function") throw new Error("request failed");
   return {
+    getDesktopContext() {
+      return fetchJson(fetchImpl, DESKTOP_CONTEXT_ENDPOINT);
+    },
+
+    getDesktopSetup() {
+      return fetchJson(fetchImpl, DESKTOP_SETUP_ENDPOINT);
+    },
+
+    activateDesktopRelay(sessionId) {
+      return fetchJson(
+        fetchImpl,
+        `${sessionEndpoint(sessionId)}/desktop-relay`,
+        jsonOptions("POST", {}),
+      );
+    },
+
+    deactivateDesktopRelay(sessionId) {
+      return fetchJson(
+        fetchImpl,
+        `${sessionEndpoint(sessionId)}/desktop-relay`,
+        { method: "DELETE" },
+      );
+    },
+
+    getDesktopBootstrap() {
+      return fetchJson(fetchImpl, DESKTOP_BOOTSTRAP_ENDPOINT);
+    },
+
+    acknowledgeDesktopBootstrap(revision) {
+      if (!Number.isSafeInteger(revision) || revision <= 0) {
+        throw new Error("request failed");
+      }
+      return fetchJson(
+        fetchImpl,
+        DESKTOP_BOOTSTRAP_ENDPOINT,
+        jsonOptions("POST", { bootstrap_revision: revision }),
+      );
+    },
+
     getSettings() {
       return fetchJson(fetchImpl, SETTINGS_ENDPOINT);
     },
@@ -102,6 +146,12 @@ export function createCloudRunApi(fetchImpl) {
         SETTINGS_ENDPOINT,
         jsonOptions("PUT", payload),
       );
+    },
+
+    verifyVastAccess() {
+      return fetchJson(fetchImpl, VERIFY_VAST_ACCESS_ENDPOINT, {
+        method: "POST",
+      });
     },
 
     capture(capture) {
@@ -149,12 +199,30 @@ export function createCloudRunApi(fetchImpl) {
       );
     },
 
-    confirmSession(sessionId, idempotencyKey) {
+    confirmSession(
+      sessionId,
+      idempotencyKey,
+      estimateDigest,
+      acceptedLongerEstimate,
+      preflightId,
+    ) {
+      if (
+        typeof estimateDigest !== "string"
+        || !/^[0-9a-f]{64}$/.test(estimateDigest)
+        || typeof acceptedLongerEstimate !== "boolean"
+        || typeof preflightId !== "string"
+        || !/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}$/.test(preflightId)
+      ) {
+        throw new Error("request failed");
+      }
       return fetchJson(
         fetchImpl,
         `${sessionEndpoint(sessionId)}/confirm`,
         jsonOptions("POST", {
           idempotency_key: String(idempotencyKey),
+          estimate_digest: estimateDigest,
+          accepted_longer_estimate: acceptedLongerEstimate,
+          preflight_id: preflightId,
         }),
       );
     },

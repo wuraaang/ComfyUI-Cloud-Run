@@ -7,14 +7,17 @@ does not expose remote CUDA as local CUDA, and does not replace or intercept
 the local **Run/Exécuter** action.
 
 > **Paid Vast.ai rental:** capture, dependency preflight, offer search, and
-> rental review do not rent hardware. **Confirm & rent GPU** can start hourly
-> billing. Autonomous and repository checks are fake/offline only:
+> rental review do not rent hardware. **Louer et préparer** is the single paid
+> confirmation and can start hourly billing. Autonomous and repository checks
+> are fake/offline only:
 > no real Vast rental or Gold run has occurred.
 
-The current worker policy derives from the official ComfyUI Vast base template
-`027fba7753c024be019030fb42aed900`. That ID is a reviewed base allowlist, not a
-release of this project: no project-specific worker template has been published
-or pinned.
+The official ComfyUI Vast template hash
+`027fba7753c024be019030fb42aed900` is an allowlisted source only for
+`hash_id`, `use_ssh`, and `ssh_direct`; its mutable image and unrelated launch
+fields are not copied. The private worker request instead pins the exact image
+`docker.io/vastai/comfy@sha256:9852fae86527d0be097ffcb90dc18368ff808bcbb7c41fbabd538bff3eb6ab9c`
+with tag `v0.29.0-cuda-12.9-py312`.
 
 ## Install and compatibility
 
@@ -26,7 +29,76 @@ Place this repository at:
 
 Restart ComfyUI. The package uses the Python standard library plus aiohttp and
 Pillow supplied by ComfyUI. It is pinned for development to ComfyUI Core
-`0.29.0`, frontend `1.47.10`, and Python `3.13.12`.
+`0.29.0`, frontend `1.47.10`, and local Python `3.13.12`. The remote lock uses
+the exact Python `3.12` series string and remote health accepts only reports
+beginning `3.12.`. Remote wheels are limited to compatible `cp312` or universal
+`py3` wheels for `any`, exact `linux_x86_64`, legacy manylinux x86_64 aliases,
+or PEP 600 `manylinux_2_5_x86_64` through `manylinux_2_39_x86_64`. The
+selected Ubuntu 24.04/glibc 2.39 runtime rejects future or malformed manylinux
+tags and `musllinux*`; other interpreters, ABIs, operating systems, and CPU
+architectures also fail closed.
+
+## Cloud Vast: the normal Desktop flow
+
+`Cloud Vast` manages the paid GPU lifecycle; it is not a second Run button.
+`ComfyUI Vast` is an independent environment opened inside the existing
+ComfyUI Desktop application. The local environment keeps its ordinary local
+Run behavior, while native Run, queue, and batch actions inside `ComfyUI Vast`
+go only to the pod GPU.
+
+The intended user flow is:
+
+1. Build or open the workflow in the normal local Desktop environment.
+2. Open `Cloud Vast`. Its free background analysis captures the current
+   canvas, finds required models and custom nodes, explains included and
+   excluded offers, and calculates a source-aware readiness estimate.
+3. Review the selected offer, price ceiling, duration, disk, model sources,
+   custom-node compatibility, and transfer estimate. Public model sources use
+   immutable Hugging Face or Civitai identities; local upload is the universal
+   fallback, and an optional R2 cache can accelerate already-known content.
+4. Click the single paid action `Louer et préparer`. The durable intent is
+   saved before Vast is called, and provisioning then runs automatically.
+5. Wait until every readiness check is green: worker, ComfyUI HTTP/WebSocket,
+   node classes, exact model digests, profile, UI assets, and Agent bridge.
+6. On first use only, add the official Remote Connection named `ComfyUI Vast`
+   in Desktop with the stable URL displayed by Cloud Vast. It is a loopback URL
+   such as `http://127.0.0.1:<port>`; it is never a public pod URL.
+7. Open `ComfyUI Vast` inside Desktop. The current canvas, saved workflows,
+   palette, background, approved UI extensions, model menus, previews, active
+   nodes, progress, native errors, and results behave through the usual ComfyUI
+   interface. Use the ordinary Run, queue, and batch controls. Agent Panel
+   remains on the Mac and can edit this active canvas or prepare ordered jobs;
+   only GPU execution crosses the authenticated relay to the pod.
+8. Verified persistent results are copied to
+   `output/cloud-vast/<session>/<job>`. Temporary `PreviewImage` files remain
+   previews and are not misreported as failed final outputs.
+9. When finished, explicitly choose `Destroy GPU — stop all Vast billing` and
+   wait until a fresh provider inventory proves the instance absent and the
+   local state reports `billing_may_continue=false`.
+
+Remember: closing either Desktop window does not destroy a pod. Closing and reopening
+the local environment or `ComfyUI Vast` reconnects to durable state without
+submitting the prompt again. A finite authorized deadline can independently
+stop its own instance; a no-limit session requires manual destruction.
+
+Cold readiness cannot honestly have a universal ten-minute guarantee. The
+live audit transferred 29,347,469,703 bytes (about 27.3 GiB) at roughly
+25–30 MB/s, so transfer alone took about 16–20 minutes. A warm compatible
+session, a real dependency delta, good network/disk ranking, immutable public
+sources, or optional R2 reuse can be much faster. The interface labels the
+estimate as cold, pre-positioned, or warm instead of promising an impossible
+deadline.
+
+V1 deliberately uses SQLite + worker persistent state + atomic snapshots. It
+has no Convex dependency and no TanStack dependency. Convex may later carry
+small orchestration metadata or watchdog state, but it cannot make Vast side
+effects exactly-once and must never carry workflows, models, previews, outputs,
+or Vast keys. TanStack adds no useful layer to this existing ComfyUI surface.
+Upstream compatibility automation is a separate, credential-free PR-opening
+workflow; it may test pinned upstream commits and open a reviewable PR, but it
+has no runtime, merge, release, deployment, credential, or rental authority.
+Every external publication, installation, template change, paid probe, create,
+or destroy still requires a fresh human GO naming its exact bounded scope.
 
 ## From canvas to remote prompt
 
@@ -138,7 +210,11 @@ verified output.
 ## Secrets and network boundaries
 
 - Vast, R2, Hugging Face, and Civitai account credentials remain in private
-  backend settings; browser responses expose only configured booleans.
+  backend settings. The settings response exposes configured booleans and
+  browser-safe `worker_release`: either `null` or the exact validated
+  `WorkerRelease.to_record()` from the service instance used by that request.
+  It never returns the lock path, archive URL, credential, token, session
+  secret, workflow, model, or private template payload.
 - Settings and durable session/job/transfer state use a private local directory
   with `0700`/`0600` permissions. Browser storage is not used.
 - Browser JavaScript calls same-origin routes only and renders untrusted values
@@ -167,8 +243,8 @@ The Vast account calls are:
 
 | Method | Route | Purpose |
 | --- | --- | --- |
-| `GET` | `/cloud-run/api/settings` | Return redacted settings and active sessions. |
-| `PUT` | `/cloud-run/api/settings` | Validate and atomically save backend settings. |
+| `GET` | `/cloud-run/api/settings` | Return redacted settings, loaded worker release, and active sessions. |
+| `PUT` | `/cloud-run/api/settings` | Validate and atomically save backend settings, then return the same browser-safe release projection. |
 | `POST` | `/cloud-run/api/captures` | Persist the native compiled canvas capture. |
 | `POST` | `/cloud-run/api/preflights` | Resolve nodes, artifacts, output allowance, and disk. |
 | `PUT` | `/cloud-run/api/mappings/{mapping_id}` | Explicitly approve one immutable mapping candidate. |
@@ -202,9 +278,13 @@ route/state/provider/subprocess allowlists, secret scanning, and a public
 artifact scan. It performs no network request, credential lookup, provider
 mutation, publication, or GPU rental.
 
-The deterministic worker artifact is review material governed by a worker
-release lock. See `docs/remote-worker-bootstrap-review.md`. There is deliberately
-no live release lock in this repository.
+The immutable Remote Worker release for commit
+`d317e2f5b69725ae92fd0d3b1dc6273623cf2407` pins remote Python `3.13.12` and is
+preserved unchanged as a historical rollback. It is incompatible with the new
+Python `3.12` runtime. A fresh deterministic artifact and immutable release are
+therefore required; review artifacts alone are never a live release identity.
+See `docs/remote-worker-bootstrap-review.md`. There is deliberately no live
+worker release lock in this repository.
 
 The offline publication tools bind one immutable GitHub Release asset to the
 repository, a 40-character lowercase commit, deterministic asset name, exact
@@ -213,14 +293,42 @@ direct identity-encoded `200`, or exactly one manually validated `302` to the
 fixed GitHub release-assets host. The temporary signed target is neither part
 of the lock nor retained, persisted, logged, or returned.
 
-`remote_worker/gateway.py` starts one fixed Caddy binary and the loopback Python
-worker without a shell. Only Caddy receives the validated Jupyter token. The
-worker receives an explicit runtime allowlist plus Vast's own-instance ID and
-API key required by its independent deadline watchdog, never the Jupyter token
-or a provider-account key. The supervisor terminates, then boundedly reaps or
-kills, the sibling when either process exits. Caddy exposes `:8765`, strips
-inbound authorization and boundary headers, and proxies only to
-`127.0.0.1:8766`.
+The selected official runtime has these exact reviewed identities:
+
+```text
+image: docker.io/vastai/comfy@sha256:9852fae86527d0be097ffcb90dc18368ff808bcbb7c41fbabd538bff3eb6ab9c
+tag: v0.29.0-cuda-12.9-py312
+linux/amd64 child: sha256:7a83c93be852db309d4be3e415cf38e186977c202638f1ef1b4a605a3bc49f0a
+config: sha256:992e89c2d0641a6c894885d4246dc706911c7a02266f368337b41bf968eaaaf2
+config size: 38584 bytes
+```
+
+The digest makes the selected runtime bytes immutable, but the config has no
+`org.opencontainers.image.revision` label. Vast's successful public build at
+source commit `46e032d852ece6edb2a2a477c5b9557cba6645bf` is correlation,
+not a cryptographic source-revision binding. The publication gate requires an
+explicit human provenance decision: before the sole template POST, accept this
+narrower official-image evidence or authorize inspection of the digest-pinned
+in-toto attestation. No template publication occurs while that decision is
+open. The narrower official-image evidence was explicitly accepted for the
+2026-08-01 release attempts.
+
+The deterministic `onstart` gzip-compresses the reviewed bootstrap, remains
+below Vast's live `16384`-character limit, exports
+`CLOUD_RUN_COMFY_ROOT=/opt/workspace-internal/ComfyUI`, and directly executes
+`/venv/main/bin/python` on the restored bytes. The raw canonical lock remains
+separately encoded. It adds no download and does not invoke the image entrypoint,
+Supervisor, portal/serverless tooling, or an official wrapper.
+`remote_worker/gateway.py` then starts one fixed Caddy binary and the loopback
+Python worker without a shell. The controller generates a per-instance boundary
+token, injects it at create time, and Caddy alone receives that token. The
+Python worker receives only the session ID plus its existing allowlisted runtime
+variables, including Vast's own-instance ID and API key required by its
+independent deadline watchdog. `JUPYTER_TOKEN` and `OPEN_BUTTON_TOKEN` are not
+fallback credentials. The worker never receives the boundary token or a
+provider-account key. The supervisor terminates, then boundedly reaps or kills,
+the sibling when either process exits. Caddy exposes `:8765`, strips inbound
+authorization and boundary headers, and proxies only to `127.0.0.1:8766`.
 
 Every Vast offer must carry complete verified, rentable, one-GPU, on-demand
 evidence, reliability of at least `0.99`, and finite provider-advertised
@@ -235,6 +343,20 @@ and rejects a drop below `min(reviewed Mbps, 1,000)` before any initial create.
 Both replacement paths independently reapply the `0.99`/`500` floors before
 selecting or creating from a fresh search result.
 
+Every search and exact-offer revalidation also carries the fixed single-GPU
+compatibility contract, and normalization rejects absent, wrongly typed,
+non-finite, or below-floor evidence:
+
+```json
+{
+  "gpu_arch": {"eq": "nvidia"},
+  "cpu_arch": {"eq": "amd64"},
+  "cuda_max_good": {"gte": 12.9},
+  "compute_cap": {"gte": 750},
+  "num_gpus": {"eq": 1}
+}
+```
+
 The deterministic commands are:
 
 ```sh
@@ -243,15 +365,15 @@ python3 scripts/build_worker_release_bundle.py \
   --output-directory <owner-private-output-directory> \
   --worker-commit <40-lowercase-hex-commit>
 
+python3 scripts/publish_worker_template.py \
+  audit-base \
+  --output-directory <owner-private-output-directory>
+
 python3 scripts/render_worker_template.py \
   --repository-root <repository-root> \
   --output-directory <owner-private-output-directory> \
   --release-metadata <owner-private-release-metadata> \
   --base-template-audit <owner-private-base-template-audit>
-
-python3 scripts/publish_worker_template.py \
-  audit-base \
-  --output-directory <owner-private-output-directory>
 
 python3 scripts/publish_worker_template.py \
   publish \
@@ -269,23 +391,33 @@ owner-private directories. Generated files use mode `0600`. The final local
 lock is created atomically without overwrite and must round-trip through the
 runtime loader before it is accepted.
 
-The template publisher is a single-purpose client for the fixed Vast template
-endpoint. It exposes only exact base audit and one-create publication actions,
-disables ambient proxies and redirects, reads the existing owner-private API
-key without accepting it on argv, never prints payloads or credentials, and
-never offers update, delete, arbitrary URL/method, offer, instance, or volume
-operations. Audit, render, and publish accept only
-`docker.io/vastai/base-image@sha256:<lowercase-64-hex>`; publication also
-requires the encoded bootstrap bytes to equal the reviewed repository file and
-the remote lock to be the exact canonical release contract. The separate
-pre-POST Task 8 gate still verifies the digest-scoped OCI manifest/config and
-required source/revision labels. Automated coverage injects only fake
-transports and synthetic keys.
+The base audit records only `hash_id`, `use_ssh`, and `ssh_direct`; it records
+neither image nor `runtype`/Jupyter fields. The renderer owns the exact image,
+tag, and filters above. Its private request fixes `runtype=ssh`, `use_ssh=true`,
+`ssh_direct=true`, `jup_direct=false`, `jupyter_dir=/workspace`,
+`use_jupyter_lab=false`, empty registry credentials, `-p 8765:8765`, an
+80 GiB recommendation, and `private=true`.
 
-No immutable Remote Worker release has been published. No private
-project-specific Vast template has been created. No local live
-`worker-release.json` exists. No Vast offer search has been performed. No paid
-Vast instance has been created. No live workflow run has occurred.
+The template publisher is a single-purpose client for the fixed Vast template
+endpoint. It validates that exact request before HTTP, projects the exact
+compared fields from wildcard worker rows, includes `extra_filters` in
+ambiguous-POST reconciliation and exact-hash readback, disables ambient proxies
+and redirects, reads the owner-private API key without argv, and performs at
+most one POST. It never prints payloads or credentials and exposes no update,
+delete, arbitrary URL/method, offer, instance, or volume operation. Publication
+also rejects `onstart` beyond Vast's live `16384`-character limit, requires the
+encoded bootstrap gzip member to equal the deterministic compression of the
+reviewed repository file, and requires the raw remote lock to be the exact
+canonical release contract. Automated coverage injects only fake transports and
+synthetic keys.
+
+At the 2026-08-01 live `onstart` correction checkpoint. Immutable Python 3.12
+Remote Worker releases for `005a4b018d9e9404640340d720fbeb43c10f19c2` and
+`f41409946bd756ce141651e651585a9077b0f809` were published and verified. No
+private project-specific Vast template exists. No local live
+`worker-release.json` exists. No post-migration ComfyUI restart has occurred.
+No Vast offer search has been performed. No paid Vast instance has been
+created. No post-migration live workflow run has occurred.
 
 Before a paid Gold run, a new human GO must state the maximum instance count,
 maximum hourly price, and absolute duration or cost. The private Gold image and

@@ -4,6 +4,79 @@ import unittest
 
 
 class WorkerProtocolTests(unittest.TestCase):
+    def test_native_material_binds_body_and_exact_server_identity(self):
+        from cloud_run.worker_protocol import (
+            ProtocolAuthenticationError,
+            native_request_material,
+        )
+
+        body = b'{"prompt":{}}'
+        identity = {
+            "job_id": "job-1",
+            "request_id": "request-1",
+            "manifest_digest": "a" * 64,
+        }
+        baseline = native_request_material(body, identity)
+        self.assertEqual(baseline, native_request_material(body, identity))
+        self.assertNotEqual(
+            baseline,
+            native_request_material(body + b" ", identity),
+        )
+        self.assertNotEqual(
+            baseline,
+            native_request_material(body, {**identity, "job_id": "job-2"}),
+        )
+        self.assertNotIn(body, baseline)
+
+        invalid = (
+            None,
+            {"job_id": "job-1"},
+            {**identity, "extra": "field"},
+            {**identity, "manifest_digest": "A" * 64},
+            {**identity, "request_id": "../request"},
+        )
+        for value in invalid:
+            with self.subTest(identity=value):
+                with self.assertRaises(ProtocolAuthenticationError):
+                    native_request_material(body, value)
+
+    def test_controller_boundary_values_have_strict_shapes(self):
+        from cloud_run.worker_protocol import (
+            BOUNDARY_TOKEN_ENVIRONMENT,
+            SESSION_ID_ENVIRONMENT,
+            is_boundary_token,
+            is_worker_session_id,
+        )
+
+        self.assertEqual(
+            BOUNDARY_TOKEN_ENVIRONMENT,
+            "CLOUD_RUN_BOUNDARY_TOKEN",
+        )
+        self.assertEqual(SESSION_ID_ENVIRONMENT, "CLOUD_RUN_SESSION_ID")
+        self.assertTrue(is_boundary_token("a" * 64))
+        for value in (
+            "a" * 63,
+            "a" * 65,
+            "A" * 64,
+            " " + "a" * 63,
+            "a" * 63 + "!",
+            b"a" * 64,
+            None,
+        ):
+            with self.subTest(boundary_token=value):
+                self.assertFalse(is_boundary_token(value))
+
+        for value in (
+            "session-1",
+            "A" + "a" * 199,
+            "session.id:1",
+        ):
+            with self.subTest(worker_session_id=value):
+                self.assertTrue(is_worker_session_id(value))
+        for value in ("", ".session", "a" * 201, "session/1", b"s"):
+            with self.subTest(worker_session_id=value):
+                self.assertFalse(is_worker_session_id(value))
+
     def test_signed_request_binds_method_path_body_time_and_nonce(self):
         from cloud_run.worker_protocol import (
             ProtocolAuthenticationError,
@@ -26,7 +99,7 @@ class WorkerProtocolTests(unittest.TestCase):
         self.assertEqual(
             envelope,
             {
-                "protocol_version": "1",
+                "protocol_version": "2",
                 "timestamp": 1000,
                 "nonce": "n-1",
                 "signature": hmac.new(
@@ -183,7 +256,7 @@ class WorkerProtocolTests(unittest.TestCase):
         )
         invalid_envelopes = (
             {**valid, "signature": "0" * 64},
-            {**valid, "protocol_version": "2"},
+            {**valid, "protocol_version": "1"},
             {**valid, "timestamp": True},
             {**valid, "nonce": "bad\nnonce"},
             {**valid, "extra": "value"},

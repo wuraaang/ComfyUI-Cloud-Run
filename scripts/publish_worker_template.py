@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
-"""Audit and publish the one reviewed private Vast worker template."""
+"""Audit, publish, or reconcile the reviewed private Vast worker template."""
 
 from __future__ import annotations
 
 import argparse
 import base64
+import ctypes
+import fcntl
+import gzip
+import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import secrets
 import stat
 import sys
 import tempfile
@@ -25,6 +30,18 @@ from scripts.build_worker_release_bundle import (
 
 
 BASE_TEMPLATE_HASH_ID = "027fba7753c024be019030fb42aed900"
+OFFICIAL_IMAGE = (
+    "docker.io/vastai/comfy@sha256:"
+    "9852fae86527d0be097ffcb90dc18368ff808bcbb7c41fbabd538bff3eb6ab9c"
+)
+OFFICIAL_TAG = "v0.29.0-cuda-12.9-py312"
+EXTRA_FILTERS = {
+    "gpu_arch": {"eq": "nvidia"},
+    "cpu_arch": {"eq": "amd64"},
+    "cuda_max_good": {"gte": 12.9},
+    "compute_cap": {"gte": 750},
+    "num_gpus": {"eq": 1},
+}
 TEMPLATE_ENDPOINT = "https://console.vast.ai/api/v0/template/"
 LOOKUP_COLUMNS = [
     "id",
@@ -33,6 +50,7 @@ LOOKUP_COLUMNS = [
     "image",
     "tag",
     "env",
+    "extra_filters",
     "onstart",
     "runtype",
     "ssh_direct",
@@ -46,18 +64,20 @@ LOOKUP_COLUMNS = [
     "recommended_disk_space",
     "private",
 ]
+BASE_LOOKUP_COLUMNS = [
+    "hash_id",
+    "use_ssh",
+    "ssh_direct",
+]
 HTTP_TIMEOUT_SECONDS = 15
 MAX_RESPONSE_BYTES = 256 * 1024
 MAX_PRIVATE_JSON_BYTES = 64 * 1024
+MAX_ONSTART_CHARACTERS = 16384
 
 _FAILURE = "Private template publication failed."
 _NAME = re.compile(r"cloud-run-worker-([0-9a-f]{40})")
 _HASH = re.compile(r"[0-9a-f]{32}")
-_IMAGE = re.compile(
-    r"docker\.io/vastai/base-image@sha256:[0-9a-f]{64}"
-)
-_TAG = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
-_MUTABLE_TAGS = {"edge", "latest", "main", "master", "nightly", "stable"}
+_SHA256 = re.compile(r"[0-9a-f]{64}")
 _REQUEST_FIELDS = {
     "name",
     "image",
@@ -73,6 +93,7 @@ _REQUEST_FIELDS = {
     "docker_login_pass",
     "onstart",
     "env",
+    "extra_filters",
     "recommended_disk_space",
     "private",
 }
@@ -89,12 +110,13 @@ _REMOTE_LOCK_FIELDS = {
     "destination",
 }
 _ROW_FIELDS = set(LOOKUP_COLUMNS)
+_BASE_ROW_FIELDS = set(BASE_LOOKUP_COLUMNS)
 _ONSTART = re.compile(
     r"#!/bin/sh\n"
     r"set -eu\n"
     r"umask 077\n"
-    r"mkdir -m 0700 /opt/comfyui-cloud-run-bootstrap\n"
-    r"printf '%s' '([A-Za-z0-9+/]+={0,2})' \| base64 -d > "
+    r"mkdir -p -m 0700 /opt/comfyui-cloud-run-bootstrap\n"
+    r"printf '%s' '([A-Za-z0-9+/]+={0,2})' \| base64 -d \| gzip -d > "
     r"/opt/comfyui-cloud-run-bootstrap/bootstrap\.py\n"
     r"chmod 0600 /opt/comfyui-cloud-run-bootstrap/bootstrap\.py\n"
     r"printf '%s' '([A-Za-z0-9+/]+={0,2})' \| base64 -d > "
@@ -102,7 +124,10 @@ _ONSTART = re.compile(
     r"chmod 0600 /opt/comfyui-cloud-run-bootstrap/release-lock\.json\n"
     r"CLOUD_RUN_WORKER_VERSION=([0-9a-f]{40})\n"
     r"export CLOUD_RUN_WORKER_VERSION\n"
-    r"exec python3 /opt/comfyui-cloud-run-bootstrap/bootstrap\.py "
+    r"CLOUD_RUN_COMFY_ROOT=/opt/workspace-internal/ComfyUI\n"
+    r"export CLOUD_RUN_COMFY_ROOT\n"
+    r"exec /venv/main/bin/python "
+    r"/opt/comfyui-cloud-run-bootstrap/bootstrap\.py "
     r"/opt/comfyui-cloud-run-bootstrap/release-lock\.json\n"
 )
 
@@ -142,6 +167,19 @@ def _compact_json(payload):
         _fail()
 
 
+def _deterministic_gzip(content):
+    return gzip.compress(content, compresslevel=9, mtime=0)
+
+
+def _strict_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            _fail()
+        result[key] = value
+    return result
+
+
 class VastTemplateTransport:
     """Bounded fixed-endpoint transport for GET template and one POST."""
 
@@ -168,7 +206,10 @@ class VastTemplateTransport:
             body = response.read(MAX_RESPONSE_BYTES + 1)
             if len(body) > MAX_RESPONSE_BYTES:
                 _fail()
-            payload = json.loads(body.decode("utf-8"))
+            payload = json.loads(
+                body.decode("utf-8"),
+                object_pairs_hook=_strict_object,
+            )
             if not isinstance(payload, dict):
                 _fail()
             return payload
@@ -193,14 +234,20 @@ class VastTemplateTransport:
             "Authorization": "Bearer " + api_key,
         }
 
-    def _lookup(self, api_key, filters):
+    def _lookup(
+        self,
+        api_key,
+        filters,
+        *,
+        select_columns=None,
+        row_normalizer=None,
+    ):
+        columns = ["*"] if select_columns is None else select_columns
+        normalizer = _normalize_row if row_normalizer is None else row_normalizer
         query = parse.urlencode(
             {
                 "select_filters": _compact_json(filters).decode("ascii"),
-                "select_cols": json.dumps(
-                    LOOKUP_COLUMNS, separators=(",", ":")
-                ),
-                "order_by": "id",
+                "select_cols": json.dumps(columns, separators=(",", ":")),
             }
         )
         http_request = request.Request(
@@ -208,12 +255,17 @@ class VastTemplateTransport:
             headers=self._headers(api_key),
             method="GET",
         )
-        return _normalize_lookup(self._response_object(http_request))
+        return _normalize_lookup(
+            self._response_object(http_request),
+            normalizer,
+        )
 
     def lookup_base(self, api_key):
         return self._lookup(
             api_key,
             {"hash_id": {"eq": BASE_TEMPLATE_HASH_ID}},
+            select_columns=BASE_LOOKUP_COLUMNS,
+            row_normalizer=_normalize_base_row,
         )
 
     def lookup_name(self, api_key, name):
@@ -240,13 +292,67 @@ class VastTemplateTransport:
         return self._response_object(http_request)
 
 
+def _valid_extra_filters(value):
+    if not isinstance(value, dict) or set(value) != set(EXTRA_FILTERS):
+        return False
+    for name, expected_constraint in EXTRA_FILTERS.items():
+        constraint = value.get(name)
+        if (
+            not isinstance(constraint, dict)
+            or set(constraint) != set(expected_constraint)
+        ):
+            return False
+        operator, expected_value = next(iter(expected_constraint.items()))
+        actual_value = constraint.get(operator)
+        if (
+            type(actual_value) is not type(expected_value)
+            or actual_value != expected_value
+        ):
+            return False
+    return True
+
+
+def _normalize_extra_filters(value):
+    if isinstance(value, str):
+        try:
+            value = json.loads(value, object_pairs_hook=_strict_object)
+        except TemplatePublicationError:
+            raise
+        except (RecursionError, UnicodeError, ValueError, json.JSONDecodeError):
+            _fail()
+    if not _valid_extra_filters(value):
+        _fail()
+    return value
+
+
+def _normalize_base_row(row):
+    if not isinstance(row, dict) or not _BASE_ROW_FIELDS.issubset(row):
+        _fail()
+    if (
+        not isinstance(row.get("hash_id"), str)
+        or _HASH.fullmatch(row["hash_id"]) is None
+        or type(row.get("use_ssh")) is not bool
+        or type(row.get("ssh_direct")) is not bool
+    ):
+        _fail()
+    return {column: row[column] for column in BASE_LOOKUP_COLUMNS}
+
+
 def _normalize_row(row):
-    if not isinstance(row, dict) or set(row) != _ROW_FIELDS:
+    if not isinstance(row, dict) or not _ROW_FIELDS.issubset(row):
         _fail()
     template_id = row.get("id")
     hash_id = row.get("hash_id")
     image = row.get("image")
     tag = row.get("tag")
+    onstart = row.get("onstart")
+    onstart_size = None
+    if isinstance(onstart, str):
+        try:
+            onstart_size = len(onstart.encode("utf-8"))
+        except UnicodeError:
+            _fail()
+    extra_filters = _normalize_extra_filters(row.get("extra_filters"))
     if (
         type(template_id) is not int
         or template_id <= 0
@@ -254,19 +360,19 @@ def _normalize_row(row):
         or not row["name"]
         or not isinstance(hash_id, str)
         or _HASH.fullmatch(hash_id) is None
-        or not isinstance(image, str)
-        or _IMAGE.fullmatch(image) is None
-        or not isinstance(tag, str)
-        or _TAG.fullmatch(tag) is None
-        or tag.casefold() in _MUTABLE_TAGS
+        or image != OFFICIAL_IMAGE
+        or tag != OFFICIAL_TAG
         or not isinstance(row.get("env"), str)
-        or not isinstance(row.get("onstart"), str)
-        or len(row["onstart"].encode("utf-8")) > MAX_PRIVATE_JSON_BYTES
+        or not isinstance(onstart, str)
+        or onstart_size > MAX_PRIVATE_JSON_BYTES
         or not isinstance(row.get("runtype"), str)
         or type(row.get("ssh_direct")) is not bool
         or type(row.get("use_ssh")) is not bool
         or type(row.get("jup_direct")) is not bool
-        or not isinstance(row.get("jupyter_dir"), str)
+        or (
+            row.get("jupyter_dir") is not None
+            and not isinstance(row.get("jupyter_dir"), str)
+        )
         or type(row.get("use_jupyter_lab")) is not bool
         or row.get("docker_login_repo") != ""
         or row.get("docker_login_user") != ""
@@ -276,10 +382,20 @@ def _normalize_row(row):
         or type(row.get("private")) is not bool
     ):
         _fail()
-    return {column: row[column] for column in LOOKUP_COLUMNS}
+    normalized = {column: row[column] for column in LOOKUP_COLUMNS}
+    normalized["extra_filters"] = extra_filters
+    return normalized
 
 
-def _normalize_lookup(payload):
+def _normalize_lookup(payload, row_normalizer):
+    if (
+        isinstance(payload, dict)
+        and set(payload) == {"success", "msg"}
+        and payload.get("success") is False
+        and type(payload.get("msg")) is str
+        and payload["msg"] == "No templates found"
+    ):
+        return []
     if not isinstance(payload, dict) or set(payload) != {
         "success",
         "templates_found",
@@ -296,10 +412,15 @@ def _normalize_lookup(payload):
         or len(templates) != count
     ):
         _fail()
-    return [_normalize_row(row) for row in templates]
+    return [row_normalizer(row) for row in templates]
 
 
-def _private_path(path, *, require_directory=False):
+def _private_path(
+    path,
+    *,
+    require_directory=False,
+    require_writable=False,
+):
     candidate = Path(path)
     try:
         metadata = os.lstat(candidate)
@@ -311,17 +432,41 @@ def _private_path(path, *, require_directory=False):
         or stat.S_ISLNK(metadata.st_mode)
         or metadata.st_uid != os.getuid()
         or metadata.st_mode & 0o077
+        or (require_writable and not metadata.st_mode & stat.S_IWUSR)
     ):
         _fail()
     return candidate
 
 
-def _read_private_json(path):
+def _read_descriptor_content(descriptor):
+    try:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        content = bytearray()
+        while len(content) <= MAX_PRIVATE_JSON_BYTES:
+            chunk = os.read(
+                descriptor,
+                min(8192, MAX_PRIVATE_JSON_BYTES + 1 - len(content)),
+            )
+            if not chunk:
+                break
+            content.extend(chunk)
+        return bytes(content)
+    except OSError:
+        _fail()
+
+
+def _read_private_json_with_identity(
+    path,
+    *,
+    hold_descriptor=False,
+    lock_exclusive=False,
+):
     candidate = Path(path)
     parent = _private_path(candidate.parent, require_directory=True)
     del parent
     before = None
     descriptor = None
+    descriptor_held = False
     try:
         before = os.lstat(candidate)
         if (
@@ -336,6 +481,8 @@ def _read_private_json(path):
         if not hasattr(os, "O_NOFOLLOW"):
             _fail()
         descriptor = os.open(candidate, os.O_RDONLY | os.O_NOFOLLOW)
+        if lock_exclusive:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         opened = os.fstat(descriptor)
         if (
             opened.st_dev != before.st_dev
@@ -347,15 +494,7 @@ def _read_private_json(path):
             or opened.st_size != before.st_size
         ):
             _fail()
-        content = bytearray()
-        while len(content) <= MAX_PRIVATE_JSON_BYTES:
-            chunk = os.read(
-                descriptor,
-                min(8192, MAX_PRIVATE_JSON_BYTES + 1 - len(content)),
-            )
-            if not chunk:
-                break
-            content.extend(chunk)
+        content = _read_descriptor_content(descriptor)
         after = os.fstat(descriptor)
         if (
             len(content) != opened.st_size
@@ -364,20 +503,38 @@ def _read_private_json(path):
             or after.st_size != opened.st_size
         ):
             _fail()
-        payload = json.loads(bytes(content).decode("utf-8"))
+        payload = json.loads(
+            bytes(content).decode("utf-8"),
+            object_pairs_hook=_strict_object,
+        )
         if not isinstance(payload, dict):
             _fail()
-        return payload
+        held = descriptor if hold_descriptor else None
+        descriptor_held = hold_descriptor
+        return payload, (opened.st_dev, opened.st_ino), content, held
     except TemplatePublicationError:
         raise
-    except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+    except (
+        OSError,
+        RecursionError,
+        UnicodeError,
+        ValueError,
+        json.JSONDecodeError,
+    ):
         _fail()
     finally:
-        if descriptor is not None:
+        if descriptor is not None and not descriptor_held:
             try:
                 os.close(descriptor)
             except OSError:
                 pass
+
+
+def _read_private_json(path):
+    payload, _identity, _content, _descriptor = (
+        _read_private_json_with_identity(path)
+    )
+    return payload
 
 
 def _credential(settings_path_resolver):
@@ -394,7 +551,7 @@ def _credential(settings_path_resolver):
         or any(ord(character) < 33 or ord(character) > 126 for character in key)
     ):
         _fail()
-    return key
+    return key, Path(settings_path)
 
 
 def _resolved_settings_path():
@@ -402,16 +559,22 @@ def _resolved_settings_path():
 
 
 def _validate_onstart(value, worker_commit):
-    if not isinstance(value, str):
+    if (
+        not isinstance(value, str)
+        or len(value) > MAX_ONSTART_CHARACTERS
+    ):
         _fail()
     match = _ONSTART.fullmatch(value)
     if match is None or match.group(3) != worker_commit:
         _fail()
     try:
-        bootstrap = base64.b64decode(match.group(1), validate=True)
+        compressed_bootstrap = base64.b64decode(
+            match.group(1),
+            validate=True,
+        )
         lock = base64.b64decode(match.group(2), validate=True)
         lock_payload = json.loads(lock.decode("utf-8"))
-    except (ValueError, UnicodeError, json.JSONDecodeError):
+    except (RecursionError, ValueError, UnicodeError, json.JSONDecodeError):
         _fail()
     if (
         not isinstance(lock_payload, dict)
@@ -447,7 +610,8 @@ def _validate_onstart(value, worker_commit):
             not stat.S_ISREG(bootstrap_metadata.st_mode)
             or stat.S_ISLNK(bootstrap_metadata.st_mode)
             or bootstrap_metadata.st_nlink != 1
-            or bootstrap != bootstrap_path.read_bytes()
+            or compressed_bootstrap
+            != _deterministic_gzip(bootstrap_path.read_bytes())
         ):
             _fail()
     except (OSError, ReleaseBuildError):
@@ -465,11 +629,8 @@ def _validate_request(payload):
     tag = payload.get("tag")
     if (
         name_match is None
-        or not isinstance(image, str)
-        or _IMAGE.fullmatch(image) is None
-        or not isinstance(tag, str)
-        or _TAG.fullmatch(tag) is None
-        or tag.casefold() in _MUTABLE_TAGS
+        or image != OFFICIAL_IMAGE
+        or tag != OFFICIAL_TAG
         or payload.get("runtype") != "ssh"
         or payload.get("use_ssh") is not True
         or payload.get("ssh_direct") is not True
@@ -480,6 +641,7 @@ def _validate_request(payload):
         or payload.get("docker_login_user") != ""
         or payload.get("docker_login_pass") != ""
         or payload.get("env") != "-p 8765:8765"
+        or not _valid_extra_filters(payload.get("extra_filters"))
         or type(payload.get("recommended_disk_space")) is not int
         or payload.get("recommended_disk_space") != 80
         or payload.get("private") is not True
@@ -520,45 +682,571 @@ def _create_identity(payload, expected_name):
     return template["id"], template["hash_id"]
 
 
-def _write_private_record(output_directory, name, payload):
-    directory = _private_path(output_directory, require_directory=True)
-    destination = directory / name
-    if destination.exists() or destination.is_symlink():
-        _fail()
+def _write_all(descriptor, content):
+    offset = 0
+    while offset < len(content):
+        written = os.write(descriptor, content[offset:])
+        if written <= 0:
+            raise OSError("private record write made no progress")
+        offset += written
+
+
+def _fsync_directory(directory):
     descriptor = None
-    temporary_path = None
     try:
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix="." + name + ".",
-            suffix=".part",
-            dir=str(directory),
-        )
-        temporary_path = Path(temporary_name)
-        content = _compact_json(payload) + b"\n"
-        os.fchmod(descriptor, 0o600)
-        os.write(descriptor, content)
+        flags = os.O_RDONLY
+        if hasattr(os, "O_DIRECTORY"):
+            flags |= os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(directory, flags)
         os.fsync(descriptor)
-        os.close(descriptor)
-        descriptor = None
-        os.link(temporary_path, destination)
-        temporary_path.unlink()
-        temporary_path = None
-        return destination
-    except TemplatePublicationError:
-        raise
-    except OSError:
-        _fail()
     finally:
         if descriptor is not None:
+            os.close(descriptor)
+
+
+def _rename_no_replace(source, destination):
+    libc = ctypes.CDLL(None, use_errno=True)
+    source_bytes = os.fsencode(source)
+    destination_bytes = os.fsencode(destination)
+    try:
+        if sys.platform == "darwin":
+            rename = libc.renamex_np
+            rename.argtypes = [
+                ctypes.c_char_p,
+                ctypes.c_char_p,
+                ctypes.c_uint,
+            ]
+            rename.restype = ctypes.c_int
+            result = rename(
+                source_bytes,
+                destination_bytes,
+                0x00000004,
+            )
+        elif sys.platform.startswith("linux"):
+            rename = libc.renameat2
+            rename.argtypes = [
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_uint,
+            ]
+            rename.restype = ctypes.c_int
+            result = rename(
+                -100,
+                source_bytes,
+                -100,
+                destination_bytes,
+                0x00000001,
+            )
+        else:
+            _fail()
+    except AttributeError:
+        _fail()
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+
+
+class _PublicationIntent:
+    def __init__(self, settings_path, template_name, template_payload):
+        name_match = (
+            _NAME.fullmatch(template_name)
+            if isinstance(template_name, str)
+            else None
+        )
+        if name_match is None:
+            _fail()
+        self.directory = _private_path(
+            Path(settings_path).parent,
+            require_directory=True,
+            require_writable=True,
+        )
+        self.path = self.directory / (
+            ".template-publication-" + name_match.group(1) + ".intent"
+        )
+        self.identity = None
+        self.mutation_started = False
+        self.removed = False
+        descriptor = None
+        created = False
+        try:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            descriptor = os.open(self.path, flags, 0o600)
+            created = True
+            os.fchmod(descriptor, 0o600)
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+                or metadata.st_nlink != 1
+            ):
+                _fail()
+            self.identity = (metadata.st_dev, metadata.st_ino)
+            content = _compact_json(
+                {
+                    "schema_version": 1,
+                    "name": template_name,
+                    "request_sha256": hashlib.sha256(
+                        _compact_json(template_payload)
+                    ).hexdigest(),
+                }
+            ) + b"\n"
+            _write_all(descriptor, content)
+            os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = None
+            _fsync_directory(self.directory)
+        except TemplatePublicationError:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            if created:
+                try:
+                    self.path.unlink()
+                    _fsync_directory(self.directory)
+                except OSError:
+                    pass
+            raise
+        except OSError:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            if created:
+                try:
+                    self.path.unlink()
+                    _fsync_directory(self.directory)
+                except OSError:
+                    pass
+            _fail()
+
+    def mark_mutation_started(self):
+        self.mutation_started = True
+
+    def _remove(self):
+        if self.removed:
+            return
+        try:
+            metadata = os.lstat(self.path)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or stat.S_ISLNK(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+                or metadata.st_nlink != 1
+                or (metadata.st_dev, metadata.st_ino) != self.identity
+            ):
+                _fail()
+            self.path.unlink()
+            self.removed = True
+            _fsync_directory(self.directory)
+        except TemplatePublicationError:
+            raise
+        except OSError:
+            _fail()
+
+    def complete(self):
+        self._remove()
+
+    def close(self):
+        if not self.mutation_started and not self.removed:
+            self._remove()
+
+
+class _ExistingPublicationIntent:
+    def __init__(self, settings_path, template_name, template_payload):
+        name_match = (
+            _NAME.fullmatch(template_name)
+            if isinstance(template_name, str)
+            else None
+        )
+        if name_match is None:
+            _fail()
+        self.worker_commit = name_match.group(1)
+        self.directory = _private_path(
+            Path(settings_path).parent,
+            require_directory=True,
+            require_writable=True,
+        )
+        self.path = self.directory / (
+            ".template-publication-" + name_match.group(1) + ".intent"
+        )
+        self.descriptor = None
+        self.recovery_descriptor = None
+        self.recovery_path = None
+        self.recovery_identity = None
+        self.retired_path = None
+        self.preserve_recovery = False
+        try:
+            (
+                payload,
+                self.identity,
+                self.content,
+                self.descriptor,
+            ) = _read_private_json_with_identity(
+                self.path,
+                hold_descriptor=True,
+                lock_exclusive=True,
+            )
+            expected_request_sha256 = hashlib.sha256(
+                _compact_json(template_payload)
+            ).hexdigest()
+            if (
+                set(payload) != {"schema_version", "name", "request_sha256"}
+                or type(payload.get("schema_version")) is not int
+                or payload["schema_version"] != 1
+                or payload.get("name") != template_name
+                or not isinstance(payload.get("request_sha256"), str)
+                or _SHA256.fullmatch(payload["request_sha256"]) is None
+                or payload["request_sha256"] != expected_request_sha256
+            ):
+                _fail()
+        except TemplatePublicationError:
+            self.close()
+            raise
+
+    @staticmethod
+    def _owned_metadata(metadata, identity):
+        return (
+            stat.S_ISREG(metadata.st_mode)
+            and not stat.S_ISLNK(metadata.st_mode)
+            and metadata.st_uid == os.getuid()
+            and stat.S_IMODE(metadata.st_mode) == 0o600
+            and metadata.st_nlink == 1
+            and (metadata.st_dev, metadata.st_ino) == identity
+        )
+
+    @classmethod
+    def _exact_metadata(cls, metadata, identity, size):
+        return (
+            cls._owned_metadata(metadata, identity)
+            and metadata.st_size == size
+        )
+
+    def _revalidate_descriptor(self, descriptor, identity):
+        try:
+            before = os.fstat(descriptor)
+            content = _read_descriptor_content(descriptor)
+            after = os.fstat(descriptor)
+            if (
+                not self._exact_metadata(
+                    before,
+                    identity,
+                    len(self.content),
+                )
+                or not self._exact_metadata(
+                    after,
+                    identity,
+                    len(self.content),
+                )
+                or content != self.content
+            ):
+                _fail()
+        except TemplatePublicationError:
+            raise
+        except OSError:
+            _fail()
+
+    def _revalidate_original(self):
+        try:
+            metadata = os.lstat(self.path)
+            if not self._exact_metadata(
+                metadata,
+                self.identity,
+                len(self.content),
+            ):
+                _fail()
+            self._revalidate_descriptor(self.descriptor, self.identity)
+            final = os.lstat(self.path)
+            if not self._exact_metadata(
+                final,
+                self.identity,
+                len(self.content),
+            ):
+                _fail()
+        except TemplatePublicationError:
+            raise
+        except OSError:
+            _fail()
+
+    def _revalidate_recovery(self):
+        try:
+            metadata = os.lstat(self.recovery_path)
+            if not self._exact_metadata(
+                metadata,
+                self.recovery_identity,
+                len(self.content),
+            ):
+                _fail()
+            self._revalidate_descriptor(
+                self.recovery_descriptor,
+                self.recovery_identity,
+            )
+        except TemplatePublicationError:
+            raise
+        except OSError:
+            _fail()
+
+    def _discard_recovery(self):
+        if self.recovery_descriptor is not None:
             try:
-                os.close(descriptor)
+                os.close(self.recovery_descriptor)
             except OSError:
                 pass
-        if temporary_path is not None:
+            self.recovery_descriptor = None
+        if self.recovery_path is None:
+            return
+        try:
+            metadata = os.lstat(self.recovery_path)
+            if self._owned_metadata(
+                metadata,
+                self.recovery_identity,
+            ):
+                self.recovery_path.unlink()
+                self.recovery_path = None
+        except OSError:
+            self.preserve_recovery = True
+
+    def prepare_recovery(self):
+        if self.recovery_path is not None:
+            _fail()
+        try:
+            descriptor, recovery_name = tempfile.mkstemp(
+                prefix=(
+                    ".template-publication-"
+                    + self.worker_commit
+                    + ".recovery."
+                ),
+                suffix=".intent",
+                dir=str(self.directory),
+            )
+            self.recovery_descriptor = descriptor
+            self.recovery_path = Path(recovery_name)
+            os.fchmod(descriptor, 0o600)
+            metadata = os.fstat(descriptor)
+            self.recovery_identity = (metadata.st_dev, metadata.st_ino)
+            if not self._exact_metadata(
+                metadata,
+                self.recovery_identity,
+                0,
+            ):
+                _fail()
+            _write_all(descriptor, self.content)
+            os.fsync(descriptor)
+            self._revalidate_recovery()
+            _fsync_directory(self.directory)
+        except TemplatePublicationError:
+            self._discard_recovery()
+            raise
+        except OSError:
+            self._discard_recovery()
+            _fail()
+
+    def _revalidate_retired(self):
+        try:
+            metadata = os.lstat(self.retired_path)
+            if not self._exact_metadata(
+                metadata,
+                self.identity,
+                len(self.content),
+            ):
+                _fail()
+            self._revalidate_descriptor(self.descriptor, self.identity)
+        except TemplatePublicationError:
+            raise
+        except OSError:
+            _fail()
+
+    def _restore_retired(self):
+        try:
+            metadata = os.lstat(self.retired_path)
+            if not self._owned_metadata(metadata, self.identity):
+                _fail()
+            _rename_no_replace(self.retired_path, self.path)
+            self.retired_path = None
+            restored = os.lstat(self.path)
+            if not self._owned_metadata(restored, self.identity):
+                _fail()
+            _fsync_directory(self.directory)
+        except TemplatePublicationError:
+            self.preserve_recovery = True
+            raise
+        except OSError:
+            self.preserve_recovery = True
+            _fail()
+
+    def complete(self):
+        if self.recovery_path is None:
+            _fail()
+        try:
+            self._revalidate_original()
+        except TemplatePublicationError:
+            self.preserve_recovery = True
+            raise
+        self.retired_path = self.directory / (
+            ".template-publication-"
+            + self.worker_commit
+            + ".retired."
+            + secrets.token_hex(16)
+            + ".intent"
+        )
+        try:
+            _rename_no_replace(self.path, self.retired_path)
+        except TemplatePublicationError:
+            self.retired_path = None
+            self.preserve_recovery = True
+            raise
+        except OSError:
+            self.retired_path = None
+            self.preserve_recovery = True
+            _fail()
+        try:
+            self._revalidate_retired()
+        except TemplatePublicationError:
+            self.preserve_recovery = True
+            self._restore_retired()
+            _fail()
+        try:
+            _fsync_directory(self.directory)
+        except OSError:
+            self.preserve_recovery = True
+            self._restore_retired()
+            _fail()
+        self._discard_recovery()
+
+    def close(self):
+        if not self.preserve_recovery:
+            self._discard_recovery()
+        elif self.recovery_descriptor is not None:
             try:
-                temporary_path.unlink()
+                os.close(self.recovery_descriptor)
             except OSError:
                 pass
+            self.recovery_descriptor = None
+        if self.descriptor is not None:
+            try:
+                os.close(self.descriptor)
+            except OSError:
+                pass
+            self.descriptor = None
+
+
+class _PrivateRecordWriter:
+    def __init__(self, output_directory, name):
+        self.directory = _private_path(
+            output_directory,
+            require_directory=True,
+            require_writable=True,
+        )
+        self.destination = self.directory / name
+        self.descriptor = None
+        self.temporary_path = None
+        self.identity = None
+        self.destination_linked = False
+        try:
+            try:
+                os.lstat(self.destination)
+            except FileNotFoundError:
+                pass
+            else:
+                _fail()
+            self.descriptor, temporary_name = tempfile.mkstemp(
+                prefix="." + name + ".",
+                suffix=".part",
+                dir=str(self.directory),
+            )
+            self.temporary_path = Path(temporary_name)
+            os.fchmod(self.descriptor, 0o600)
+            metadata = os.fstat(self.descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+                or metadata.st_nlink != 1
+            ):
+                _fail()
+            self.identity = (metadata.st_dev, metadata.st_ino)
+        except TemplatePublicationError:
+            self.close()
+            raise
+        except OSError:
+            self.close()
+            _fail()
+
+    def publish(self, payload):
+        try:
+            content = _compact_json(payload) + b"\n"
+            _write_all(self.descriptor, content)
+            os.fsync(self.descriptor)
+            os.close(self.descriptor)
+            self.descriptor = None
+            os.link(
+                self.temporary_path,
+                self.destination,
+                follow_symlinks=False,
+            )
+            self.destination_linked = True
+            self.temporary_path.unlink()
+            self.temporary_path = None
+            _fsync_directory(self.directory)
+            return self.destination
+        except TemplatePublicationError:
+            raise
+        except OSError:
+            _fail()
+
+    def rollback(self):
+        if not self.destination_linked:
+            return
+        try:
+            metadata = os.lstat(self.destination)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or stat.S_ISLNK(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+                or metadata.st_nlink not in {1, 2}
+                or (metadata.st_dev, metadata.st_ino) != self.identity
+            ):
+                _fail()
+            self.destination.unlink()
+            self.destination_linked = False
+            _fsync_directory(self.directory)
+        except TemplatePublicationError:
+            raise
+        except OSError:
+            _fail()
+
+    def close(self):
+        if self.descriptor is not None:
+            try:
+                os.close(self.descriptor)
+            except OSError:
+                pass
+            self.descriptor = None
+        if self.temporary_path is not None:
+            try:
+                self.temporary_path.unlink()
+            except OSError:
+                pass
+            self.temporary_path = None
+
+
+def _write_private_record(output_directory, name, payload):
+    writer = _PrivateRecordWriter(output_directory, name)
+    try:
+        return writer.publish(payload)
+    finally:
+        writer.close()
 
 
 def audit_base_template(
@@ -567,7 +1255,7 @@ def audit_base_template(
     settings_path_resolver=_resolved_settings_path,
     transport=None,
 ):
-    api_key = _credential(settings_path_resolver)
+    api_key, _settings_path = _credential(settings_path_resolver)
     client = transport if transport is not None else VastTemplateTransport()
     try:
         matches = client.lookup_base(api_key)
@@ -576,21 +1264,15 @@ def audit_base_template(
         row = matches[0]
         if (
             row["hash_id"] != BASE_TEMPLATE_HASH_ID
-            or row["runtype"] != "jupyter_direc ssh_direc"
             or row["use_ssh"] is not True
             or row["ssh_direct"] is not True
-            or row["jupyter_dir"] != "/workspace"
         ):
             _fail()
         record = {
             "schema_version": 1,
             "hash_id": row["hash_id"],
-            "image": row["image"],
-            "tag": row["tag"],
-            "runtype": row["runtype"],
             "use_ssh": row["use_ssh"],
             "ssh_direct": row["ssh_direct"],
-            "jupyter_dir": row["jupyter_dir"],
         }
         _write_private_record(
             output_directory,
@@ -612,43 +1294,113 @@ def publish_worker_template(
     transport=None,
 ):
     template_payload = _validate_request(_read_private_json(request_file))
-    api_key = _credential(settings_path_resolver)
+    api_key, settings_path = _credential(settings_path_resolver)
     client = transport if transport is not None else VastTemplateTransport()
     name = template_payload["name"]
+    writer = _PrivateRecordWriter(
+        output_directory,
+        "template-publication.json",
+    )
     try:
-        if client.lookup_name(api_key, name):
-            _fail()
-    except TemplatePublicationError:
-        raise
-    except Exception:
-        _fail()
-
-    template_id = None
-    template_hash_id = None
-    try:
-        template_id, template_hash_id = _create_identity(
-            client.create_worker_template(api_key, template_payload),
-            name,
-        )
-    except Exception:
+        intent = _PublicationIntent(settings_path, name, template_payload)
         try:
-            reconciled = client.lookup_name(api_key, name)
-            if len(reconciled) != 1 or not _matches_request(
-                reconciled[0], template_payload
-            ):
+            try:
+                if client.lookup_name(api_key, name):
+                    _fail()
+            except TemplatePublicationError:
+                raise
+            except Exception:
                 _fail()
-            template_id = reconciled[0]["id"]
-            template_hash_id = reconciled[0]["hash_id"]
-        except Exception:
-            _fail()
 
+            template_id = None
+            template_hash_id = None
+            intent.mark_mutation_started()
+            try:
+                template_id, template_hash_id = _create_identity(
+                    client.create_worker_template(api_key, template_payload),
+                    name,
+                )
+            except Exception:
+                try:
+                    reconciled = client.lookup_name(api_key, name)
+                    if len(reconciled) != 1 or not _matches_request(
+                        reconciled[0], template_payload
+                    ):
+                        _fail()
+                    template_id = reconciled[0]["id"]
+                    template_hash_id = reconciled[0]["hash_id"]
+                except Exception:
+                    _fail()
+
+            try:
+                verified = client.lookup_hash(api_key, template_hash_id)
+                if (
+                    len(verified) != 1
+                    or verified[0]["id"] != template_id
+                    or verified[0]["hash_id"] != template_hash_id
+                    or not _matches_request(verified[0], template_payload)
+                ):
+                    _fail()
+                record = {
+                    "id": template_id,
+                    "hash_id": template_hash_id,
+                    "verified": True,
+                }
+                writer.publish(record)
+                intent.complete()
+                return record
+            except TemplatePublicationError:
+                raise
+            except Exception:
+                _fail()
+        finally:
+            intent.close()
+    finally:
+        writer.close()
+
+
+def reconcile_worker_template(
+    request_file,
+    output_directory,
+    *,
+    settings_path_resolver=_resolved_settings_path,
+    transport=None,
+):
+    template_payload = _validate_request(_read_private_json(request_file))
+    api_key, settings_path = _credential(settings_path_resolver)
+    client = transport if transport is not None else VastTemplateTransport()
+    name = template_payload["name"]
+    writer = _PrivateRecordWriter(
+        output_directory,
+        "template-publication.json",
+    )
+    intent = None
     try:
-        verified = client.lookup_hash(api_key, template_hash_id)
+        intent = _ExistingPublicationIntent(
+            settings_path,
+            name,
+            template_payload,
+        )
+        name_matches = [
+            _normalize_row(row)
+            for row in client.lookup_name(api_key, name)
+        ]
         if (
-            len(verified) != 1
-            or verified[0]["id"] != template_id
-            or verified[0]["hash_id"] != template_hash_id
-            or not _matches_request(verified[0], template_payload)
+            len(name_matches) != 1
+            or not _matches_request(name_matches[0], template_payload)
+        ):
+            _fail()
+        template_id = name_matches[0]["id"]
+        template_hash_id = name_matches[0]["hash_id"]
+        hash_matches = [
+            _normalize_row(row)
+            for row in client.lookup_hash(api_key, template_hash_id)
+        ]
+        if (
+            len(hash_matches) != 1
+            or hash_matches[0]["id"] != template_id
+            or hash_matches[0]["hash_id"] != template_hash_id
+            or not _matches_request(hash_matches[0], template_payload)
         ):
             _fail()
         record = {
@@ -656,21 +1408,28 @@ def publish_worker_template(
             "hash_id": template_hash_id,
             "verified": True,
         }
-        _write_private_record(
-            output_directory,
-            "template-publication.json",
-            record,
-        )
+        intent.prepare_recovery()
+        writer.publish(record)
+        intent.complete()
         return record
     except TemplatePublicationError:
+        writer.rollback()
         raise
     except Exception:
+        writer.rollback()
         _fail()
+    finally:
+        if intent is not None:
+            intent.close()
+        writer.close()
 
 
 def main(argv=None):
     parser = _PrivateArgumentParser(
-        description="Audit or publish the fixed private Vast worker template."
+        description=(
+            "Audit, publish, or reconcile the fixed private Vast worker "
+            "template."
+        )
     )
     subparsers = parser.add_subparsers(dest="action", required=True)
     audit_parser = subparsers.add_parser("audit-base")
@@ -678,17 +1437,33 @@ def main(argv=None):
     publish_parser = subparsers.add_parser("publish")
     publish_parser.add_argument("--request-file", type=Path, required=True)
     publish_parser.add_argument("--output-directory", type=Path, required=True)
+    reconcile_parser = subparsers.add_parser("reconcile")
+    reconcile_parser.add_argument("--request-file", type=Path, required=True)
+    reconcile_parser.add_argument(
+        "--output-directory",
+        type=Path,
+        required=True,
+    )
     arguments = parser.parse_args(argv)
     try:
         if arguments.action == "audit-base":
             audit_base_template(arguments.output_directory)
             print("action=audit-base verified=true")
-        else:
+        elif arguments.action == "publish":
             result = publish_worker_template(
                 arguments.request_file,
                 arguments.output_directory,
             )
             print("action=publish")
+            print("id=" + str(result["id"]))
+            print("hash_id=" + result["hash_id"])
+            print("verified=true")
+        else:
+            result = reconcile_worker_template(
+                arguments.request_file,
+                arguments.output_directory,
+            )
+            print("action=reconcile")
             print("id=" + str(result["id"]))
             print("hash_id=" + result["hash_id"])
             print("verified=true")

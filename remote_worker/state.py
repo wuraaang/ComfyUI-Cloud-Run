@@ -9,10 +9,14 @@ from pathlib import Path
 import re
 import stat
 import tempfile
+import uuid
 
-from cloud_run.worker_protocol import PROTOCOL_VERSION
+if "." in (__package__ or ""):
+    from ..cloud_run.worker_protocol import PROTOCOL_VERSION
+else:
+    from cloud_run.worker_protocol import PROTOCOL_VERSION
 
-STATE_SCHEMA_VERSION = 1
+STATE_SCHEMA_VERSION = 3
 MAX_STATE_BYTES = 16 * 1024 * 1024
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}")
 _HEX_64 = re.compile(r"[0-9a-f]{64}")
@@ -23,20 +27,46 @@ _JOB_STATES = {
     "failed",
     "interrupted",
 }
+_EXECUTION_STATES = {
+    "queued",
+    "running",
+    "succeeded",
+    "failed",
+    "interrupted",
+}
+_HARVEST_STATES = {"pending", "running", "succeeded", "failed"}
 _JOB_RECORD_FIELDS = {
     "kind",
     "job_id",
     "request_digest",
+    "request_id",
     "manifest_digest",
     "state",
     "client_id",
     "prompt_id",
+    "native_response",
+    "execution_state",
+    "harvest_state",
     "sequence",
     "events",
     "previews",
     "outputs",
     "error",
+    "created_at",
     "updated_at",
+}
+_SCHEMA_ONE_JOB_RECORD_FIELDS = _JOB_RECORD_FIELDS - {
+    "created_at",
+    "request_id",
+    "native_response",
+    "execution_state",
+    "harvest_state",
+}
+_SCHEMA_TWO_JOB_RECORD_FIELDS = _JOB_RECORD_FIELDS - {
+    "request_id",
+    "native_response",
+    "execution_state",
+    "harvest_state",
 }
 _PROVISION_STATES = {
     "applying",
@@ -120,6 +150,60 @@ def _finite_number(value):
     )
 
 
+def _canonical_uuid(value):
+    if not isinstance(value, str):
+        return False
+    try:
+        return str(uuid.UUID(value)) == value
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
+def _safe_native_response_tree(value):
+    stack = [(value, 0)]
+    while stack:
+        item, depth = stack.pop()
+        if depth > 64:
+            return False
+        if isinstance(item, dict):
+            for key, child in item.items():
+                if not isinstance(key, str):
+                    return False
+                folded = re.sub(
+                    r"[^a-z0-9]+",
+                    "_",
+                    key.casefold(),
+                ).strip("_")
+                components = set(folded.split("_"))
+                if components.intersection(
+                    {
+                        "authorization",
+                        "bearer",
+                        "cookie",
+                        "password",
+                        "secret",
+                        "token",
+                    }
+                ) or folded.endswith(
+                    (
+                        "_api_key",
+                        "_access_key",
+                        "_access_token",
+                        "_signed_url",
+                    )
+                ):
+                    return False
+                stack.append((child, depth + 1))
+        elif isinstance(item, list):
+            stack.extend((child, depth + 1) for child in item)
+        elif isinstance(item, float):
+            if not math.isfinite(item):
+                return False
+        elif item is not None and not isinstance(item, (bool, int, str)):
+            return False
+    return True
+
+
 def _validate_job_record(job_id, record):
     if (
         not _identifier(job_id)
@@ -129,6 +213,7 @@ def _validate_job_record(job_id, record):
         or record.get("job_id") != job_id
         or not isinstance(record.get("request_digest"), str)
         or not _HEX_64.fullmatch(record["request_digest"])
+        or not _identifier(record.get("request_id"))
         or not isinstance(record.get("manifest_digest"), str)
         or not _HEX_64.fullmatch(record["manifest_digest"])
         or record.get("state") not in _JOB_STATES
@@ -137,6 +222,8 @@ def _validate_job_record(job_id, record):
             record.get("prompt_id") is not None
             and not _identifier(record["prompt_id"])
         )
+        or record.get("execution_state") not in _EXECUTION_STATES
+        or record.get("harvest_state") not in _HARVEST_STATES
         or isinstance(record.get("sequence"), bool)
         or not isinstance(record.get("sequence"), int)
         or record["sequence"] < 0
@@ -147,8 +234,52 @@ def _validate_job_record(job_id, record):
             record.get("error") is not None
             and not isinstance(record["error"], dict)
         )
+        or not _finite_number(record.get("created_at"))
+        or record["created_at"] < 0
         or not _finite_number(record.get("updated_at"))
         or record["updated_at"] < 0
+        or record["updated_at"] < record["created_at"]
+    ):
+        raise WorkerStateError("Worker job state is invalid.")
+    response = record["native_response"]
+    if response is not None:
+        if (
+            not isinstance(response, dict)
+            or set(response) != {"prompt_id", "number", "node_errors"}
+            or response.get("prompt_id") != record["prompt_id"]
+            or not _canonical_uuid(response.get("prompt_id"))
+            or isinstance(response.get("number"), bool)
+            or not isinstance(response.get("number"), (int, float))
+            or not math.isfinite(response["number"])
+            or not isinstance(response.get("node_errors"), dict)
+            or not _safe_native_response_tree(response)
+        ):
+            raise WorkerStateError("Worker job state is invalid.")
+    if (
+        (record["state"] == "queued" and record["execution_state"] != "queued")
+        or (
+            record["state"] == "running"
+            and record["execution_state"] not in {"running", "succeeded"}
+        )
+        or (
+            record["state"] == "succeeded"
+            and (
+                record["execution_state"] != "succeeded"
+                or record["harvest_state"] != "succeeded"
+            )
+        )
+        or (
+            record["state"] == "failed"
+            and record["execution_state"] not in {"failed", "succeeded"}
+        )
+        or (
+            record["state"] == "interrupted"
+            and record["execution_state"] != "interrupted"
+        )
+        or (
+            record["execution_state"] != "succeeded"
+            and record["harvest_state"] != "pending"
+        )
     ):
         raise WorkerStateError("Worker job state is invalid.")
     if len(record["events"]) != record["sequence"]:
@@ -283,6 +414,63 @@ def _default_state(expected_session_id):
     }
 
 
+def _legacy_execution_state(state):
+    return {
+        "queued": "queued",
+        "running": "running",
+        "succeeded": "succeeded",
+        "failed": "failed",
+        "interrupted": "interrupted",
+    }.get(state)
+
+
+def _migrate_state(state):
+    if not isinstance(state, dict) or state.get("schema_version") not in {1, 2}:
+        return state, False
+    if set(state) != _STATE_FIELDS or not isinstance(state.get("jobs"), dict):
+        raise WorkerStateError("Worker state is invalid.")
+    source_schema = state["schema_version"]
+    expected_fields = (
+        _SCHEMA_ONE_JOB_RECORD_FIELDS
+        if source_schema == 1
+        else _SCHEMA_TWO_JOB_RECORD_FIELDS
+    )
+    jobs = {}
+    for job_id, record in state["jobs"].items():
+        if (
+            not isinstance(record, dict)
+            or set(record) != expected_fields
+            or not _finite_number(record.get("updated_at"))
+            or record["updated_at"] < 0
+        ):
+            raise WorkerStateError("Worker job state is invalid.")
+        legacy_state = record.get("state")
+        execution_state = _legacy_execution_state(legacy_state)
+        if execution_state is None:
+            raise WorkerStateError("Worker job state is invalid.")
+        migrated = {
+            **record,
+            **(
+                {"created_at": float(record["updated_at"])}
+                if source_schema == 1
+                else {}
+            ),
+            "request_id": job_id,
+            "native_response": None,
+            "execution_state": execution_state,
+            "harvest_state": (
+                "succeeded" if legacy_state == "succeeded" else "pending"
+            ),
+        }
+        _validate_job_record(job_id, migrated)
+        jobs[job_id] = migrated
+    return {
+        **state,
+        "schema_version": STATE_SCHEMA_VERSION,
+        "jobs": jobs,
+    }, True
+
+
 def _validate_state(state):
     if (
         not isinstance(state, dict)
@@ -320,6 +508,8 @@ def _validate_state(state):
             raise WorkerStateError("Worker state is invalid.")
     elif deadline is not None:
         raise WorkerStateError("Worker state is invalid.")
+    for job_id, record in state["jobs"].items():
+        _validate_job_record(job_id, record)
     try:
         encoded = json.dumps(
             state,
@@ -349,6 +539,8 @@ class WorkerStateStore:
         if not self.path.exists():
             return _default_state(self.expected_session_id)
         descriptor = None
+        migrated = False
+        state = None
         try:
             parent_metadata = os.lstat(self.path.parent)
             if (
@@ -373,6 +565,7 @@ class WorkerStateStore:
             if len(content) != metadata.st_size:
                 raise WorkerStateError("Worker state is unavailable.")
             state = json.loads(content.decode("utf-8"))
+            state, migrated = _migrate_state(state)
             _validate_state(state)
             if (
                 self.expected_session_id is not None
@@ -380,7 +573,6 @@ class WorkerStateStore:
                 != self.expected_session_id
             ):
                 raise WorkerStateError("Worker state is unavailable.")
-            return state
         except WorkerStateError:
             raise
         except (OSError, UnicodeError, json.JSONDecodeError):
@@ -388,6 +580,9 @@ class WorkerStateStore:
         finally:
             if descriptor is not None:
                 os.close(descriptor)
+        if migrated:
+            return self.save(state)
+        return state
 
     def save(self, state):
         encoded = _validate_state(state)

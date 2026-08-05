@@ -3,10 +3,18 @@ set -eu
 
 script_directory=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repository_root=$(CDPATH= cd -- "$script_directory/.." && pwd)
+comfyui_python_runner="$script_directory/run_with_comfyui_python.sh"
 cd "$repository_root"
 
 python_command=${PYTHON_COMMAND:-python3}
 node_command=${NODE_COMMAND:-node}
+
+# The deterministic gate never inherits credentials that could turn an
+# accidental provider/cache request into a real external side effect.
+unset VAST_API_KEY CONTAINER_API_KEY JUPYTER_TOKEN OPEN_BUTTON_TOKEN
+unset R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID
+unset AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN HF_TOKEN
+unset HUGGING_FACE_HUB_TOKEN CIVITAI_API_KEY CIVITAI_TOKEN
 
 command -v "$python_command" >/dev/null 2>&1 || {
   echo "[check] Python command not found" >&2
@@ -16,37 +24,22 @@ command -v "$node_command" >/dev/null 2>&1 || {
   echo "[check] Node command not found" >&2
   exit 1
 }
-
-gold_python_command=${COMFYUI_PYTHON_COMMAND:-}
-if [ -z "$gold_python_command" ] && \
-  "$python_command" -c 'import PIL' >/dev/null 2>&1; then
-  gold_python_command=$python_command
-fi
-if [ -z "$gold_python_command" ] && [ -n "${HOME:-}" ]; then
-  for comfy_python_candidate in \
-    "$HOME/ComfyUI-Installs/ComfyUI/standalone-env/bin/python3.13" \
-    "$HOME/ComfyUI-Installs/ComfyUI/standalone-env/bin/python3"
-  do
-    if [ -x "$comfy_python_candidate" ] && \
-      "$comfy_python_candidate" -c 'import PIL' >/dev/null 2>&1; then
-      gold_python_command=$comfy_python_candidate
-      break
-    fi
-  done
-fi
-if [ -z "$gold_python_command" ] || \
-  ! "$gold_python_command" -c 'import PIL' >/dev/null 2>&1; then
-  echo "[check] ComfyUI Python with Pillow not found; set COMFYUI_PYTHON_COMMAND" >&2
+if [ ! -x "$comfyui_python_runner" ]; then
+  echo "[check] shared ComfyUI Python runner is unavailable" >&2
   exit 1
 fi
 
 echo "[check] Python tests"
-PYTHONDONTWRITEBYTECODE=1 "$python_command" -m unittest discover \
+PYTHONDONTWRITEBYTECODE=1 "$comfyui_python_runner" -m unittest discover \
   -s tests/python -p 'test_*.py' -v
 
 echo "[check] fake reusable session"
 PYTHONDONTWRITEBYTECODE=1 "$python_command" -m unittest \
   tests.python.test_fake_session_integration -v
+
+echo "[check] fake Desktop bridge"
+PYTHONDONTWRITEBYTECODE=1 "$comfyui_python_runner" -m unittest \
+  tests.python.test_fake_desktop_bridge_integration -v
 
 echo "[check] worker protocol and artifact"
 PYTHONDONTWRITEBYTECODE=1 "$python_command" -m unittest \
@@ -128,8 +121,10 @@ with tempfile.TemporaryDirectory() as temporary_directory:
 PY
 
 echo "[check] synthetic Gold validator"
-PYTHONDONTWRITEBYTECODE=1 "$gold_python_command" -W error -m unittest \
-  tests.python.test_gold_output_validation -v
+PYTHONDONTWRITEBYTECODE=1 "$comfyui_python_runner" \
+  -W error -m unittest \
+  tests.python.test_gold_output_validation \
+  tests.python.test_smoke_output_validation -v
 
 echo "[check] Node tests"
 "$node_command" --test tests/js/*.test.mjs
@@ -231,6 +226,20 @@ if provider_urls != {
 }:
     fail("unexpected Vast provider URL surface")
 
+provider_origin_owners = {
+    str(path)
+    for path in [
+        *sorted(Path("cloud_run").glob("*.py")),
+        *sorted(Path("remote_worker").glob("*.py")),
+    ]
+    if "console.vast.ai" in path.read_text(encoding="utf-8")
+}
+if provider_origin_owners != {
+    "cloud_run/vast.py",
+    "remote_worker/deadline.py",
+}:
+    fail("Vast provider origin escaped reviewed HTTP boundaries")
+
 provider_methods = {
     node.func.attr
     for node in ast.walk(vast_tree)
@@ -293,6 +302,8 @@ for node in ast.walk(routes_tree):
 allowed_cloud_run_routes = {
     ("GET", "/cloud-run/api/settings"),
     ("PUT", "/cloud-run/api/settings"),
+    ("GET", "/cloud-run/api/desktop-context"),
+    ("GET", "/cloud-run/api/desktop-setup"),
     ("POST", "/cloud-run/api/captures"),
     ("POST", "/cloud-run/api/preflights"),
     ("PUT", "/cloud-run/api/mappings/{mapping_id}"),
@@ -305,8 +316,25 @@ allowed_cloud_run_routes = {
     ("POST", "/cloud-run/api/sessions"),
     ("POST", "/cloud-run/api/sessions/{session_id}/confirm"),
     ("GET", "/cloud-run/api/sessions/{session_id}"),
+    ("GET", "/cloud-run/api/sessions/{session_id}/profile"),
+    (
+        "POST",
+        "/cloud-run/api/sessions/{session_id}/profile/conflicts/{conflict_id}",
+    ),
+    (
+        "POST",
+        "/cloud-run/api/sessions/{session_id}/desktop-relay",
+    ),
+    (
+        "DELETE",
+        "/cloud-run/api/sessions/{session_id}/desktop-relay",
+    ),
     ("POST", "/cloud-run/api/sessions/{session_id}/jobs"),
     ("GET", "/cloud-run/api/sessions/{session_id}/jobs/{job_id}"),
+    (
+        "POST",
+        "/cloud-run/api/sessions/{session_id}/jobs/{job_id}/harvest",
+    ),
     (
         "GET",
         "/cloud-run/api/sessions/{session_id}/jobs/{job_id}/events",
@@ -336,7 +364,11 @@ allowed_worker_routes = {
     ("POST", "/worker/v1/jobs"),
     ("GET", "/worker/v1/jobs/{job_id}"),
     ("GET", "/worker/v1/jobs/{job_id}/events"),
+    ("GET", "/worker/v1/jobs/{job_id}/snapshot"),
     ("GET", "/worker/v1/jobs/{job_id}/previews/{preview_id}"),
+    ("PUT", "/worker/v1/profile"),
+    ("GET", "/worker/v1/profile"),
+    ("GET", "/worker/v1/profile/artifacts/{artifact_id}"),
     ("PUT", "/worker/v1/deadline"),
 }
 if worker_route_set() != allowed_worker_routes:
@@ -347,6 +379,7 @@ expected_session_states = {
     "offer_selected",
     "confirming",
     "creating",
+    "reconciling_create",
     "bootstrapping",
     "provisioning",
     "validating",
@@ -442,6 +475,22 @@ production_paths = [
     *sorted(Path("remote_worker").glob("*.py")),
     *reviewed_release_tool_paths,
 ]
+provider_boundary_paths = [
+    Path("cloud_run/vast.py"),
+    Path("cloud_run/lifecycle.py"),
+    Path("remote_worker/gateway.py"),
+    Path("remote_worker/Caddyfile"),
+]
+provider_credential_literals = (
+    "JUPYTER_TOKEN",
+    "OPEN_BUTTON_TOKEN",
+    "jupyter_token",
+)
+for path in provider_boundary_paths:
+    source = path.read_text(encoding="utf-8")
+    for literal in provider_credential_literals:
+        if literal in source:
+            fail("provider credential literal in " + str(path))
 frontend_paths = sorted(Path("web/js").glob("*.js"))
 for path in production_paths:
     source = path.read_text(encoding="utf-8")
@@ -515,6 +564,9 @@ for path in frontend_paths:
     source = path.read_text(encoding="utf-8")
     for forbidden_frontend_value in (
         "console.vast.ai",
+        "bearer ",
+        "signed_url",
+        "signedurl",
         "/" + "asks/",
         "/" + "instances/",
         "http" + "://",
@@ -522,8 +574,9 @@ for path in frontend_paths:
         "local" + "Storage",
         "session" + "Storage",
         ".inner" + "HTML",
+        "Run Vast",
     ):
-        if forbidden_frontend_value in source:
+        if forbidden_frontend_value.casefold() in source.casefold():
             fail("forbidden frontend provider or browser storage surface")
 
 forbidden_response_keys = {
@@ -572,8 +625,10 @@ allowed_external_hosts = {
     "cas-bridge.xethub.hf.co",
     "cdn-lfs-eu-1.hf.co",
     "cdn-lfs-us-1.hf.co",
+    "cdn.comfy.org",
     "civitai.com",
     "console.vast.ai",
+    "files.pythonhosted.org",
     "github.com",
     "huggingface.co",
     "release-assets.githubusercontent.com",
@@ -603,8 +658,10 @@ if not {
     "cas-bridge.xethub.hf.co",
     "cdn-lfs-eu-1.hf.co",
     "cdn-lfs-us-1.hf.co",
+    "cdn.comfy.org",
     "civitai.com",
     "console.vast.ai",
+    "files.pythonhosted.org",
     "github.com",
     "huggingface.co",
     "release-assets.githubusercontent.com",
@@ -635,6 +692,7 @@ PY
 
 echo "[check] public artifact scan"
 "$python_command" - <<'PY'
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -647,9 +705,34 @@ def fail(message):
     raise SystemExit(1)
 
 
-excluded = {".git", ".worktrees", "__pycache__", "node_modules"}
+excluded = {
+    ".git",
+    ".superpowers",
+    ".worktrees",
+    "__pycache__",
+    "node_modules",
+}
+allowed_public_binary_artifacts = {
+    Path(
+        "tests/fixtures/frontend-1.47.10/"
+        "agent-panel-"
+        "c0e05111db15e8bc040c63ff9457fc142326afab66532f942b631f268fb606be.tar"
+    ): (
+        2_908_160,
+        "c0e05111db15e8bc040c63ff9457fc142326afab66532f942b631f268fb606be",
+    ),
+    Path(
+        "tests/fixtures/frontend-1.47.10/"
+        "efficiency-frontend-"
+        "27862272e5ba1bc7b7066dd8475cb3234ba496ba57967358f5a636c16bad1a21.tar"
+    ): (
+        40_960,
+        "27862272e5ba1bc7b7066dd8475cb3234ba496ba57967358f5a636c16bad1a21",
+    ),
+}
 allowed_suffixes = {
     "",
+    ".css",
     ".js",
     ".json",
     ".md",
@@ -659,8 +742,34 @@ allowed_suffixes = {
     ".toml",
 }
 allowed_json = {
+    Path("cloud_run/certified_baseline.lock.json"),
     Path("package.json"),
     Path("remote_worker/template-policy.json"),
+    Path(
+        "tests/fixtures/certified-baseline/"
+        "agent-panel-0.11.38/PROVENANCE.json"
+    ),
+    Path(
+        "tests/fixtures/certified-baseline/"
+        "agent-panel-0.11.38/WEB_ROOT.json"
+    ),
+    Path(
+        "tests/fixtures/certified-baseline/"
+        "efficiency-nodes-1.0.9/CLASS_TYPES.json"
+    ),
+    Path(
+        "tests/fixtures/certified-baseline/"
+        "efficiency-nodes-1.0.9/PROVENANCE.json"
+    ),
+    Path(
+        "tests/fixtures/certified-baseline/"
+        "efficiency-nodes-1.0.9/RUNTIME_PATHS.json"
+    ),
+    Path("tests/fixtures/certified-baseline/hermes-nous/FILES.json"),
+    Path(
+        "tests/fixtures/certified-baseline/hermes-nous/PROVENANCE.json"
+    ),
+    Path("tests/fixtures/cloud-run-core-output-smoke.json"),
     Path("tests/fixtures/native-model-metadata-workflow.json"),
 }
 forbidden_suffixes = {
@@ -697,6 +806,7 @@ secret_patterns = {
     ),
 }
 observed_json = set()
+observed_public_binary_artifacts = set()
 count = 0
 for path in sorted(Path(".").rglob("*")):
     if any(part in excluded for part in path.parts):
@@ -709,6 +819,21 @@ for path in sorted(Path(".").rglob("*")):
         continue
     if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
         fail("repository contains a non-regular public artifact")
+    relative = Path(path.as_posix().removeprefix("./"))
+    expected_binary = allowed_public_binary_artifacts.get(relative)
+    if expected_binary is not None:
+        try:
+            body = path.read_bytes()
+        except OSError:
+            fail("reviewed public binary artifact is unavailable")
+        if (
+            metadata.st_size != expected_binary[0]
+            or hashlib.sha256(body).hexdigest() != expected_binary[1]
+        ):
+            fail("reviewed public binary artifact identity changed")
+        observed_public_binary_artifacts.add(relative)
+        count += 1
+        continue
     if path.suffix.casefold() in forbidden_suffixes:
         fail("repository contains a forbidden binary/private artifact")
     if path.suffix.casefold() not in allowed_suffixes:
@@ -719,7 +844,6 @@ for path in sorted(Path(".").rglob("*")):
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
         fail("repository public artifact is not UTF-8 text")
-    relative = Path(path.as_posix().removeprefix("./"))
     if relative.name in {
         ".env",
         "settings.json",
@@ -738,7 +862,9 @@ for path in sorted(Path(".").rglob("*")):
     count += 1
 if observed_json != allowed_json:
     fail("public JSON artifact allowlist changed")
-print("[check] scanned {} public text artifacts".format(count))
+if observed_public_binary_artifacts != set(allowed_public_binary_artifacts):
+    fail("reviewed public binary artifact allowlist changed")
+print("[check] scanned {} public artifacts".format(count))
 PY
 
 echo "[check] all checks passed"

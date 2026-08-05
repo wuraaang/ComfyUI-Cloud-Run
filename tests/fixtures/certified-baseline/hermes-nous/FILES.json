@@ -1,0 +1,26 @@
+{
+  "files": [
+    {
+      "path": "__init__.py",
+      "sha256": "2265b256b8cecdebef252f99fef03dbcdcd4ac29f089c1f0cbca3e3bde8f13be",
+      "size_bytes": 163
+    },
+    {
+      "path": "web/hermes-nous.css",
+      "sha256": "cd55d3eeb3acff8ccc4cf0bdebf16a828da9d4ad9191f768a671697cfacc7c0d",
+      "size_bytes": 17083
+    },
+    {
+      "path": "web/hermes-nous.js",
+      "sha256": "da2b4f3ab8b60c6dfc0942f6a43066a0b3e032084b71f5f021a81e014e4f4a4d",
+      "size_bytes": 15050
+    }
+  ],
+  "source_tree_sha256": "743a5a2505cab78c3502c0fcf50b83780790a5a5b14e7fc1be3e438a3ca7c82f",
+  "web": {
+    "file_count": 2,
+    "root": "web",
+    "sha256": "d07506b932fc68e7548281e5ad32944c5d6bb1d8ec3f97e5a693033889784275",
+    "size_bytes": 32133
+  }
+}

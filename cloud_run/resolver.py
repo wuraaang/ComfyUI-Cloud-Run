@@ -6,6 +6,7 @@ from dataclasses import dataclass, replace
 
 from .artifacts import (
     ArtifactCollisionError,
+    ResolvedLocalArtifact,
     calculate_disk_gb,
     estimate_output_bytes,
     resolve_artifacts,
@@ -14,10 +15,14 @@ from .artifacts import (
 from .comfy_host import HostCompatibilityError, NodeNotFound
 from .dependency_repository import MappingValidationError
 from .manifest import (
+    _PROTECTED_RUNTIME_DISTRIBUTIONS,
+    _wheel_distribution,
     ArtifactSpec,
     CustomNodeSpec,
+    ProfileSpec,
     PythonWheelSpec,
     SourceSpec,
+    UiPackageSpec,
     validate_dependency,
 )
 from .registry import RegistryError
@@ -49,6 +54,9 @@ class DependencyPreflightResult:
     disk_gb: int
     rentable: bool
     local_artifacts: tuple = ()
+    ui_packages: tuple[UiPackageSpec, ...] = ()
+    profile: ProfileSpec | None = None
+    minimum_vram_gb: float = 0.0
 
 
 def _candidate_is_complete(candidate, class_type):
@@ -112,6 +120,30 @@ def _custom_node_from_mapping(candidate):
     return node
 
 
+def _merge_custom_node(nodes, wheels, node):
+    existing_node = nodes.get(node.package_id)
+    if existing_node is not None and existing_node != node:
+        raise ArtifactCollisionError(
+            "Custom-node package has conflicting approved mappings."
+        )
+    for wheel in node.wheels:
+        distribution = _wheel_distribution(wheel.filename)
+        existing_wheel = wheels.get(distribution)
+        if (
+            not distribution
+            or distribution in _PROTECTED_RUNTIME_DISTRIBUTIONS
+            or (
+                existing_wheel is not None
+                and existing_wheel != wheel
+            )
+        ):
+            raise ArtifactCollisionError(
+                "Python wheel distribution has conflicting approved identities."
+            )
+        wheels[distribution] = wheel
+    nodes[node.package_id] = node
+
+
 class DependencyResolver:
     """Resolve nodes without installing, uploading, renting, or executing."""
 
@@ -124,6 +156,7 @@ class DependencyResolver:
         cache_catalog=None,
         resolution_context=None,
         model_source_resolver=None,
+        profile_provider=None,
     ):
         self.host = host
         self.repository = repository
@@ -131,6 +164,112 @@ class DependencyResolver:
         self.cache_catalog = cache_catalog
         self.resolution_context = resolution_context
         self.model_source_resolver = model_source_resolver
+        self.profile_provider = profile_provider
+
+    def _approved_profile(self, capture):
+        if self.profile_provider is None:
+            return (), (), (), None, 0.0
+        try:
+            payload = self.profile_provider(capture)
+        except Exception:
+            raise MappingValidationError(
+                "Approved Desktop profile is unavailable."
+            ) from None
+        if not isinstance(payload, dict) or set(payload) != {
+            "ui_packages",
+            "custom_nodes",
+            "local_artifacts",
+            "profile",
+            "minimum_vram_gb",
+        }:
+            raise MappingValidationError(
+                "Approved Desktop profile is invalid."
+            )
+        ui_packages = payload["ui_packages"]
+        custom_nodes = payload["custom_nodes"]
+        local_artifacts = payload["local_artifacts"]
+        profile = payload["profile"]
+        minimum_vram = payload["minimum_vram_gb"]
+        if (
+            not isinstance(ui_packages, tuple)
+            or not all(isinstance(item, UiPackageSpec) for item in ui_packages)
+            or not isinstance(custom_nodes, tuple)
+            or not all(
+                isinstance(item, CustomNodeSpec) for item in custom_nodes
+            )
+            or not isinstance(local_artifacts, tuple)
+            or not all(
+                isinstance(item, ResolvedLocalArtifact)
+                for item in local_artifacts
+            )
+            or (profile is not None and not isinstance(profile, ProfileSpec))
+            or isinstance(minimum_vram, bool)
+            or not isinstance(minimum_vram, (int, float))
+            or not 0 <= float(minimum_vram) <= 1024
+        ):
+            raise MappingValidationError(
+                "Approved Desktop profile is invalid."
+            )
+        try:
+            packages = {}
+            for package in ui_packages:
+                validate_dependency(package)
+                existing = packages.get(package.package_id)
+                if existing is not None and existing != package:
+                    raise ValueError("Conflicting UI package.")
+                packages[package.package_id] = package
+            nodes = {}
+            class_packages = {}
+            for node in custom_nodes:
+                validate_dependency(node)
+                existing = nodes.get(node.package_id)
+                if existing is not None and existing != node:
+                    raise ValueError("Conflicting custom-node package.")
+                nodes[node.package_id] = node
+                for class_type in node.provided_class_types:
+                    provider = class_packages.get(class_type)
+                    if provider is not None and provider != node.package_id:
+                        raise ValueError("Conflicting custom-node class.")
+                    class_packages[class_type] = node.package_id
+            if set(packages).intersection(nodes):
+                raise ValueError("Conflicting Desktop package identity.")
+            locals_by_id = {}
+            for local in local_artifacts:
+                LocalCacheArtifact(
+                    artifact_id=local.artifact_id,
+                    private_path=local.private_path,
+                    size_bytes=local.size_bytes,
+                    sha256=local.sha256,
+                )
+                identity = (
+                    local.private_path,
+                    local.size_bytes,
+                    local.sha256,
+                )
+                existing = locals_by_id.get(local.artifact_id)
+                if existing is not None and existing != identity:
+                    raise ValueError("Conflicting local artifact.")
+                locals_by_id[local.artifact_id] = identity
+            if profile is not None:
+                validate_dependency(profile)
+        except (TypeError, ValueError):
+            raise MappingValidationError(
+                "Approved Desktop profile is invalid."
+            ) from None
+        return (
+            tuple(packages[key] for key in sorted(packages)),
+            tuple(nodes[key] for key in sorted(nodes)),
+            tuple(
+                next(
+                    item
+                    for item in local_artifacts
+                    if item.artifact_id == key
+                )
+                for key in sorted(locals_by_id)
+            ),
+            profile,
+            float(minimum_vram),
+        )
 
     def register_agent_suggestion(self, payload):
         if not isinstance(payload, dict) or set(payload) != {
@@ -270,8 +409,24 @@ class DependencyResolver:
             reason="No approved immutable source is available.",
         )
 
-    async def resolve_nodes(self, capture):
+    async def resolve_nodes(self, capture, *, certified_custom_nodes=()):
         self.host.assert_compatible()
+        if not isinstance(certified_custom_nodes, tuple) or not all(
+            isinstance(item, CustomNodeSpec)
+            for item in certified_custom_nodes
+        ):
+            raise MappingValidationError(
+                "Approved Desktop profile is invalid."
+            )
+        certified_classes = {}
+        for node in certified_custom_nodes:
+            for class_type in node.provided_class_types:
+                provider = certified_classes.get(class_type)
+                if provider is not None and provider != node.package_id:
+                    raise MappingValidationError(
+                        "Approved Desktop profile is invalid."
+                    )
+                certified_classes[class_type] = node.package_id
         rows = []
         seen = set()
         for raw_class_type in capture.executable_class_types:
@@ -279,6 +434,15 @@ class DependencyResolver:
             if class_type in seen:
                 continue
             seen.add(class_type)
+            if class_type in certified_classes:
+                rows.append(
+                    NodeResolution(
+                        class_type=class_type,
+                        status="resolved",
+                        source_kind="certified_baseline",
+                    )
+                )
+                continue
             rows.append(await self._resolve_one(class_type))
         resolved = tuple(rows)
         return NodeResolutionResult(
@@ -297,7 +461,17 @@ class DependencyResolver:
         base_bytes,
         explicit_output_allowance_bytes,
     ):
-        nodes = await self.resolve_nodes(capture)
+        (
+            ui_packages,
+            baseline_custom_nodes,
+            baseline_local_artifacts,
+            profile,
+            minimum_vram_gb,
+        ) = self._approved_profile(capture)
+        nodes = await self.resolve_nodes(
+            capture,
+            certified_custom_nodes=baseline_custom_nodes,
+        )
         requirements = static_file_requirements(capture, metadata)
         model_sources = {}
         if self.model_source_resolver is not None:
@@ -315,9 +489,24 @@ class DependencyResolver:
             requirements=requirements,
         )
         artifact_rows = artifact_result.rows
+        local_artifacts_by_id = {}
+        for local in (
+            *artifact_result.local_artifacts,
+            *baseline_local_artifacts,
+        ):
+            existing = local_artifacts_by_id.get(local.artifact_id)
+            if existing is not None and existing != local:
+                raise ArtifactCollisionError(
+                    "Local artifact has conflicting approved identities."
+                )
+            local_artifacts_by_id[local.artifact_id] = local
+        local_artifacts = tuple(
+            local_artifacts_by_id[key]
+            for key in sorted(local_artifacts_by_id)
+        )
         if self.cache_catalog is not None:
             registered = set()
-            for local in artifact_result.local_artifacts:
+            for local in local_artifacts:
                 try:
                     self.cache_catalog.register_local_artifact(
                         LocalCacheArtifact(
@@ -328,7 +517,9 @@ class DependencyResolver:
                         )
                     )
                 except Exception:
-                    continue
+                    raise MappingValidationError(
+                        "Approved local upload is unavailable."
+                    ) from None
                 registered.add(local.artifact_id)
             try:
                 cache_configured = (
@@ -350,6 +541,14 @@ class DependencyResolver:
         )
 
         custom_nodes_by_package = {}
+        wheels_by_distribution = {}
+        for node in baseline_custom_nodes:
+            _merge_custom_node(
+                custom_nodes_by_package,
+                wheels_by_distribution,
+                node,
+            )
+        ui_package_ids = {package.package_id for package in ui_packages}
         for row in nodes.rows:
             if row.status != "resolved" or row.source_kind != "approved":
                 continue
@@ -360,12 +559,15 @@ class DependencyResolver:
             ):
                 continue
             custom_node = _custom_node_from_mapping(candidate)
-            existing = custom_nodes_by_package.get(custom_node.package_id)
-            if existing is not None and existing != custom_node:
+            if custom_node.package_id in ui_package_ids:
                 raise ArtifactCollisionError(
-                    "Custom-node package has conflicting approved mappings."
+                    "Desktop package has conflicting approved roles."
                 )
-            custom_nodes_by_package[custom_node.package_id] = custom_node
+            _merge_custom_node(
+                custom_nodes_by_package,
+                wheels_by_distribution,
+                custom_node,
+            )
         custom_nodes = tuple(
             custom_nodes_by_package[key]
             for key in sorted(custom_nodes_by_package)
@@ -376,6 +578,9 @@ class DependencyResolver:
             + sum(wheel.size_bytes for wheel in node.wheels)
             for node in custom_nodes
         )
+        profile_dependency_bytes = sum(
+            package.archive.size_bytes for package in ui_packages
+        ) + (profile.archive.size_bytes if profile is not None else 0)
         model_bytes = sum(
             artifact.size_bytes
             for artifact in artifact_result.artifacts
@@ -388,7 +593,11 @@ class DependencyResolver:
         )
         disk_gb = calculate_disk_gb(
             base_bytes=base_bytes,
-            dependency_bytes=custom_dependency_bytes + model_bytes,
+            dependency_bytes=(
+                custom_dependency_bytes
+                + profile_dependency_bytes
+                + model_bytes
+            ),
             input_bytes=input_bytes,
             output_bytes=output_allowance,
         )
@@ -400,7 +609,10 @@ class DependencyResolver:
             output_allowance_bytes=output_allowance,
             disk_gb=disk_gb,
             rentable=nodes.rentable and artifact_result.rentable,
-            local_artifacts=artifact_result.local_artifacts,
+            local_artifacts=local_artifacts,
+            ui_packages=ui_packages,
+            profile=profile,
+            minimum_vram_gb=minimum_vram_gb,
         )
 
     async def resolve_preflight(

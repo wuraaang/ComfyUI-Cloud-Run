@@ -58,13 +58,32 @@ _EVENT_TYPES = {
     "b_preview_with_metadata",
 }
 _ERROR_MESSAGES = {
-    "validation_failed": "Remote ComfyUI rejected the compiled prompt.",
-    "out_of_memory": "Remote execution ran out of GPU memory.",
-    "execution_failed": "Remote execution failed.",
-    "execution_interrupted": "Remote execution was interrupted.",
-    "worker_restarted": (
-        "Remote execution was interrupted by a worker restart."
+    "validation_error": ("Cloud Vast validation failed.",),
+    "dependency_error": ("A required Cloud Vast dependency is unavailable.",),
+    "transfer_error": ("Cloud Vast data transfer failed.",),
+    "quote_expired": ("The quote expired before confirmation.",),
+    "provider_error": ("The Vast provider request failed.",),
+    "provisioning_error": ("The remote environment could not become ready.",),
+    "comfy_startup_error": ("Remote ComfyUI did not become ready.",),
+    "execution_error": (
+        "Remote workflow execution failed.",
+        "Remote ComfyUI rejected the compiled prompt.",
+        "Remote execution ran out of GPU memory.",
+        "Remote workflow execution was interrupted.",
     ),
+    "synchronization_error": ("Remote job synchronization failed.",),
+    "harvest_error": ("Remote output retrieval failed.",),
+    "invalid_output": ("Remote output metadata was invalid.",),
+    "worker_restart_error": ("The worker restarted during execution.",),
+    "lifecycle_error": ("GPU lifecycle verification failed.",),
+    "internal_error": ("An unexpected Cloud Vast error occurred.",),
+}
+_LEGACY_ERROR_CODES = {
+    "validation_failed": "execution_error",
+    "out_of_memory": "execution_error",
+    "execution_failed": "execution_error",
+    "execution_interrupted": "execution_error",
+    "worker_restarted": "worker_restart_error",
 }
 _SUSPICIOUS_TEXT = re.compile(
     r"(?i)(authorization|bearer|api[_ -]?key|password|secret|token)"
@@ -83,10 +102,15 @@ class ArtifactVerificationError(RelayError):
     pass
 
 
+class InvalidOutputError(ArtifactVerificationError, RelayValidationError):
+    """A persistent-output contract or publication path was unsafe."""
+
+
 @dataclass(frozen=True)
 class RelayArtifactResult:
     job_id: str
     artifact_id: str
+    node_id: str
     state: TransferState
     local_path: Path
     size_bytes: int
@@ -97,6 +121,7 @@ class RelayArtifactResult:
         return {
             "job_id": self.job_id,
             "artifact_id": self.artifact_id,
+            "node_id": self.node_id,
             "state": self.state.value,
             "size_bytes": self.size_bytes,
             "sha256": self.sha256,
@@ -239,7 +264,7 @@ def _fsync_directory(path):
             os.close(descriptor)
 
 
-def _hash_path(path, *, maximum):
+def _fsync_file(path):
     descriptor = None
     try:
         flags = os.O_RDONLY
@@ -249,6 +274,41 @@ def _hash_path(path, *, maximum):
         metadata = os.fstat(descriptor)
         if (
             not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+        ):
+            raise OSError("Unsafe local artifact.")
+        os.fsync(descriptor)
+    except OSError:
+        raise ArtifactVerificationError(
+            "Local artifact durability failed."
+        ) from None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _lstat_or_none(path):
+    try:
+        return os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise ArtifactVerificationError(
+            "Local artifact verification failed."
+        ) from None
+
+
+def _hash_path_identity(path, *, maximum):
+    descriptor = None
+    try:
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(path, flags)
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
             or metadata.st_size < 0
             or metadata.st_size > maximum
         ):
@@ -273,11 +333,17 @@ def _hash_path(path, *, maximum):
             or after.st_size != metadata.st_size
             or after.st_mtime_ns != metadata.st_mtime_ns
             or after.st_ino != metadata.st_ino
+            or after.st_dev != metadata.st_dev
         ):
             raise ArtifactVerificationError(
                 "Local artifact verification failed."
             )
-        return size, digest.hexdigest()
+        return (
+            size,
+            digest.hexdigest(),
+            metadata.st_dev,
+            metadata.st_ino,
+        )
     except ArtifactVerificationError:
         raise
     except OSError:
@@ -287,6 +353,14 @@ def _hash_path(path, *, maximum):
     finally:
         if descriptor is not None:
             os.close(descriptor)
+
+
+def _hash_path(path, *, maximum):
+    size, digest, _device, _inode = _hash_path_identity(
+        path,
+        maximum=maximum,
+    )
+    return size, digest
 
 
 def _validated_output(descriptor):
@@ -308,7 +382,7 @@ def _validated_output(descriptor):
         or "/" in filename
         or "\\" in filename
         or any(ord(character) < 32 for character in filename)
-        or len(filename.encode("utf-8")) > 1024
+        or len(filename.encode("utf-8")) > 255
         or not isinstance(subfolder, str)
         or "\\" in subfolder
         or any(ord(character) < 32 for character in subfolder)
@@ -330,6 +404,8 @@ def _validated_output(descriptor):
             raise _relay_error()
         parts = ()
     else:
+        if any(len(part.encode("utf-8")) > 255 for part in relative.parts):
+            raise _relay_error()
         parts = relative.parts
     return {
         **descriptor,
@@ -340,15 +416,21 @@ def _validated_output(descriptor):
 def _sanitize_error(data):
     if not isinstance(data, dict):
         return {
-            "code": "execution_failed",
-            "message": _ERROR_MESSAGES["execution_failed"],
+            "code": "internal_error",
+            "message": _ERROR_MESSAGES["internal_error"][0],
         }
-    code = data.get("code")
+    code = _LEGACY_ERROR_CODES.get(data.get("code"), data.get("code"))
     if code not in _ERROR_MESSAGES:
-        code = "execution_failed"
+        code = "internal_error"
+    allowed_messages = _ERROR_MESSAGES[code]
+    supplied_message = data.get("message")
     result = {
         "code": code,
-        "message": _ERROR_MESSAGES[code],
+        "message": (
+            supplied_message
+            if supplied_message in allowed_messages
+            else allowed_messages[0]
+        ),
     }
     for source, destination in (
         ("node_id", "node_id"),
@@ -494,8 +576,7 @@ class LocalRelay:
         clock=None,
     ):
         if worker is not None and (
-            not callable(getattr(worker, "events", None))
-            or not callable(getattr(worker, "job", None))
+            not callable(getattr(worker, "snapshot", None))
         ):
             raise ValueError("Local relay worker boundary is invalid.")
         if not isinstance(repository, JobRepository):
@@ -537,9 +618,21 @@ class LocalRelay:
         directory = _private_directory(self.previews_root / job_id)
         return directory / (preview_id + ".preview")
 
-    def _output_parent(self, job_id, parts):
+    def _output_parent(self, job, parts):
+        if (
+            not _identifier(getattr(job, "session_id", None))
+            or not _identifier(getattr(job, "job_id", None))
+        ):
+            raise InvalidOutputError(
+                "Local output publication failed."
+            )
         current = self.output_root
-        for part in (job_id, *parts):
+        for part in (
+            "cloud-vast",
+            job.session_id,
+            job.job_id,
+            *parts,
+        ):
             current = current / part
             try:
                 current.mkdir(mode=0o700, exist_ok=True)
@@ -550,11 +643,342 @@ class LocalRelay:
                     or metadata.st_uid != os.getuid()
                 ):
                     raise OSError("Unsafe output directory.")
+                os.chmod(current, 0o700)
             except OSError:
-                raise ArtifactVerificationError(
+                raise InvalidOutputError(
                     "Local output publication failed."
                 ) from None
         return current
+
+    def _candidate_paths(self, job, output, desktop_candidates):
+        if desktop_candidates is None:
+            supplied = ()
+        elif (
+            isinstance(desktop_candidates, (tuple, list))
+            and len(desktop_candidates) <= 16
+        ):
+            supplied = tuple(desktop_candidates)
+        else:
+            raise _relay_error("Desktop output candidates were rejected.")
+        conventional = self.output_root.joinpath(
+            *output["subfolder_parts"],
+            output["filename"],
+        )
+        deterministic = self.output_root.joinpath(
+            "cloud-vast",
+            job.session_id,
+            job.job_id,
+            *output["subfolder_parts"],
+            output["filename"],
+        )
+        result = []
+        seen = set()
+        candidates = (
+            (deterministic, False),
+            (conventional, False),
+            *((raw, True) for raw in supplied),
+        )
+        for raw, explicit in candidates:
+            try:
+                candidate = Path(raw)
+                if not candidate.is_absolute():
+                    raise ValueError("Relative candidate.")
+                metadata = _lstat_or_none(candidate)
+                if metadata is not None and stat.S_ISLNK(metadata.st_mode):
+                    raise InvalidOutputError(
+                        "Desktop output candidate was rejected."
+                    )
+                lexical_parent = candidate.parent
+                parent = lexical_parent.resolve(strict=True)
+                if parent != lexical_parent:
+                    raise InvalidOutputError(
+                        "Desktop output candidate was rejected."
+                    )
+                relative_parent = parent.relative_to(self.output_root)
+                current = self.output_root
+                for part in relative_parent.parts:
+                    current = current / part
+                    directory = os.lstat(current)
+                    if (
+                        not stat.S_ISDIR(directory.st_mode)
+                        or stat.S_ISLNK(directory.st_mode)
+                        or directory.st_uid != os.getuid()
+                    ):
+                        raise InvalidOutputError(
+                            "Desktop output candidate was rejected."
+                        )
+            except FileNotFoundError:
+                continue
+            except InvalidOutputError:
+                raise
+            except (OSError, RuntimeError, TypeError, ValueError):
+                if explicit:
+                    raise _relay_error(
+                        "Desktop output candidates were rejected."
+                    ) from None
+                continue
+            key = str(candidate)
+            if key not in seen:
+                seen.add(key)
+                result.append(candidate)
+        return tuple(result)
+
+    def _candidate_identity(self, candidate, output):
+        try:
+            resolved = candidate.resolve(strict=True)
+            resolved.relative_to(self.output_root)
+            metadata = os.lstat(candidate)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or stat.S_ISLNK(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+            ):
+                raise OSError("Unsafe Desktop output candidate.")
+            if metadata.st_size != output["size_bytes"]:
+                return None
+            return _hash_path_identity(
+                candidate,
+                maximum=output["size_bytes"],
+            )
+        except FileNotFoundError:
+            return None
+        except (OSError, RuntimeError, ValueError, ArtifactVerificationError):
+            raise InvalidOutputError(
+                "Desktop output candidate was rejected."
+            ) from None
+
+    @staticmethod
+    def _digest_collision_filename(filename, digest):
+        suffix = Path(filename).suffix
+        stem = filename[: -len(suffix)] if suffix else filename
+        marker = "-" + digest
+        maximum = 255 - len((marker + suffix).encode("utf-8"))
+        while stem and len(stem.encode("utf-8")) > maximum:
+            stem = stem[:-1]
+        if not stem or maximum < 1:
+            raise InvalidOutputError(
+                "Local output publication failed."
+            )
+        return stem + marker + suffix
+
+    def _output_destination(self, parent, output):
+        destination = parent / output["filename"]
+        metadata = _lstat_or_none(destination)
+        if metadata is None:
+            return destination
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+        ):
+            raise InvalidOutputError(
+                "Local output destination was rejected."
+            )
+        if metadata.st_size == output["size_bytes"]:
+            size, digest = _hash_path(
+                destination,
+                maximum=output["size_bytes"],
+            )
+            if size == output["size_bytes"] and hmac.compare_digest(
+                digest,
+                output["sha256"],
+            ):
+                return destination
+        alternate = parent / self._digest_collision_filename(
+            output["filename"],
+            output["sha256"],
+        )
+        metadata = _lstat_or_none(alternate)
+        if metadata is None:
+            return alternate
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_size != output["size_bytes"]
+        ):
+            raise ArtifactVerificationError(
+                "Local output destination already exists."
+            )
+        size, digest = _hash_path(
+            alternate,
+            maximum=output["size_bytes"],
+        )
+        if size == output["size_bytes"] and hmac.compare_digest(
+            digest,
+            output["sha256"],
+        ):
+            return alternate
+        raise ArtifactVerificationError(
+            "Local output destination already exists."
+        )
+
+    def _stage_candidate(self, candidate, part, output):
+        try:
+            part.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            raise ArtifactVerificationError(
+                "Desktop output adoption failed."
+            ) from None
+        source = None
+        target = None
+        try:
+            source_flags = os.O_RDONLY
+            if hasattr(os, "O_NOFOLLOW"):
+                source_flags |= os.O_NOFOLLOW
+            source = os.open(candidate, source_flags)
+            before = os.fstat(source)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_uid != os.getuid()
+                or before.st_size != output["size_bytes"]
+            ):
+                raise OSError("Unsafe Desktop output candidate.")
+            target_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            if hasattr(os, "O_NOFOLLOW"):
+                target_flags |= os.O_NOFOLLOW
+            target = os.open(part, target_flags, 0o600)
+            os.fchmod(target, 0o600)
+            digest = hashlib.sha256()
+            copied = 0
+            while True:
+                chunk = os.read(source, 1024 * 1024)
+                if not chunk:
+                    break
+                copied += len(chunk)
+                if copied > output["size_bytes"]:
+                    raise OSError("Desktop output changed.")
+                digest.update(chunk)
+                _write_all(target, chunk)
+            after = os.fstat(source)
+            if (
+                copied != output["size_bytes"]
+                or not hmac.compare_digest(
+                    digest.hexdigest(),
+                    output["sha256"],
+                )
+                or (before.st_dev, before.st_ino, before.st_size)
+                != (after.st_dev, after.st_ino, after.st_size)
+                or before.st_mtime_ns != after.st_mtime_ns
+            ):
+                raise OSError("Desktop output changed.")
+            os.fsync(target)
+        except OSError:
+            if target is not None:
+                os.close(target)
+                target = None
+            try:
+                part.unlink()
+            except OSError:
+                pass
+            raise ArtifactVerificationError(
+                "Desktop output adoption failed."
+            ) from None
+        finally:
+            if source is not None:
+                os.close(source)
+            if target is not None:
+                os.close(target)
+        _fsync_directory(part.parent)
+        return part
+
+    def _record_verified_output(self, job_id, output, published):
+        (
+            published_size,
+            published_digest,
+            published_device,
+            published_inode,
+        ) = _hash_path_identity(
+            published,
+            maximum=output["size_bytes"],
+        )
+        if (
+            published_size != output["size_bytes"]
+            or not hmac.compare_digest(
+                published_digest,
+                output["sha256"],
+            )
+        ):
+            raise ArtifactVerificationError(
+                "Local output verification failed."
+            )
+        os.chmod(published, 0o600)
+        _fsync_file(published)
+        _fsync_directory(published.parent)
+        self.repository.save_transfer(
+            job_id=job_id,
+            artifact_id=output["artifact_id"],
+            direction="download",
+            expected_size=output["size_bytes"],
+            sha256=output["sha256"],
+            offset=output["size_bytes"],
+            state=TransferState.VERIFIED,
+            private_path=str(published),
+            source_node_id=output["node_id"],
+            published_device=published_device,
+            published_inode=published_inode,
+        )
+        return RelayArtifactResult(
+            job_id=job_id,
+            artifact_id=output["artifact_id"],
+            node_id=output["node_id"],
+            state=TransferState.VERIFIED,
+            local_path=published,
+            size_bytes=output["size_bytes"],
+            sha256=output["sha256"],
+            mime_type=output["mime_type"],
+        )
+
+    def _adopt_desktop_candidate(
+        self,
+        job,
+        output,
+        desktop_candidates,
+    ):
+        for candidate in self._candidate_paths(
+            job,
+            output,
+            desktop_candidates,
+        ):
+            identity = self._candidate_identity(candidate, output)
+            if identity is None:
+                continue
+            size, digest, _device, _inode = identity
+            if size != output["size_bytes"] or not hmac.compare_digest(
+                digest,
+                output["sha256"],
+            ):
+                continue
+            parent = self._output_parent(
+                job,
+                output["subfolder_parts"],
+            )
+            destination = self._output_destination(parent, output)
+            try:
+                same_file = os.path.samefile(candidate, destination)
+            except (FileNotFoundError, OSError):
+                same_file = False
+            if same_file:
+                published = destination
+            elif _lstat_or_none(destination) is not None:
+                published = destination
+            else:
+                part = self._part_path(job.job_id, output["artifact_id"])
+                self._stage_candidate(candidate, part, output)
+                published = self._publish(
+                    part,
+                    destination,
+                    expected_size=output["size_bytes"],
+                    sha256=output["sha256"],
+                )
+            return self._record_verified_output(
+                job.job_id,
+                output,
+                published,
+            )
+        return None
 
     def _existing_part(self, path, expected_size):
         if not path.exists():
@@ -600,7 +1024,17 @@ class LocalRelay:
         return size, hasher
 
     def _publish(self, part, destination, *, expected_size, sha256):
-        if destination.exists():
+        metadata = _lstat_or_none(destination)
+        if metadata is not None:
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or stat.S_ISLNK(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or metadata.st_size != expected_size
+            ):
+                raise ArtifactVerificationError(
+                    "Local output destination already exists."
+                )
             size, digest = _hash_path(
                 destination,
                 maximum=expected_size,
@@ -616,6 +1050,9 @@ class LocalRelay:
                 part.unlink()
             except FileNotFoundError:
                 pass
+            os.chmod(destination, 0o600)
+            _fsync_file(destination)
+            _fsync_directory(destination.parent)
             return destination
         try:
             os.link(part, destination)
@@ -712,23 +1149,21 @@ class LocalRelay:
         job_id,
         descriptor,
         output_root=None,
+        desktop_candidates=(),
     ):
-        self._job(job_id)
+        job = self._job(job_id)
         output = _validated_output(descriptor)
         if output_root is not None and _output_root(output_root) != (
             self.output_root
         ):
             raise _relay_error("Local output directory changed.")
-        if self.worker is None or not callable(
-            getattr(self.worker, "download_artifact", None)
-        ):
-            raise RelayError("Remote output transfer is unavailable.")
         artifact_id = output["artifact_id"]
         existing = self.repository.get_transfer(job_id, artifact_id)
         if existing is not None and (
             existing.expected_size != output["size_bytes"]
             or existing.sha256 != output["sha256"]
             or existing.direction != "download"
+            or existing.source_node_id not in {None, output["node_id"]}
         ):
             raise ArtifactVerificationError(
                 "Remote output identity changed."
@@ -747,7 +1182,20 @@ class LocalRelay:
                 raise ArtifactVerificationError(
                     "Local output verification failed."
                 ) from None
-            size, current_digest = _hash_path(
+            if (
+                existing.source_node_id != output["node_id"]
+                or existing.published_device is None
+                or existing.published_inode is None
+            ):
+                raise ArtifactVerificationError(
+                    "Local output verification failed."
+                )
+            (
+                size,
+                current_digest,
+                current_device,
+                current_inode,
+            ) = _hash_path_identity(
                 published,
                 maximum=output["size_bytes"],
             )
@@ -757,6 +1205,8 @@ class LocalRelay:
                     current_digest,
                     output["sha256"],
                 )
+                or current_device != existing.published_device
+                or current_inode != existing.published_inode
             ):
                 raise ArtifactVerificationError(
                     "Local output verification failed."
@@ -764,12 +1214,24 @@ class LocalRelay:
             return RelayArtifactResult(
                 job_id=job_id,
                 artifact_id=artifact_id,
+                node_id=output["node_id"],
                 state=TransferState.VERIFIED,
                 local_path=published,
                 size_bytes=output["size_bytes"],
                 sha256=output["sha256"],
                 mime_type=output["mime_type"],
             )
+        adopted = self._adopt_desktop_candidate(
+            job,
+            output,
+            desktop_candidates,
+        )
+        if adopted is not None:
+            return adopted
+        if self.worker is None or not callable(
+            getattr(self.worker, "download_artifact", None)
+        ):
+            raise RelayError("Remote output transfer is unavailable.")
         part = self._part_path(job_id, artifact_id)
         offset, digest = self._existing_part(
             part,
@@ -793,6 +1255,7 @@ class LocalRelay:
                 else TransferState.TRANSFERRING
             ),
             private_path=str(part),
+            source_node_id=output["node_id"],
         )
         file_descriptor = None
         current = offset
@@ -804,6 +1267,7 @@ class LocalRelay:
                 file_descriptor = os.open(part, flags, 0o600)
                 os.fchmod(file_descriptor, 0o600)
                 os.lseek(file_descriptor, offset, os.SEEK_SET)
+                _fsync_directory(part.parent)
 
                 async def on_chunk(chunk):
                     nonlocal current
@@ -828,6 +1292,7 @@ class LocalRelay:
                         offset=current,
                         state=TransferState.TRANSFERRING,
                         private_path=str(part),
+                        source_node_id=output["node_id"],
                     )
 
                 receipt = await self.worker.download_artifact(
@@ -863,34 +1328,20 @@ class LocalRelay:
                     "Remote output verification failed."
                 )
             parent = self._output_parent(
-                job_id,
+                job,
                 output["subfolder_parts"],
             )
-            destination = parent / output["filename"]
+            destination = self._output_destination(parent, output)
             published = self._publish(
                 part,
                 destination,
                 expected_size=output["size_bytes"],
                 sha256=output["sha256"],
             )
-            self.repository.save_transfer(
-                job_id=job_id,
-                artifact_id=artifact_id,
-                direction="download",
-                expected_size=output["size_bytes"],
-                sha256=output["sha256"],
-                offset=output["size_bytes"],
-                state=TransferState.VERIFIED,
-                private_path=str(published),
-            )
-            return RelayArtifactResult(
-                job_id=job_id,
-                artifact_id=artifact_id,
-                state=TransferState.VERIFIED,
-                local_path=published,
-                size_bytes=output["size_bytes"],
-                sha256=output["sha256"],
-                mime_type=output["mime_type"],
+            return self._record_verified_output(
+                job_id,
+                output,
+                published,
             )
         except asyncio.CancelledError:
             raise
@@ -918,6 +1369,7 @@ class LocalRelay:
                 offset=actual,
                 state=TransferState.FAILED,
                 private_path=str(part),
+                source_node_id=output["node_id"],
             )
             raise
         except (WorkerClientError, OSError, ValueError):
@@ -933,6 +1385,7 @@ class LocalRelay:
                 offset=current,
                 state=TransferState.FAILED,
                 private_path=str(part),
+                source_node_id=output["node_id"],
             )
             raise ArtifactVerificationError(
                 "Remote output transfer failed."
@@ -950,6 +1403,7 @@ class LocalRelay:
                 offset=current,
                 state=TransferState.FAILED,
                 private_path=str(part),
+                source_node_id=output["node_id"],
             )
             raise ArtifactVerificationError(
                 "Remote output transfer failed."
@@ -1067,48 +1521,99 @@ class LocalRelay:
             raise RelayError("Remote worker is unavailable.")
         cursor = self.repository.last_event_sequence(job_id)
         try:
-            response = await self.worker.events(job_id, cursor)
+            snapshot = await self.worker.snapshot(job_id, cursor)
         except (asyncio.CancelledError, KeyboardInterrupt):
             raise
         except Exception:
-            raise RelayError("Remote worker events are unavailable.") from None
+            raise RelayError("Remote worker snapshot is unavailable.") from None
+        return await self.sync_snapshot(job_id, snapshot)
+
+    async def sync_snapshot(self, job_id, snapshot):
+        self._job(job_id)
         if (
-            not isinstance(response, dict)
-            or set(response) != {
+            not isinstance(snapshot, dict)
+            or set(snapshot) != {
                 "job_id",
+                "state",
+                "prompt_id",
                 "events",
                 "last_sequence",
+                "outputs",
+                "error",
+                "created_at",
+                "updated_at",
             }
-            or response.get("job_id") != job_id
-            or not isinstance(response.get("events"), list)
-            or isinstance(response.get("last_sequence"), bool)
-            or not isinstance(response.get("last_sequence"), int)
+            or snapshot.get("job_id") != job_id
+            or snapshot.get("state")
+            not in {
+                "queued",
+                "running",
+                "succeeded",
+                "failed",
+                "interrupted",
+            }
+            or not isinstance(snapshot.get("events"), list)
+            or not isinstance(snapshot.get("outputs"), list)
+            or isinstance(snapshot.get("last_sequence"), bool)
+            or not isinstance(snapshot.get("last_sequence"), int)
+            or snapshot["last_sequence"] < 0
+            or not _finite_number(snapshot.get("created_at"))
+            or snapshot["created_at"] < 0
+            or not _finite_number(snapshot.get("updated_at"))
+            or snapshot["updated_at"] < snapshot["created_at"]
         ):
             raise _relay_error()
+        prompt_id = snapshot.get("prompt_id")
+        if prompt_id is not None:
+            try:
+                if str(uuid.UUID(prompt_id)) != prompt_id:
+                    raise ValueError("Non-canonical prompt ID.")
+            except (AttributeError, TypeError, ValueError):
+                raise _relay_error() from None
+        starting_cursor = self.repository.last_event_sequence(job_id)
+        cursor = starting_cursor
         sanitized_events = []
-        for raw_event in response["events"]:
-            event = _sanitize_event(raw_event, cursor + 1)
-            stored = self.repository.append_event(
-                job_id,
-                event["sequence"],
-                event["type"],
-                event["data"],
-                created_at=event["created_at"],
+        for raw_event in snapshot["events"]:
+            raw_sequence = (
+                raw_event.get("sequence")
+                if isinstance(raw_event, dict)
+                else None
             )
-            cursor = event["sequence"]
+            if (
+                isinstance(raw_sequence, bool)
+                or not isinstance(raw_sequence, int)
+                or raw_sequence < 1
+                or raw_sequence > cursor + 1
+            ):
+                raise _relay_error()
+            event = _sanitize_event(raw_event, raw_sequence)
+            try:
+                stored = self.repository.append_event(
+                    job_id,
+                    event["sequence"],
+                    event["type"],
+                    event["data"],
+                    created_at=event["created_at"],
+                )
+            except ValueError:
+                raise _relay_error() from None
+            if stored.created_at != event["created_at"]:
+                raise _relay_error()
+            cursor = max(cursor, event["sequence"])
             material = {
                 "sequence": stored.sequence,
                 "type": stored.event_type,
                 "data": stored.payload,
                 "created_at": stored.created_at,
             }
-            sanitized_events.append(material)
+            if stored.sequence > starting_cursor:
+                sanitized_events.append(material)
             if event["type"] in {
                 "b_preview",
                 "b_preview_with_metadata",
             }:
                 await self._cache_preview(job_id, event["data"])
-        if response["last_sequence"] != cursor:
+        if snapshot["last_sequence"] != cursor:
             raise _relay_error()
         for stored_event in self.repository.list_events(job_id, 0):
             if stored_event.event_type not in {
@@ -1129,48 +1634,10 @@ class LocalRelay:
                     job_id,
                     stored_event.payload,
                 )
-        try:
-            remote = await self.worker.job(job_id)
-        except (asyncio.CancelledError, KeyboardInterrupt):
-            raise
-        except Exception:
-            raise RelayError("Remote worker job is unavailable.") from None
-        if (
-            not isinstance(remote, dict)
-            or set(remote) != {
-                "job_id",
-                "state",
-                "prompt_id",
-                "last_sequence",
-                "outputs",
-                "error",
-            }
-            or remote.get("job_id") != job_id
-            or remote.get("state")
-            not in {
-                "queued",
-                "running",
-                "succeeded",
-                "failed",
-                "interrupted",
-            }
-            or not isinstance(remote.get("outputs"), list)
-            or isinstance(remote.get("last_sequence"), bool)
-            or not isinstance(remote.get("last_sequence"), int)
-            or remote["last_sequence"] != cursor
-        ):
-            raise _relay_error()
-        prompt_id = remote.get("prompt_id")
-        if prompt_id is not None:
-            try:
-                if str(uuid.UUID(prompt_id)) != prompt_id:
-                    raise ValueError("Non-canonical prompt ID.")
-            except (AttributeError, TypeError, ValueError):
-                raise _relay_error() from None
         outputs = []
-        if remote["state"] == "succeeded":
+        if snapshot["state"] == "succeeded":
             seen_artifacts = set()
-            for output in remote["outputs"]:
+            for output in snapshot["outputs"]:
                 validated = _validated_output(output)
                 if validated["artifact_id"] in seen_artifacts:
                     raise _relay_error()
@@ -1181,14 +1648,16 @@ class LocalRelay:
                         descriptor=output,
                     )
                 )
+        elif snapshot["outputs"]:
+            raise _relay_error()
         error = (
-            _sanitize_error(remote["error"])
-            if remote["error"] is not None
+            _sanitize_error(snapshot["error"])
+            if snapshot["error"] is not None
             else None
         )
         return RelaySyncResult(
             job_id=job_id,
-            state=remote["state"],
+            state=snapshot["state"],
             last_sequence=cursor,
             events=tuple(sanitized_events),
             outputs=tuple(outputs),
@@ -1271,7 +1740,15 @@ class LocalRelay:
         if not _identifier(artifact_id):
             raise _relay_error()
         transfer = self.repository.get_transfer(job_id, artifact_id)
-        if transfer is None or transfer.state != TransferState.VERIFIED:
+        if (
+            transfer is None
+            or transfer.state != TransferState.VERIFIED
+            or transfer.direction != "download"
+            or transfer.artifact_id.startswith("preview:")
+            or transfer.source_node_id is None
+            or transfer.published_device is None
+            or transfer.published_inode is None
+        ):
             raise _relay_error("Local output was not found.")
         path = Path(transfer.private_path)
         try:
@@ -1280,10 +1757,15 @@ class LocalRelay:
             raise ArtifactVerificationError(
                 "Local output verification failed."
             ) from None
-        size, digest = _hash_path(path, maximum=MAX_OUTPUT_BYTES)
+        size, digest, device, inode = _hash_path_identity(
+            path,
+            maximum=MAX_OUTPUT_BYTES,
+        )
         if (
             size != transfer.expected_size
             or not hmac.compare_digest(digest, transfer.sha256)
+            or device != transfer.published_device
+            or inode != transfer.published_inode
         ):
             raise ArtifactVerificationError(
                 "Local output verification failed."

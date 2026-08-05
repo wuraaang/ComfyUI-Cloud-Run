@@ -1,0 +1,13 @@
+{
+  "loader_size_bytes": 163,
+  "permitted_paths": [
+    "LICENSE",
+    "web/**"
+  ],
+  "web": {
+    "file_count": 67,
+    "root": "web",
+    "sha256": "8a49270675f193c65c998068b1ac92257bc28b168aa38ad9567f2d2fa771542d",
+    "size_bytes": 2852341
+  }
+}

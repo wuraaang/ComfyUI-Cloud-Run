@@ -11,9 +11,10 @@ from cloud_run.comfy_host import (
 
 
 class RecordingGitRunner:
-    def __init__(self, *, dirty=False):
+    def __init__(self, *, dirty=False, top_level=None):
         self.calls = []
         self.dirty = dirty
+        self.top_level = top_level
 
     def __call__(self, argv):
         self.calls.append(tuple(argv))
@@ -28,6 +29,12 @@ class RecordingGitRunner:
             return types.SimpleNamespace(
                 returncode=0,
                 stdout="a" * 40 + "\n",
+                stderr="",
+            )
+        if command == ("rev-parse", "--show-toplevel"):
+            return types.SimpleNamespace(
+                returncode=0,
+                stdout=(self.top_level or argv[2]) + "\n",
                 stderr="",
             )
         if command == (
@@ -96,12 +103,39 @@ class ComfyHostTests(unittest.TestCase):
                     "git",
                     "-C",
                     "/safe/ComfyUI/custom_nodes/Fancy",
+                    "rev-parse",
+                    "--show-toplevel",
+                ),
+                (
+                    "git",
+                    "-C",
+                    "/safe/ComfyUI/custom_nodes/Fancy",
                     "status",
                     "--porcelain",
                     "--untracked-files=no",
                 ),
             ],
         )
+
+    def test_nested_cnr_package_is_not_identified_as_parent_checkout(self):
+        host = ComfyHost(
+            comfy_root=Path("/safe/ComfyUI"),
+            custom_nodes_root=Path("/safe/ComfyUI/custom_nodes"),
+            node_records={
+                "Nested": NodeRecord(
+                    "/safe/ComfyUI/custom_nodes/Nested/node.py",
+                    "custom_nodes.Nested.node",
+                )
+            },
+            version_reader=lambda: ("0.29.0", "1.47.10", "3.13.12"),
+            git_runner=RecordingGitRunner(top_level="/safe/ComfyUI"),
+        )
+
+        result = host.describe_node("Nested")
+
+        self.assertEqual(result.status, "mapping_required")
+        self.assertIsNone(result.repository_url)
+        self.assertIsNone(result.revision)
 
     def test_dirty_custom_node_requires_mapping_without_using_untracked_files(self):
         host = ComfyHost(

@@ -9,10 +9,18 @@ import re
 import stat
 import sys
 
+from cloud_run.worker_protocol import SESSION_ID_ENVIRONMENT
+
 from .comfy import ComfyProcess
 from .deadline import deadline_watchdog
 from .install import CustomNodeInstaller
 from .jobs import MAX_JOB_REQUEST_BYTES, JobManager
+from .native_proxy import (
+    MAX_NATIVE_BODY_BYTES,
+    NativeComfyProxy,
+    NativeProxyResponse,
+)
+from .profile import MAX_PROFILE_REQUEST_BYTES, ProfileStore
 from .provision import (
     MAX_MANIFEST_REQUEST_BYTES,
     DiskReservation,
@@ -73,6 +81,7 @@ def build_worker_runtime(
     wheels_root = _private_directory(data_root / "wheels")
     working_root = _private_directory(data_root / "comfy-work")
     previews_root = _private_directory(data_root / "previews")
+    profile_root = _private_directory(data_root / "profile")
     state_path = Path(state_path)
     try:
         state_parent = state_path.parent.resolve(strict=True)
@@ -109,6 +118,15 @@ def build_worker_runtime(
             else AiohttpRangeClient()
         ),
     )
+    profile_store = ProfileStore(
+        state_root=profile_root,
+        user_root=Path(comfy_root) / "user" / "default",
+        input_root=Path(comfy_root) / "input",
+        custom_nodes_root=Path(comfy_root) / "custom_nodes",
+        archive_resolver=lambda profile: transfer_manager.destination_path(
+            profile.archive
+        ),
+    )
     provisioner = Provisioner(
         state_store=state_store,
         worker_version=worker_version,
@@ -116,12 +134,14 @@ def build_worker_runtime(
         artifacts=artifacts,
         installer=installer,
         disk=DiskReservation(comfy_root),
+        profile_store=profile_store,
     )
     job_manager = JobManager(
         comfy=comfy,
         state=state_store,
         preview_root=previews_root,
     )
+    native_proxy = NativeComfyProxy(recorder=job_manager.recorder)
     watchdog = (
         deadline_factory(state=state_store)
         if deadline_factory is not None
@@ -133,7 +153,9 @@ def build_worker_runtime(
         transfer_manager=transfer_manager,
         provisioner=provisioner,
         job_manager=job_manager,
+        native_proxy=native_proxy,
         deadline_watchdog=watchdog,
+        profile_store=profile_store,
     )
 
 
@@ -155,12 +177,31 @@ def build_aiohttp_application(
         )
     application = web.Application(
         client_max_size=(
-            max(MAX_MANIFEST_REQUEST_BYTES, MAX_JOB_REQUEST_BYTES) + 1
+            max(
+                MAX_MANIFEST_REQUEST_BYTES,
+                MAX_JOB_REQUEST_BYTES,
+                MAX_NATIVE_BODY_BYTES,
+                MAX_PROFILE_REQUEST_BYTES,
+            )
+            + 1
         )
     )
 
     async def handle(request):
-        response = await worker.handle(request)
+        if request.path.startswith("/worker/v1/"):
+            response = await worker.handle(request)
+        else:
+            response = await worker.handle_native(request)
+        if isinstance(response, web.StreamResponse):
+            return response
+        if isinstance(response, NativeProxyResponse):
+            return web.Response(
+                body=response.body,
+                status=response.status,
+                headers=response.headers,
+            )
+        if response.status == 204 and response.payload is None:
+            return web.Response(status=204, headers=response.headers)
         if isinstance(response.payload, bytes):
             return web.Response(
                 body=response.payload,
@@ -257,7 +298,7 @@ def main(argv=None):
         raise RuntimeError("aiohttp is required by the Remote Worker.") from None
     arguments = parse_worker_arguments(argv)
     session_id = (
-        os.environ.get("CLOUD_RUN_SESSION_ID", "").strip() or None
+        os.environ.get(SESSION_ID_ENVIRONMENT, "").strip() or None
     )
     data_root = arguments.state_directory
     state_path = data_root / "worker-state.json"

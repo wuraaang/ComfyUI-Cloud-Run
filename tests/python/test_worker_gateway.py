@@ -13,6 +13,10 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+from cloud_run.worker_protocol import (
+    BOUNDARY_TOKEN_ENVIRONMENT,
+    SESSION_ID_ENVIRONMENT,
+)
 from remote_worker.gateway import (
     CADDY_CANDIDATES,
     GatewayError,
@@ -129,27 +133,32 @@ class RecordingPopen:
 
 
 class GatewayTokenTests(unittest.TestCase):
-    def test_accepts_only_the_bounded_inert_utf8_token_alphabet(self):
-        accepted = "Az09._~+/=-"
+    def test_accepts_only_the_project_boundary_token(self):
+        accepted = "a" * 64
         self.assertEqual(
-            validated_gateway_token({"JUPYTER_TOKEN": accepted}),
+            validated_gateway_token({BOUNDARY_TOKEN_ENVIRONMENT: accepted}),
             accepted,
         )
-        self.assertEqual(
-            validated_gateway_token({"JUPYTER_TOKEN": "a" * 4096}),
-            "a" * 4096,
-        )
 
-        for token in ("", "a" * 4097, "has space", "line\nbreak", "café"):
+        for token in ("", "A" * 64, "a" * 63, "a" * 65, "has space"):
             with self.subTest(token_length=len(token)):
                 with self.assertRaisesRegex(GatewayError, "^" + STATIC_ERROR + "$"):
-                    validated_gateway_token({"JUPYTER_TOKEN": token})
+                    validated_gateway_token({BOUNDARY_TOKEN_ENVIRONMENT: token})
+
+    def test_provider_owned_tokens_never_substitute_for_project_boundary(self):
+        provider_tokens = {
+            "JUPYTER_TOKEN": "a" * 64,
+            "OPEN_BUTTON_TOKEN": "b" * 64,
+        }
+
+        with self.assertRaisesRegex(GatewayError, "^" + STATIC_ERROR + "$"):
+            validated_gateway_token(provider_tokens)
 
     def test_rejections_disclose_only_the_static_gateway_error(self):
         token = "not allowed secret"
         caught = None
         try:
-            validated_gateway_token({"JUPYTER_TOKEN": token})
+            validated_gateway_token({BOUNDARY_TOKEN_ENVIRONMENT: token})
         except GatewayError as error:
             caught = error
         self.assertIsNotNone(caught)
@@ -247,10 +256,12 @@ class CaddySelectionTests(unittest.TestCase):
 
 class GatewayProcessTests(unittest.TestCase):
     def setUp(self):
-        self.token = "opaque-token+/="
+        self.token = "a" * 64
         self.runtime_environment = {
-            "JUPYTER_TOKEN": self.token,
-            "CLOUD_RUN_SESSION_ID": "session-1",
+            BOUNDARY_TOKEN_ENVIRONMENT: self.token,
+            "JUPYTER_TOKEN": "b" * 64,
+            "OPEN_BUTTON_TOKEN": "c" * 64,
+            SESSION_ID_ENVIRONMENT: "session-1",
             "CLOUD_RUN_COMFY_ROOT": "/opt/ComfyUI",
             "CLOUD_RUN_WORKER_VERSION": "a" * 40,
             "CONTAINER_ID": "77",
@@ -263,6 +274,10 @@ class GatewayProcessTests(unittest.TestCase):
             "PYTHONUNBUFFERED": "1",
             "TMPDIR": "/tmp",
             "VAST_API_KEY": "must-not-cross",
+            "HTTP_PROXY": "http://must-not-cross.example",
+            "HTTPS_PROXY": "https://must-not-cross.example",
+            "ALL_PROXY": "socks5://must-not-cross.example",
+            "NO_PROXY": "127.0.0.1",
             "UNRELATED": "must-not-cross",
         }
         self.config_directory = STATE_DIRECTORY / "caddy-config"
@@ -334,7 +349,7 @@ class GatewayProcessTests(unittest.TestCase):
         self.assertEqual(
             factory.calls[0][1]["env"],
             {
-                "JUPYTER_TOKEN": self.token,
+                BOUNDARY_TOKEN_ENVIRONMENT: self.token,
                 "HOME": "/var/lib/comfyui-cloud-run",
                 "XDG_CONFIG_HOME": str(self.config_directory),
                 "XDG_DATA_HOME": str(self.data_directory),
@@ -342,7 +357,7 @@ class GatewayProcessTests(unittest.TestCase):
         )
         worker_environment = factory.calls[1][1]["env"]
         expected_names = {
-            "CLOUD_RUN_SESSION_ID",
+            SESSION_ID_ENVIRONMENT,
             "CLOUD_RUN_COMFY_ROOT",
             "CLOUD_RUN_WORKER_VERSION",
             "CONTAINER_ID",
@@ -368,7 +383,15 @@ class GatewayProcessTests(unittest.TestCase):
             ),
             msg="worker instance credential was not preserved",
         )
+        self.assertEqual(
+            worker_environment[SESSION_ID_ENVIRONMENT],
+            self.runtime_environment[SESSION_ID_ENVIRONMENT],
+        )
+        self.assertNotIn(BOUNDARY_TOKEN_ENVIRONMENT, worker_environment)
         self.assertNotIn("JUPYTER_TOKEN", worker_environment)
+        self.assertNotIn("OPEN_BUTTON_TOKEN", worker_environment)
+        for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"):
+            self.assertNotIn(name, worker_environment)
 
     def test_filtered_environment_builds_real_deadline_armed_worker_runtime(self):
         from remote_worker.deadline import (
@@ -491,22 +514,28 @@ class GatewayConfigurationTests(unittest.TestCase):
         caddyfile = Path(__import__("remote_worker.gateway").gateway.__file__).with_name(
             "Caddyfile"
         )
-        text = caddyfile.read_text(encoding="utf-8")
-        self.assertIn("admin off", text)
-        self.assertIn("auto_https off", text)
-        self.assertEqual(text.count(":8765 {"), 1)
-        self.assertIn(
-            '@unauthorized not header Authorization "Bearer {$JUPYTER_TOKEN}"',
-            text,
-        )
-        self.assertIn("request_header -Authorization", text)
-        self.assertIn("request_header -X-Cloud-Run-Boundary", text)
-        self.assertIn(
-            "request_header X-Cloud-Run-Boundary authenticated",
-            text,
-        )
-        self.assertIn("reverse_proxy 127.0.0.1:8766", text)
-        self.assertNotIn("0.0.0.0:8766", text)
+        expected = """{
+    admin off
+    auto_https off
+}
+
+:8765 {
+    route {
+        @unauthorized not header Authorization "Bearer {$CLOUD_RUN_BOUNDARY_TOKEN}"
+        respond @unauthorized 401
+
+        request_header -Authorization
+        request_header -Cookie
+        request_header -X-Cloud-Run-Boundary
+        request_header -X-Forwarded-For
+        request_header -X-Forwarded-Host
+        request_header -X-Forwarded-Proto
+        request_header X-Cloud-Run-Boundary authenticated
+        reverse_proxy 127.0.0.1:8766
+    }
+}
+"""
+        self.assertEqual(caddyfile.read_text(encoding="utf-8"), expected)
 
     def test_argument_parser_accepts_only_the_fixed_state_directory(self):
         arguments = parse_gateway_arguments(

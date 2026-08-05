@@ -36,6 +36,7 @@ class LoaderContractTests(unittest.TestCase):
     def test_web_only_exports_and_exact_decorator_routes(self):
         entrypoint = REPOSITORY_ROOT / "__init__.py"
         self.assertTrue(entrypoint.is_file(), "root custom-node entrypoint is missing")
+        original_sys_path = tuple(sys.path)
 
         routes = FakeRoutes()
         server_module = types.ModuleType("server")
@@ -72,6 +73,31 @@ class LoaderContractTests(unittest.TestCase):
             package = importlib.util.module_from_spec(spec)
             sys.modules[package_name] = package
             spec.loader.exec_module(package)
+            native_jobs = importlib.import_module(
+                package_name + ".remote_worker.native_jobs"
+            )
+            self.assertEqual(
+                native_jobs.RunErrorCode.__module__,
+                package_name + ".cloud_run.run_errors",
+            )
+            self.assertEqual(
+                native_jobs.CompiledCapture.__module__,
+                package_name + ".cloud_run.worker_protocol",
+            )
+            desktop_relay = importlib.import_module(
+                package_name + ".cloud_run.desktop_relay"
+            )
+            service_module = importlib.import_module(
+                package_name + ".cloud_run.service"
+            )
+            self.assertEqual(
+                desktop_relay._native_route_policy().__module__,
+                package_name + ".remote_worker.native_proxy",
+            )
+            self.assertEqual(
+                service_module._native_prompt_intent_class().__module__,
+                package_name + ".remote_worker.native_jobs",
+            )
         finally:
             sys.modules.pop(package_name, None)
             for name in list(sys.modules):
@@ -86,6 +112,8 @@ class LoaderContractTests(unittest.TestCase):
             else:
                 sys.modules["aiohttp"] = prior_aiohttp
 
+        self.assertEqual(tuple(sys.path), original_sys_path)
+
         self.assertEqual(package.WEB_DIRECTORY, "./web")
         self.assertEqual(package.NODE_CLASS_MAPPINGS, {})
         self.assertEqual(package.NODE_DISPLAY_NAME_MAPPINGS, {})
@@ -96,6 +124,8 @@ class LoaderContractTests(unittest.TestCase):
             ],
             [
                 ("GET", "/cloud-run/api/settings"),
+                ("GET", "/cloud-run/api/desktop-context"),
+                ("GET", "/cloud-run/api/desktop-setup"),
                 ("PUT", "/cloud-run/api/settings"),
                 ("POST", "/cloud-run/api/captures"),
                 ("POST", "/cloud-run/api/preflights"),
@@ -119,12 +149,33 @@ class LoaderContractTests(unittest.TestCase):
                     "/cloud-run/api/sessions/{session_id}",
                 ),
                 (
+                    "GET",
+                    "/cloud-run/api/sessions/{session_id}/profile",
+                ),
+                (
+                    "POST",
+                    "/cloud-run/api/sessions/{session_id}/profile/conflicts/"
+                    "{conflict_id}",
+                ),
+                (
+                    "POST",
+                    "/cloud-run/api/sessions/{session_id}/desktop-relay",
+                ),
+                (
+                    "DELETE",
+                    "/cloud-run/api/sessions/{session_id}/desktop-relay",
+                ),
+                (
                     "POST",
                     "/cloud-run/api/sessions/{session_id}/jobs",
                 ),
                 (
                     "GET",
                     "/cloud-run/api/sessions/{session_id}/jobs/{job_id}",
+                ),
+                (
+                    "POST",
+                    "/cloud-run/api/sessions/{session_id}/jobs/{job_id}/harvest",
                 ),
                 (
                     "PUT",

@@ -1,6 +1,8 @@
 import asyncio
 import hashlib
 import json
+import os
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -79,8 +81,35 @@ class FakeWorker:
         self.remote_events = list(events or [])
         self.previews = dict(previews or {})
         self.ranges = []
+        self.snapshot_calls = []
+        self.events_calls = 0
+        self.job_calls = 0
+
+    async def snapshot(self, job_id, after_sequence):
+        self.snapshot_calls.append((job_id, after_sequence))
+        last_sequence = (
+            self.remote_events[-1]["sequence"]
+            if self.remote_events
+            else 0
+        )
+        return {
+            "job_id": job_id,
+            "state": "succeeded",
+            "prompt_id": "11111111-1111-4111-8111-111111111111",
+            "events": [
+                event
+                for event in self.remote_events
+                if event["sequence"] > after_sequence
+            ],
+            "last_sequence": last_sequence,
+            "outputs": self.descriptors,
+            "error": None,
+            "created_at": 10.0,
+            "updated_at": 20.0,
+        }
 
     async def events(self, job_id, after_sequence):
+        self.events_calls += 1
         return {
             "job_id": job_id,
             "events": [
@@ -96,6 +125,7 @@ class FakeWorker:
         }
 
     async def job(self, job_id):
+        self.job_calls += 1
         return {
             "job_id": job_id,
             "state": "succeeded",
@@ -144,6 +174,7 @@ class LocalRelayTests(unittest.TestCase):
         self.private_root = self.root / "private"
         self.output_root = self.root / "output"
         self.output_root.mkdir()
+        self.output_root = self.output_root.resolve()
         self.repository = JobRepository(
             self.private_root / "sessions.sqlite3"
         )
@@ -178,9 +209,31 @@ class LocalRelayTests(unittest.TestCase):
         self.assertEqual(result.state, TransferState.VERIFIED)
         self.assertEqual(result.local_path.read_bytes(), EXPECTED_OUTPUT)
         self.assertFalse(result.local_path.name.endswith(".part"))
+        self.assertEqual(
+            result.local_path,
+            self.output_root.resolve()
+            / "cloud-vast"
+            / "session-1"
+            / "job-1"
+            / "wallpaper.png",
+        )
+        self.assertEqual(
+            os.stat(result.local_path).st_mode & 0o777,
+            0o600,
+        )
+        for directory in (
+            result.local_path.parent,
+            result.local_path.parent.parent,
+            result.local_path.parent.parent.parent,
+        ):
+            self.assertEqual(os.stat(directory).st_mode & 0o777, 0o700)
         transfer = self.repository.get_transfer("job-1", "output-1")
         self.assertEqual(transfer.offset, len(EXPECTED_OUTPUT))
         self.assertEqual(transfer.state, TransferState.VERIFIED)
+        metadata = os.stat(result.local_path)
+        self.assertEqual(transfer.source_node_id, "7")
+        self.assertEqual(transfer.published_device, metadata.st_dev)
+        self.assertEqual(transfer.published_inode, metadata.st_ino)
 
         duplicate = asyncio.run(
             relay.download_output(
@@ -191,6 +244,169 @@ class LocalRelayTests(unittest.TestCase):
         )
         self.assertEqual(duplicate.local_path, result.local_path)
         self.assertEqual(relay.worker.ranges, ["bytes=5-"])
+
+    def test_exact_desktop_download_is_adopted_once_without_worker_fetch(self):
+        candidate = self.output_root / "wallpaper.png"
+        candidate.write_bytes(EXPECTED_OUTPUT)
+        worker = FakeWorker()
+        relay = self.relay(worker)
+
+        first = asyncio.run(
+            relay.download_output(
+                job_id="job-1",
+                descriptor=descriptor(),
+                desktop_candidates=(candidate,),
+            )
+        )
+        second = asyncio.run(
+            relay.download_output(
+                job_id="job-1",
+                descriptor=descriptor(),
+                desktop_candidates=(candidate,),
+            )
+        )
+
+        self.assertEqual(worker.ranges, [])
+        self.assertEqual(first.local_path, second.local_path)
+        self.assertEqual(first.local_path.read_bytes(), EXPECTED_OUTPUT)
+        self.assertEqual(
+            first.local_path,
+            self.output_root.resolve()
+            / "cloud-vast"
+            / "session-1"
+            / "job-1"
+            / "wallpaper.png",
+        )
+        outputs = [
+            item
+            for item in self.repository.list_transfers("job-1")
+            if not item.artifact_id.startswith("preview:")
+        ]
+        self.assertEqual(len(outputs), 1)
+        self.assertEqual(outputs[0].state, TransferState.VERIFIED)
+
+    def test_mismatched_desktop_download_fetches_to_digest_suffixed_collision(self):
+        candidate = self.output_root / "wallpaper.png"
+        candidate.write_bytes(b"different-desktop-output")
+        collision = (
+            self.output_root
+            / "cloud-vast"
+            / "session-1"
+            / "job-1"
+            / "wallpaper.png"
+        )
+        collision.parent.mkdir(mode=0o700, parents=True)
+        collision.write_bytes(b"existing-different-output")
+        worker = FakeWorker()
+        relay = self.relay(worker)
+        expected_digest = hashlib.sha256(EXPECTED_OUTPUT).hexdigest()
+
+        result = asyncio.run(
+            relay.download_output(
+                job_id="job-1",
+                descriptor=descriptor(),
+                desktop_candidates=(candidate,),
+            )
+        )
+
+        self.assertEqual(worker.ranges, ["bytes=0-"])
+        self.assertEqual(result.local_path.read_bytes(), EXPECTED_OUTPUT)
+        self.assertEqual(
+            result.local_path.name,
+            "wallpaper-" + expected_digest + ".png",
+        )
+        self.assertEqual(candidate.read_bytes(), b"different-desktop-output")
+        self.assertEqual(collision.read_bytes(), b"existing-different-output")
+
+    def test_persistent_output_rejects_escaping_paths_and_symlinks(self):
+        from cloud_run.relay import RelayValidationError
+
+        invalid_descriptors = []
+        absolute = descriptor()
+        absolute["subfolder"] = "/outside"
+        invalid_descriptors.append(absolute)
+        traversal = descriptor()
+        traversal["subfolder"] = "../outside"
+        invalid_descriptors.append(traversal)
+        malformed_temp = descriptor()
+        malformed_temp["type"] = "temp"
+        invalid_descriptors.append(malformed_temp)
+
+        for invalid in invalid_descriptors:
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(RelayValidationError):
+                    asyncio.run(
+                        self.relay(FakeWorker()).download_output(
+                            job_id="job-1",
+                            descriptor=invalid,
+                        )
+                    )
+
+        outside = self.root / "outside.png"
+        outside.write_bytes(EXPECTED_OUTPUT)
+        worker = FakeWorker()
+        with self.assertRaises(RelayValidationError):
+            asyncio.run(
+                self.relay(worker).download_output(
+                    job_id="job-1",
+                    descriptor=descriptor(),
+                    desktop_candidates=(outside,),
+                )
+            )
+        self.assertEqual(worker.ranges, [])
+
+        link = self.output_root / "wallpaper.png"
+        link.symlink_to(outside)
+        with self.assertRaises(RelayValidationError):
+            asyncio.run(
+                self.relay(FakeWorker()).download_output(
+                    job_id="job-1",
+                    descriptor=descriptor(),
+                )
+            )
+        link.unlink()
+
+        outside_directory = self.root / "outside-directory"
+        outside_directory.mkdir()
+        (self.output_root / "cloud-vast").symlink_to(
+            outside_directory,
+            target_is_directory=True,
+        )
+        with self.assertRaises(RelayValidationError):
+            asyncio.run(
+                self.relay(FakeWorker()).download_output(
+                    job_id="job-1",
+                    descriptor=descriptor(),
+                )
+            )
+        self.assertEqual(list(outside_directory.iterdir()), [])
+
+    def test_verified_output_rejects_changed_node_and_same_byte_replacement(self):
+        from cloud_run.relay import ArtifactVerificationError
+
+        relay = self.relay(FakeWorker())
+        result = asyncio.run(
+            relay.download_output(
+                job_id="job-1",
+                descriptor=descriptor(),
+            )
+        )
+        changed_node = descriptor()
+        changed_node["node_id"] = "8"
+
+        with self.assertRaises(ArtifactVerificationError):
+            asyncio.run(
+                relay.download_output(
+                    job_id="job-1",
+                    descriptor=changed_node,
+                )
+            )
+
+        replacement = result.local_path.with_suffix(".replacement")
+        shutil.copyfile(result.local_path, replacement)
+        os.replace(replacement, result.local_path)
+        with self.assertRaises(ArtifactVerificationError):
+            relay.published_artifact("job-1", "output-1")
 
     def test_transport_interruption_keeps_only_a_resumable_private_part(self):
         from cloud_run.relay import ArtifactVerificationError
@@ -282,13 +498,97 @@ class LocalRelayTests(unittest.TestCase):
         self.assertEqual(
             events[0].payload,
             {
-                "code": "execution_failed",
-                "message": "Remote execution failed.",
+                "code": "execution_error",
+                "message": "Remote workflow execution failed.",
                 "node_id": "7",
             },
         )
         self.assertNotIn("provider-key", repr(events))
         self.assertEqual(list(self.output_root.iterdir()), [])
+
+    def test_sync_catches_up_from_event_94_using_only_atomic_snapshot(self):
+        remote_events = [
+            {
+                "sequence": sequence,
+                "type": (
+                    "execution_success"
+                    if sequence == 158
+                    else "progress"
+                ),
+                "data": (
+                    {"timestamp": 158.0}
+                    if sequence == 158
+                    else {"value": sequence, "max": 158}
+                ),
+                "created_at": float(sequence),
+            }
+            for sequence in range(1, 159)
+        ]
+        for event in remote_events[:93]:
+            self.repository.append_event(
+                "job-1",
+                event["sequence"],
+                event["type"],
+                event["data"],
+                created_at=event["created_at"],
+            )
+        worker = FakeWorker(descriptors=[], events=remote_events)
+        relay = self.relay(worker)
+
+        result = asyncio.run(relay.sync_job("job-1"))
+
+        self.assertEqual(result.last_sequence, 158)
+        self.assertEqual(
+            self.repository.last_event_sequence("job-1"),
+            158,
+        )
+        self.assertEqual(worker.snapshot_calls, [("job-1", 93)])
+        self.assertEqual(worker.events_calls, 0)
+        self.assertEqual(worker.job_calls, 0)
+
+    def test_snapshot_replay_is_idempotent_but_gap_or_change_is_rejected(self):
+        from cloud_run.relay import RelayValidationError
+
+        relay = self.relay(FakeWorker(descriptors=[]))
+        event = {
+            "sequence": 1,
+            "type": "progress",
+            "data": {"value": 1, "max": 2},
+            "created_at": 11.0,
+        }
+        snapshot = {
+            "job_id": "job-1",
+            "state": "running",
+            "prompt_id": "11111111-1111-4111-8111-111111111111",
+            "events": [event],
+            "last_sequence": 1,
+            "outputs": [],
+            "error": None,
+            "created_at": 10.0,
+            "updated_at": 12.0,
+        }
+
+        first = asyncio.run(relay.sync_snapshot("job-1", snapshot))
+        replay = asyncio.run(relay.sync_snapshot("job-1", snapshot))
+
+        self.assertEqual(len(first.events), 1)
+        self.assertEqual(replay.events, ())
+        self.assertEqual(len(self.repository.list_events("job-1", 0)), 1)
+
+        changed = {
+            **snapshot,
+            "events": [{**event, "data": {"value": 2, "max": 2}}],
+        }
+        with self.assertRaises(RelayValidationError):
+            asyncio.run(relay.sync_snapshot("job-1", changed))
+
+        gap = {
+            **snapshot,
+            "events": [{**event, "sequence": 3}],
+            "last_sequence": 3,
+        }
+        with self.assertRaises(RelayValidationError):
+            asyncio.run(relay.sync_snapshot("job-1", gap))
 
     def test_preview_is_verified_into_private_cache(self):
         preview = b"\x89PNG\r\n\x1a\npreview"
@@ -322,6 +622,7 @@ class LocalRelayTests(unittest.TestCase):
         cached = relay.preview_content("job-1", preview_id)
 
         self.assertEqual(result.state, "succeeded")
+        self.assertEqual(result.outputs, ())
         self.assertEqual(cached.content, preview)
         self.assertNotIn(str(self.private_root), repr(result.public_payload()))
         transfer = self.repository.get_transfer(

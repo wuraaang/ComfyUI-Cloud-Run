@@ -200,6 +200,7 @@ class ComfyHost:
                 "remote.origin.url",
             ),
             ("git", "-C", root, "rev-parse", "HEAD"),
+            ("git", "-C", root, "rev-parse", "--show-toplevel"),
             (
                 "git",
                 "-C",
@@ -220,10 +221,12 @@ class ComfyHost:
             return None
         repository_url = _normalize_installed_origin(results[0])
         revision = results[1].strip()
-        dirty = bool(results[2].strip())
+        top_level = _absolute_lexical(results[2].strip())
+        dirty = bool(results[3].strip())
         if (
             repository_url is None
             or not _HEX_40.fullmatch(revision)
+            or top_level != _absolute_lexical(package_root)
             or dirty
         ):
             return None

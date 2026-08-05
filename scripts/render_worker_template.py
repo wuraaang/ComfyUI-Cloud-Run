@@ -6,10 +6,10 @@ from __future__ import annotations
 import argparse
 import base64
 from dataclasses import dataclass
+import gzip
 import json
 import os
 from pathlib import Path
-import re
 import stat
 import sys
 import tempfile
@@ -29,30 +29,35 @@ BOOTSTRAP_DIRECTORY = "/opt/comfyui-cloud-run-bootstrap"
 REMOTE_LOCK_NAME = "remote-release-lock.json"
 ONSTART_NAME = "onstart.sh"
 TEMPLATE_REQUEST_NAME = "template-request.json"
+OFFICIAL_IMAGE = (
+    "docker.io/vastai/comfy@sha256:"
+    "9852fae86527d0be097ffcb90dc18368ff808bcbb7c41fbabd538bff3eb6ab9c"
+)
+OFFICIAL_TAG = "v0.29.0-cuda-12.9-py312"
+_EXTRA_FILTERS = {
+    "gpu_arch": {"eq": "nvidia"},
+    "cpu_arch": {"eq": "amd64"},
+    "cuda_max_good": {"gte": 12.9},
+    "compute_cap": {"gte": 750},
+    "num_gpus": {"eq": 1},
+}
 _BASE_FIELDS = {
     "schema_version",
     "hash_id",
-    "image",
-    "tag",
-    "runtype",
     "use_ssh",
     "ssh_direct",
-    "jupyter_dir",
 }
 _POLICY = {
     "schema_version": 1,
     "base_template_hash_id": BASE_TEMPLATE_HASH_ID,
     "comfyui_core_version": "0.29.0",
     "comfyui_frontend_version": "1.47.10",
-    "python_version": "3.13.12",
-    "protocol_version": "1",
+    "python_version": "3.12",
+    "protocol_version": "2",
     "worker_port": 8765,
 }
-_IMAGE_DIGEST = re.compile(
-    r"docker\.io/vastai/base-image@sha256:[0-9a-f]{64}"
-)
-_PINNED_TAG = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
-_MUTABLE_TAGS = {"edge", "latest", "main", "master", "nightly", "stable"}
+_WORKER_JUPYTER_DIRECTORY = "/workspace"
+MAX_ONSTART_CHARACTERS = 16384
 
 
 class TemplateRenderError(RuntimeError):
@@ -113,34 +118,21 @@ def _validated_base_template(base_template):
     if not isinstance(base_template, dict) or set(base_template) != _BASE_FIELDS:
         raise TemplateRenderError("Base template audit is invalid.")
     schema_version = base_template.get("schema_version")
-    image = base_template.get("image")
-    tag = base_template.get("tag")
     if (
         type(schema_version) is not int
         or schema_version != 1
         or base_template.get("hash_id") != BASE_TEMPLATE_HASH_ID
-        or not isinstance(image, str)
-        or not _IMAGE_DIGEST.fullmatch(image)
-        or not isinstance(tag, str)
-        or not _PINNED_TAG.fullmatch(tag)
-        or tag.casefold() in _MUTABLE_TAGS
-        or base_template.get("runtype") != "jupyter_direc ssh_direc"
         or type(base_template.get("use_ssh")) is not bool
         or base_template.get("use_ssh") is not True
         or type(base_template.get("ssh_direct")) is not bool
         or base_template.get("ssh_direct") is not True
-        or base_template.get("jupyter_dir") != "/workspace"
     ):
         raise TemplateRenderError("Base template audit is invalid.")
     return {
         "schema_version": 1,
         "hash_id": BASE_TEMPLATE_HASH_ID,
-        "image": image,
-        "tag": tag,
-        "runtype": "jupyter_direc ssh_direc",
         "use_ssh": True,
         "ssh_direct": True,
-        "jupyter_dir": "/workspace",
     }
 
 
@@ -190,6 +182,10 @@ def _json_bytes(payload):
     )
 
 
+def _deterministic_gzip(content):
+    return gzip.compress(content, compresslevel=9, mtime=0)
+
+
 def _write_private_atomic(path, content):
     destination = Path(path)
     temporary_name = None
@@ -219,17 +215,19 @@ def _write_private_atomic(path, content):
 
 
 def _onstart(bootstrap, remote_lock_bytes, worker_commit):
-    bootstrap_base64 = base64.b64encode(bootstrap).decode("ascii")
+    bootstrap_base64 = base64.b64encode(
+        _deterministic_gzip(bootstrap)
+    ).decode("ascii")
     lock_base64 = base64.b64encode(remote_lock_bytes).decode("ascii")
     return "\n".join(
         (
             "#!/bin/sh",
             "set -eu",
             "umask 077",
-            "mkdir -m 0700 " + BOOTSTRAP_DIRECTORY,
+            "mkdir -p -m 0700 " + BOOTSTRAP_DIRECTORY,
             "printf '%s' '"
             + bootstrap_base64
-            + "' | base64 -d > "
+            + "' | base64 -d | gzip -d > "
             + BOOTSTRAP_DIRECTORY
             + "/bootstrap.py",
             "chmod 0600 " + BOOTSTRAP_DIRECTORY + "/bootstrap.py",
@@ -241,7 +239,9 @@ def _onstart(bootstrap, remote_lock_bytes, worker_commit):
             "chmod 0600 " + BOOTSTRAP_DIRECTORY + "/release-lock.json",
             "CLOUD_RUN_WORKER_VERSION=" + worker_commit,
             "export CLOUD_RUN_WORKER_VERSION",
-            "exec python3 "
+            "CLOUD_RUN_COMFY_ROOT=/opt/workspace-internal/ComfyUI",
+            "export CLOUD_RUN_COMFY_ROOT",
+            "exec /venv/main/bin/python "
             + BOOTSTRAP_DIRECTORY
             + "/bootstrap.py "
             + BOOTSTRAP_DIRECTORY
@@ -284,21 +284,27 @@ def render_worker_template(
         remote_lock_bytes,
         validated_metadata.worker_commit,
     )
+    if len(onstart) > MAX_ONSTART_CHARACTERS:
+        raise TemplateRenderError("Rendered onstart exceeds Vast's limit.")
     request = {
         "name": "cloud-run-worker-" + validated_metadata.worker_commit,
-        "image": validated_base["image"],
-        "tag": validated_base["tag"],
+        "image": OFFICIAL_IMAGE,
+        "tag": OFFICIAL_TAG,
         "runtype": "ssh",
         "use_ssh": validated_base["use_ssh"],
         "ssh_direct": validated_base["ssh_direct"],
         "jup_direct": False,
-        "jupyter_dir": validated_base["jupyter_dir"],
+        "jupyter_dir": _WORKER_JUPYTER_DIRECTORY,
         "use_jupyter_lab": False,
         "docker_login_repo": "",
         "docker_login_user": "",
         "docker_login_pass": "",
         "onstart": onstart,
         "env": "-p 8765:8765",
+        "extra_filters": {
+            key: dict(constraint)
+            for key, constraint in _EXTRA_FILTERS.items()
+        },
         "recommended_disk_space": 80,
         "private": True,
     }

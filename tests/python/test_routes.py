@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import closing
 from dataclasses import replace
 import hashlib
 import json
@@ -10,10 +11,26 @@ import types
 import unittest
 from unittest import mock
 
-from cloud_run.artifacts import FileInputMetadata
+from cloud_run.artifacts import FileInputMetadata, ResolvedLocalArtifact
 from cloud_run.capture import CompiledCapture
-from cloud_run.dependency_repository import DependencyRepository
-from cloud_run.manifest import ArtifactSpec, DependencyManifest, SourceSpec
+from cloud_run.certified_baseline import (
+    CertifiedBaselineResolution,
+    CertifiedBaselineUnavailable,
+)
+from cloud_run.dependency_repository import (
+    DependencyRepository,
+    MappingValidationError,
+)
+from cloud_run.desktop_profile import DesktopProfileStore
+from cloud_run.job_repository import JobRepository
+from cloud_run.manifest import (
+    ArtifactSpec,
+    CustomNodeSpec,
+    DependencyManifest,
+    PythonWheelSpec,
+    SourceSpec,
+    UiPackageSpec,
+)
 from cloud_run.model_sources import ModelSourceResolution
 from cloud_run.routes import (
     _RuntimeResolver,
@@ -21,17 +38,21 @@ from cloud_run.routes import (
     build_service,
     register_routes,
 )
+from cloud_run.repository import PaidRentalConflict, SessionRepository
 from cloud_run.models import (
     AttemptState,
     CloudAttempt,
     CloudJob,
     CloudSession,
+    ExecutionState,
+    HarvestState,
     JobState,
     OfferQuote,
     SessionState,
     TransferState,
 )
 from cloud_run.vast import OfferSearchError
+from cloud_run.worker_release import WorkerRelease
 
 
 class FakeResponse:
@@ -154,9 +175,70 @@ class SettingsRouteTests(unittest.TestCase):
                 "official_template_id": "027fba7753c024be019030fb42aed900",
                 "official_template_name": "Official ComfyUI",
                 "lifecycle_enabled": True,
+                "worker_release": None,
                 "active_sessions": [],
+                "active_sessions_error": None,
             },
         )
+
+    def test_get_returns_only_the_loaded_worker_release_record(self):
+        release = WorkerRelease.from_payload(
+            {
+                "schema_version": 1,
+                "template_hash_id": "1" * 32,
+                "worker_commit": "a" * 40,
+                "worker_archive_sha256": "b" * 64,
+                "protocol_version": "2",
+                "comfyui_core_version": "0.29.0",
+                "comfyui_frontend_version": "1.47.10",
+                "python_version": "3.12",
+                "worker_port": 8765,
+            }
+        )
+        private_markers = (
+            "/private/worker-release.json",
+            "https://signed.example/private-worker.tar.gz",
+            "credential-marker",
+            "a" * 64,
+            "session-secret-marker",
+            "private-workflow-marker",
+            "private-model-marker",
+            "private-template-payload-marker",
+        )
+        service = types.SimpleNamespace(
+            release=release,
+            lock_path=private_markers[0],
+            archive_url=private_markers[1],
+            api_key=private_markers[2],
+            provider_token=private_markers[3],
+            session_secret=private_markers[4],
+            workflow=private_markers[5],
+            model=private_markers[6],
+            template_request=private_markers[7],
+        )
+        handlers = captured_handlers(service_factory=lambda: service)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            with mock.patch.dict(
+                os.environ,
+                {"COMFYUI_CLOUD_RUN_DATA_DIR": temporary_directory},
+                clear=False,
+            ):
+                response = asyncio.run(
+                    handlers[("GET", "/cloud-run/api/settings")](
+                        FakeRequest()
+                    )
+                )
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(
+            response.payload["worker_release"],
+            release.to_record(),
+        )
+        rendered = repr(response.payload)
+        for marker in private_markers:
+            with self.subTest(marker=marker):
+                self.assertNotIn(marker, rendered)
 
     def test_get_rediscovers_recovered_sessions_without_browser_storage(self):
         from cloud_run.job_repository import JobRepository
@@ -180,7 +262,7 @@ class SettingsRouteTests(unittest.TestCase):
                 SessionState.READY,
                 now=100.0,
                 instance_id="77",
-                provider_token="private-provider-token",
+                provider_token="a" * 64,
                 session_secret_hex="d" * 64,
             )
             sessions.create_or_get(ready)
@@ -213,8 +295,183 @@ class SettingsRouteTests(unittest.TestCase):
         )
         self.assertEqual(active[0]["status"], "ready")
         self.assertNotIn("private-session-key", repr(active))
-        self.assertNotIn("private-provider-token", repr(active))
+        self.assertNotIn("a" * 64, repr(active))
         self.assertNotIn("d" * 64, repr(active))
+
+    def test_settings_preserves_minimal_destroy_card_when_detailed_rendering_fails(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            database = root / "private" / "sessions.sqlite3"
+            sessions = SessionRepository(database)
+            jobs = JobRepository(database)
+            selected = attempt().quote
+            ready = CloudSession.new(
+                "private-fallback-key",
+                session_id="session-fallback",
+                quote=selected,
+                manifest_digest=selected.manifest_digest,
+                deadline_at=7_300.0,
+                deadline_mode="finite",
+                disk_gb=80,
+                now=100.0,
+                state=SessionState.READY,
+            ).transition(
+                SessionState.READY,
+                now=100.0,
+                instance_id="77",
+                provider_token="a" * 64,
+                session_secret_hex="d" * 64,
+            )
+            sessions.create_or_get(ready)
+            service = types.SimpleNamespace(
+                session_repository=sessions,
+                job_repository=jobs,
+                session_service=types.SimpleNamespace(),
+                clock=lambda: 200.0,
+            )
+            handlers = captured_handlers(service_factory=lambda: service)
+            with mock.patch.dict(
+                os.environ,
+                {"COMFYUI_CLOUD_RUN_DATA_DIR": str(root / "settings")},
+                clear=False,
+            ), mock.patch(
+                "cloud_run.routes._session_payload",
+                side_effect=RuntimeError("private-detail-marker"),
+            ):
+                response = asyncio.run(
+                    handlers[("GET", "/cloud-run/api/settings")](
+                        FakeRequest()
+                    )
+                )
+
+        self.assertEqual(
+            response.payload["active_sessions"],
+            [
+                {
+                    "session_id": "session-fallback",
+                    "instance_id": "77",
+                    "status": "ready",
+                    "billing_may_continue": True,
+                    "can_destroy": True,
+                    "rate": selected.dph_total,
+                    "error": None,
+                }
+            ],
+        )
+        self.assertEqual(
+            response.payload["active_sessions_error"],
+            "Active session details are temporarily unavailable.",
+        )
+        self.assertNotIn("private-detail-marker", repr(response.payload))
+
+    def test_settings_reports_bounded_error_when_active_session_listing_fails(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            sessions = SessionRepository(root / "private" / "sessions.sqlite3")
+            service = types.SimpleNamespace(
+                session_repository=sessions,
+                release=None,
+            )
+            handlers = captured_handlers(service_factory=lambda: service)
+            with mock.patch.dict(
+                os.environ,
+                {"COMFYUI_CLOUD_RUN_DATA_DIR": str(root / "settings")},
+                clear=False,
+            ), mock.patch.object(
+                sessions,
+                "list_recoverable",
+                side_effect=RuntimeError("private-list-marker"),
+            ):
+                response = asyncio.run(
+                    handlers[("GET", "/cloud-run/api/settings")](
+                        FakeRequest()
+                    )
+                )
+
+        self.assertEqual(response.payload["active_sessions"], [])
+        self.assertEqual(
+            response.payload["active_sessions_error"],
+            "Active session details are temporarily unavailable.",
+        )
+        self.assertNotIn("private-list-marker", repr(response.payload))
+
+    def test_one_broken_session_does_not_hide_other_active_sessions(self):
+        from cloud_run.routes import _session_payload as detailed_payload
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            database = root / "private" / "sessions.sqlite3"
+            sessions = SessionRepository(database)
+            jobs = JobRepository(database)
+            for identifier, instance_id in (
+                ("session-broken", "77"),
+                ("session-healthy", "88"),
+            ):
+                session = CloudSession.new(
+                    "key-" + identifier,
+                    session_id=identifier,
+                    manifest_digest="c" * 64,
+                    deadline_at=7_300.0,
+                    deadline_mode="finite",
+                    disk_gb=80,
+                    now=100.0,
+                    state=SessionState.READY,
+                ).transition(
+                    SessionState.READY,
+                    now=100.0,
+                    instance_id=instance_id,
+                    provider_token="a" * 64,
+                    session_secret_hex="d" * 64,
+                )
+                sessions.create_or_get(session)
+            service = types.SimpleNamespace(
+                session_repository=sessions,
+                job_repository=jobs,
+                session_service=types.SimpleNamespace(
+                    alerts=lambda _session, now: []
+                ),
+                clock=lambda: 200.0,
+            )
+            handlers = captured_handlers(service_factory=lambda: service)
+
+            def render(session, observed_service):
+                if session.session_id == "session-broken":
+                    raise RuntimeError("private-one-session-marker")
+                return detailed_payload(session, observed_service)
+
+            with mock.patch.dict(
+                os.environ,
+                {"COMFYUI_CLOUD_RUN_DATA_DIR": str(root / "settings")},
+                clear=False,
+            ), mock.patch(
+                "cloud_run.routes._session_payload",
+                side_effect=render,
+            ):
+                response = asyncio.run(
+                    handlers[("GET", "/cloud-run/api/settings")](
+                        FakeRequest()
+                    )
+                )
+
+        active = response.payload["active_sessions"]
+        self.assertEqual(
+            [item["session_id"] for item in active],
+            ["session-broken", "session-healthy"],
+        )
+        self.assertEqual(set(active[0]), {
+            "session_id",
+            "instance_id",
+            "status",
+            "billing_may_continue",
+            "can_destroy",
+            "rate",
+            "error",
+        })
+        self.assertIn("current_job", active[1])
+        self.assertEqual(
+            response.payload["active_sessions_error"],
+            "Active session details are temporarily unavailable.",
+        )
 
     def test_put_saves_key_but_returns_only_public_settings(self):
         sensitive_marker = "synthetic-value"
@@ -249,7 +506,9 @@ class SettingsRouteTests(unittest.TestCase):
             "official_template_id": "027fba7753c024be019030fb42aed900",
             "official_template_name": "Official ComfyUI",
             "lifecycle_enabled": True,
+            "worker_release": None,
             "active_sessions": [],
+            "active_sessions_error": None,
         }
         self.assertEqual(put_response.status, 200)
         self.assertEqual(put_response.payload, expected)
@@ -304,6 +563,109 @@ class ServiceConstructionTests(unittest.TestCase):
 
         self.assertIsNone(service.release)
         self.assertIsNone(service.session_service.release)
+        self.assertEqual(
+            service.desktop_relay.continue_guard,
+            service.session_service._raise_if_destroy_requested,
+        )
+
+
+def certified_baseline_fixture(root):
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    records = []
+
+    def archive(artifact_id, kind, destination, body):
+        path = root / (artifact_id + ".bin")
+        path.write_bytes(body)
+        digest = hashlib.sha256(body).hexdigest()
+        spec = ArtifactSpec(
+            artifact_id=artifact_id,
+            kind=kind,
+            logical_name=artifact_id + ".tar",
+            destination=destination,
+            size_bytes=len(body),
+            sha256=digest,
+            source=SourceSpec(
+                "local-upload",
+                "local-upload:" + artifact_id,
+            ),
+        )
+        records.append(
+            ResolvedLocalArtifact(
+                artifact_id=artifact_id,
+                private_path=str(path),
+                size_bytes=len(body),
+                sha256=digest,
+            )
+        )
+        return spec
+
+    agent = UiPackageSpec(
+        package_id="comfyui-agent-panel",
+        repository_url="https://github.com/artokun/comfyui-mcp-panel",
+        revision="a" * 40,
+        archive=archive(
+            "ui-agent-panel",
+            "ui_package_archive",
+            "custom_nodes/comfyui-agent-panel",
+            b"agent",
+        ),
+        web_sha256="1" * 64,
+        required_capabilities=("graph_read", "native_run"),
+    )
+    hermes = UiPackageSpec(
+        package_id="hermes-nous",
+        repository_url="https://github.com/wuraaang/ComfyUI-Cloud-Run",
+        revision="sha256:" + "2" * 64,
+        archive=archive(
+            "ui-hermes-nous",
+            "ui_package_archive",
+            "custom_nodes/hermes-nous",
+            b"hermes",
+        ),
+        web_sha256="3" * 64,
+        required_capabilities=(),
+    )
+    wheel_path = root / "simpleeval.whl"
+    wheel_path.write_bytes(b"simpleeval")
+    wheel_digest = hashlib.sha256(b"simpleeval").hexdigest()
+    records.append(
+        ResolvedLocalArtifact(
+            artifact_id="wheel-simpleeval",
+            private_path=str(wheel_path),
+            size_bytes=len(b"simpleeval"),
+            sha256=wheel_digest,
+        )
+    )
+    efficiency = CustomNodeSpec(
+        package_id="efficiency-nodes-comfyui",
+        repository_url="https://github.com/jags111/efficiency-nodes-comfyui",
+        revision="b" * 40,
+        archive=archive(
+            "custom-efficiency-nodes",
+            "custom_node_archive",
+            "custom_nodes/efficiency-nodes-comfyui",
+            b"efficiency",
+        ),
+        wheels=(
+            PythonWheelSpec(
+                filename="simpleeval-1.0.7-py3-none-any.whl",
+                size_bytes=len(b"simpleeval"),
+                sha256=wheel_digest,
+                source=SourceSpec(
+                    "local-upload",
+                    "local-upload:wheel-simpleeval",
+                ),
+            ),
+        ),
+        provided_class_types=("KSampler (Efficient)",),
+    )
+    return CertifiedBaselineResolution(
+        ui_packages=(agent, hermes),
+        custom_nodes=(efficiency,),
+        local_artifacts=tuple(records),
+        digest="4" * 64,
+    )
 
 
 class RuntimeResolverTests(unittest.TestCase):
@@ -346,15 +708,159 @@ class RuntimeResolverTests(unittest.TestCase):
             {"upscale_models": (model_root,)},
         )
 
-    def test_injected_model_source_resolver_keeps_route_tests_offline(self):
+    def test_missing_or_changed_baseline_blocks_rentability(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            baseline_resolver = types.SimpleNamespace(
+                resolve=mock.AsyncMock(
+                    side_effect=CertifiedBaselineUnavailable()
+                )
+            )
+            runtime = _RuntimeResolver(
+                object(),
+                profile_store=types.SimpleNamespace(
+                    private_root=root / "profiles"
+                ),
+                baseline_resolver=baseline_resolver,
+                baseline_fetcher=mock.AsyncMock(),
+                baseline_cache_root=root / "baseline",
+            )
+            host = types.SimpleNamespace(comfy_root=root / "ComfyUI")
+            context = {
+                "metadata": {},
+                "model_roots": {},
+                "input_root": root / "input",
+                "source_mappings": {},
+                "base_bytes": 40,
+            }
+
+            with mock.patch(
+                "cloud_run.routes.ComfyHost.from_running_host",
+                return_value=host,
+            ), mock.patch(
+                "cloud_run.routes._runtime_resolution_context",
+                return_value=lambda _capture: context,
+            ):
+                with self.assertRaisesRegex(
+                    MappingValidationError,
+                    "Certified Desktop baseline is unavailable",
+                ):
+                    asyncio.run(
+                        runtime.resolve_preflight(types.SimpleNamespace())
+                    )
+
+        self.assertEqual(baseline_resolver.resolve.await_count, 1)
+
+    def test_agent_panel_is_required_from_production_profile(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            baseline = certified_baseline_fixture(root / "baseline-fixture")
+            baseline_resolver = types.SimpleNamespace(
+                resolve=mock.AsyncMock(return_value=baseline)
+            )
+            profile = types.SimpleNamespace(
+                ui_packages=baseline.ui_packages,
+                manifest_spec=lambda: None,
+            )
+            profile_store = types.SimpleNamespace(
+                private_root=root / "profiles",
+                capture=mock.Mock(return_value=profile),
+            )
+            observed = {}
+
+            class ResolverProbe:
+                def __init__(self, **kwargs):
+                    observed.update(kwargs)
+
+                async def resolve_preflight(self, capture, **_kwargs):
+                    return observed["profile_provider"](capture)
+
+            runtime = _RuntimeResolver(
+                object(),
+                artifact_catalog=object(),
+                profile_store=profile_store,
+                baseline_resolver=baseline_resolver,
+                baseline_fetcher=mock.AsyncMock(),
+                baseline_cache_root=root / "baseline-cache",
+            )
+            host = types.SimpleNamespace(comfy_root=root / "ComfyUI")
+            context = {
+                "metadata": {},
+                "model_roots": {},
+                "input_root": root / "input",
+                "source_mappings": {},
+                "base_bytes": 40,
+            }
+            capture = types.SimpleNamespace()
+
+            with mock.patch(
+                "cloud_run.routes.ComfyHost.from_running_host",
+                return_value=host,
+            ), mock.patch(
+                "cloud_run.routes._runtime_resolution_context",
+                return_value=lambda _capture: context,
+            ), mock.patch(
+                "cloud_run.routes.certified_bootstrap_workflow",
+                return_value={"nodes": []},
+            ), mock.patch(
+                "cloud_run.routes.DependencyResolver",
+                ResolverProbe,
+            ):
+                payload = asyncio.run(runtime.resolve_preflight(capture))
+
+        self.assertEqual(
+            set(payload),
+            {
+                "ui_packages",
+                "custom_nodes",
+                "local_artifacts",
+                "profile",
+                "minimum_vram_gb",
+            },
+        )
+        self.assertIn(
+            "comfyui-agent-panel",
+            {item.package_id for item in payload["ui_packages"]},
+        )
+        profile_store.capture.assert_called_once_with(
+            user_root=host.comfy_root / "user",
+            profile_name="default",
+            input_root=context["input_root"],
+            bootstrap_workflow={"nodes": []},
+            ui_packages=baseline.ui_packages,
+            ui_assets=(),
+        )
+
+    def test_runtime_preflight_discovers_certified_baseline_without_injected_ui_packages(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             model_root = root / "models"
             input_root = root / "input"
+            comfy_root = root / "ComfyUI"
             model_root.mkdir()
             input_root.mkdir()
+            (comfy_root / "user" / "default" / "workflows").mkdir(
+                parents=True
+            )
+            (
+                comfy_root
+                / "user"
+                / "default"
+                / "workflows"
+                / "saved.json"
+            ).write_text('{"nodes":[]}', encoding="utf-8")
             repository = DependencyRepository(
                 root / "private" / "sessions.sqlite3"
+            )
+            profile_store = DesktopProfileStore(
+                repository=JobRepository(
+                    root / "private" / "sessions.sqlite3"
+                ),
+                private_root=root / "private" / "profiles",
+            )
+            baseline = certified_baseline_fixture(root / "baseline-fixture")
+            baseline_resolver = types.SimpleNamespace(
+                resolve=mock.AsyncMock(return_value=baseline)
             )
             revision = "a" * 40
             digest = "c" * 64
@@ -400,25 +906,62 @@ class RuntimeResolverTests(unittest.TestCase):
                     }
 
             host = FakeHost()
+            host.comfy_root = comfy_root
             folder_paths = types.ModuleType("folder_paths")
             folder_paths.folder_names_and_paths = {
                 "diffusion_models": ((str(model_root),), {".safetensors"})
             }
             folder_paths.get_filename_list = lambda _category: []
             folder_paths.get_input_directory = lambda: str(input_root)
-            capture = types.SimpleNamespace(
-                executable_class_types=("UNETLoader",),
-                output={
-                    "1": {
-                        "class_type": "UNETLoader",
-                        "inputs": {"model_name": "example.safetensors"},
+            def capture_with_seed(seed):
+                return CompiledCapture.from_payload(
+                    {
+                        "workflow": {
+                            "version": 1,
+                            "nodes": [
+                                {
+                                    "id": 1,
+                                    "type": "UNETLoader",
+                                    "mode": 0,
+                                    "properties": {"cnr_id": "comfy-core"},
+                                    "widgets_values": [
+                                        "example.safetensors"
+                                    ],
+                                },
+                                {
+                                    "id": 3,
+                                    "type": "KSampler",
+                                    "mode": 0,
+                                    "properties": {"cnr_id": "comfy-core"},
+                                    "widgets_values": [seed, "randomize"],
+                                },
+                            ],
+                            "extra": {"frontendVersion": "1.47.10"},
+                        },
+                        "output": {
+                            "1": {
+                                "class_type": "UNETLoader",
+                                "inputs": {
+                                    "model_name": "example.safetensors"
+                                },
+                            },
+                            "3": {
+                                "class_type": "KSampler",
+                                "inputs": {"model": ["1", 0], "seed": seed},
+                            },
+                        },
+                        "queue_options": {},
                     }
-                },
-                workflow={"nodes": []},
-            )
+                )
+
             resolver = _RuntimeResolver(
                 repository,
+                artifact_catalog=profile_store.repository,
                 model_source_resolver=model_source_resolver,
+                profile_store=profile_store,
+                baseline_resolver=baseline_resolver,
+                baseline_fetcher=mock.AsyncMock(),
+                baseline_cache_root=root / "private" / "baseline-cache",
             )
 
             with mock.patch.dict(
@@ -428,16 +971,58 @@ class RuntimeResolverTests(unittest.TestCase):
                 "cloud_run.routes.ComfyHost.from_running_host",
                 return_value=host,
             ):
-                result = asyncio.run(
+                first_result = asyncio.run(
                     resolver.resolve_preflight(
-                        capture,
+                        capture_with_seed(7),
                         explicit_output_allowance_bytes=1024,
                     )
                 )
+                second_result = asyncio.run(
+                    resolver.resolve_preflight(
+                        capture_with_seed(999),
+                        explicit_output_allowance_bytes=1024,
+                    )
+                )
+                profile_archive_exists = profile_store.archive_path(
+                    profile_store.latest()
+                ).is_file()
+                registered_baseline_ids = tuple(
+                    item.artifact_id
+                    for item in baseline.local_artifacts
+                    if profile_store.repository.get_local_artifact(
+                        item.artifact_id
+                    )
+                    is not None
+                )
 
-        self.assertTrue(result.rentable)
-        self.assertEqual(result.artifacts[0].source.kind, "huggingface")
-        model_source_resolver.resolve.assert_awaited_once()
+        self.assertTrue(first_result.rentable)
+        self.assertTrue(second_result.rentable)
+        self.assertEqual(
+            first_result.artifacts[0].source.kind,
+            "huggingface",
+        )
+        self.assertEqual(first_result.profile.profile_id, "desktop-profile")
+        self.assertEqual(first_result.profile.revision, 1)
+        self.assertEqual(second_result.profile.revision, 1)
+        self.assertEqual(
+            first_result.profile.archive.sha256,
+            second_result.profile.archive.sha256,
+        )
+        self.assertTrue(profile_archive_exists)
+        self.assertEqual(model_source_resolver.resolve.await_count, 2)
+        self.assertEqual(
+            tuple(item.package_id for item in first_result.ui_packages),
+            ("comfyui-agent-panel", "hermes-nous"),
+        )
+        self.assertEqual(
+            tuple(item.package_id for item in first_result.custom_nodes),
+            ("efficiency-nodes-comfyui",),
+        )
+        self.assertEqual(baseline_resolver.resolve.await_count, 2)
+        self.assertEqual(
+            registered_baseline_ids,
+            tuple(item.artifact_id for item in baseline.local_artifacts),
+        )
 
 
 class OffersRouteTests(unittest.TestCase):
@@ -751,7 +1336,7 @@ def attempt(state=AttemptState.OFFER_SELECTED):
             template_hash_id="1" * 32,
             worker_commit="a" * 40,
             worker_archive_sha256="b" * 64,
-            protocol_version="1",
+            protocol_version="2",
             manifest_digest="c" * 64,
             max_instance_creates=1,
         ),
@@ -769,6 +1354,104 @@ class LegacyRouteRemovalTests(unittest.TestCase):
 
 
 class PaidSessionRouteTests(unittest.TestCase):
+    def test_harvest_retry_route_accepts_only_an_empty_control_payload(self):
+        job = CloudJob(
+            job_id="job-1",
+            session_id="session-1",
+            idempotency_key="private-job-key",
+            state=JobState.HARVESTING,
+            prompt_digest="d" * 64,
+            capture_json='{"output":{},"queue_options":{},"workflow":{}}',
+            manifest_digest="e" * 64,
+            remote_prompt_id="11111111-1111-1111-1111-111111111111",
+            sanitized_error="Remote output retrieval failed.",
+            created_at=101.0,
+            updated_at=102.0,
+            version=5,
+            execution_state=ExecutionState.SUCCEEDED,
+            harvest_state=HarvestState.FAILED,
+        )
+        service = mock.Mock()
+        service.retry_harvest = mock.AsyncMock(return_value=job)
+        handlers = captured_handlers(service_factory=lambda: service)
+        route = (
+            "POST",
+            (
+                "/cloud-run/api/sessions/{session_id}/jobs/{job_id}/"
+                "harvest"
+            ),
+        )
+
+        response = asyncio.run(
+            handlers[route](
+                FakeRequest(
+                    {},
+                    match_info={
+                        "session_id": "session-1",
+                        "job_id": "job-1",
+                    },
+                )
+            )
+        )
+        rejected = asyncio.run(
+            handlers[route](
+                FakeRequest(
+                    {"provider_token": "forbidden"},
+                    match_info={
+                        "session_id": "session-1",
+                        "job_id": "job-1",
+                    },
+                )
+            )
+        )
+
+        service.retry_harvest.assert_awaited_once_with(
+            "session-1",
+            "job-1",
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.payload["execution_status"], "succeeded")
+        self.assertEqual(response.payload["harvest_status"], "failed")
+        self.assertEqual(rejected.status, 400)
+        self.assertNotIn("private-job-key", repr(response.payload))
+
+    def test_paid_rental_conflict_maps_to_static_http_409(self):
+        service = mock.Mock()
+        service.confirm_session = mock.AsyncMock(
+            side_effect=PaidRentalConflict()
+        )
+        handlers = captured_handlers(service_factory=lambda: service)
+
+        response = asyncio.run(
+            handlers[
+                (
+                    "POST",
+                    "/cloud-run/api/sessions/{session_id}/confirm",
+                )
+            ](
+                FakeRequest(
+                    {
+                        "idempotency_key": "private-session-key",
+                        "estimate_digest": "a" * 64,
+                        "accepted_longer_estimate": False,
+                        "preflight_id": "preflight-1",
+                    },
+                    match_info={"session_id": "session-1"},
+                )
+            )
+        )
+
+        self.assertEqual(response.status, 409)
+        self.assertEqual(
+            response.payload,
+            {
+                "error": (
+                    "Another Cloud Run rental is active or unresolved. "
+                    "Do not start another rental yet."
+                )
+            },
+        )
+
     def test_quote_and_confirm_routes_use_only_the_exact_session_contract(self):
         quoted = CloudSession.new(
             "private-session-idempotency-key",
@@ -806,6 +1489,7 @@ class PaidSessionRouteTests(unittest.TestCase):
                 "duration_seconds": 7200,
             },
             "max_instance_creates": 1,
+            "estimate_digest": "a" * 64,
         }
 
         quote_response = asyncio.run(
@@ -824,7 +1508,10 @@ class PaidSessionRouteTests(unittest.TestCase):
                     {
                         "idempotency_key": (
                             "private-session-idempotency-key"
-                        )
+                        ),
+                        "estimate_digest": "a" * 64,
+                        "accepted_longer_estimate": True,
+                        "preflight_id": "preflight-2",
                     },
                     match_info={"session_id": "session-1"},
                 )
@@ -852,10 +1539,14 @@ class PaidSessionRouteTests(unittest.TestCase):
                 "duration_seconds": 7200,
             },
             max_instance_creates=1,
+            estimate_digest="a" * 64,
         )
         service.confirm_session.assert_awaited_once_with(
             "session-1",
             idempotency_key="private-session-idempotency-key",
+            estimate_digest="a" * 64,
+            accepted_longer_estimate=True,
+            current_preflight_id="preflight-2",
         )
         self.assertEqual(quote_response.status, 200)
         self.assertEqual(quote_response.payload["status"], "offer_selected")
@@ -1120,7 +1811,15 @@ class RelayMediaRouteTests(unittest.TestCase):
                 prompt_digest="c" * 64,
                 capture_json=json.dumps(
                     {
-                        "workflow": {},
+                        "workflow": {
+                            "nodes": [
+                                {
+                                    "id": 9,
+                                    "type": "SaveImage",
+                                    "title": "Wallpaper output",
+                                }
+                            ]
+                        },
                         "output": {},
                         "queue_options": {},
                     }
@@ -1176,6 +1875,7 @@ class RelayMediaRouteTests(unittest.TestCase):
         output_path = self.output_root / "job-1" / "wallpaper.png"
         output_path.parent.mkdir(mode=0o700)
         output_path.write_bytes(output)
+        output_metadata = output_path.stat()
         repository.save_transfer(
             job_id="job-1",
             artifact_id="output-1",
@@ -1185,6 +1885,9 @@ class RelayMediaRouteTests(unittest.TestCase):
             offset=len(output),
             state=TransferState.VERIFIED,
             private_path=str(output_path),
+            source_node_id="9",
+            published_device=output_metadata.st_dev,
+            published_inode=output_metadata.st_ino,
         )
         self.service = types.SimpleNamespace(
             job_repository=repository,
@@ -1324,11 +2027,77 @@ class RelayMediaRouteTests(unittest.TestCase):
             response.payload["outputs"][0]["state"],
             "local_verified",
         )
+        self.assertTrue(
+            response.payload["outputs"][0]["local_verified"]
+        )
         self.assertEqual(
             response.payload["outputs"][0]["filename"],
             "wallpaper.png",
         )
+        self.assertEqual(response.payload["outputs"][0]["node_id"], "9")
+        self.assertNotIn("node_id", response.payload["transfers"][1])
         self.assertNotIn(str(self.root), repr(response.payload))
+
+    def test_job_status_folds_native_events_into_current_node_and_progress(self):
+        repository = self.service.job_repository
+        repository.append_event(
+            "job-1",
+            2,
+            "executing",
+            {"node_id": "9", "display_node_id": "9"},
+            created_at=16.0,
+        )
+        repository.append_event(
+            "job-1",
+            3,
+            "progress",
+            {"value": 20, "max": 20, "node_id": "9"},
+            created_at=17.0,
+        )
+        repository.append_event(
+            "job-1",
+            4,
+            "progress_text",
+            {"node_id": "9", "text": "Sampling complete"},
+            created_at=18.0,
+        )
+
+        response = asyncio.run(
+            self.handlers[
+                (
+                    "GET",
+                    (
+                        "/cloud-run/api/sessions/{session_id}/jobs/"
+                        "{job_id}"
+                    ),
+                )
+            ](
+                FakeRequest(
+                    match_info={
+                        "session_id": "session-1",
+                        "job_id": "job-1",
+                    }
+                )
+            )
+        )
+
+        self.assertEqual(
+            response.payload["current_node"],
+            {"id": "9", "title": "Wallpaper output"},
+        )
+        self.assertEqual(
+            response.payload["progress"],
+            {"value": 20, "max": 20},
+        )
+        self.assertEqual(
+            response.payload["progress_text"],
+            "Sampling complete",
+        )
+        self.assertEqual(response.payload["last_sequence"], 4)
+        self.assertEqual(response.payload["execution_state"], "pending")
+        self.assertEqual(response.payload["harvest_state"], "pending")
+        self.assertEqual(response.payload["execution_status"], "pending")
+        self.assertEqual(response.payload["harvest_status"], "pending")
 
     def test_session_status_aggregates_cost_alerts_job_and_local_history(self):
         response = asyncio.run(
@@ -1398,8 +2167,8 @@ class RelayMediaRouteTests(unittest.TestCase):
             ),
         )
         manifest = DependencyManifest(
-            schema_version=1,
-            protocol_version="1",
+            schema_version=2,
+            protocol_version="2",
             comfyui_core_version="0.29.0",
             comfyui_frontend_version="1.47.10",
             worker_version="a" * 40,
@@ -1479,13 +2248,14 @@ class RelayMediaRouteTests(unittest.TestCase):
                 "validated_units": 0,
                 "seconds_without_progress": 5.0,
                 "stall_budget_seconds": 600,
+                "stall_active": False,
             },
         )
         self.assertNotIn("huggingface.co", repr(response.payload))
         self.assertNotIn("local-upload", repr(response.payload))
         self.assertNotIn(str(self.root), repr(response.payload))
 
-        with repository._connect() as connection:
+        with closing(repository._connect()) as connection:
             connection.execute(
                 """
                 UPDATE provision_transactions
@@ -1514,6 +2284,112 @@ class RelayMediaRouteTests(unittest.TestCase):
             15,
         )
 
+    def test_ready_provision_transaction_reports_installed_units_as_validated_and_stops_stall_clock(self):
+        repository = self.service.job_repository
+        artifact = ArtifactSpec(
+            artifact_id="model-ready",
+            kind="model",
+            logical_name="ready.safetensors",
+            destination="models/checkpoints/ready.safetensors",
+            size_bytes=10,
+            sha256="b" * 64,
+            source=SourceSpec(
+                "huggingface",
+                (
+                    "https://huggingface.co/example/model/resolve/"
+                    + "a" * 40
+                    + "/ready.safetensors"
+                ),
+                immutable_revision="a" * 40,
+            ),
+        )
+        manifest = DependencyManifest(
+            schema_version=2,
+            protocol_version="2",
+            comfyui_core_version="0.29.0",
+            comfyui_frontend_version="1.47.10",
+            worker_version="a" * 40,
+            prompt_digest="d" * 64,
+            custom_nodes=(),
+            artifacts=(artifact,),
+            output_allowance_bytes=1024,
+            disk_gb=80,
+        )
+        repository.save_manifest(
+            manifest.digest,
+            manifest.canonical_bytes().decode("utf-8"),
+            created_at=100.0,
+        )
+        repository.record_provision_progress(
+            transaction_id="provision-" + manifest.digest,
+            session_id="session-1",
+            job_id="bootstrap:session-1",
+            manifest_digest=manifest.digest,
+            state="ready",
+            phase="ready",
+            current_dependency_id=None,
+            transferred_bytes=10,
+            total_bytes=10,
+            last_progress_at=100.0,
+        )
+        repository.replace_installed_set(
+            "session-1",
+            (
+                {
+                    "dependency_id": artifact.artifact_id,
+                    "digest": artifact.sha256,
+                    "revision": None,
+                    "destination": artifact.destination,
+                },
+            ),
+        )
+        validating = CloudSession.new(
+            "session-ready-progress",
+            session_id="session-1",
+            quote=replace(
+                attempt().quote,
+                manifest_digest=manifest.digest,
+                transfer_bytes=10,
+                output_allowance_bytes=1024,
+                disk_gb=80,
+            ),
+            manifest_digest=manifest.digest,
+            deadline_at=7_300.0,
+            deadline_mode="finite",
+            disk_gb=80,
+            now=100.0,
+            state=SessionState.VALIDATING,
+        ).transition(
+            SessionState.VALIDATING,
+            now=100.0,
+            instance_id="77",
+        )
+        self.service.refresh_session = mock.AsyncMock(
+            return_value=validating
+        )
+
+        response = asyncio.run(
+            self.handlers[
+                ("GET", "/cloud-run/api/sessions/{session_id}")
+            ](FakeRequest(match_info={"session_id": "session-1"}))
+        )
+
+        self.assertEqual(
+            response.payload["provisioning"],
+            {
+                "phase": "ready",
+                "current_model": None,
+                "transferred_bytes": 10,
+                "total_bytes": 10,
+                "installed_units": 1,
+                "validated_units": 1,
+                "seconds_without_progress": None,
+                "stall_budget_seconds": 600,
+                "stall_active": False,
+            },
+        )
+        self.assertFalse(response.payload["desktop_ready"])
+
     def test_wrong_session_cannot_read_an_existing_job(self):
         response = asyncio.run(
             self.handlers[
@@ -1537,6 +2413,150 @@ class RelayMediaRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status, 404)
         self.assertNotIn("job-1", repr(response.payload))
+
+
+class DesktopRelayRouteTests(unittest.TestCase):
+    def setUp(self):
+        self.calls = []
+
+        class Status:
+            def __init__(inner_self, active):
+                inner_self.active = active
+
+            def public_payload(inner_self):
+                return {
+                    "bound": True,
+                    "url": "http://127.0.0.1:32145",
+                    "connection_name": "ComfyUI Vast",
+                    "active_session_id": (
+                        "session-1" if inner_self.active else None
+                    ),
+                    "profile_revision": 3 if inner_self.active else None,
+                    "ready": inner_self.active,
+                    "error": None,
+                }
+
+        test = self
+
+        class Service:
+            def desktop_setup(inner_self):
+                return {
+                    **Status(True).public_payload(),
+                    "manual_setup_required": True,
+                    "instructions": ["Open Remote Connections."],
+                }
+
+            async def activate_desktop_relay(inner_self, session_id):
+                test.calls.append(("activate", session_id))
+                return Status(True)
+
+            async def deactivate_desktop_relay(inner_self, session_id):
+                test.calls.append(("deactivate", session_id))
+                return Status(False)
+
+        service = Service()
+        self.handlers = captured_handlers(service_factory=lambda: service)
+
+    def test_local_context_and_setup_never_set_remote_capability(self):
+        context = asyncio.run(
+            self.handlers[("GET", "/cloud-run/api/desktop-context")](
+                FakeRequest()
+            )
+        )
+        setup = asyncio.run(
+            self.handlers[("GET", "/cloud-run/api/desktop-setup")](
+                FakeRequest()
+            )
+        )
+
+        self.assertEqual(context.payload, {"role": "local"})
+        self.assertNotIn("Set-Cookie", context.headers)
+        self.assertEqual(setup.payload["url"], "http://127.0.0.1:32145")
+        self.assertEqual(setup.payload["connection_name"], "ComfyUI Vast")
+        self.assertNotIn("capability", repr(setup.payload).casefold())
+
+    def test_activation_and_deactivation_are_explicit_local_only_routes(self):
+        activate = asyncio.run(
+            self.handlers[
+                (
+                    "POST",
+                    "/cloud-run/api/sessions/{session_id}/desktop-relay",
+                )
+            ](
+                FakeRequest(
+                    body={},
+                    match_info={"session_id": "session-1"},
+                )
+            )
+        )
+        deactivate = asyncio.run(
+            self.handlers[
+                (
+                    "DELETE",
+                    "/cloud-run/api/sessions/{session_id}/desktop-relay",
+                )
+            ](
+                FakeRequest(match_info={"session_id": "session-1"})
+            )
+        )
+
+        self.assertEqual(activate.status, 200)
+        self.assertTrue(activate.payload["ready"])
+        self.assertEqual(deactivate.status, 200)
+        self.assertFalse(deactivate.payload["ready"])
+        self.assertEqual(
+            self.calls,
+            [("activate", "session-1"), ("deactivate", "session-1")],
+        )
+
+
+class DesktopProfileRouteTests(unittest.TestCase):
+    def test_profile_status_and_explicit_conflict_choice_are_scoped(self):
+        service = mock.Mock()
+        status = {
+            "profile_id": "desktop-profile",
+            "local_revision": 3,
+            "remote_revision": 2,
+            "state": "conflict",
+            "warning": None,
+            "conflicts": [{"conflict_id": "conflict-1"}],
+        }
+        service.session_profile = mock.AsyncMock(return_value=status)
+        service.resolve_session_profile_conflict = mock.AsyncMock(
+            return_value={**status, "state": "local_changes_pending"}
+        )
+        handlers = captured_handlers(service_factory=lambda: service)
+
+        fetched = asyncio.run(
+            handlers[("GET", "/cloud-run/api/sessions/{session_id}/profile")](
+                FakeRequest(match_info={"session_id": "session-1"})
+            )
+        )
+        resolved = asyncio.run(
+            handlers[
+                (
+                    "POST",
+                    "/cloud-run/api/sessions/{session_id}/profile/conflicts/"
+                    "{conflict_id}",
+                )
+            ](
+                FakeRequest(
+                    {"winner": "cloud_vast"},
+                    match_info={
+                        "session_id": "session-1",
+                        "conflict_id": "conflict-1",
+                    },
+                )
+            )
+        )
+
+        self.assertEqual(fetched.payload, status)
+        self.assertEqual(resolved.payload["state"], "local_changes_pending")
+        service.resolve_session_profile_conflict.assert_awaited_once_with(
+            "session-1",
+            "conflict-1",
+            winner="cloud_vast",
+        )
 
 
 if __name__ == "__main__":

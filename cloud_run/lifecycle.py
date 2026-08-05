@@ -1,4 +1,4 @@
-"""Billing-safe cancellation, readiness, recovery, and one replacement."""
+"""Billing-safe cancellation, readiness, and recovery."""
 
 from __future__ import annotations
 
@@ -6,26 +6,27 @@ import asyncio
 import time
 
 from .constants import COMFYUI_CONTAINER_PORT, DEFAULT_DISK_GB
-from .models import AttemptState, OfferQuote, SessionState
-from .offers import (
-    apply_offer_policy,
-    offer_meets_connection_quality_policy,
-    select_best_offer,
-)
+from .models import AttemptState, SessionState
+from .repository import ConcurrentSessionUpdate
 from .session_service import TerminalProvisioningError
+from .worker_protocol import is_boundary_token
 from .worker_release import WorkerRelease
 from . import vast
 
 
 DEFAULT_POLL_INTERVAL_SECONDS = 5
 DEFAULT_BOOT_DEADLINE_SECONDS = 15 * 60
-RETRYABLE_START_FAILURES = {
-    "boot_timeout",
-    "healthcheck_failure",
-    "transport_failure",
-}
+BOUNDARY_AUTHENTICATION_GRACE_SECONDS = 60
+BOUNDARY_AUTHENTICATION_ERROR = (
+    "Remote worker boundary authentication failed."
+)
 _WATCHDOGS = {}
 _SESSION_WATCHDOGS = {}
+_PRESERVE_ERROR = object()
+_CREDENTIAL_BINDING_ERROR = (
+    "The configured Vast credential changed after this rental; verify and "
+    "destroy the residual instance in the Vast console."
+)
 
 
 async def _default_readiness_probe(base_url):
@@ -73,6 +74,8 @@ class CloudRunLifecycle:
         self.release = release if isinstance(release, WorkerRelease) else None
         self.session_repository = session_repository
         self.session_service = session_service
+        self._session_recovery_tasks = {}
+        self._session_preemptions = {}
 
     def _attempt(self, attempt_id):
         attempt = self.repository.get(str(attempt_id))
@@ -91,14 +94,52 @@ class CloudRunLifecycle:
             )
         return settings, key
 
+    @staticmethod
+    def _settings_revision(settings):
+        revision = (
+            settings.get("api_key_revision")
+            if isinstance(settings, dict)
+            else None
+        )
+        return revision if isinstance(revision, str) and revision else None
+
+    @staticmethod
+    def _session_settings_revision_matches(session, settings_revision):
+        return bool(
+            isinstance(settings_revision, str)
+            and settings_revision
+            and session.create_settings_revision == settings_revision
+        )
+
+    def _fail_closed_credential_binding(self, session):
+        current = self.session_repository.get(session.session_id) or session
+        state = (
+            SessionState.FAILED
+            if current.state
+            in {
+                SessionState.DESTROY_REQUESTED,
+                SessionState.DESTROYING,
+            }
+            else current.state
+        )
+        return self.session_repository.transition(
+            current.session_id,
+            state,
+            now=float(self.clock()),
+            sanitized_error=_CREDENTIAL_BINDING_ERROR,
+        )
+
     async def _inventory(self, api_key):
         try:
             inventory = await self.provider.list_instances(api_key)
         except Exception:
             return None
-        if not isinstance(inventory, list):
+        if (
+            not isinstance(inventory, list)
+            or any(not isinstance(item, dict) for item in inventory)
+        ):
             return None
-        return [item for item in inventory if isinstance(item, dict)]
+        return inventory
 
     @staticmethod
     def _by_label(inventory, label):
@@ -107,6 +148,27 @@ class CloudRunLifecycle:
         return sorted(
             [item for item in inventory if item.get("label") == label],
             key=lambda item: str(item.get("instance_id") or ""),
+        )
+
+    @staticmethod
+    def _attempt_residual_ids(matches):
+        return tuple(
+            str(item.get("instance_id"))
+            for item in matches
+            if item.get("instance_id") is not None
+        )
+
+    def _fail_attempt_on_multiple_matches(self, attempt, matches):
+        return self.repository.transition(
+            attempt.attempt_id,
+            AttemptState.FAILED,
+            now=float(self.clock()),
+            instance_id=None,
+            residual_inventory=self._attempt_residual_ids(matches),
+            ready_url=None,
+            sanitized_error=(
+                "Multiple managed Vast instances match this attempt."
+            ),
         )
 
     async def _verified_absent(self, api_key, attempt, instance_id):
@@ -139,7 +201,12 @@ class CloudRunLifecycle:
                     sanitized_error=message,
                 )
             matches = self._by_label(inventory, attempt.label)
-            if matches:
+            if len(matches) > 1:
+                return self._fail_attempt_on_multiple_matches(
+                    attempt,
+                    matches,
+                )
+            if len(matches) == 1:
                 instance_id = str(matches[0].get("instance_id") or "")
                 attempt = self.repository.transition(
                     attempt.attempt_id,
@@ -207,6 +274,7 @@ class CloudRunLifecycle:
             AttemptState.CANCELLED,
             now=float(self.clock()),
             instance_id=None,
+            residual_inventory=(),
             ready_url=None,
             sanitized_error=None,
         )
@@ -281,13 +349,19 @@ class CloudRunLifecycle:
             _settings, api_key = self._api_key()
             inventory = await self._inventory(api_key)
             matches = self._by_label(inventory, attempt.label)
-            if not matches:
+            if len(matches) > 1:
+                return self._fail_attempt_on_multiple_matches(
+                    attempt,
+                    matches,
+                )
+            if len(matches) != 1:
                 return attempt
             return self.repository.transition(
                 attempt.attempt_id,
                 AttemptState.STARTING,
                 now=float(self.clock()),
                 instance_id=str(matches[0]["instance_id"]),
+                residual_inventory=(),
                 sanitized_error=None,
             )
         if attempt.state != AttemptState.STARTING or not attempt.instance_id:
@@ -366,6 +440,7 @@ class CloudRunLifecycle:
     async def wait_until_session_ready(self, session_id):
         initial = self._session(session_id)
         deadline = initial.updated_at + self.boot_deadline_seconds
+        boundary_authentication_started_at = None
         while True:
             try:
                 session = await self.reconcile_session_once(session_id)
@@ -373,6 +448,17 @@ class CloudRunLifecycle:
                 raise
             except TerminalProvisioningError as error:
                 diagnostic = str(error)
+                now = float(self.clock())
+                if diagnostic == BOUNDARY_AUTHENTICATION_ERROR:
+                    if boundary_authentication_started_at is None:
+                        boundary_authentication_started_at = now
+                    grace_deadline = (
+                        boundary_authentication_started_at
+                        + BOUNDARY_AUTHENTICATION_GRACE_SECONDS
+                    )
+                    if now < min(deadline, grace_deadline):
+                        await self.sleep(self.poll_interval_seconds)
+                        continue
                 session = self._session(session_id)
                 session = self.session_repository.transition(
                     session.session_id,
@@ -386,6 +472,8 @@ class CloudRunLifecycle:
                 )
             except Exception:
                 session = self._session(session_id)
+            else:
+                boundary_authentication_started_at = None
             if session.state in {
                 SessionState.READY,
                 SessionState.FAILED,
@@ -413,6 +501,8 @@ class CloudRunLifecycle:
 
     def schedule_session_watchdog(self, session_id):
         key = str(session_id)
+        if key in self._session_preemptions:
+            return None
         existing = _SESSION_WATCHDOGS.get(key)
         if existing is not None and not existing.done():
             return existing
@@ -435,7 +525,38 @@ class CloudRunLifecycle:
         task.add_done_callback(finished)
         return task
 
-    async def _destroy_for_replacement(self, attempt):
+    async def preempt_session(self, session_id):
+        key = str(session_id or "")
+        if not key:
+            raise ValueError("Cloud Run session identity is invalid.")
+        existing = self._session_preemptions.get(key)
+        if existing is not None:
+            await asyncio.shield(existing)
+            return
+        completed = asyncio.get_running_loop().create_future()
+        self._session_preemptions[key] = completed
+        try:
+            recovery_tasks = self._session_recovery_tasks.pop(key, set())
+            tasks = {
+                task
+                for task in (
+                    _SESSION_WATCHDOGS.pop(key, None),
+                    *recovery_tasks,
+                )
+                if task is not None and task is not asyncio.current_task()
+            }
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            if self._session_preemptions.get(key) is completed:
+                self._session_preemptions.pop(key, None)
+            if not completed.done():
+                completed.set_result(None)
+
+    async def _destroy_failed_attempt(self, attempt):
         _settings, api_key = self._api_key()
         instance_id = attempt.instance_id
         if not instance_id:
@@ -443,7 +564,15 @@ class CloudRunLifecycle:
             matches = self._by_label(inventory, attempt.label)
             if inventory is None:
                 return attempt, False
-            if matches:
+            if len(matches) > 1:
+                return (
+                    self._fail_attempt_on_multiple_matches(
+                        attempt,
+                        matches,
+                    ),
+                    False,
+                )
+            if len(matches) == 1:
                 instance_id = str(matches[0].get("instance_id") or "")
         if attempt.state != AttemptState.DESTROYING:
             attempt = self.repository.transition(
@@ -454,12 +583,12 @@ class CloudRunLifecycle:
                 ready_url=None,
             )
         if instance_id:
-            destroyed = await self.provider.destroy_instance(
-                api_key,
-                instance_id,
-            )
-            if not destroyed:
-                return attempt, False
+            try:
+                await self.provider.destroy_instance(api_key, instance_id)
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                raise
+            except Exception:
+                pass
         absent = await self._verified_absent(
             api_key,
             attempt,
@@ -468,18 +597,17 @@ class CloudRunLifecycle:
         return attempt, absent
 
     async def handle_start_failure(self, attempt_id, *, failure_code):
+        del failure_code
+        diagnostic = "The managed instance did not become ready."
         attempt = self._attempt(attempt_id)
         if attempt.state != AttemptState.FAILED:
             attempt = self.repository.transition(
                 attempt.attempt_id,
                 AttemptState.FAILED,
                 now=float(self.clock()),
-                sanitized_error="The managed instance did not become ready.",
+                sanitized_error=diagnostic,
             )
-        if failure_code not in RETRYABLE_START_FAILURES:
-            return attempt
-
-        attempt, absent = await self._destroy_for_replacement(attempt)
+        attempt, absent = await self._destroy_failed_attempt(attempt)
         if not absent:
             return self.repository.transition(
                 attempt.attempt_id,
@@ -490,163 +618,15 @@ class CloudRunLifecycle:
                     "Vast console immediately."
                 ),
             )
-        if (
-            1 + attempt.retry_count
-            >= attempt.quote.max_instance_creates
-        ):
-            return self.repository.transition(
-                attempt.attempt_id,
-                AttemptState.FAILED,
-                now=float(self.clock()),
-                instance_id=None,
-                sanitized_error=(
-                    "The authorized total instance-create limit was reached."
-                ),
-            )
-
-        if self.blacklist is not None:
-            self.blacklist.add(
-                attempt.quote.to_record(),
-                reason=failure_code,
-                now=float(self.clock()),
-            )
-        attempt = self.repository.transition(
-            attempt.attempt_id,
-            AttemptState.RETRYING,
-            now=float(self.clock()),
-            retry_count=1,
-            instance_id=None,
-            ready_url=None,
-            sanitized_error=None,
-        )
-        settings, api_key = self._api_key()
-        if (
-            self.release is None
-            or not attempt.quote.reviewed_release_bound
-            or attempt.quote.template_hash_id
-            != self.release.template_hash_id
-            or attempt.quote.worker_commit != self.release.worker_commit
-            or attempt.quote.worker_archive_sha256
-            != self.release.worker_archive_sha256
-            or attempt.quote.protocol_version
-            != self.release.protocol_version
-        ):
-            return self.repository.transition(
-                attempt.attempt_id,
-                AttemptState.FAILED,
-                now=float(self.clock()),
-                sanitized_error=(
-                    "Reviewed worker release lock is unavailable."
-                ),
-            )
-        try:
-            offers = await self.provider.search_offers(
-                api_key,
-                max_price_per_hour=settings["max_price_per_hour"],
-                min_vram_gb=settings["min_vram_gb"],
-                disk_gb=attempt.quote.disk_gb,
-            )
-            eligible = apply_offer_policy(
-                [
-                    offer
-                    for offer in offers
-                    if float(offer.get("dph_total", float("inf")))
-                    <= attempt.quote.max_price_per_hour
-                    and offer_meets_connection_quality_policy(offer)
-                ],
-                blacklist=self.blacklist,
-                now=float(self.clock()),
-            )
-            selected = select_best_offer(
-                eligible,
-                requested_gpu=attempt.quote.gpu_name,
-            )
-        except Exception:
-            return self.repository.transition(
-                attempt.attempt_id,
-                AttemptState.FAILED,
-                now=float(self.clock()),
-                sanitized_error=(
-                    "No safe replacement offer is currently available."
-                ),
-            )
-
-        replacement_quote = OfferQuote(
-            offer_id=str(selected["offer_id"]),
-            gpu_name=str(selected["gpu_name"]),
-            gpu_ram_gb=float(selected["gpu_ram_gb"]),
-            dph_total=float(selected["dph_total"]),
-            reliability=(
-                float(selected["reliability"])
-                if selected.get("reliability") is not None
-                else None
-            ),
-            inet_down_mbps=selected.get("inet_down_mbps"),
-            disk_bw_mbps=selected.get("disk_bw_mbps"),
-            max_price_per_hour=attempt.quote.max_price_per_hour,
-            expires_at=float(self.clock()) + 120,
-            disk_gb=attempt.quote.disk_gb,
-            transfer_bytes=attempt.quote.transfer_bytes,
-            output_allowance_bytes=(
-                attempt.quote.output_allowance_bytes
-            ),
-            inet_down_cost=selected.get("inet_down_cost"),
-            inet_up_cost=selected.get("inet_up_cost"),
-            duration_seconds=attempt.quote.duration_seconds,
-            deadline_mode=attempt.quote.deadline_mode,
-            approximate_max_active_charge=(
-                float(selected["dph_total"])
-                * attempt.quote.duration_seconds
-                / 3600
-                if attempt.quote.duration_seconds is not None
-                else None
-            ),
-            template_hash_id=attempt.quote.template_hash_id,
-            worker_commit=attempt.quote.worker_commit,
-            worker_archive_sha256=(
-                attempt.quote.worker_archive_sha256
-            ),
-            protocol_version=attempt.quote.protocol_version,
-            manifest_digest=attempt.quote.manifest_digest,
-            machine_id=selected.get("machine_id"),
-            host_id=selected.get("host_id"),
-            public_ipaddr=selected.get("public_ipaddr"),
-            max_instance_creates=attempt.quote.max_instance_creates,
-        )
-        attempt = self.repository.transition(
-            attempt.attempt_id,
-            AttemptState.CREATING,
-            now=float(self.clock()),
-            quote=replacement_quote,
-            retry_count=1,
-        )
-        try:
-            instance_id = await self.provider.create_instance(
-                api_key,
-                offer_id=replacement_quote.offer_id,
-                disk_gb=replacement_quote.disk_gb,
-                label=attempt.label,
-                release=self.release,
-            )
-        except Exception:
-            inventory = await self._inventory(api_key)
-            matches = self._by_label(inventory, attempt.label)
-            if not matches:
-                return self.repository.transition(
-                    attempt.attempt_id,
-                    AttemptState.FAILED,
-                    now=float(self.clock()),
-                    sanitized_error=(
-                        "Replacement creation could not be confirmed."
-                    ),
-                )
-            instance_id = matches[0].get("instance_id")
         return self.repository.transition(
             attempt.attempt_id,
-            AttemptState.STARTING,
+            AttemptState.FAILED,
             now=float(self.clock()),
-            instance_id=str(instance_id),
-            sanitized_error=None,
+            instance_id=None,
+            provider_token=None,
+            residual_inventory=(),
+            ready_url=None,
+            sanitized_error=diagnostic,
         )
 
     async def recover(self):
@@ -667,34 +647,124 @@ class CloudRunLifecycle:
         recovered = []
         for attempt in attempts:
             matches = self._by_label(managed, attempt.label)
+            known_id_matches = [
+                item
+                for item in inventory
+                if attempt.instance_id is not None
+                and str(item.get("instance_id"))
+                == str(attempt.instance_id)
+            ]
             current = attempt
-            if attempt.state == AttemptState.CREATING and matches:
+            if attempt.state == AttemptState.RETRYING:
+                diagnostic = (
+                    "Automatic Vast replacement is disabled. "
+                    "Start a new reviewed rental."
+                )
+                if len(matches) > 1:
+                    current = self._fail_attempt_on_multiple_matches(
+                        attempt,
+                        matches,
+                    )
+                elif len(matches) == 1:
+                    current = self.repository.transition(
+                        attempt.attempt_id,
+                        AttemptState.FAILED,
+                        now=float(self.clock()),
+                        instance_id=str(matches[0]["instance_id"]),
+                        sanitized_error=diagnostic,
+                    )
+                    current, absent = await self._destroy_failed_attempt(
+                        current
+                    )
+                    current = self.repository.transition(
+                        current.attempt_id,
+                        AttemptState.FAILED,
+                        now=float(self.clock()),
+                        instance_id=None if absent else current.instance_id,
+                        provider_token=None if absent else current.provider_token,
+                        residual_inventory=(
+                            () if absent else current.residual_inventory
+                        ),
+                        ready_url=None,
+                        sanitized_error=(
+                            diagnostic
+                            if absent
+                            else (
+                                "The Vast instance is still present; destroy "
+                                "it in the Vast console immediately."
+                            )
+                        ),
+                    )
+                elif known_id_matches:
+                    current = self.repository.transition(
+                        attempt.attempt_id,
+                        AttemptState.FAILED,
+                        now=float(self.clock()),
+                        instance_id=str(attempt.instance_id),
+                        residual_inventory=tuple(
+                            str(item.get("instance_id"))
+                            for item in known_id_matches
+                            if item.get("instance_id") is not None
+                        ),
+                        sanitized_error=(
+                            "The managed Vast instance identity no longer "
+                            "matches its attempt label. Destroy it in the "
+                            "Vast console immediately."
+                        ),
+                    )
+                else:
+                    current = self.repository.transition(
+                        attempt.attempt_id,
+                        AttemptState.FAILED,
+                        now=float(self.clock()),
+                        instance_id=None,
+                        provider_token=None,
+                        residual_inventory=(),
+                        ready_url=None,
+                        sanitized_error=diagnostic,
+                    )
+            elif attempt.state == AttemptState.CREATING and len(matches) > 1:
+                current = self._fail_attempt_on_multiple_matches(
+                    attempt,
+                    matches,
+                )
+            elif attempt.state == AttemptState.CREATING and matches:
                 current = self.repository.transition(
                     attempt.attempt_id,
                     AttemptState.STARTING,
                     now=float(self.clock()),
                     instance_id=str(matches[0]["instance_id"]),
+                    residual_inventory=(),
                     sanitized_error=None,
                 )
             elif attempt.state == AttemptState.STARTING:
-                if matches and not attempt.instance_id:
+                if len(matches) > 1:
+                    current = self._fail_attempt_on_multiple_matches(
+                        attempt,
+                        matches,
+                    )
+                    recovered.append(current)
+                    continue
+                if len(matches) == 1 and not attempt.instance_id:
                     current = self.repository.transition(
                         attempt.attempt_id,
                         AttemptState.STARTING,
                         now=float(self.clock()),
                         instance_id=str(matches[0]["instance_id"]),
+                        residual_inventory=(),
                     )
                 current = await self.reconcile_once(current.attempt_id)
             elif attempt.state in {
                 AttemptState.CANCEL_REQUESTED,
                 AttemptState.DESTROYING,
             }:
-                if matches and not attempt.instance_id:
+                if len(matches) == 1 and not attempt.instance_id:
                     current = self.repository.transition(
                         attempt.attempt_id,
                         attempt.state,
                         now=float(self.clock()),
                         instance_id=str(matches[0]["instance_id"]),
+                        residual_inventory=(),
                     )
                 current = await self.cancel(current.attempt_id)
             recovered.append(current)
@@ -712,6 +782,47 @@ class CloudRunLifecycle:
         return session
 
     @staticmethod
+    def _session_teardown_pending(session):
+        return bool(
+            session.state != SessionState.DESTROYED
+            and (
+                session.destroy_requested
+                or session.state
+                in {
+                    SessionState.DESTROY_REQUESTED,
+                    SessionState.DESTROYING,
+                }
+            )
+        )
+
+    @staticmethod
+    def _session_proven_never_started(session):
+        return bool(
+            session.state
+            in {
+                SessionState.PREFLIGHT,
+                SessionState.OFFER_SELECTED,
+            }
+            and session.instance_id is None
+            and not session.residual_inventory
+            and session.installed_manifest_digest is None
+            and session.worker_base_url is None
+            and session.provider_token is None
+            and session.session_secret_hex is None
+            and session.pending_deadline_at is None
+            and session.pending_deadline_mode is None
+            and session.pending_deadline_action is None
+            and session.create_settings_revision is None
+            and session.create_configuration_revision is None
+            and session.create_reconcile_started_at is None
+            and session.create_empty_observations == 0
+            and session.create_first_empty_at is None
+            and session.create_last_empty_at is None
+            and session.retry_count == 0
+            and not session.destroy_requested
+        )
+
+    @staticmethod
     def _session_matches(inventory, label):
         return sorted(
             [
@@ -723,11 +834,10 @@ class CloudRunLifecycle:
             key=lambda item: str(item.get("instance_id") or ""),
         )
 
-    def _session_connection(self, instance):
+    def _session_connection(self, session, instance):
         if self.release is None:
             return None
         status = str(instance.get("actual_status") or "").casefold()
-        token = instance.get("jupyter_token")
         base_url = vast.derive_base_url(
             instance,
             self.release.worker_port,
@@ -735,16 +845,34 @@ class CloudRunLifecycle:
         if (
             status not in {"running", "ready"}
             or not base_url
-            or not isinstance(token, str)
-            or not token
-            or token != token.strip()
-            or len(token) > 4096
-            or any(ord(character) < 33 for character in token)
+            or not is_boundary_token(session.provider_token)
         ):
             return None
-        return base_url, token
+        return base_url
 
-    def _finalize_session_destroyed(self, session, *, terminal_error=None):
+    def _finalize_session_destroyed(
+        self,
+        session,
+        *,
+        terminal_error=None,
+        compare_and_set=False,
+    ):
+        def transition(current, state, **changes):
+            if compare_and_set:
+                return self.session_repository.save(
+                    current.transition(
+                        state,
+                        now=float(self.clock()),
+                        **changes,
+                    )
+                )
+            return self.session_repository.transition(
+                current.session_id,
+                state,
+                now=float(self.clock()),
+                **changes,
+            )
+
         if session.state == SessionState.DESTROYED:
             return session
         if session.state not in {
@@ -753,23 +881,20 @@ class CloudRunLifecycle:
             SessionState.DESTROY_REQUESTED,
             SessionState.DESTROYING,
         }:
-            session = self.session_repository.transition(
-                session.session_id,
+            session = transition(
+                session,
                 SessionState.DESTROY_REQUESTED,
-                now=float(self.clock()),
                 destroy_requested=True,
             )
         if session.state == SessionState.DESTROY_REQUESTED:
-            session = self.session_repository.transition(
-                session.session_id,
+            session = transition(
+                session,
                 SessionState.DESTROYING,
-                now=float(self.clock()),
                 destroy_requested=True,
             )
-        return self.session_repository.transition(
-            session.session_id,
+        return transition(
+            session,
             SessionState.DESTROYED,
-            now=float(self.clock()),
             destroy_requested=True,
             instance_id=None,
             worker_base_url=None,
@@ -782,24 +907,139 @@ class CloudRunLifecycle:
             pending_deadline_action=None,
         )
 
+    @staticmethod
+    def _known_session_instance_ids(session):
+        values = set()
+        if session.instance_id is not None:
+            values.add(str(session.instance_id))
+        values.update(str(item) for item in session.residual_inventory)
+        return values
+
+    @classmethod
+    def _inventory_session_instance_ids(cls, session, inventory):
+        known_ids = cls._known_session_instance_ids(session)
+        return {
+            str(item.get("instance_id"))
+            for item in inventory
+            if item.get("instance_id") is not None
+            and (
+                item.get("label") == session.label
+                or str(item.get("instance_id")) in known_ids
+            )
+        }
+
+    def _transition_observed_session(
+        self,
+        observed,
+        state,
+        **changes,
+    ):
+        try:
+            saved = self.session_repository.save(
+                observed.transition(
+                    state,
+                    now=float(self.clock()),
+                    **changes,
+                )
+            )
+        except ConcurrentSessionUpdate:
+            return (
+                self.session_repository.get(observed.session_id) or observed,
+                False,
+            )
+        return saved, True
+
+    @classmethod
+    def _preserved_inventory_ids(cls, session, inventory):
+        identities = cls._known_session_instance_ids(session)
+        identities.update(
+            cls._inventory_session_instance_ids(session, inventory)
+        )
+        return identities
+
+    @classmethod
+    def _adoption_residual_ids(cls, session, inventory, instance_id):
+        identities = cls._preserved_inventory_ids(session, inventory)
+        identities.discard(str(instance_id))
+        return tuple(sorted(identities))
+
+    def finalize_verified_absence(
+        self,
+        session,
+        inventory,
+        *,
+        settings_revision,
+        terminal_error=_PRESERVE_ERROR,
+    ):
+        if not self._session_settings_revision_matches(
+            session,
+            settings_revision,
+        ):
+            return None
+        if (
+            not isinstance(inventory, list)
+            or any(not isinstance(item, dict) for item in inventory)
+        ):
+            return None
+        known_ids = self._known_session_instance_ids(session)
+        if not known_ids:
+            return None
+        if any(
+            item.get("label") == session.label
+            or (
+                item.get("instance_id") is not None
+                and str(item.get("instance_id")) in known_ids
+            )
+            for item in inventory
+        ):
+            return None
+        current = self.session_repository.get(session.session_id)
+        if (
+            current is None
+            or current.version != session.version
+            or current.label != session.label
+            or current.instance_id != session.instance_id
+            or current.residual_inventory != session.residual_inventory
+            or not self._session_settings_revision_matches(
+                current,
+                settings_revision,
+            )
+        ):
+            raise ConcurrentSessionUpdate(
+                "The session identity changed after inventory observation."
+            )
+        error = (
+            current.sanitized_error
+            if terminal_error is _PRESERVE_ERROR
+            else terminal_error
+        )
+        return self._finalize_session_destroyed(
+            current,
+            terminal_error=error,
+            compare_and_set=True,
+        )
+
     async def _activate_session_instance(self, session, instance):
-        connection = self._session_connection(instance)
-        if connection is None:
+        base_url = self._session_connection(session, instance)
+        if base_url is None:
             return session
-        base_url, token = connection
         instance_id = str(instance.get("instance_id") or "")
         if not instance_id or instance.get("label") != session.label:
             return session
-        session = self.session_repository.transition(
-            session.session_id,
+        session, saved = self._transition_observed_session(
+            session,
             session.state,
-            now=float(self.clock()),
             instance_id=instance_id,
             worker_base_url=base_url,
-            provider_token=token,
-            residual_inventory=(),
+            residual_inventory=self._adoption_residual_ids(
+                session,
+                (instance,),
+                instance_id,
+            ),
             sanitized_error=None,
         )
+        if not saved:
+            return session
         service = self.session_service
         if session.state in {
             SessionState.BOOTSTRAPPING,
@@ -824,43 +1064,55 @@ class CloudRunLifecycle:
         session = self._session(session_id)
         if session.state == SessionState.DESTROYED:
             return session
-        if session.state in {
-            SessionState.DESTROY_REQUESTED,
-            SessionState.DESTROYING,
-        }:
+        if self._session_teardown_pending(session):
             return await self.destroy_session(session.session_id)
         settings, api_key = self._api_key()
-        del settings
+        settings_revision = self._settings_revision(settings)
+        if not self._session_settings_revision_matches(
+            session,
+            settings_revision,
+        ):
+            return session
         if session.state == SessionState.CREATING:
             inventory = await self._inventory(api_key)
             matches = self._session_matches(inventory, session.label)
             if len(matches) > 1:
-                return self.session_repository.transition(
-                    session.session_id,
+                failed, _saved = self._transition_observed_session(
+                    session,
                     SessionState.FAILED,
-                    now=float(self.clock()),
-                    instance_id=(
-                        str(matches[0].get("instance_id") or "")
-                        or session.instance_id
-                    ),
+                    instance_id=None,
                     residual_inventory=tuple(
-                        str(item.get("instance_id"))
-                        for item in matches
-                        if item.get("instance_id") is not None
+                        sorted(
+                            self._preserved_inventory_ids(
+                                session,
+                                inventory,
+                            )
+                        )
                     ),
                     sanitized_error=(
                         "Multiple managed Vast instances match this session."
                     ),
                 )
+                return failed
             if not matches:
-                return session
-            session = self.session_repository.transition(
-                session.session_id,
+                return (
+                    self.session_repository.get(session.session_id)
+                    or session
+                )
+            instance_id = str(matches[0]["instance_id"])
+            session, saved = self._transition_observed_session(
+                session,
                 SessionState.BOOTSTRAPPING,
-                now=float(self.clock()),
-                instance_id=str(matches[0]["instance_id"]),
+                instance_id=instance_id,
+                residual_inventory=self._adoption_residual_ids(
+                    session,
+                    inventory,
+                    instance_id,
+                ),
                 sanitized_error=None,
             )
+            if not saved:
+                return session
             return await self._activate_session_instance(
                 session,
                 matches[0],
@@ -883,19 +1135,38 @@ class CloudRunLifecycle:
         if session.state == SessionState.DESTROYED:
             return session
         if (
-            session.state
-            in {
-                SessionState.PREFLIGHT,
-                SessionState.OFFER_SELECTED,
-            }
-            and session.instance_id is None
+            terminal_error is not None
+            and session.deadline_mode == "none"
             and not session.destroy_requested
         ):
+            if (
+                session.state != SessionState.FAILED
+                or session.sanitized_error != terminal_error
+            ):
+                return self.session_repository.transition(
+                    session.session_id,
+                    SessionState.FAILED,
+                    now=float(self.clock()),
+                    sanitized_error=terminal_error,
+                )
+            return session
+        if self._session_proven_never_started(session):
             return self._finalize_session_destroyed(
                 session,
                 terminal_error=terminal_error,
             )
         original_state = session.state
+        if session.state in {
+            SessionState.PREFLIGHT,
+            SessionState.OFFER_SELECTED,
+        }:
+            session = self.session_repository.transition(
+                session.session_id,
+                SessionState.FAILED,
+                now=float(self.clock()),
+                destroy_requested=True,
+                sanitized_error=terminal_error,
+            )
         if session.state not in {
             SessionState.DESTROY_REQUESTED,
             SessionState.DESTROYING,
@@ -907,62 +1178,92 @@ class CloudRunLifecycle:
                 destroy_requested=True,
                 sanitized_error=terminal_error,
             )
-        _settings, api_key = self._api_key()
+        preempt_surfaces = getattr(
+            self.session_service,
+            "preempt_session_surfaces",
+            None,
+        )
+        if callable(preempt_surfaces):
+            try:
+                await preempt_surfaces(session.session_id)
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                raise
+            except Exception:
+                pass
+        settings, api_key = self._api_key()
+        settings_revision = self._settings_revision(settings)
+        if not self._session_settings_revision_matches(
+            session,
+            settings_revision,
+        ):
+            return self._fail_closed_credential_binding(session)
         instance_id = session.instance_id
         if not instance_id:
             inventory = await self._inventory(api_key)
             if inventory is None:
-                return self.session_repository.transition(
-                    session.session_id,
+                failed, _saved = self._transition_observed_session(
+                    session,
                     SessionState.FAILED,
-                    now=float(self.clock()),
                     destroy_requested=True,
                     sanitized_error=(
                         "Destruction could not be verified because Vast "
                         "inventory is unavailable."
                     ),
                 )
+                return failed
             matches = self._session_matches(inventory, session.label)
             if len(matches) > 1:
-                return self.session_repository.transition(
-                    session.session_id,
+                failed, _saved = self._transition_observed_session(
+                    session,
                     SessionState.FAILED,
-                    now=float(self.clock()),
-                    instance_id=(
-                        str(matches[0].get("instance_id") or "")
-                        or None
-                    ),
+                    instance_id=None,
                     residual_inventory=tuple(
-                        str(item.get("instance_id"))
-                        for item in matches
-                        if item.get("instance_id") is not None
+                        sorted(
+                            self._preserved_inventory_ids(
+                                session,
+                                inventory,
+                            )
+                        )
                     ),
                     destroy_requested=True,
                     sanitized_error=(
                         "Multiple managed Vast instances match this session."
                     ),
                 )
+                return failed
             if matches and matches[0].get("instance_id") is not None:
                 instance_id = str(matches[0]["instance_id"])
-                session = self.session_repository.transition(
-                    session.session_id,
+                session, saved = self._transition_observed_session(
+                    session,
                     session.state,
-                    now=float(self.clock()),
                     instance_id=instance_id,
-                    residual_inventory=(),
+                    residual_inventory=self._adoption_residual_ids(
+                        session,
+                        inventory,
+                        instance_id,
+                    ),
                 )
+                if not saved:
+                    return session
             elif matches:
-                return self.session_repository.transition(
-                    session.session_id,
+                failed, _saved = self._transition_observed_session(
+                    session,
                     SessionState.FAILED,
-                    now=float(self.clock()),
                     destroy_requested=True,
-                    residual_inventory=(),
+                    residual_inventory=tuple(
+                        sorted(
+                            self._preserved_inventory_ids(
+                                session,
+                                inventory,
+                            )
+                        )
+                    ),
                     sanitized_error=(
                         "A managed Vast instance remains but its identity "
                         "cannot be verified; use the Vast console immediately."
                     ),
                 )
+                return failed
             elif original_state in {
                 SessionState.CONFIRMING,
                 SessionState.CREATING,
@@ -973,20 +1274,44 @@ class CloudRunLifecycle:
             ):
                 return session
             else:
-                return self._finalize_session_destroyed(
+                try:
+                    destroyed = self.finalize_verified_absence(
+                        session,
+                        inventory,
+                        settings_revision=settings_revision,
+                        terminal_error=terminal_error,
+                    )
+                except ConcurrentSessionUpdate:
+                    return self._session(session.session_id)
+                if destroyed is not None:
+                    return destroyed
+                known_ids = self._known_session_instance_ids(session)
+                failed, _saved = self._transition_observed_session(
                     session,
-                    terminal_error=terminal_error,
+                    SessionState.FAILED,
+                    residual_inventory=tuple(sorted(known_ids)),
+                    destroy_requested=True,
+                    sanitized_error=(
+                        "The Vast instance is still present; destroy it in "
+                        "the Vast console immediately."
+                        if known_ids
+                        else (
+                            "Destruction could not be verified because the "
+                            "managed Vast instance identity is unavailable."
+                        )
+                    ),
                 )
+                return failed
         if session.state != SessionState.DESTROYING:
-            session = self.session_repository.transition(
-                session.session_id,
+            session, saved = self._transition_observed_session(
+                session,
                 SessionState.DESTROYING,
-                now=float(self.clock()),
                 instance_id=str(instance_id),
                 destroy_requested=True,
                 worker_base_url=None,
-                provider_token=None,
             )
+            if not saved:
+                return session
         try:
             await self.provider.destroy_instance(api_key, instance_id)
         except (asyncio.CancelledError, KeyboardInterrupt):
@@ -995,48 +1320,48 @@ class CloudRunLifecycle:
             pass
         inventory = await self._inventory(api_key)
         if inventory is None:
-            return self.session_repository.transition(
-                session.session_id,
+            known_ids = self._known_session_instance_ids(session)
+            known_ids.add(str(instance_id))
+            failed, _saved = self._transition_observed_session(
+                session,
                 SessionState.FAILED,
-                now=float(self.clock()),
                 instance_id=str(instance_id),
-                residual_inventory=(str(instance_id),),
+                residual_inventory=tuple(sorted(known_ids)),
                 destroy_requested=True,
                 sanitized_error=(
                     "Destruction could not be verified because Vast "
                     "inventory is unavailable."
                 ),
             )
-        residual = self._session_matches(inventory, session.label)
-        residual_ids = tuple(
-            str(item.get("instance_id"))
-            for item in residual
-            if item.get("instance_id") is not None
-        )
-        still_present = any(
-            str(item.get("instance_id")) == str(instance_id)
-            or item.get("label") == session.label
-            for item in inventory
-        )
-        if still_present:
-            return self.session_repository.transition(
-                session.session_id,
-                SessionState.FAILED,
-                now=float(self.clock()),
-                instance_id=str(instance_id),
-                residual_inventory=(
-                    residual_ids or (str(instance_id),)
-                ),
-                destroy_requested=True,
-                sanitized_error=(
-                    "The Vast instance is still present; destroy it in "
-                    "the Vast console immediately."
-                ),
+            return failed
+        try:
+            destroyed = self.finalize_verified_absence(
+                session,
+                inventory,
+                settings_revision=settings_revision,
+                terminal_error=terminal_error,
             )
-        return self._finalize_session_destroyed(
+        except ConcurrentSessionUpdate:
+            return self._session(session.session_id)
+        if destroyed is not None:
+            return destroyed
+        residual_ids = self._preserved_inventory_ids(
             session,
-            terminal_error=terminal_error,
+            inventory,
         )
+        residual_ids.add(str(instance_id))
+        failed, _saved = self._transition_observed_session(
+            session,
+            SessionState.FAILED,
+            instance_id=str(instance_id),
+            residual_inventory=tuple(sorted(residual_ids)),
+            destroy_requested=True,
+            sanitized_error=(
+                "The Vast instance is still present; destroy it in "
+                "the Vast console immediately."
+            ),
+        )
+        return failed
 
     async def enforce_session_deadline(self, session_id):
         session = self._session(session_id)
@@ -1071,20 +1396,56 @@ class CloudRunLifecycle:
                 confirmed(destroyed.session_id)
         return destroyed
 
-    async def recover_sessions(self):
+    async def _recover_destroy_requested(
+        self,
+        original,
+        *,
+        settings_revision,
+    ):
         repository = self.session_repository
-        if repository is None or not callable(
-            getattr(repository, "list_recoverable", None)
+        current = repository.get(original.session_id)
+        if current is None or current.version != original.version:
+            return current or original
+        if not self._session_settings_revision_matches(
+            current,
+            settings_revision,
         ):
-            return []
-        sessions = repository.list_recoverable()
-        try:
-            _settings, api_key = self._api_key()
-            inventory = await self._inventory(api_key)
-        except Exception:
-            return sessions
+            return current
+        if not self._session_teardown_pending(current):
+            return current
+        resume_session = getattr(
+            self.session_service,
+            "resume_session",
+            None,
+        )
+        if callable(resume_session):
+            try:
+                return await resume_session(current.session_id)
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                raise
+            except Exception:
+                pass
+        return await self.destroy_session(current.session_id)
+
+    async def _recover_session_from_inventory(
+        self,
+        original,
+        inventory,
+        *,
+        settings_revision,
+    ):
+        repository = self.session_repository
+        current = repository.get(original.session_id)
+        if current is None or current.version != original.version:
+            return current or original
+        if not self._session_settings_revision_matches(
+            current,
+            settings_revision,
+        ):
+            return current
         if inventory is None:
-            return sessions
+            return current
+        session = current
         managed = [
             item
             for item in inventory
@@ -1092,153 +1453,269 @@ class CloudRunLifecycle:
                 "comfy-cloud-run-"
             )
         ]
-        recovered = []
-        for original in sessions:
-            session = original
-            matches = self._session_matches(managed, session.label)
-            known_id_matches = [
-                item
-                for item in inventory
-                if session.instance_id is not None
-                and str(item.get("instance_id"))
-                == str(session.instance_id)
-            ]
-            if session.state in {
-                SessionState.DESTROY_REQUESTED,
-                SessionState.DESTROYING,
-            }:
-                session = await self.destroy_session(
-                    session.session_id
-                )
-                recovered.append(session)
-                continue
-            if len(matches) > 1:
-                session = repository.transition(
-                    session.session_id,
+        matches = self._session_matches(managed, session.label)
+        known_ids = self._known_session_instance_ids(session)
+        known_id_matches = [
+            item
+            for item in inventory
+            if item.get("instance_id") is not None
+            and str(item.get("instance_id")) in known_ids
+        ]
+        if self._session_teardown_pending(session):
+            return await self._recover_destroy_requested(
+                session,
+                settings_revision=settings_revision,
+            )
+        if len(matches) > 1:
+            failed, _saved = self._transition_observed_session(
+                session,
+                SessionState.FAILED,
+                instance_id=None,
+                residual_inventory=tuple(
+                    sorted(
+                        self._preserved_inventory_ids(
+                            session,
+                            inventory,
+                        )
+                    )
+                ),
+                sanitized_error=(
+                    "Multiple managed Vast instances match this session."
+                ),
+            )
+            return failed
+        if not matches:
+            if known_id_matches:
+                failed, _saved = self._transition_observed_session(
+                    session,
                     SessionState.FAILED,
-                    now=float(self.clock()),
-                    instance_id=(
-                        str(matches[0].get("instance_id") or "")
-                        or session.instance_id
-                    ),
+                    instance_id=session.instance_id,
                     residual_inventory=tuple(
-                        str(item.get("instance_id"))
-                        for item in matches
-                        if item.get("instance_id") is not None
+                        sorted(
+                            self._preserved_inventory_ids(
+                                session,
+                                inventory,
+                            )
+                        )
                     ),
                     sanitized_error=(
-                        "Multiple managed Vast instances match this session."
+                        "The managed Vast instance identity no longer "
+                        "matches its session label."
                     ),
                 )
-                recovered.append(session)
-                continue
-            if not matches:
-                if known_id_matches:
-                    session = repository.transition(
-                        session.session_id,
-                        SessionState.FAILED,
-                        now=float(self.clock()),
-                        instance_id=str(session.instance_id),
-                        residual_inventory=tuple(
-                            str(item.get("instance_id"))
-                            for item in known_id_matches
-                            if item.get("instance_id") is not None
-                        ),
-                        sanitized_error=(
-                            "The managed Vast instance identity no longer "
-                            "matches its session label."
-                        ),
-                    )
-                    recovered.append(session)
-                    continue
-                deadline_expired = (
-                    session.deadline_mode == "finite"
-                    and isinstance(session.deadline_at, (int, float))
-                    and not isinstance(session.deadline_at, bool)
-                    and float(self.clock()) >= session.deadline_at
-                    and session.instance_id is not None
-                    and session.state
-                    not in {
-                        SessionState.CONFIRMING,
-                        SessionState.CREATING,
-                    }
-                )
+                return failed
+            deadline_expired = (
+                session.deadline_mode == "finite"
+                and isinstance(session.deadline_at, (int, float))
+                and not isinstance(session.deadline_at, bool)
+                and float(self.clock()) >= session.deadline_at
+                and session.instance_id is not None
+                and session.state
+                not in {
+                    SessionState.CONFIRMING,
+                    SessionState.CREATING,
+                }
+            )
+            absent = self.finalize_verified_absence(
+                session,
+                inventory,
+                settings_revision=settings_revision,
+            )
+            if absent is not None:
                 if deadline_expired:
-                    session = self._finalize_session_destroyed(session)
                     confirmed = getattr(
                         self.session_service,
                         "confirmed_deadline_destroy",
                         None,
                     )
                     if callable(confirmed):
-                        confirmed(session.session_id)
-                    recovered.append(session)
-                    continue
-                if session.state in {
-                    SessionState.CREATING,
-                    SessionState.BOOTSTRAPPING,
-                    SessionState.PROVISIONING,
-                    SessionState.VALIDATING,
-                    SessionState.READY,
-                    SessionState.RUNNING,
-                    SessionState.HARVESTING,
-                    SessionState.REPAIRING,
-                }:
-                    session = repository.transition(
-                        session.session_id,
-                        SessionState.FAILED,
-                        now=float(self.clock()),
-                        instance_id=None,
-                        worker_base_url=None,
-                        provider_token=None,
-                        residual_inventory=(),
-                        sanitized_error=(
-                            "The managed Vast instance is absent."
-                        ),
-                    )
-                recovered.append(session)
-                continue
-            instance = matches[0]
-            if session.state == SessionState.CREATING:
-                session = repository.transition(
-                    session.session_id,
-                    SessionState.BOOTSTRAPPING,
-                    now=float(self.clock()),
-                    instance_id=str(instance["instance_id"]),
-                    sanitized_error=None,
-                )
-            try:
-                session = await self._activate_session_instance(
+                        confirmed(absent.session_id)
+                return absent
+            if session.state in {
+                SessionState.CREATING,
+                SessionState.BOOTSTRAPPING,
+                SessionState.PROVISIONING,
+                SessionState.VALIDATING,
+                SessionState.READY,
+                SessionState.RUNNING,
+                SessionState.HARVESTING,
+                SessionState.REPAIRING,
+            }:
+                session, _saved = self._transition_observed_session(
                     session,
-                    instance,
-                )
-            except (asyncio.CancelledError, KeyboardInterrupt):
-                raise
-            except TerminalProvisioningError as error:
-                diagnostic = str(error)
-                session = repository.get(session.session_id)
-                session = repository.transition(
-                    session.session_id,
                     SessionState.FAILED,
-                    now=float(self.clock()),
-                    sanitized_error=diagnostic,
+                    instance_id=None,
+                    worker_base_url=None,
+                    residual_inventory=(),
+                    sanitized_error=(
+                        "The managed Vast instance is absent."
+                    ),
                 )
-                session = await self.destroy_session(
-                    session.session_id,
-                    terminal_error=diagnostic,
+            return session
+        instance = matches[0]
+        if session.state == SessionState.CREATING:
+            instance_id = str(instance["instance_id"])
+            session, saved = self._transition_observed_session(
+                session,
+                SessionState.BOOTSTRAPPING,
+                instance_id=instance_id,
+                residual_inventory=self._adoption_residual_ids(
+                    session,
+                    inventory,
+                    instance_id,
+                ),
+                sanitized_error=None,
+            )
+            if not saved:
+                return session
+        try:
+            session = await self._activate_session_instance(
+                session,
+                instance,
+            )
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            raise
+        except TerminalProvisioningError as error:
+            diagnostic = str(error)
+            session = repository.get(session.session_id)
+            session = repository.transition(
+                session.session_id,
+                SessionState.FAILED,
+                now=float(self.clock()),
+                sanitized_error=diagnostic,
+            )
+            session = await self.destroy_session(
+                session.session_id,
+                terminal_error=diagnostic,
+            )
+            if session.state == SessionState.DESTROYED:
+                confirmed = getattr(
+                    self.session_service,
+                    "confirmed_terminal_destroy",
+                    None,
                 )
-                if session.state == SessionState.DESTROYED:
-                    confirmed = getattr(
-                        self.session_service,
-                        "confirmed_terminal_destroy",
-                        None,
+                if callable(confirmed):
+                    confirmed(session.session_id)
+        except Exception:
+            session = repository.get(session.session_id)
+        return session
+
+    async def recover_sessions(self):
+        repository = self.session_repository
+        if repository is None or not callable(
+            getattr(repository, "list_recoverable", None)
+        ):
+            return []
+        sessions = repository.list_recoverable()
+        sessions = [
+            session
+            for session in sessions
+            if session.session_id not in self._session_preemptions
+        ]
+        if not sessions:
+            return []
+        try:
+            settings, api_key = self._api_key()
+        except Exception:
+            return sessions
+        settings_revision = self._settings_revision(settings)
+        eligible_sessions = []
+        blocked_sessions = {}
+        for session in sessions:
+            if self._session_settings_revision_matches(
+                session,
+                settings_revision,
+            ):
+                eligible_sessions.append(session)
+            else:
+                blocked_sessions[session.session_id] = session
+        if not eligible_sessions:
+            return sessions
+        recovered_by_id = dict(blocked_sessions)
+        inventory_sessions = []
+        for session in eligible_sessions:
+            if self._session_teardown_pending(session):
+                try:
+                    recovered = await self._recover_destroy_requested(
+                        session,
+                        settings_revision=settings_revision,
                     )
-                    if callable(confirmed):
-                        confirmed(session.session_id)
-            except Exception:
-                session = repository.get(session.session_id)
-            recovered.append(session)
-        return recovered
+                except (
+                    asyncio.CancelledError,
+                    KeyboardInterrupt,
+                    SystemExit,
+                ):
+                    raise
+                except Exception:
+                    recovered = repository.get(session.session_id) or session
+                recovered_by_id[session.session_id] = recovered
+            else:
+                inventory_sessions.append(session)
+        if not inventory_sessions:
+            return [
+                recovered_by_id[session.session_id]
+                for session in sessions
+                if session.session_id in recovered_by_id
+            ]
+        inventory_task = asyncio.create_task(self._inventory(api_key))
+        recovery_tasks = []
+
+        async def recover_one(original):
+            inventory = await asyncio.shield(inventory_task)
+            return await self._recover_session_from_inventory(
+                original,
+                inventory,
+                settings_revision=settings_revision,
+            )
+
+        for session in inventory_sessions:
+            task = asyncio.create_task(recover_one(session))
+            recovery_tasks.append(task)
+            registered = self._session_recovery_tasks.setdefault(
+                session.session_id,
+                set(),
+            )
+            registered.add(task)
+
+            def recovery_finished(completed, session_id=session.session_id):
+                current = self._session_recovery_tasks.get(session_id)
+                if current is None:
+                    return
+                current.discard(completed)
+                if not current:
+                    self._session_recovery_tasks.pop(session_id, None)
+
+            task.add_done_callback(recovery_finished)
+        try:
+            results = await asyncio.gather(
+                *recovery_tasks,
+                return_exceptions=True,
+            )
+        finally:
+            if not inventory_task.done():
+                inventory_task.cancel()
+                await asyncio.gather(inventory_task, return_exceptions=True)
+        if results and not recovered_by_id and all(
+            isinstance(result, asyncio.CancelledError)
+            for result in results
+        ):
+            raise asyncio.CancelledError
+        for original, result in zip(inventory_sessions, results):
+            if isinstance(result, asyncio.CancelledError):
+                continue
+            if isinstance(result, (KeyboardInterrupt, SystemExit)):
+                raise result
+            if isinstance(result, BaseException):
+                recovered_by_id[original.session_id] = (
+                    repository.get(original.session_id) or original
+                )
+            else:
+                recovered_by_id[original.session_id] = result
+        return [
+            recovered_by_id[session.session_id]
+            for session in sessions
+            if session.session_id in recovered_by_id
+        ]
 
     async def handle_session_boot_failure(
         self,
@@ -1246,19 +1723,25 @@ class CloudRunLifecycle:
         *,
         failure_code,
     ):
+        del failure_code
+        diagnostic = "The managed worker did not become ready."
         session = self._session(session_id)
         if session.state != SessionState.FAILED:
             session = self.session_repository.transition(
                 session.session_id,
                 SessionState.FAILED,
                 now=float(self.clock()),
-                sanitized_error=(
-                    "The managed worker did not become ready."
-                ),
+                sanitized_error=diagnostic,
             )
-        if failure_code not in RETRYABLE_START_FAILURES:
+        if session.deadline_mode == "none":
             return session
-        _settings, api_key = self._api_key()
+        settings, api_key = self._api_key()
+        settings_revision = self._settings_revision(settings)
+        if not self._session_settings_revision_matches(
+            session,
+            settings_revision,
+        ):
+            return self._fail_closed_credential_binding(session)
         instance_id = session.instance_id
         session = self.session_repository.transition(
             session.session_id,
@@ -1266,221 +1749,68 @@ class CloudRunLifecycle:
             now=float(self.clock()),
             instance_id=instance_id,
             worker_base_url=None,
-            provider_token=None,
         )
         if instance_id:
             try:
-                destroyed = await self.provider.destroy_instance(
+                await self.provider.destroy_instance(
                     api_key,
                     instance_id,
                 )
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                raise
             except Exception:
-                destroyed = False
-            if not destroyed:
-                return self.session_repository.transition(
-                    session.session_id,
-                    SessionState.FAILED,
-                    now=float(self.clock()),
-                    residual_inventory=(str(instance_id),),
-                    sanitized_error=(
-                        "The Vast instance could not be destroyed."
-                    ),
-                )
+                pass
         inventory = await self._inventory(api_key)
+        known_ids = self._known_session_instance_ids(session)
         absent = inventory is not None and not any(
-            str(item.get("instance_id")) == str(instance_id)
-            or item.get("label") == session.label
+            item.get("label") == session.label
+            or (
+                item.get("instance_id") is not None
+                and str(item.get("instance_id")) in known_ids
+            )
             for item in inventory
         )
         if not absent:
-            return self.session_repository.transition(
-                session.session_id,
+            residual_ids = set(known_ids)
+            if inventory is not None:
+                residual_ids.update(
+                    self._inventory_session_instance_ids(
+                        session,
+                        inventory,
+                    )
+                )
+            failed, _saved = self._transition_observed_session(
+                session,
                 SessionState.FAILED,
-                now=float(self.clock()),
-                residual_inventory=(
-                    (str(instance_id),) if instance_id else ()
-                ),
+                residual_inventory=tuple(sorted(residual_ids)),
                 sanitized_error=(
                     "The Vast instance is still present; destroy it in "
                     "the Vast console immediately."
                 ),
             )
+            return failed
+        current = self.session_repository.get(session.session_id)
+        if current is None:
+            return session
         if (
-            session.quote is not None
-            and 1 + session.retry_count
-            >= session.quote.max_instance_creates
+            current.version != session.version
+            or current.instance_id != session.instance_id
+            or current.residual_inventory != session.residual_inventory
+            or current.create_settings_revision
+            != session.create_settings_revision
         ):
-            return self.session_repository.transition(
-                session.session_id,
-                SessionState.FAILED,
-                now=float(self.clock()),
-                instance_id=None,
-                residual_inventory=(),
-                sanitized_error=(
-                    "The authorized total instance-create limit was reached."
-                ),
-            )
-        if (
-            self.release is None
-            or session.quote is None
-            or session.quote.template_hash_id
-            != self.release.template_hash_id
-            or session.quote.worker_commit != self.release.worker_commit
-            or session.quote.worker_archive_sha256
-            != self.release.worker_archive_sha256
-            or session.quote.protocol_version
-            != self.release.protocol_version
-        ):
-            return self.session_repository.transition(
-                session.session_id,
-                SessionState.FAILED,
-                now=float(self.clock()),
-                instance_id=None,
-                sanitized_error=(
-                    "Reviewed worker release lock is unavailable."
-                ),
-            )
-        if self.blacklist is not None:
-            self.blacklist.add(
-                session.quote.to_record(),
-                reason=failure_code,
-                now=float(self.clock()),
-            )
-        settings, api_key = self._api_key()
-        try:
-            offers = await self.provider.search_offers(
-                api_key,
-                max_price_per_hour=settings["max_price_per_hour"],
-                min_vram_gb=settings["min_vram_gb"],
-                disk_gb=session.disk_gb,
-            )
-            eligible = apply_offer_policy(
-                [
-                    offer
-                    for offer in offers
-                    if float(offer.get("dph_total", float("inf")))
-                    <= session.quote.max_price_per_hour
-                    and offer_meets_connection_quality_policy(offer)
-                ],
-                blacklist=self.blacklist,
-                now=float(self.clock()),
-            )
-            selected = select_best_offer(
-                eligible,
-                requested_gpu=session.quote.gpu_name,
-            )
-        except Exception:
-            return self.session_repository.transition(
-                session.session_id,
-                SessionState.FAILED,
-                now=float(self.clock()),
-                instance_id=None,
-                sanitized_error=(
-                    "No safe replacement offer is currently available."
-                ),
-            )
-        replacement_quote = OfferQuote(
-            offer_id=str(selected["offer_id"]),
-            gpu_name=str(selected["gpu_name"]),
-            gpu_ram_gb=float(selected["gpu_ram_gb"]),
-            dph_total=float(selected["dph_total"]),
-            reliability=(
-                float(selected["reliability"])
-                if selected.get("reliability") is not None
-                else None
-            ),
-            inet_down_mbps=selected.get("inet_down_mbps"),
-            disk_bw_mbps=selected.get("disk_bw_mbps"),
-            max_price_per_hour=session.quote.max_price_per_hour,
-            expires_at=float(self.clock()) + 120,
-            disk_gb=session.quote.disk_gb,
-            transfer_bytes=session.quote.transfer_bytes,
-            output_allowance_bytes=(
-                session.quote.output_allowance_bytes
-            ),
-            inet_down_cost=selected.get("inet_down_cost"),
-            inet_up_cost=selected.get("inet_up_cost"),
-            duration_seconds=session.quote.duration_seconds,
-            deadline_mode=session.quote.deadline_mode,
-            approximate_max_active_charge=(
-                float(selected["dph_total"])
-                * session.quote.duration_seconds
-                / 3600
-                if session.quote.duration_seconds is not None
-                else None
-            ),
-            template_hash_id=session.quote.template_hash_id,
-            worker_commit=session.quote.worker_commit,
-            worker_archive_sha256=(
-                session.quote.worker_archive_sha256
-            ),
-            protocol_version=session.quote.protocol_version,
-            manifest_digest=session.quote.manifest_digest,
-            machine_id=selected.get("machine_id"),
-            host_id=selected.get("host_id"),
-            public_ipaddr=selected.get("public_ipaddr"),
-            max_instance_creates=session.quote.max_instance_creates,
-        )
-        session = self.session_repository.transition(
-            session.session_id,
-            SessionState.CREATING,
+            return current
+        cleared = session.transition(
+            SessionState.FAILED,
             now=float(self.clock()),
-            quote=replacement_quote,
-            retry_count=1,
             instance_id=None,
+            worker_base_url=None,
+            provider_token=None,
+            session_secret_hex=None,
             residual_inventory=(),
-            sanitized_error=None,
+            sanitized_error=diagnostic,
         )
         try:
-            replacement_id = await self.provider.create_instance(
-                api_key,
-                offer_id=replacement_quote.offer_id,
-                disk_gb=replacement_quote.disk_gb,
-                label=session.label,
-                release=self.release,
-            )
-        except Exception:
-            inventory = await self._inventory(api_key)
-            matches = self._session_matches(inventory, session.label)
-            if len(matches) == 1 and matches[0].get("instance_id"):
-                return self.session_repository.transition(
-                    session.session_id,
-                    SessionState.BOOTSTRAPPING,
-                    now=float(self.clock()),
-                    instance_id=str(matches[0]["instance_id"]),
-                    residual_inventory=(),
-                    sanitized_error=None,
-                )
-            if len(matches) > 1:
-                return self.session_repository.transition(
-                    session.session_id,
-                    SessionState.FAILED,
-                    now=float(self.clock()),
-                    instance_id=(
-                        str(matches[0].get("instance_id") or "")
-                        or None
-                    ),
-                    residual_inventory=tuple(
-                        str(item.get("instance_id"))
-                        for item in matches
-                        if item.get("instance_id") is not None
-                    ),
-                    sanitized_error=(
-                        "Multiple managed Vast instances match this session."
-                    ),
-                )
-            return self.session_repository.transition(
-                session.session_id,
-                SessionState.FAILED,
-                now=float(self.clock()),
-                sanitized_error=(
-                    "Replacement creation could not be confirmed."
-                ),
-            )
-        return self.session_repository.transition(
-            session.session_id,
-            SessionState.BOOTSTRAPPING,
-            now=float(self.clock()),
-            instance_id=str(replacement_id),
-            sanitized_error=None,
-        )
+            return self.session_repository.save(cleared)
+        except ConcurrentSessionUpdate:
+            return self.session_repository.get(session.session_id) or session

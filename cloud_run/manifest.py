@@ -12,11 +12,12 @@ from urllib.parse import urlsplit
 
 PINNED_COMFYUI_CORE_VERSION = "0.29.0"
 PINNED_COMFYUI_FRONTEND_VERSION = "1.47.10"
-MANIFEST_SCHEMA_VERSION = 1
-PROTOCOL_VERSION = "1"
+MANIFEST_SCHEMA_VERSION = 2
+PROTOCOL_VERSION = "2"
 
 _HEX_40 = re.compile(r"[0-9a-f]{40}")
 _HEX_64 = re.compile(r"[0-9a-f]{64}")
+_UI_REVISION = re.compile(r"(?:[0-9a-f]{40}|sha256:[0-9a-f]{64})")
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}")
 _GITHUB_PART = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}")
 _R2_BUCKET = re.compile(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]")
@@ -25,9 +26,54 @@ _ARTIFACT_KINDS = {
     "custom_node_archive",
     "input",
     "model",
+    "profile_archive",
     "python_wheel",
+    "ui_package_archive",
     "worker",
 }
+_PROFILE_ROOTS = frozenset(
+    {"assets", "backgrounds", "bootstrap", "palettes", "settings", "workflows"}
+)
+_PROFILE_FORBIDDEN_NAMES = frozenset(
+    {
+        ".env",
+        "cache",
+        "caches",
+        "comfyui.db",
+        "credentials",
+        "cookies",
+        "logs",
+        "secrets",
+        "tokens",
+        "__pycache__",
+    }
+)
+_PROFILE_FORBIDDEN_SUFFIXES = frozenset(
+    {".db", ".key", ".log", ".pem", ".pyc", ".pyo"}
+)
+_UI_CAPABILITIES = frozenset(
+    {"graph_read", "graph_edit", "native_run", "native_batch"}
+)
+_PROTECTED_RUNTIME_DISTRIBUTIONS = frozenset(
+    {
+        "accelerate",
+        "aiohttp",
+        "comfyui",
+        "comfyui-frontend-package",
+        "numpy",
+        "open-clip-torch",
+        "pillow",
+        "pip",
+        "requests",
+        "safetensors",
+        "setuptools",
+        "torch",
+        "torchaudio",
+        "torchvision",
+        "transformers",
+        "wheel",
+    }
+)
 
 
 class ManifestValidationError(ValueError):
@@ -72,6 +118,32 @@ class CustomNodeSpec:
 
 
 @dataclass(frozen=True)
+class ProfileFileSpec:
+    path: str
+    size_bytes: int
+    sha256: str
+
+
+@dataclass(frozen=True)
+class ProfileSpec:
+    profile_id: str
+    revision: int
+    archive: ArtifactSpec
+    bootstrap_digest: str
+    files: tuple[ProfileFileSpec, ...]
+
+
+@dataclass(frozen=True)
+class UiPackageSpec:
+    package_id: str
+    repository_url: str
+    revision: str
+    archive: ArtifactSpec
+    web_sha256: str
+    required_capabilities: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class DependencyManifest:
     schema_version: int
     protocol_version: str
@@ -83,6 +155,9 @@ class DependencyManifest:
     artifacts: tuple[ArtifactSpec, ...]
     output_allowance_bytes: int
     disk_gb: int
+    ui_packages: tuple[UiPackageSpec, ...] = ()
+    profile: ProfileSpec | None = None
+    minimum_vram_gb: float = 0.0
 
     def canonical_bytes(self):
         validate_dependency(self)
@@ -109,6 +184,9 @@ class ManifestDelta:
     custom_nodes: tuple[CustomNodeSpec, ...]
     artifacts: tuple[ArtifactSpec, ...]
     wheels: tuple[PythonWheelSpec, ...]
+    ui_packages: tuple[UiPackageSpec, ...] = ()
+    profile_changed: bool = False
+    runtime_change: bool = False
 
     @classmethod
     def between(cls, installed, desired):
@@ -125,7 +203,14 @@ class ManifestDelta:
             getattr(installed, field) != getattr(desired, field)
             for field in version_fields
         ):
-            return cls(False, "runtime_identity_changed", (), (), ())
+            return cls(
+                False,
+                "runtime_identity_changed",
+                (),
+                (),
+                (),
+                runtime_change=True,
+            )
 
         installed_nodes = {
             item.package_id: item for item in installed.custom_nodes
@@ -135,8 +220,13 @@ class ManifestDelta:
             for item in (
                 *installed.artifacts,
                 *(node.archive for node in installed.custom_nodes),
+                *(package.archive for package in installed.ui_packages),
             )
         }
+        if installed.profile is not None:
+            installed_destinations[
+                installed.profile.archive.destination
+            ] = installed.profile.archive.sha256
         installed_wheels = {
             wheel.filename: wheel.sha256
             for node in installed.custom_nodes
@@ -159,11 +249,25 @@ class ManifestDelta:
                 or sorted(prior.provided_class_types)
                 != sorted(node.provided_class_types)
             ):
-                return cls(False, "installed_custom_node_changed", (), (), ())
+                return cls(
+                    False,
+                    "installed_custom_node_changed",
+                    (),
+                    (),
+                    (),
+                    runtime_change=True,
+                )
             for wheel in node.wheels:
                 prior_digest = installed_wheels.get(wheel.filename)
                 if prior_digest is not None and prior_digest != wheel.sha256:
-                    return cls(False, "installed_wheel_changed", (), (), ())
+                    return cls(
+                        False,
+                        "installed_wheel_changed",
+                        (),
+                        (),
+                        (),
+                        runtime_change=True,
+                    )
                 if prior_digest is None:
                     new_wheels.append(wheel)
 
@@ -174,9 +278,70 @@ class ManifestDelta:
         ):
             prior_digest = installed_destinations.get(artifact.destination)
             if prior_digest is not None and prior_digest != artifact.sha256:
-                return cls(False, "installed_destination_changed", (), (), ())
+                return cls(
+                    False,
+                    "installed_destination_changed",
+                    (),
+                    (),
+                    (),
+                )
             if prior_digest is None:
                 new_artifacts.append(artifact)
+
+        installed_ui = {
+            item.package_id: item for item in installed.ui_packages
+        }
+        new_ui = []
+        for package in sorted(
+            desired.ui_packages,
+            key=lambda item: item.package_id,
+        ):
+            prior = installed_ui.get(package.package_id)
+            if prior is None:
+                prior_digest = installed_destinations.get(
+                    package.archive.destination
+                )
+                if (
+                    prior_digest is not None
+                    and prior_digest != package.archive.sha256
+                ):
+                    return cls(
+                        False,
+                        "installed_destination_changed",
+                        (),
+                        (),
+                        (),
+                    )
+                new_ui.append(package)
+            elif prior != package:
+                return cls(
+                    False,
+                    "installed_ui_package_changed",
+                    (),
+                    (),
+                    (),
+                )
+
+        profile_changed = False
+        if desired.profile is not None:
+            prior_profile = installed.profile
+            if prior_profile is None:
+                profile_changed = True
+            elif desired.profile == prior_profile:
+                profile_changed = False
+            elif (
+                desired.profile.profile_id == prior_profile.profile_id
+                and desired.profile.revision > prior_profile.revision
+            ):
+                profile_changed = True
+            else:
+                return cls(
+                    False,
+                    "installed_profile_changed",
+                    (),
+                    (),
+                    (),
+                )
 
         return cls(
             True,
@@ -189,12 +354,29 @@ class ManifestDelta:
                     key=lambda item: (item.filename, item.sha256),
                 )
             ),
+            tuple(new_ui),
+            profile_changed,
+            False,
         )
 
 
 def _validated_identifier(value, name):
     if not isinstance(value, str) or not _IDENTIFIER.fullmatch(value):
         raise ManifestValidationError(f"Invalid {name}.")
+    return value
+
+
+def _validated_class_type(value):
+    if (
+        not isinstance(value, str)
+        or not 1 <= len(value) <= 200
+        or value != value.strip()
+        or any(
+            not 32 <= ord(character) <= 126
+            for character in value
+        )
+    ):
+        raise ManifestValidationError("Invalid provided class type.")
     return value
 
 
@@ -317,7 +499,7 @@ def _validate_destination(destination):
     parts = path.parts
     if (
         not parts
-        or parts[0] not in {"custom_nodes", "input", "models"}
+        or parts[0] not in {"custom_nodes", "input", "models", "user"}
         or any(part in {"", ".", ".."} for part in parts)
         or str(path) != destination
     ):
@@ -337,10 +519,18 @@ def _validate_artifact(artifact):
         "custom_node_archive": "custom_nodes",
         "input": "input",
         "model": "models",
+        "profile_archive": "user",
         "python_wheel": "custom_nodes",
+        "ui_package_archive": "custom_nodes",
         "worker": "custom_nodes",
     }[artifact.kind]
     if destination.parts[0] != required_root:
+        raise ManifestValidationError("Artifact destination kind mismatch.")
+    if artifact.kind == "profile_archive" and artifact.destination != (
+        "user/default/cloud-vast-profile"
+    ):
+        raise ManifestValidationError("Profile archive destination is invalid.")
+    if artifact.kind != "profile_archive" and destination.parts[0] == "user":
         raise ManifestValidationError("Artifact destination kind mismatch.")
     if (
         isinstance(artifact.size_bytes, bool)
@@ -383,6 +573,11 @@ def _validate_wheel(wheel):
             raise ManifestValidationError("R2 object digest does not match wheel.")
 
 
+def _wheel_distribution(filename):
+    stem = filename.split("-", 1)[0]
+    return re.sub(r"[-_.]+", "-", stem).casefold()
+
+
 def _validate_custom_node(node):
     if not isinstance(node, CustomNodeSpec):
         raise ManifestValidationError("Invalid custom-node package.")
@@ -405,10 +600,95 @@ def _validate_custom_node(node):
         raise ManifestValidationError("Custom node must declare class types.")
     class_types = set()
     for class_type in node.provided_class_types:
-        _validated_identifier(class_type, "provided class type")
+        _validated_class_type(class_type)
         if class_type in class_types:
             raise ManifestValidationError("Provided class types must be unique.")
         class_types.add(class_type)
+
+
+def _validate_ui_package(package):
+    if not isinstance(package, UiPackageSpec):
+        raise ManifestValidationError("Invalid UI-only package.")
+    _validated_identifier(package.package_id, "UI package ID")
+    normalize_github_repository(package.repository_url)
+    if not isinstance(package.revision, str) or not _UI_REVISION.fullmatch(
+        package.revision
+    ):
+        raise ManifestValidationError("UI package requires an immutable revision.")
+    _validate_artifact(package.archive)
+    if package.archive.kind != "ui_package_archive":
+        raise ManifestValidationError("UI package archive kind is invalid.")
+    if not isinstance(package.web_sha256, str) or not _HEX_64.fullmatch(
+        package.web_sha256
+    ):
+        raise ManifestValidationError("Invalid UI package web digest.")
+    capabilities = package.required_capabilities
+    if (
+        not isinstance(capabilities, tuple)
+        or len(capabilities) != len(set(capabilities))
+        or any(item not in _UI_CAPABILITIES for item in capabilities)
+    ):
+        raise ManifestValidationError("Invalid UI package capabilities.")
+
+
+def _validate_profile_file(item):
+    if not isinstance(item, ProfileFileSpec):
+        raise ManifestValidationError("Invalid profile file.")
+    path = item.path
+    if (
+        not isinstance(path, str)
+        or not path
+        or path.startswith("/")
+        or "\\" in path
+        or any(ord(character) < 32 for character in path)
+    ):
+        raise ManifestValidationError("Invalid profile file path.")
+    relative = PurePosixPath(path)
+    folded = tuple(part.casefold() for part in relative.parts)
+    if (
+        str(relative) != path
+        or not relative.parts
+        or relative.parts[0] not in _PROFILE_ROOTS
+        or any(part in {"", ".", ".."} for part in relative.parts)
+        or any(part in _PROFILE_FORBIDDEN_NAMES for part in folded)
+        or PurePosixPath(path).suffix.casefold() in _PROFILE_FORBIDDEN_SUFFIXES
+    ):
+        raise ManifestValidationError("Invalid profile file path.")
+    if (
+        isinstance(item.size_bytes, bool)
+        or not isinstance(item.size_bytes, int)
+        or item.size_bytes < 0
+    ):
+        raise ManifestValidationError("Invalid profile file size.")
+    if not isinstance(item.sha256, str) or not _HEX_64.fullmatch(item.sha256):
+        raise ManifestValidationError("Invalid profile file digest.")
+
+
+def _validate_profile(profile):
+    if not isinstance(profile, ProfileSpec):
+        raise ManifestValidationError("Invalid safe profile.")
+    _validated_identifier(profile.profile_id, "profile ID")
+    if (
+        isinstance(profile.revision, bool)
+        or not isinstance(profile.revision, int)
+        or profile.revision <= 0
+    ):
+        raise ManifestValidationError("Invalid profile revision.")
+    _validate_artifact(profile.archive)
+    if profile.archive.kind != "profile_archive":
+        raise ManifestValidationError("Profile archive kind is invalid.")
+    if not isinstance(profile.bootstrap_digest, str) or not _HEX_64.fullmatch(
+        profile.bootstrap_digest
+    ):
+        raise ManifestValidationError("Invalid profile bootstrap digest.")
+    if not isinstance(profile.files, tuple) or not profile.files:
+        raise ManifestValidationError("Safe profile files must be immutable.")
+    paths = set()
+    for item in profile.files:
+        _validate_profile_file(item)
+        if item.path in paths:
+            raise ManifestValidationError("Profile file paths must be unique.")
+        paths.add(item.path)
 
 
 def _validate_manifest(manifest):
@@ -431,6 +711,16 @@ def _validate_manifest(manifest):
         raise ManifestValidationError("Custom nodes must be immutable.")
     if not isinstance(manifest.artifacts, tuple):
         raise ManifestValidationError("Artifacts must be immutable.")
+    if not isinstance(manifest.ui_packages, tuple):
+        raise ManifestValidationError("UI packages must be immutable.")
+    if manifest.profile is not None:
+        _validate_profile(manifest.profile)
+    if (
+        isinstance(manifest.minimum_vram_gb, bool)
+        or not isinstance(manifest.minimum_vram_gb, (int, float))
+        or not 0 <= float(manifest.minimum_vram_gb) <= 1024
+    ):
+        raise ManifestValidationError("Minimum VRAM is outside safe bounds.")
     if (
         isinstance(manifest.output_allowance_bytes, bool)
         or not isinstance(manifest.output_allowance_bytes, int)
@@ -448,6 +738,7 @@ def _validate_manifest(manifest):
     provided_class_types = set()
     artifact_ids = set()
     destinations = set()
+    wheels_by_distribution = {}
     for node in manifest.custom_nodes:
         _validate_custom_node(node)
         if node.package_id in package_ids:
@@ -456,6 +747,21 @@ def _validate_manifest(manifest):
         if provided_class_types.intersection(node.provided_class_types):
             raise ManifestValidationError("Class types have multiple providers.")
         provided_class_types.update(node.provided_class_types)
+        for wheel in node.wheels:
+            distribution = _wheel_distribution(wheel.filename)
+            existing_wheel = wheels_by_distribution.get(distribution)
+            if (
+                not distribution
+                or distribution in _PROTECTED_RUNTIME_DISTRIBUTIONS
+                or (
+                    existing_wheel is not None
+                    and existing_wheel != wheel
+                )
+            ):
+                raise ManifestValidationError(
+                    "Python wheel distributions conflict."
+                )
+            wheels_by_distribution[distribution] = wheel
         if node.archive.artifact_id in artifact_ids:
             raise ManifestValidationError("Artifact IDs must be unique.")
         artifact_ids.add(node.archive.artifact_id)
@@ -472,6 +778,26 @@ def _validate_manifest(manifest):
             raise ManifestValidationError("Artifact destinations must be unique.")
         destinations.add(artifact.destination)
 
+    for package in manifest.ui_packages:
+        _validate_ui_package(package)
+        if package.package_id in package_ids:
+            raise ManifestValidationError("Package IDs must be unique.")
+        package_ids.add(package.package_id)
+        archive = package.archive
+        if archive.artifact_id in artifact_ids:
+            raise ManifestValidationError("Artifact IDs must be unique.")
+        artifact_ids.add(archive.artifact_id)
+        if archive.destination in destinations:
+            raise ManifestValidationError("Artifact destinations must be unique.")
+        destinations.add(archive.destination)
+
+    if manifest.profile is not None:
+        archive = manifest.profile.archive
+        if archive.artifact_id in artifact_ids:
+            raise ManifestValidationError("Artifact IDs must be unique.")
+        if archive.destination in destinations:
+            raise ManifestValidationError("Artifact destinations must be unique.")
+
 
 def validate_dependency(value):
     if isinstance(value, SourceSpec):
@@ -482,6 +808,12 @@ def validate_dependency(value):
         _validate_wheel(value)
     elif isinstance(value, CustomNodeSpec):
         _validate_custom_node(value)
+    elif isinstance(value, UiPackageSpec):
+        _validate_ui_package(value)
+    elif isinstance(value, ProfileFileSpec):
+        _validate_profile_file(value)
+    elif isinstance(value, ProfileSpec):
+        _validate_profile(value)
     elif isinstance(value, DependencyManifest):
         _validate_manifest(value)
     else:
@@ -535,6 +867,40 @@ def _custom_node_record(node):
     }
 
 
+def _ui_package_record(package):
+    return {
+        "package_id": package.package_id,
+        "repository_url": package.repository_url,
+        "revision": package.revision,
+        "archive": _artifact_record(package.archive),
+        "web_sha256": package.web_sha256,
+        "required_capabilities": sorted(package.required_capabilities),
+    }
+
+
+def _profile_file_record(item):
+    return {
+        "path": item.path,
+        "size_bytes": item.size_bytes,
+        "sha256": item.sha256,
+    }
+
+
+def _profile_record(profile):
+    if profile is None:
+        return None
+    return {
+        "profile_id": profile.profile_id,
+        "revision": profile.revision,
+        "archive": _artifact_record(profile.archive),
+        "bootstrap_digest": profile.bootstrap_digest,
+        "files": [
+            _profile_file_record(item)
+            for item in sorted(profile.files, key=lambda item: item.path)
+        ],
+    }
+
+
 def _manifest_record(manifest):
     return {
         "schema_version": manifest.schema_version,
@@ -561,6 +927,15 @@ def _manifest_record(manifest):
                 ),
             )
         ],
+        "ui_packages": [
+            _ui_package_record(package)
+            for package in sorted(
+                manifest.ui_packages,
+                key=lambda item: item.package_id,
+            )
+        ],
+        "profile": _profile_record(manifest.profile),
+        "minimum_vram_gb": float(manifest.minimum_vram_gb),
         "output_allowance_bytes": manifest.output_allowance_bytes,
         "disk_gb": manifest.disk_gb,
     }

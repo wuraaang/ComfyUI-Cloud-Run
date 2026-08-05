@@ -1,5 +1,6 @@
 import hashlib
 import unittest
+from dataclasses import replace
 
 from cloud_run.manifest import (
     ArtifactSpec,
@@ -8,7 +9,10 @@ from cloud_run.manifest import (
     ManifestDelta,
     ManifestValidationError,
     PythonWheelSpec,
+    ProfileFileSpec,
+    ProfileSpec,
     SourceSpec,
+    UiPackageSpec,
     validate_dependency,
 )
 
@@ -74,8 +78,8 @@ def custom_node(
 
 def dependency_manifest(*, artifacts=(), custom_nodes=()):
     return DependencyManifest(
-        schema_version=1,
-        protocol_version="1",
+        schema_version=2,
+        protocol_version="2",
         comfyui_core_version="0.29.0",
         comfyui_frontend_version="1.47.10",
         worker_version="worker-1",
@@ -87,7 +91,273 @@ def dependency_manifest(*, artifacts=(), custom_nodes=()):
     )
 
 
+def ui_package():
+    return UiPackageSpec(
+        package_id="comfyui-agent-panel",
+        repository_url="https://github.com/acme/comfyui-agent-panel",
+        revision="a" * 40,
+        archive=artifact(
+            "ui_package_archive",
+            "custom_nodes/comfyui-agent-panel",
+            30,
+            "b" * 64,
+            artifact_id="ui-agent-panel",
+        ),
+        web_sha256="c" * 64,
+        required_capabilities=(
+            "graph_read",
+            "graph_edit",
+            "native_run",
+            "native_batch",
+        ),
+    )
+
+
+def profile(*, path="workflows/example.json", revision=1):
+    archive = artifact(
+        "profile_archive",
+        "user/default/cloud-vast-profile",
+        40,
+        "d" * 64,
+        artifact_id="profile-archive-1",
+    )
+    return ProfileSpec(
+        profile_id="profile-1",
+        revision=revision,
+        archive=archive,
+        bootstrap_digest="e" * 64,
+        files=(
+            ProfileFileSpec(
+                path=path,
+                size_bytes=12,
+                sha256="f" * 64,
+            ),
+        ),
+    )
+
+
 class DependencyManifestTests(unittest.TestCase):
+    def test_archive_wheel_web_or_class_variation_changes_manifest_digest(self):
+        node = custom_node(class_types=("KSampler (Efficient)",))
+        package = ui_package()
+        baseline = replace(
+            dependency_manifest(custom_nodes=(node,)),
+            schema_version=2,
+            protocol_version="2",
+            ui_packages=(package,),
+        )
+        variants = (
+            replace(
+                baseline,
+                custom_nodes=(
+                    replace(
+                        node,
+                        archive=replace(node.archive, sha256="1" * 64),
+                    ),
+                ),
+            ),
+            replace(
+                baseline,
+                custom_nodes=(
+                    replace(
+                        node,
+                        wheels=(
+                            replace(node.wheels[0], sha256="2" * 64),
+                        ),
+                    ),
+                ),
+            ),
+            replace(
+                baseline,
+                ui_packages=(replace(package, web_sha256="3" * 64),),
+            ),
+            replace(
+                baseline,
+                custom_nodes=(
+                    replace(
+                        node,
+                        provided_class_types=(
+                            "KSampler (Efficient)",
+                            "XY Plot",
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+        self.assertEqual(len({baseline.digest, *(item.digest for item in variants)}), 5)
+
+    def test_custom_node_class_types_accept_exact_native_display_names(self):
+        native_names = (
+            "KSampler (Efficient)",
+            "XY Input: Seeds++ Batch",
+            "XY Input: Sampler/Scheduler",
+        )
+        node = custom_node(class_types=native_names)
+
+        try:
+            validated = validate_dependency(node)
+        except ManifestValidationError as exc:
+            self.fail(f"native class type was rejected: {exc}")
+
+        self.assertIs(validated, node)
+
+        for invalid in ("", "line\nbreak", "nul\0byte", "é", "x" * 201):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ManifestValidationError):
+                    validate_dependency(custom_node(class_types=(invalid,)))
+
+    def test_manifest_rejects_conflicting_or_protected_wheel_distributions(self):
+        first_wheel = PythonWheelSpec(
+            filename="simpleeval-1.0.7-py3-none-any.whl",
+            size_bytes=5,
+            sha256="1" * 64,
+            source=source(locator="local-upload:wheel-simpleeval-1"),
+        )
+        second_wheel = replace(
+            first_wheel,
+            filename="simpleeval-9.9.9-py3-none-any.whl",
+            sha256="2" * 64,
+            source=source(locator="local-upload:wheel-simpleeval-9"),
+        )
+        first = replace(custom_node(), wheels=(first_wheel,))
+        second = replace(
+            custom_node(),
+            package_id="acme.second",
+            archive=artifact(
+                "custom_node_archive",
+                "custom_nodes/acme.second",
+                20,
+                "3" * 64,
+                artifact_id="custom-acme-second",
+            ),
+            wheels=(second_wheel,),
+            provided_class_types=("SecondNode",),
+        )
+
+        with self.assertRaises(ManifestValidationError):
+            validate_dependency(
+                dependency_manifest(custom_nodes=(first, second))
+            )
+
+        protected = replace(
+            first,
+            wheels=(
+                replace(
+                    first_wheel,
+                    filename="torch-9.9.9-py3-none-any.whl",
+                ),
+            ),
+        )
+        with self.assertRaises(ManifestValidationError):
+            validate_dependency(
+                dependency_manifest(custom_nodes=(protected,))
+            )
+
+        exact_reuse = replace(second, wheels=(first_wheel,))
+        self.assertIs(
+            validate_dependency(
+                dependency_manifest(custom_nodes=(first, exact_reuse))
+            ).custom_nodes[1].wheels[0],
+            first_wheel,
+        )
+
+    def test_ui_revision_accepts_git_commit_or_explicit_sha256_only(self):
+        for revision in ("a" * 40, "sha256:" + "b" * 64):
+            with self.subTest(revision=revision):
+                package = replace(ui_package(), revision=revision)
+                try:
+                    validated = validate_dependency(package)
+                except ManifestValidationError as exc:
+                    self.fail(f"immutable UI revision was rejected: {exc}")
+                self.assertIs(validated, package)
+
+        for revision in (
+            "main",
+            "b" * 64,
+            "sha256:" + "B" * 64,
+            "sha256:" + "b" * 63,
+            "sha512:" + "b" * 64,
+        ):
+            with self.subTest(revision=revision):
+                with self.assertRaises(ManifestValidationError):
+                    validate_dependency(replace(ui_package(), revision=revision))
+
+        with self.assertRaises(ManifestValidationError):
+            validate_dependency(
+                replace(custom_node(), revision="sha256:" + "b" * 64)
+            )
+
+    def test_ui_packages_and_safe_profile_are_distinct_immutable_contracts(self):
+        panel = ui_package()
+        safe_profile = profile()
+
+        self.assertIs(validate_dependency(panel), panel)
+        self.assertIs(validate_dependency(safe_profile), safe_profile)
+        executable = custom_node(class_types=())
+        with self.assertRaises(ManifestValidationError):
+            validate_dependency(executable)
+
+        manifest = replace(
+            dependency_manifest(),
+            schema_version=2,
+            protocol_version="2",
+            ui_packages=(panel,),
+            profile=safe_profile,
+            minimum_vram_gb=12.0,
+        )
+        encoded = manifest.canonical_bytes()
+        self.assertIn(b'"ui_packages"', encoded)
+        self.assertIn(b'"profile"', encoded)
+        self.assertIn(b'"minimum_vram_gb":12.0', encoded)
+        self.assertNotIn(b"secret_handle", encoded)
+
+    def test_profile_paths_reject_private_or_unsafe_desktop_state(self):
+        forbidden = (
+            "comfyui.db",
+            ".env",
+            "cache/state.json",
+            "__pycache__/module.pyc",
+            "logs/worker.log",
+            "../escape.json",
+            "/absolute/workflow.json",
+            "workflows/../../escape.json",
+            "credentials/token.json",
+        )
+        for path in forbidden:
+            with self.subTest(path=path):
+                with self.assertRaises(ManifestValidationError):
+                    validate_dependency(profile(path=path))
+
+    def test_profile_and_new_ui_package_are_compatible_delta_dimensions(self):
+        installed = replace(
+            dependency_manifest(),
+            schema_version=2,
+            protocol_version="2",
+            ui_packages=(),
+            profile=None,
+            minimum_vram_gb=8.0,
+        )
+        desired = replace(
+            installed,
+            ui_packages=(ui_package(),),
+            profile=profile(),
+            minimum_vram_gb=12.0,
+        )
+
+        delta = ManifestDelta.between(installed, desired)
+        self.assertTrue(delta.compatible)
+        self.assertEqual(delta.ui_packages, (ui_package(),))
+        self.assertTrue(delta.profile_changed)
+        self.assertFalse(delta.runtime_change)
+
+        upgraded = replace(desired, profile=profile(revision=2))
+        self.assertTrue(ManifestDelta.between(desired, upgraded).compatible)
+        runtime_changed = replace(desired, worker_version="worker-2")
+        runtime_delta = ManifestDelta.between(desired, runtime_changed)
+        self.assertFalse(runtime_delta.compatible)
+        self.assertTrue(runtime_delta.runtime_change)
+
     def test_manifest_is_canonical_content_addressed_and_browser_safe(self):
         manifest = dependency_manifest(
             artifacts=(

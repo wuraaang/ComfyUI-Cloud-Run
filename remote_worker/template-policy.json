@@ -3,7 +3,7 @@
   "base_template_hash_id": "027fba7753c024be019030fb42aed900",
   "comfyui_core_version": "0.29.0",
   "comfyui_frontend_version": "1.47.10",
-  "python_version": "3.13.12",
-  "protocol_version": "1",
+  "python_version": "3.12",
+  "protocol_version": "2",
   "worker_port": 8765
 }

@@ -24,11 +24,15 @@ ALLOWED_REMOTE_FILES = frozenset(
         "remote_worker/bootstrap.py",
         "remote_worker/comfy.py",
         "remote_worker/deadline.py",
+        "remote_worker/diagnostics.py",
         "remote_worker/gateway.py",
         "remote_worker/install.py",
         "remote_worker/jobs.py",
         "remote_worker/main.py",
+        "remote_worker/native_jobs.py",
+        "remote_worker/native_proxy.py",
         "remote_worker/provision.py",
+        "remote_worker/profile.py",
         "remote_worker/server.py",
         "remote_worker/state.py",
         "remote_worker/template-policy.json",
@@ -38,6 +42,7 @@ ALLOWED_REMOTE_FILES = frozenset(
 SHARED_FILES = frozenset(
     {
         "cloud_run/manifest.py",
+        "cloud_run/run_errors.py",
         "cloud_run/worker_protocol.py",
     }
 )
@@ -74,14 +79,16 @@ def _source_files(repository_root):
     observed = set()
     try:
         for path in remote_root.rglob("*"):
-            relative = path.relative_to(root).as_posix()
+            relative_path = path.relative_to(root)
+            if "__pycache__" in relative_path.parts or path.suffix == ".pyc":
+                continue
+            relative = relative_path.as_posix()
             metadata = os.lstat(path)
             if stat.S_ISDIR(metadata.st_mode):
                 if path.name in {
                     ".git",
                     ".hg",
                     ".svn",
-                    "__pycache__",
                     "tests",
                 }:
                     raise ArtifactBuildError(

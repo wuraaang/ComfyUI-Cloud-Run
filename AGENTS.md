@@ -11,29 +11,29 @@ its proven Vast client and lifecycle policies. Reimplement those contracts
 narrowly for ComfyUI; do not import its Flask, SQLAlchemy, dataset, training,
 checkpoint, or AI Toolkit code.
 
-## Current slice: workflow-derived Vast GPU sessions
+## Current slice: local Desktop / remote GPU bridge
 
-Extend the certified Vast lifecycle into a local ComfyUI Desktop control plane
-for temporary remote GPU sessions:
+Use ComfyUI Desktop's official independent environments to make one temporary
+Vast pod the GPU backend of an official Remote Connection named `ComfyUI Vast`:
 
-- capture the exact prompt compiled by the pinned frontend without posting it
-  to local `/prompt` or running a local reference generation;
-- resolve every dependency before the first paid mutation, with immutable
-  custom-node revisions and exact artifact sizes and SHA-256 digests;
-- rent one explicitly confirmed ephemeral Vast instance as a reusable session;
-- provision and validate the repository-owned Remote Worker and native ComfyUI;
-- execute one sequential job at a time and support compatible manifest deltas;
-- relay progress, previews, errors, history, and verified outputs locally;
-- enforce the finite deadline locally and from the worker;
-- create no Vast volume and never use Stop as a billing terminal action;
-- expose `Destroy GPU — stop all Vast billing` with strengthened confirmation
-  and fresh-inventory absence verification.
+- the normal local Desktop environment remains independently usable and owns
+  the `Cloud Vast` lifecycle control;
+- `ComfyUI Vast` uses the pod's native node definitions, model lists, Run,
+  queue, batch, progress, previews, history, errors, and outputs;
+- There is no `Run Vast` button and a remote prompt has no route to local
+  `/prompt` or local GPU execution;
+- a safe versioned profile mirrors the canvas, workflows, appearance, approved
+  UI extensions, and background without copying databases or credentials;
+- the Agent Panel orchestrator remains on the Mac behind a scoped loopback
+  bridge and is a mandatory readiness check when present;
+- atomic worker snapshots and a backend-owned reconciler recover jobs, events,
+  typed errors, and verified outputs across disconnects and restarts;
+- one explicit `Louer et préparer` confirmation persists intent and revalidates
+  the exact quote before any provider create.
 
-The project template remains fail-closed until its public worker artifact,
-bootstrap, authentication, deadline enforcement, and teardown have passed the
-offline gate and an immutable release lock is reviewed. Automated work uses
-fake providers only; live rental and publication require separate human
-authorization.
+No real Vast mutation without a fresh human GO. Automated implementation and
+certification use fake providers only; worker publication, template changes,
+external installation, and paid field testing remain separate approvals.
 
 ## Paid-action gate
 

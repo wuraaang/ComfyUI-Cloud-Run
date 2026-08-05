@@ -14,6 +14,15 @@ function finiteNumber(value) {
 }
 
 
+function finiteNonnegativeNumber(value) {
+  return typeof value === "number"
+    && Number.isFinite(value)
+    && value >= 0
+    ? value
+    : null;
+}
+
+
 function positiveInteger(value) {
   const number = Number(value);
   return Number.isSafeInteger(number) && number > 0 ? number : null;
@@ -32,6 +41,41 @@ function safeId(value) {
   )
     ? value
     : null;
+}
+
+
+const SESSION_STATUSES = new Set([
+  "preflight",
+  "offer_selected",
+  "confirming",
+  "creating",
+  "reconciling_create",
+  "bootstrapping",
+  "provisioning",
+  "validating",
+  "repairing",
+  "ready",
+  "running",
+  "harvesting",
+  "destroy_requested",
+  "destroying",
+  "destroyed",
+  "failed",
+]);
+
+
+export function safeSessionPayload(session, expectedSessionId = null) {
+  const sessionId = safeId(session?.session_id);
+  return Boolean(
+    session
+    && typeof session === "object"
+    && !Array.isArray(session)
+    && sessionId !== null
+    && (expectedSessionId === null || sessionId === expectedSessionId)
+    && SESSION_STATUSES.has(session.status)
+    && typeof session.billing_may_continue === "boolean"
+    && typeof session.can_destroy === "boolean"
+  );
 }
 
 
@@ -207,6 +251,31 @@ function estimatedTransferSeconds(transferBytes, inetDownMbps) {
 }
 
 
+function safeReadinessEstimate(value) {
+  if (
+    !value
+    || typeof value !== "object"
+    || !["cold", "prepositioned", "warm"].includes(value.label)
+    || !Number.isSafeInteger(value.cached_bytes)
+    || value.cached_bytes < 0
+    || !Number.isSafeInteger(value.remaining_bytes)
+    || value.remaining_bytes < 0
+    || typeof value.assumed_mbps !== "number"
+    || !Number.isFinite(value.assumed_mbps)
+    || value.assumed_mbps <= 0
+    || !Number.isSafeInteger(value.estimated_seconds)
+    || value.estimated_seconds < 0
+    || typeof value.source_ready !== "boolean"
+    || typeof value.ten_minute_eligible !== "boolean"
+    || typeof value.digest !== "string"
+    || !/^[0-9a-f]{64}$/.test(value.digest)
+  ) {
+    return null;
+  }
+  return value;
+}
+
+
 function bytesText(value) {
   const bytes = Number(value);
   if (!Number.isSafeInteger(bytes) || bytes < 0) return "unknown size";
@@ -250,6 +319,8 @@ function sessionMessage(session) {
     offer_selected: "Paid quote ready for explicit confirmation.",
     confirming: "Revalidating the exact Vast offer.",
     creating: "Creating the Vast instance; billing may have started.",
+    reconciling_create:
+      "GPU rental could not be confirmed. Cloud Vast is checking Vast inventory.",
     bootstrapping: "Authenticating the project Remote Worker.",
     provisioning: "Transferring and installing verified dependencies.",
     validating: "Validating remote ComfyUI nodes and files.",
@@ -260,27 +331,43 @@ function sessionMessage(session) {
     destroy_requested: "GPU destruction requested and durably recorded.",
     destroying: "Destroying the GPU and verifying Vast inventory.",
     destroyed: "Vast inventory confirms that billing has stopped.",
-    failed: "Cloud Run session needs attention.",
+    failed: "Cloud Vast session needs attention.",
   };
-  return messages[String(session?.status)] ?? "Unknown Cloud Run session state.";
+  return messages[String(session?.status)] ?? "Unknown Cloud Vast session state.";
 }
 
 
-function providerMutationMayHaveOccurred(session) {
-  return new Set([
-    "confirming",
-    "creating",
-    "bootstrapping",
-    "provisioning",
-    "validating",
-    "repairing",
-    "ready",
-    "running",
-    "harvesting",
-    "destroy_requested",
-    "destroying",
-    "failed",
-  ]).has(String(session?.status));
+function rentalOutcome(session) {
+  const outcome = String(session?.rental_outcome ?? "");
+  return new Set(["not_started", "unknown", "active", "absent"]).has(
+    outcome,
+  )
+    ? outcome
+    : null;
+}
+
+
+function hasResidualInventory(session) {
+  return (
+    Array.isArray(session?.residual_inventory)
+    && session.residual_inventory.length > 0
+  );
+}
+
+
+function isEmergencyRentalState(session) {
+  const outcome = rentalOutcome(session);
+  return (
+    outcome === "unknown"
+    || (outcome === null && session?.billing_may_continue === true)
+    || (
+      outcome === "active"
+      && (
+        session?.status === "failed"
+        || hasResidualInventory(session)
+      )
+    )
+  );
 }
 
 
@@ -288,6 +375,7 @@ function pollableSession(session) {
   return new Set([
     "confirming",
     "creating",
+    "reconciling_create",
     "bootstrapping",
     "provisioning",
     "validating",
@@ -329,10 +417,14 @@ export function createSessionConsole(document, api = {}, options = {}) {
     id: options.id ?? "cloud-run-session-console",
     className: "cloud-run-session-console",
   });
-  const title = element(document, "h3", { text: "Cloud Run session" });
+  const title = element(document, "h3", { text: "Cloud Vast session" });
   const settingsSummary = element(document, "div", {
     className: "cloud-run-configured-summary",
   });
+  const settingsError = element(document, "div", {
+    className: "cloud-run-active-session-error",
+  });
+  settingsError.hidden = true;
 
   const preflightTitle = element(document, "h4", {
     text: "Dependency preflight",
@@ -350,11 +442,25 @@ export function createSessionConsole(document, api = {}, options = {}) {
     id: "cloud-run-output-allowance",
     type: "number",
   });
+  const outputAllowanceLabel = element(document, "label", {
+    text: "Explicit output allowance (bytes)",
+  });
+  outputAllowanceLabel.setAttribute("for", outputAllowanceInput.id);
+  const outputAllowanceHelp = element(document, "div", {
+    id: "cloud-run-output-allowance-help",
+    text: "Examples: 16 MiB = 16777216; 1 GiB = 1073741824.",
+  });
   outputAllowanceInput.setAttribute("min", "1");
   outputAllowanceInput.setAttribute("step", "1");
+  outputAllowanceInput.setAttribute("inputmode", "numeric");
+  outputAllowanceInput.inputMode = "numeric";
   outputAllowanceInput.setAttribute(
     "aria-label",
     "Explicit output allowance in bytes",
+  );
+  outputAllowanceInput.setAttribute(
+    "aria-describedby",
+    outputAllowanceHelp.id,
   );
   const preflightButton = element(document, "button", {
     id: "cloud-run-preflight",
@@ -368,7 +474,12 @@ export function createSessionConsole(document, api = {}, options = {}) {
   });
   preflightButton.disabled = true;
   searchButton.disabled = true;
-  preflightControls.append(outputAllowanceInput, preflightButton);
+  preflightControls.append(
+    outputAllowanceLabel,
+    outputAllowanceInput,
+    outputAllowanceHelp,
+    preflightButton,
+  );
   if (!options.searchButton) preflightControls.appendChild(searchButton);
 
   const quotePanel = element(document, "section", {
@@ -381,12 +492,29 @@ export function createSessionConsole(document, api = {}, options = {}) {
   const quoteDetails = element(document, "div");
   const confirmButton = element(document, "button", {
     id: "cloud-run-confirm-session",
-    text: "Confirm & rent this GPU",
+    text: "Louer et préparer",
     type: "button",
     className: "cloud-run-danger",
   });
+  const longerEstimateReview = element(document, "label", {
+    id: "cloud-run-longer-estimate-review",
+  });
+  const longerEstimateCheckbox = element(document, "input", {
+    id: "cloud-run-accept-longer-estimate",
+    type: "checkbox",
+  });
+  const longerEstimateText = element(document, "span", {
+    text: "I accept that this reviewed preparation estimate exceeds ten minutes.",
+  });
+  longerEstimateReview.append(longerEstimateCheckbox, longerEstimateText);
+  longerEstimateReview.hidden = true;
   confirmButton.disabled = true;
-  quotePanel.append(quoteTitle, quoteDetails, confirmButton);
+  quotePanel.append(
+    quoteTitle,
+    quoteDetails,
+    longerEstimateReview,
+    confirmButton,
+  );
 
   const sessionPanel = element(document, "section", {
     className: "cloud-run-live-session",
@@ -479,13 +607,25 @@ export function createSessionConsole(document, api = {}, options = {}) {
   const historyRows = element(document, "div");
   historyPanel.append(historyTitle, historyRows);
 
+  const desktopPanel = element(document, "section", {
+    className: "cloud-run-desktop-setup",
+  });
+  desktopPanel.hidden = true;
+  const desktopTitle = element(document, "h4", { text: "ComfyUI Vast" });
+  const desktopStatus = element(document, "div");
+  const desktopInstructions = element(document, "div");
+  const desktopGuidance = element(document, "div", {
+    text: "Ouvrir ComfyUI Vast dans Desktop.",
+  });
+  desktopPanel.append(
+    desktopTitle,
+    desktopStatus,
+    desktopInstructions,
+    desktopGuidance,
+  );
+
   const sessionControls = element(document, "div", {
     className: "cloud-run-actions",
-  });
-  const runNextJobButton = element(document, "button", {
-    id: "cloud-run-next-job",
-    text: "Run current canvas on this GPU",
-    type: "button",
   });
   const destroyButton = element(document, "button", {
     id: "cloud-run-destroy-gpu",
@@ -493,9 +633,17 @@ export function createSessionConsole(document, api = {}, options = {}) {
     type: "button",
     className: "cloud-run-danger",
   });
-  runNextJobButton.hidden = true;
+  const verifyVastAccessButton = element(document, "button", {
+    id: "cloud-run-verify-vast-access",
+    text: "Verify Vast access",
+    type: "button",
+  });
   destroyButton.hidden = true;
-  sessionControls.append(runNextJobButton, destroyButton);
+  verifyVastAccessButton.hidden = true;
+  sessionControls.append(
+    verifyVastAccessButton,
+    destroyButton,
+  );
 
   const destroyReview = element(document, "section", {
     className: "cloud-run-destroy-review cloud-run-danger",
@@ -529,12 +677,14 @@ export function createSessionConsole(document, api = {}, options = {}) {
   root.append(
     title,
     settingsSummary,
+    settingsError,
     preflightTitle,
     summary,
     rows,
     preflightControls,
     quotePanel,
     sessionPanel,
+    desktopPanel,
     jobPanel,
     historyPanel,
     sessionControls,
@@ -548,6 +698,7 @@ export function createSessionConsole(document, api = {}, options = {}) {
   let currentSession = null;
   let currentJob = null;
   let sessionIdempotencyKey = null;
+  let currentReadiness = null;
   let destroyReviewToken = null;
   let explicitOutputAllowance = null;
   let eventCursor = 0;
@@ -556,6 +707,21 @@ export function createSessionConsole(document, api = {}, options = {}) {
   let pollTimer = null;
   const history = new Map();
   let mappingButtons = [];
+
+  function sessionAllowsOfferSearch() {
+    return (
+      currentSession === null
+      || currentSession?.can_search_offers === true
+    );
+  }
+
+  function canSearchOffers() {
+    return (
+      !busy
+      && offerSearchReady
+      && sessionAllowsOfferSearch()
+    );
+  }
 
   function notifySession(session) {
     if (typeof options.onSession === "function") {
@@ -594,25 +760,62 @@ export function createSessionConsole(document, api = {}, options = {}) {
   function setBusy(value) {
     busy = Boolean(value);
     preflightButton.disabled = busy || !captureId;
-    searchButton.disabled = busy || !offerSearchReady;
+    searchButton.disabled = !canSearchOffers();
     confirmButton.disabled =
       busy
       || currentSession?.status !== "offer_selected"
-      || !sessionIdempotencyKey;
+      || !sessionIdempotencyKey
+      || currentReadiness === null
+      || currentReadiness.source_ready !== true
+      || (
+        !currentReadiness.ten_minute_eligible
+        && longerEstimateCheckbox.checked !== true
+      );
     const ready = currentSession?.status === "ready";
     const deadlineMutable = deadlineCanSynchronize(currentSession);
-    runNextJobButton.disabled = busy || !ready;
     extendThirtyButton.disabled = busy || !deadlineMutable;
     extendHourButton.disabled = busy || !deadlineMutable;
     disableDeadlineButton.disabled = busy || !deadlineMutable;
     destroyButton.disabled =
       busy
-      || !providerMutationMayHaveOccurred(currentSession)
-      || ["destroy_requested", "destroying", "destroyed"].includes(
-        String(currentSession?.status),
-      );
+      || currentSession?.can_destroy !== true;
+    verifyVastAccessButton.disabled =
+      busy
+      || currentSession?.can_verify_vast_access !== true;
     destroyNowButton.disabled = busy || !destroyReviewToken;
     for (const button of mappingButtons) button.disabled = busy;
+  }
+
+  function clearPaidReview() {
+    sessionIdempotencyKey = null;
+    quoteDetails.replaceChildren();
+    currentReadiness = null;
+    longerEstimateCheckbox.checked = false;
+    longerEstimateReview.hidden = true;
+    quotePanel.hidden = true;
+    confirmButton.hidden = true;
+    confirmButton.disabled = true;
+    destroyReviewToken = null;
+    dataLossCheckbox.checked = false;
+    destroyReview.hidden = true;
+  }
+
+  function clearSearchableHistoricalSession() {
+    if (
+      rentalOutcome(currentSession) !== "absent"
+      || currentSession?.can_search_offers !== true
+    ) {
+      return false;
+    }
+    clearPoll();
+    currentSession = null;
+    sessionPanel.hidden = true;
+    desktopPanel.hidden = true;
+    destroyButton.hidden = true;
+    verifyVastAccessButton.hidden = true;
+    notifySession(null);
+    setBusy(busy);
+    return true;
   }
 
   function renderSettings(payload) {
@@ -633,6 +836,16 @@ export function createSessionConsole(document, api = {}, options = {}) {
       `${configured}; ${cache}` +
       `${sources.length ? `; ${sources.join(", ")}` : ""}. ` +
       "Account keys remain write-only on this Mac.";
+    const activeSessionError =
+      payload?.active_sessions_error ===
+        "Active session details are temporarily unavailable."
+        ? "Active session details are temporarily unavailable."
+        : "";
+    settingsError.textContent = activeSessionError;
+    settingsError.className = activeSessionError
+      ? "cloud-run-active-session-error cloud-run-danger"
+      : "cloud-run-active-session-error";
+    settingsError.hidden = !activeSessionError;
   }
 
   function renderPreflight(payload) {
@@ -732,10 +945,22 @@ export function createSessionConsole(document, api = {}, options = {}) {
       && payload.transfer_bytes >= 0
       ? payload.transfer_bytes
       : 0;
+    const cached = Number.isSafeInteger(payload?.cached_bytes)
+      && payload.cached_bytes >= 0
+      && payload.cached_bytes <= transfer
+      ? payload.cached_bytes
+      : 0;
+    const minimumVram = strictNonnegativeNumber(payload?.minimum_vram_gb);
     const output = positiveInteger(payload?.output_allowance_bytes);
     const disk = positiveInteger(payload?.disk_gb);
     summary.textContent =
       `Transfer: ${bytesText(transfer)}. ` +
+      `Pre-positioned: ${bytesText(cached)}; remaining ${bytesText(
+        transfer - cached,
+      )}. ` +
+      `Workflow minimum VRAM: ${
+        minimumVram === null ? "unavailable" : `${minimumVram} GiB`
+      }. ` +
       `Output allowance: ${output === null ? "required" : bytesText(output)}. ` +
       `Disk: ${disk === null ? "pending" : `${disk} GiB ephemeral`}.`;
     currentPreflightId =
@@ -749,9 +974,14 @@ export function createSessionConsole(document, api = {}, options = {}) {
       && manifestReady
       && output !== null
       && disk !== null;
-    searchButton.disabled = busy || !offerSearchReady;
+    if (offerSearchReady) clearSearchableHistoricalSession();
+    searchButton.disabled = !canSearchOffers();
     status.textContent = payload?.rentable === true
-      ? "Preflight complete. Offer search is unlocked."
+      ? (
+        offerSearchReady && sessionAllowsOfferSearch()
+          ? "Preflight complete. Offer search is unlocked."
+          : "Preflight complete. Resolve the current Vast access gate before offer search."
+      )
       : "Resolve every listed dependency before offer search.";
   }
 
@@ -778,6 +1008,13 @@ export function createSessionConsole(document, api = {}, options = {}) {
     }
     quotePanel.hidden = false;
     quoteDetails.replaceChildren();
+    const readiness = safeReadinessEstimate(quote.readiness);
+    const changedEstimate = readiness?.digest !== currentReadiness?.digest;
+    currentReadiness = readiness;
+    if (changedEstimate) longerEstimateCheckbox.checked = false;
+    longerEstimateReview.hidden = (
+      readiness === null || readiness.ten_minute_eligible
+    );
     const values = [
       `Offer ${safeText(quote.offer_id, "unknown")}`,
       `${safeText(quote.gpu_name, "Unknown GPU")} — ` +
@@ -791,15 +1028,20 @@ export function createSessionConsole(document, api = {}, options = {}) {
       }`,
       `Download: ${metricText(quote.inet_down_mbps, "Mbps")}`,
       `Disk speed: ${metricText(quote.disk_bw_mbps, "MB/s")}`,
+      `DLPerf: ${metricText(quote.dlperf, "")}`.trim(),
       `Download class: ${downloadClassText(quote.inet_down_mbps)}`,
       `Bandwidth: ${bandwidthPrice(quote.inet_down_cost)} down; ` +
         `${bandwidthPrice(quote.inet_up_cost)} up`,
       `theoretical transfer ≈ ${theoreticalTransferText(
-        estimatedTransferSeconds(
+        readiness?.estimated_seconds ?? estimatedTransferSeconds(
           quote.transfer_bytes,
           quote.inet_down_mbps,
         ),
       )}; actual startup can be longer`,
+      `Readiness: ${readiness?.label ?? "unavailable"}; ` +
+        `cached ${bytesText(readiness?.cached_bytes)}; ` +
+        `remaining ${bytesText(readiness?.remaining_bytes)}; ` +
+        `assumption ${metricText(readiness?.assumed_mbps, "MB/s")}`,
       `${positiveInteger(quote.disk_gb) ?? "unknown"} GB ephemeral disk`,
       `${bytesText(quote.transfer_bytes)} dependencies and inputs`,
       `${bytesText(quote.output_allowance_bytes)} output allowance`,
@@ -824,7 +1066,7 @@ export function createSessionConsole(document, api = {}, options = {}) {
     }
     quoteDetails.appendChild(element(document, "strong", {
       text:
-        "No rental exists until Confirm & rent this GPU is pressed. " +
+        "No rental exists until Louer et préparer is pressed. " +
         "After confirmation, billing continues until verified destruction.",
     }));
     confirmButton.hidden = payload?.status !== "offer_selected";
@@ -856,7 +1098,7 @@ export function createSessionConsole(document, api = {}, options = {}) {
       digest_verification: "Digest verification",
       comfyui_startup: "ComfyUI startup",
       environment_validation: "Environment validation",
-      ready: "Provisioning ready",
+      ready: "Verified transfer/install completed",
     };
     const workerPhase = typeof progress?.phase === "string"
       && Object.hasOwn(workerPhases, progress.phase)
@@ -893,15 +1135,46 @@ export function createSessionConsole(document, api = {}, options = {}) {
       : null;
     const installs = positiveInteger(progress?.installed_units);
     const validation = positiveInteger(progress?.validated_units);
-    const secondsWithoutProgress = Number(progress?.seconds_without_progress);
+    const secondsWithoutProgress = progress?.seconds_without_progress;
     const safeSeconds = (
-      Number.isSafeInteger(secondsWithoutProgress)
+      typeof secondsWithoutProgress === "number"
+      && Number.isFinite(secondsWithoutProgress)
       && secondsWithoutProgress >= 0
     )
-      ? secondsWithoutProgress
+      ? Math.floor(secondsWithoutProgress)
       : null;
     const stallBudget = positiveInteger(progress?.stall_budget_seconds) ?? 600;
-    const stalled = safeSeconds !== null && safeSeconds >= stallBudget;
+    const stalled = progress?.stall_active === true;
+    const provisionComplete = (
+      workerPhase === "ready"
+      && progress?.stall_active === false
+      && progress?.seconds_without_progress === null
+    );
+    let desktopReadiness = "";
+    if (provisionComplete) {
+      if (session?.desktop_ready === true) {
+        desktopReadiness = "Desktop readiness certified";
+      } else {
+        const report = session?.readiness_report;
+        const attempt = positiveInteger(report?.attempt_number);
+        const checks = Array.isArray(report?.checks)
+          && report.checks.length > 0
+          && report.checks.length <= 100
+          && report.checks.every(
+            (check) => check && typeof check === "object"
+              && ["passed", "failed", "not_required"].includes(check.status),
+          )
+          ? report.checks
+          : null;
+        desktopReadiness = attempt !== null && checks !== null
+          ? `Desktop readiness attempt ${attempt}: ${
+            checks.filter(
+              (check) => ["passed", "not_required"].includes(check.status),
+            ).length
+          } of ${checks.length} checks passed`
+          : "Desktop readiness checks pending";
+      }
+    }
     provisioningStatus.className = stalled
       ? "cloud-run-provisioning-status cloud-run-danger"
       : "cloud-run-provisioning-status";
@@ -910,8 +1183,11 @@ export function createSessionConsole(document, api = {}, options = {}) {
       `${currentModel === null ? "" : ` — model ${currentModel}`}` +
       `${installs === null ? "" : ` — ${installs} install units`}` +
       `${validation === null ? "" : ` — ${validation} validations`}` +
+      `${desktopReadiness ? ` — ${desktopReadiness}` : ""}` +
       (
-        safeSeconds === null
+        provisionComplete
+          ? "."
+          : safeSeconds === null
           ? ` — aborts after ${stallBudget} seconds without meaningful progress.`
           : stalled
             ? ` — STALL DETECTED — ${safeSeconds} seconds since meaningful ` +
@@ -930,7 +1206,7 @@ export function createSessionConsole(document, api = {}, options = {}) {
         "cloud-run-deadline-warning cloud-run-danger";
       deadlineWarning.textContent =
         "RED WARNING — automatic deadline disabled; Vast billing has no " +
-        "Cloud Run time limit.";
+        "Cloud Vast time limit.";
     } else {
       deadlineWarning.className = "cloud-run-deadline-warning";
       const deadline = finiteNumber(session?.deadline_at);
@@ -1114,7 +1390,7 @@ export function createSessionConsole(document, api = {}, options = {}) {
       ) {
         eventState.error = {
           code: safeText(data.code, "execution_error"),
-          message: safeText(data.message, "Remote execution failed."),
+          message: safeText(data.message, "Remote workflow execution failed."),
         };
       }
     }
@@ -1123,18 +1399,121 @@ export function createSessionConsole(document, api = {}, options = {}) {
     if (currentJob) renderJob(currentJob);
   }
 
-  function renderSession(session) {
-    if (!session || typeof session !== "object") return;
+  function safeDesktopSetup(payload, expectedSessionId) {
+    if (
+      !payload
+      || typeof payload !== "object"
+      || payload.connection_name !== "ComfyUI Vast"
+      || typeof payload.bound !== "boolean"
+      || typeof payload.ready !== "boolean"
+      || (
+        payload.active_session_id !== null
+        && payload.active_session_id !== expectedSessionId
+      )
+      || !Array.isArray(payload.instructions)
+      || payload.instructions.length > 8
+      || payload.instructions.some(
+        (item) => typeof item !== "string" || !item || item.length > 500,
+      )
+    ) {
+      return null;
+    }
+    let parsed;
+    try {
+      parsed = new URL(payload.url);
+    } catch {
+      return null;
+    }
+    if (
+      parsed.protocol !== "http:"
+      || parsed.hostname !== "127.0.0.1"
+      || !/^[1-9][0-9]{0,4}$/.test(parsed.port)
+      || Number(parsed.port) > 65535
+      || parsed.pathname !== "/"
+      || parsed.search
+      || parsed.hash
+      || parsed.username
+      || parsed.password
+    ) {
+      return null;
+    }
+    return {
+      ...payload,
+      instructions: [...payload.instructions],
+    };
+  }
+
+  async function refreshDesktopSetup() {
+    const expectedSessionId = safeId(currentSession?.session_id);
+    if (
+      currentSession?.status !== "ready"
+      || expectedSessionId === null
+      || typeof api.getDesktopSetup !== "function"
+    ) {
+      desktopPanel.hidden = currentSession?.status !== "ready";
+      desktopStatus.textContent = "ComfyUI Vast Desktop setup is unavailable.";
+      desktopInstructions.textContent = "";
+      return null;
+    }
+    let setup;
+    try {
+      setup = safeDesktopSetup(
+        await api.getDesktopSetup(),
+        expectedSessionId,
+      );
+    } catch {
+      setup = null;
+    }
+    if (
+      currentSession?.session_id !== expectedSessionId
+      || currentSession?.status !== "ready"
+    ) {
+      return null;
+    }
+    desktopPanel.hidden = false;
+    if (setup === null) {
+      desktopStatus.textContent = "ComfyUI Vast Desktop setup is unavailable.";
+      desktopInstructions.textContent = "";
+      return null;
+    }
+    desktopStatus.textContent =
+      `${setup.connection_name} — ${setup.ready ? "active" : "not active"}. `
+      + `Desktop address: ${setup.url}`;
+    desktopInstructions.textContent = setup.instructions.join(" ");
+    return setup;
+  }
+
+  function renderSession(session, expectedSessionId = null) {
+    if (!safeSessionPayload(session, expectedSessionId)) return false;
     currentSession = session;
     if (session.offer) renderQuote(session, {
       idempotencyKey: sessionIdempotencyKey,
     });
+    const outcome = rentalOutcome(session);
+    if (outcome === "absent") clearPaidReview();
     sessionPanel.hidden = false;
-    sessionStatus.textContent =
-      `${sessionMessage(session)} ` +
+    const identity =
       `Session ${safeText(session.session_id, "unknown")}` +
       `${session.instance_id ? `; Vast instance ${String(session.instance_id)}` : ""}.`;
-    const rate = finiteNumber(session?.offer?.dph_total);
+    if (outcome === "unknown") {
+      sessionStatus.textContent =
+        "GPU rental could not be confirmed. Cloud Vast is checking Vast inventory. " +
+        "Do not start another rental yet. " +
+        "Billing status is not yet known; Vast may have created an instance. " +
+        identity;
+    } else if (
+      outcome === "absent"
+      && session.can_search_offers === true
+    ) {
+      sessionStatus.textContent =
+        "GPU rental failed. Vast inventory confirms that no instance is active for " +
+        "this session. No Vast billing is active. Search again and choose another " +
+        `GPU. ${identity}`;
+    } else {
+      sessionStatus.textContent = `${sessionMessage(session)} ${identity}`;
+    }
+    const rate = finiteNonnegativeNumber(session?.offer?.dph_total)
+      ?? finiteNonnegativeNumber(session?.rate);
     const elapsed = finiteNumber(session.elapsed_seconds)
       ?? (
         finiteNumber(session.created_at) !== null
@@ -1154,12 +1533,19 @@ export function createSessionConsole(document, api = {}, options = {}) {
       `Approximate active spend: ${spend === null ? "unknown" : money(spend)}.`;
     renderProvisioning(session);
     renderDeadline(session);
-    sessionError.textContent = session.error
-      ? `Session error: ${String(session.error)}`
+    const safeError = typeof session.error === "string" && session.error
+      ? `Session error: ${session.error}`
       : "";
-    if (session.billing_may_continue === true) {
+    sessionError.textContent = safeError;
+    if (session.can_verify_vast_access === true) {
       sessionError.textContent +=
-        " Warning — Vast billing may still be active. " +
+        `${sessionError.textContent ? " " : ""}` +
+        "Correct the saved Vast API key, then use the free Verify Vast access action.";
+    }
+    if (isEmergencyRentalState(session)) {
+      sessionError.textContent +=
+        `${sessionError.textContent ? " " : ""}` +
+        "Warning — Vast billing may still be active. " +
         safeText(
           session.emergency_action,
           "Use the Vast console immediately.",
@@ -1170,9 +1556,12 @@ export function createSessionConsole(document, api = {}, options = {}) {
     }
 
     const ready = session.status === "ready";
-    runNextJobButton.hidden = !ready;
+    desktopPanel.hidden = !ready;
     deadlineControls.hidden = !deadlineCanSynchronize(session);
-    destroyButton.hidden = !providerMutationMayHaveOccurred(session);
+    destroyButton.hidden = session.can_destroy !== true;
+    verifyVastAccessButton.hidden =
+      session.can_verify_vast_access !== true;
+    confirmButton.hidden = session.status !== "offer_selected";
     if (session.status === "destroyed") {
       destroyReview.hidden = true;
       destroyReviewToken = null;
@@ -1187,7 +1576,9 @@ export function createSessionConsole(document, api = {}, options = {}) {
     }
     setBusy(busy);
     notifySession(session);
+    if (ready) void refreshDesktopSetup();
     schedulePoll();
+    return true;
   }
 
   async function refresh() {
@@ -1197,7 +1588,11 @@ export function createSessionConsole(document, api = {}, options = {}) {
         safeId(currentSession?.session_id)
         && typeof api.getSession === "function"
       ) {
-        renderSession(await api.getSession(currentSession.session_id));
+        const expectedSessionId = currentSession.session_id;
+        const refreshed = await api.getSession(expectedSessionId);
+        if (!renderSession(refreshed, expectedSessionId)) {
+          throw new Error("Invalid session status response.");
+        }
       }
       if (
         safeId(currentSession?.session_id)
@@ -1264,16 +1659,30 @@ export function createSessionConsole(document, api = {}, options = {}) {
     if (
       !safeId(currentSession?.session_id)
       || !sessionIdempotencyKey
+      || currentReadiness === null
       || typeof api.confirmSession !== "function"
     ) {
       return;
     }
     setBusy(true);
-    status.textContent = "Submitting explicit paid confirmation…";
+    status.textContent =
+      "Rechecking the current canvas and profile before rental…";
     try {
+      if (typeof options.revalidateCurrentCanvas !== "function") {
+        throw new Error("current canvas validation unavailable");
+      }
+      const currentPreflight = await options.revalidateCurrentCanvas();
+      const currentPreflightId = safeId(currentPreflight?.preflight_id);
+      if (currentPreflightId === null || currentPreflight?.rentable !== true) {
+        throw new Error("current canvas changed");
+      }
+      status.textContent = "Submitting explicit paid confirmation…";
       renderSession(await api.confirmSession(
         currentSession.session_id,
         sessionIdempotencyKey,
+        currentReadiness.digest,
+        longerEstimateCheckbox.checked === true,
+        currentPreflightId,
       ));
       status.textContent =
         "Paid confirmation accepted; provisioning is server-driven.";
@@ -1286,40 +1695,7 @@ export function createSessionConsole(document, api = {}, options = {}) {
     }
   });
 
-  runNextJobButton.addEventListener("click", async () => {
-    if (
-      currentSession?.status !== "ready"
-      || typeof options.capture !== "function"
-      || typeof options.newIdempotencyKey !== "function"
-      || typeof api.createJob !== "function"
-    ) {
-      return;
-    }
-    setBusy(true);
-    status.textContent =
-      "Compiling the current canvas without local execution…";
-    try {
-      const captured = await options.capture();
-      const nextCaptureId = safeId(
-        typeof captured === "string" ? captured : captured?.capture_id,
-      );
-      const key = safeId(options.newIdempotencyKey());
-      if (!nextCaptureId || !key) throw new Error("invalid capture");
-      setCapture(nextCaptureId);
-      renderJob(await api.createJob(
-        currentSession.session_id,
-        nextCaptureId,
-        key,
-      ));
-      status.textContent = "Remote job submitted to the current GPU session.";
-    } catch {
-      status.textContent =
-        "The fresh canvas could not be submitted to this GPU session.";
-    } finally {
-      setBusy(false);
-      schedulePoll();
-    }
-  });
+  longerEstimateCheckbox.addEventListener("change", () => setBusy(busy));
 
   async function updateDeadline(action, acknowledged = undefined) {
     if (
@@ -1360,6 +1736,37 @@ export function createSessionConsole(document, api = {}, options = {}) {
       return;
     }
     await updateDeadline("disable", true);
+  });
+
+  verifyVastAccessButton.addEventListener("click", async () => {
+    const sessionId = safeId(currentSession?.session_id);
+    if (
+      currentSession?.can_verify_vast_access !== true
+      || !sessionId
+      || typeof api.verifyVastAccess !== "function"
+      || typeof api.getSettings !== "function"
+      || typeof api.getSession !== "function"
+    ) {
+      return;
+    }
+    setBusy(true);
+    status.textContent = "Verifying read-only Vast inventory access…";
+    try {
+      await api.verifyVastAccess();
+      renderSettings(await api.getSettings());
+      const refreshed = await api.getSession(sessionId);
+      renderSession(refreshed);
+      if (refreshed?.can_search_offers === true) {
+        clearSearchableHistoricalSession();
+      }
+      status.textContent =
+        "Vast access verified. A fresh offer search is available.";
+    } catch {
+      status.textContent =
+        "Vast access could not be verified; the rental gate remains active.";
+    } finally {
+      setBusy(false);
+    }
   });
 
   destroyButton.addEventListener("click", async () => {
@@ -1455,17 +1862,21 @@ export function createSessionConsole(document, api = {}, options = {}) {
   return {
     root,
     settingsSummary,
+    settingsError,
     outputAllowanceInput,
     preflightButton,
     searchButton,
     status,
     quotePanel,
     confirmButton,
+    longerEstimateReview,
+    longerEstimateCheckbox,
     sessionPanel,
+    sessionError,
     provisioningStatus,
     deadlineWarning,
-    runNextJobButton,
     destroyButton,
+    verifyVastAccessButton,
     destroyReview,
     dataLossCheckbox,
     destroyNowButton,
@@ -1480,10 +1891,18 @@ export function createSessionConsole(document, api = {}, options = {}) {
     renderJob,
     applyEvents,
     setCapture,
+    clearPaidReview,
     refresh,
+    refreshDesktopSetup,
     stopPolling: clearPoll,
     get preflightId() {
       return currentPreflightId;
+    },
+    get outputAllowance() {
+      return explicitOutputAllowance;
+    },
+    get canSearchOffers() {
+      return canSearchOffers();
     },
     get session() {
       return currentSession;
